@@ -9,7 +9,7 @@
 #   4. installs + starts a systemd user service so it runs 24/7
 #
 # Env overrides:
-#   MACCHIATO_SERVER_URL   (default wss://macchiato-server.fly.dev/connector)
+#   MACCHIATO_SERVER_URL   (default wss://api.macchiato.chat/connector)
 #   HERMES_PYTHON          (path to the python inside your Hermes venv, if auto-detect fails)
 
 set -euo pipefail

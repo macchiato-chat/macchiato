@@ -11,7 +11,7 @@ Flow:
 The socket must stay open until you claim, so this script waits (≈ the 8-min code TTL).
 
 Run with the Hermes venv python (has `websockets`):
-  MACCHIATO_SERVER_URL=wss://macchiato-server.fly.dev/connector \
+  MACCHIATO_SERVER_URL=wss://api.macchiato.chat/connector \
   ~/.local/share/pipx/venvs/hermes-agent/bin/python services/hermes-connector/pair.py
 """
 
@@ -25,8 +25,8 @@ import sys
 
 import websockets
 
-SERVER_URL = os.environ.get("MACCHIATO_SERVER_URL", "wss://macchiato-server.fly.dev/connector")
-WEB_URL = os.environ.get("MACCHIATO_WEB_URL", "https://macchiato-web.fly.dev")
+SERVER_URL = os.environ.get("MACCHIATO_SERVER_URL", "wss://api.macchiato.chat/connector")
+WEB_URL = os.environ.get("MACCHIATO_WEB_URL", "https://macchiato.chat")
 CRED_PATH = os.path.expanduser(os.environ.get("MACCHIATO_CRED", "~/.macchiato/connector.json"))
 CODE_FILE = os.environ.get("MACCHIATO_CODE_FILE", "/tmp/macchiato-pair-code.txt")
 PROTO = 2

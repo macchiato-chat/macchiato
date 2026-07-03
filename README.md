@@ -2,6 +2,8 @@
 
 **Chat with *your own* AI agent — from anywhere.**
 
+🌐 **[macchiato.chat](https://macchiato.chat)**
+
 Macchiato connects the AI agent running on **your** hardware (a Raspberry Pi, a home server, a laptop) to a polished chat app on your phone and on the web. Your agent keeps living where it always has — Macchiato gives it a beautiful front door.
 
 - 📱 **iOS + Web** — chat, voice input, push notifications
@@ -25,7 +27,7 @@ The installer will:
 
 1. find your Hermes install (the connector runs on Hermes' own Python),
 2. download the connector to `~/.macchiato/app/`,
-3. show a **pairing code** — enter it in the Macchiato web app to claim this connector,
+3. show a **pairing code** — enter it at [macchiato.chat](https://macchiato.chat) to claim this connector,
 4. install a `systemd` user service so it runs 24/7.
 
 **Requirements:** Linux with systemd (Raspberry Pi OS, Debian, Ubuntu…), a working [Hermes](https://github.com/NousResearch) install (pipx), and a Macchiato account.
@@ -34,7 +36,7 @@ The installer will:
 
 ### 中文安裝說明
 
-在跑 Hermes 的那台機器上執行上面的一行命令。腳本會自動找到 Hermes、下載連接器、顯示**配對碼**（在 Macchiato 網頁端輸入認領）、並裝成 systemd 常駐服務。日誌：`journalctl --user -u macchiato-connector -f`。
+在跑 Hermes 的那台機器上執行上面的一行命令。腳本會自動找到 Hermes、下載連接器、顯示**配對碼**（在 [macchiato.chat](https://macchiato.chat) 登錄後輸入認領）、並裝成 systemd 常駐服務。日誌：`journalctl --user -u macchiato-connector -f`。
 
 ### Manual install
 
@@ -87,4 +89,4 @@ Not yet — the installer pulls straight from this repository. A `pip install` p
 
 ---
 
-© Brian Sun · [PolyForm Shield 1.0.0](LICENSE.md) · not open source, but yours to read
+© Brian Sun · [macchiato.chat](https://macchiato.chat) · [PolyForm Shield 1.0.0](LICENSE.md) · not open source, but yours to read
