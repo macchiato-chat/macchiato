@@ -29,7 +29,7 @@ SERVER_URL = os.environ.get("MACCHIATO_SERVER_URL", "wss://api.macchiato.chat/co
 WEB_URL = os.environ.get("MACCHIATO_WEB_URL", "https://macchiato.chat")
 CRED_PATH = os.path.expanduser(os.environ.get("MACCHIATO_CRED", "~/.macchiato/connector.json"))
 CODE_FILE = os.environ.get("MACCHIATO_CODE_FILE", "/tmp/macchiato-pair-code.txt")
-PROTO = 2
+PROTO = 3  # 對齊 server 的 LINK_B_PROTO（packages/protocol）；不符會被拒 "proto mismatch"
 WAIT_S = 30 * 60  # overall pairing window (we refresh the code well within the server TTL)
 REFRESH_S = 6 * 60 + 30  # re-request a fresh code before the server's 8-min code TTL
 
