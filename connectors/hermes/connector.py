@@ -1,0 +1,961 @@
+#!/usr/bin/env python3
+"""
+Macchiato Pi connector — bridges real Hermes (via GatewayClient / tui_gateway)
+to the App Server over Link B (the server's `/connector` WSS).
+
+Link B contract (services/server/src/linkB + packages/protocol/src/link.ts):
+  - open WSS → send  hello {t, connectorToken, agentLinkId, proto} → await {t:"ready"}
+  - server → connector:  {t:"tui", agentLinkId, sessionId, frame}   (frame = tui REQUEST)
+  - connector → server:  {t:"tui", agentLinkId, sessionId, frame}   (frame = tui EVENT)
+  - {t:"ping"} → {t:"pong"}
+
+Session-id translation (the connector's job, per outbound.ts):
+  The server uses its OWN session ids (chat_sessions.hermes_session_id); real Hermes
+  assigns its own. We lazily create a real Hermes session per server session id and
+  map both ways, rewriting `session_id` on the way through.
+
+Run (needs `websockets`, present in the Hermes venv):
+  MACCHIATO_CONNECTOR_TOKEN=... MACCHIATO_AGENT_LINK_ID=... \
+  ~/.local/share/pipx/venvs/hermes-agent/bin/python services/hermes-connector/connector.py
+Env:
+  MACCHIATO_SERVER_URL      default ws://localhost:8080/connector
+  MACCHIATO_CONNECTOR_TOKEN required
+  MACCHIATO_AGENT_LINK_ID   required
+  HERMES_PYTHON             gateway python (default: hermes-agent venv)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import importlib
+import json
+import mimetypes
+import os
+import re
+import shutil
+import sys
+import time
+import urllib.request
+from collections import deque
+
+import websockets
+
+from gateway_client import GatewayClient, GatewayError
+from e2e_keys import E2EKeyStore
+from backfill import (
+    count_importable,
+    enumerate_importable,
+    changed_sessions,
+    tail_session,
+    current_max_id,
+    keepable,
+    cron_feed_target,
+)
+
+LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
+IMPORT_BATCH = 20
+# §15 全渠道持續鏡像（tail state.db）—— **核心功能，常開、不可關閉**。
+MIRROR_POLL_S = float(os.environ.get("MACCHIATO_MIRROR_POLL_S", "2"))  # 輪詢間隔（小=更即時、多步回合更增量）
+MIRROR_STATE = os.path.expanduser("~/.macchiato/mirror.json")  # 鏡像水位線持久化
+ATTACH_DIR = os.path.expanduser("~/.macchiato/attachments")  # 入站附件落地（gateway 同機可讀）
+HEALTH_FILE = os.path.expanduser("~/.macchiato/health.json")  # 本地健康快照（可本機 inspect）
+PUSH_SOCK = os.path.expanduser(os.environ.get("MACCHIATO_PUSH_SOCK", "~/.macchiato/push.sock"))  # §17 主動投遞：Hermes macchiato 插件 → 連接器
+HEALTH_INTERVAL_S = float(os.environ.get("MACCHIATO_HEALTH_S", "30"))
+ATTACH_TTL_S = float(os.environ.get("MACCHIATO_ATTACH_TTL_S", str(6 * 3600)))  # 入站附件保留 6h 後 GC
+MIRROR_STUCK_S = float(os.environ.get("MACCHIATO_MIRROR_STUCK_S", "60"))  # 鏡像輪詢時延超此→判卡死、重啟
+
+
+def _sanitize_filename(name: str) -> str:
+    name = os.path.basename(name or "").strip()
+    name = re.sub(r"[^\w.\-]+", "_", name)
+    return name[:120] or "attachment"
+
+
+def _materialize_attachment(ref: dict) -> str:
+    """下載 presigned GET url 到本地文件（連接器與 gateway 同機，落盤即可讓 gateway 讀）。"""
+    name = _sanitize_filename(ref.get("name") or "")
+    if "." not in name:
+        ext = mimetypes.guess_extension((ref.get("mime") or "").split(";")[0].strip()) or ""
+        name += ext
+    d = os.path.join(ATTACH_DIR, re.sub(r"[^\w\-]+", "_", str(ref.get("id") or "att")))
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, name)
+    req = urllib.request.Request(ref["url"], headers={"User-Agent": "macchiato-connector"})
+    with urllib.request.urlopen(req, timeout=30) as r, open(path, "wb") as f:
+        shutil.copyfileobj(r, f)
+    return path
+
+
+def _transcribe_attachment(ref: dict) -> dict:
+    """語音輸入：下載 audio 附件 → 用 Hermes 自帶 STT（tools.voice_mode）本地轉錄。
+    返回 {"text": <轉錄文字>}；不可用/失敗/空 → {"text": "", "error": <機器可讀原因>}。
+    阻塞（下載 + Whisper），務必在 asyncio.to_thread 裡跑。連接器與 Hermes 同 venv，
+    `tools` 是 editable 安裝、任意 CWD 可 import；STT provider 需在 ~/.hermes/config.yaml 配好
+    （local faster-whisper / openai / groq / mistral），否則 transcribe_recording 報錯→這裡降級。"""
+    try:
+        path = _materialize_attachment(ref)
+    except Exception as exc:
+        return {"text": "", "error": f"download_failed: {exc!r}"}
+    try:
+        from tools.voice_mode import transcribe_recording
+    except Exception as exc:
+        return {"text": "", "error": f"stt_unavailable: {exc!r}"}
+    try:
+        result = transcribe_recording(path)
+    except Exception as exc:
+        return {"text": "", "error": f"stt_failed: {exc!r}"}
+    if not result.get("success"):
+        return {"text": "", "error": str(result.get("error") or "stt_failed")}
+    return {"text": (result.get("transcript") or "").strip()}
+
+
+MEDIA_MAX = 12 * 1024 * 1024  # 出站附件 base64 內聯上限（12MB），超出跳過
+
+
+def _extract_media_files(text: str) -> list:
+    """復用 Hermes 平台適配器的 MEDIA:/裸路徑解析（與 Discord/Telegram 投遞同一套）。"""
+    from gateway.platforms.base import BasePlatformAdapter as B
+
+    media, cleaned = B.extract_media(text)
+    media = B.filter_media_delivery_paths(media)  # [(path, is_voice)]，校驗存在
+    local, _ = B.extract_local_files(cleaned)
+    local = B.filter_local_delivery_paths(local)
+    out, seen = [], set()
+    for path, _v in list(media) + [(p, False) for p in local]:
+        if path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
+
+
+def _read_media_file(path: str) -> dict | None:
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    if size <= 0 or size > MEDIA_MAX:
+        if size > MEDIA_MAX:
+            print(f"[media too big, skip] {path} {size}B", file=sys.stderr)
+        return None
+    with open(path, "rb") as f:
+        data = f.read()
+    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    return {
+        "kind": "image" if mime.startswith("image/") else "document",
+        "name": os.path.basename(path),
+        "mime": mime,
+        "size": size,
+        "data_b64": base64.b64encode(data).decode("ascii"),
+    }
+
+
+def _gc_attachments() -> int:
+    """刪除 ATTACH_DIR 下超過 ATTACH_TTL_S 的入站附件（prompt 早已消費，無需長留）。"""
+    now = time.time()
+    removed = 0
+    try:
+        for root, _dirs, files in os.walk(ATTACH_DIR, topdown=False):
+            for name in files:
+                p = os.path.join(root, name)
+                try:
+                    if now - os.path.getmtime(p) > ATTACH_TTL_S:
+                        os.remove(p)
+                        removed += 1
+                except OSError:
+                    pass
+            if root != ATTACH_DIR:
+                try:
+                    os.rmdir(root)  # 只刪空目錄
+                except OSError:
+                    pass
+    except FileNotFoundError:
+        pass
+    return removed
+
+
+def _check_hermes_compat() -> dict:
+    """探測連接器依賴的 Hermes 內部 API + 版本（Hermes 自動更新可能改動內部，需自檢）。
+    返回 {hermes_version, checks:{name: True|"FAIL: ..."}}。"""
+    checks: dict = {}
+    ver = None
+    try:
+        from importlib.metadata import version as _ver
+
+        ver = _ver("hermes-agent")
+    except Exception as exc:
+        checks["hermes_version"] = f"FAIL: {exc!r}"
+
+    def _probe(name, fn):
+        try:
+            fn()
+            checks[name] = True
+        except Exception as exc:
+            checks[name] = f"FAIL: {exc!r}"
+
+    def _sdb():
+        m = importlib.import_module("hermes_state")
+        for a in ("set_session_archived", "resolve_session_id"):
+            assert hasattr(m.SessionDB, a), a
+
+    def _base():
+        b = importlib.import_module("gateway.platforms.base").BasePlatformAdapter
+        for a in ("extract_media", "extract_local_files", "filter_media_delivery_paths"):
+            assert hasattr(b, a), a
+
+    _probe("hermes_state.SessionDB", _sdb)  # session.archive 回寫
+    _probe("gateway.platforms.base", _base)  # 出站附件 extract_media
+    def _tui():
+        import importlib.util as _u
+
+        # 只查模塊存在、不 import（tui_gateway.entry import 時會註冊 signal，工作線程里會炸）。
+        assert _u.find_spec("tui_gateway.entry") is not None
+
+    _probe("tui_gateway.entry", _tui)  # gateway 主幹
+    return {"hermes_version": ver, "checks": checks}
+
+
+class Connector:
+    def __init__(
+        self,
+        server_url: str,
+        connector_token: str,
+        agent_link_id: str,
+        *,
+        hermes_python: str | None = None,
+    ) -> None:
+        self.server_url = server_url
+        self.connector_token = connector_token
+        self.agent_link_id = agent_link_id
+        self.hermes_python = hermes_python
+
+        self.ws = None
+        self.gw: GatewayClient | None = None
+        self._fwd: dict[str, str] = {}  # server session id -> real hermes session id
+        self._rev: dict[str, str] = {}  # real hermes session id -> server session id
+        self._pending_interrupt: set[str] = set()  # 回合映射建立前到達的 session.interrupt：別丟，等回合起步即取消
+        self._sdb = None  # 懶加載的 Hermes SessionDB（session.archive 用，寫 state.db.archived）
+        self._mirror_task = None  # §15 持續鏡像 tailer 任務
+        self._health_task = None  # 健康上報任務
+        self._push_server = None  # §17 主動投遞：本地 unix socket（Hermes macchiato 插件 → Link B）
+        self._push_seq = 0
+        self._started_at = time.time()
+        self._linkb_state = "init"
+        self._mirror_last_run = None
+        self._last_error = None
+        self._compat: dict = {}
+        self._mirror_st = None  # 鏡像水位線狀態（nack 回退也要訪問）
+        self._mirror_batch_id = 0
+        self._mirror_rewind = deque(maxlen=64)  # (batchId, {sid: 舊floor})，供 nack 回退
+        self._e2e = E2EKeyStore()  # §19 per-session E2E 密鑰管理（持 K_S、封裝給設備、加解密內容）
+
+    async def run(self) -> None:
+        loop = asyncio.get_running_loop()
+
+        def on_event(params: dict) -> None:
+            # agent → you: translate real session id back to the server's, then forward.
+            real_sid = params.get("session_id")
+            server_sid = self._rev.get(real_sid, real_sid)
+            if self._e2e.is_e2e(server_sid):
+                return  # §19 E2E（方案 A）：抑制 live 明文轉發；內容改由加密鏡像投遞（~2s 一條完整消息）
+            frame = {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {**params, "session_id": server_sid},
+            }
+            loop.create_task(self._to_server(server_sid, frame))
+            # 出站附件：message.complete 正文裡 MEDIA:/裸路徑標的文件 → media.attach。
+            if params.get("type") == "message.complete":
+                text = (params.get("payload") or {}).get("text") or ""
+                if text:
+                    loop.create_task(self._emit_media_from_text(server_sid, text))
+
+        self.gw = GatewayClient(
+            on_event=on_event,
+            on_restart=self._on_gateway_restart,
+            hermes_python=self.hermes_python,
+        )
+        await self.gw.start()
+        print("· hermes gateway up")
+
+        self._compat = await asyncio.to_thread(_check_hermes_compat)
+        self._log_compat()
+
+        self._mirror_task = asyncio.create_task(self._mirror_loop())
+        print(f"· 持續鏡像已啟（輪詢 {MIRROR_POLL_S}s）")
+        self._health_task = asyncio.create_task(self._health_loop())
+        await self._start_push_socket()
+
+        hello = json.dumps(
+            {
+                "t": "hello",
+                "connectorToken": self.connector_token,
+                "agentLinkId": self.agent_link_id,
+                "proto": LINK_B_PROTO,
+            }
+        )
+        # 保活心跳 + 自動重連：Fly 邊緣會掐閒置 WS；gateway 與 session 映射跨重連保留。
+        backoff = 1
+        try:
+            while True:
+                try:
+                    async with websockets.connect(
+                        self.server_url, ping_interval=20, ping_timeout=None, close_timeout=10
+                    ) as ws:
+                        self.ws = ws
+                        self._linkb_state = "handshaking"
+                        await ws.send(hello)
+                        async for raw in ws:
+                            backoff = 1  # 收到幀 = 健康，重置退避
+                            await self._on_server_msg(raw)
+                except (websockets.exceptions.ConnectionClosed, OSError) as exc:
+                    print(f"· link B 斷開（{type(exc).__name__}），{backoff}s 後重連…", file=sys.stderr)
+                self.ws = None
+                self._linkb_state = "disconnected"
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+        finally:
+            for tk in (self._mirror_task, self._health_task):
+                if tk is not None:
+                    tk.cancel()
+            if self._push_server is not None:
+                self._push_server.close()
+                try:
+                    os.unlink(PUSH_SOCK)
+                except OSError:
+                    pass
+            await self.gw.close()
+
+    async def _to_server(self, server_sid: str, frame: dict) -> None:
+        if self.ws is None:
+            return
+        try:
+            await self.ws.send(
+                json.dumps(
+                    {"t": "tui", "agentLinkId": self.agent_link_id, "sessionId": server_sid, "frame": frame},
+                    ensure_ascii=False,
+                )
+            )
+        except Exception as exc:
+            print(f"[to_server failed] {exc!r}", file=sys.stderr)
+
+    def _on_gateway_restart(self) -> None:
+        # gateway 重啟後，舊 session 映射失效（新 gateway 無這些活躍會話）→ 清空，
+        # 下次 prompt 重新 resume（帶上下文）/ create。
+        # 自驅會話的 live 消息已投遞過 → 重啟後推進其鏡像水位線、免得重發。需含 _fwd 鍵
+        # （持久化 hermesSessionId，鏡像看到的就是它）；_rev 鍵是運行時 id、非 state.db 會話，
+        # _advance_mirror_driven 會自動忽略（不在 changed_sessions 里）。
+        # §19 E2E 例外：E2E 自驅會話的內容靠加密鏡像投遞（live 被 on_event 抑制）→ 絕不能推進其
+        # 水位線，否則重啟前**尚未鏡像**的 E2E 消息會被永久跳過（丟失）。按持久化 id（K_S 的鍵）判 E2E，
+        # 把該會話的運行時 id 與持久化 id 都排除出 driven。
+        e2e_skip = set()
+        for real_id, server_sid in self._rev.items():
+            if self._e2e.is_e2e(server_sid):
+                e2e_skip.add(real_id)
+                e2e_skip.add(server_sid)
+        driven = [s for s in (list(self._rev.keys()) + list(self._fwd.keys())) if s not in e2e_skip]
+        self._fwd.clear()
+        self._rev.clear()
+        self._pending_interrupt.clear()  # 重啟後舊回合已死，早到的 pending 中斷作廢
+        print("· gateway 重啟，已清空 session 映射")
+        # 修 A：_rev 一清，鏡像就不再跳過這些會話 → 會把 live 已投遞的消息重發成重複。
+        # 把它們的鏡像水位線推到當前 max（重啟後不重發舊消息；之後的 Discord 續聊仍會鏡像）。
+        if driven:
+            asyncio.create_task(self._advance_mirror_driven(driven))
+
+    async def _advance_mirror_driven(self, sids: list) -> None:
+        if self._mirror_st is None:
+            return
+        wm = self._mirror_st["sessions"]
+        try:
+            maxes = {r[0]: r[4] for r in await changed_sessions()}
+        except Exception as exc:
+            print(f"[advance_mirror_driven failed] {exc!r}", file=sys.stderr)
+            return
+        changed = False
+        for sid in sids:
+            mx = maxes.get(sid)
+            if mx is not None and mx > wm.get(sid, 0):
+                wm[sid] = mx
+                changed = True
+        if changed:
+            self._save_mirror_state(self._mirror_st)
+            print(f"· 鏡像水位線推進 {len(sids)} 自驅會話（修 A：防重啟重發）", file=sys.stderr)
+
+    def _session_db(self):
+        # 懶加載 Hermes 的 SessionDB（連接器跑在 hermes-agent venv 內，同一份 hermes_state）。
+        # 用它官方的 set_session_archived（會連帶處理壓縮 lineage，比裸 UPDATE 穩）。
+        if self._sdb is None:
+            from hermes_state import SessionDB
+
+            self._sdb = SessionDB()  # 默認 ~/.hermes/state.db；check_same_thread=False，可跨線程
+        return self._sdb
+
+    async def _set_hermes_archived(self, server_sid: str, archived: bool) -> None:
+        # session.archive 是 server 造的合成方法、tui_gateway 沒有 → 連接器自己寫 state.db。
+        # 既有映射優先；導入會話 server 直接下發 hermes_session_id，故 fallback 用原值。
+        real = self._fwd.get(server_sid, server_sid)
+
+        def _do():
+            db = self._session_db()
+            sid = db.resolve_session_id(real) or real
+            return sid, db.set_session_archived(sid, archived)
+
+        sid, ok = await asyncio.to_thread(_do)
+        print(f"· session.archive {sid} → archived={archived}（{'ok' if ok else 'no-op'}）")
+
+    async def _attach_to_session(self, real_sid: str, ref: dict) -> None:
+        # 入站附件：下載 presigned url → image.attach/file.attach；隨後的 prompt.submit 會帶上。
+        path = await asyncio.to_thread(_materialize_attachment, ref)
+        method = "image.attach" if ref.get("kind") == "image" else "file.attach"
+        await self.gw.request(method, {"session_id": real_sid, "path": path})
+        print(f"· 附件 {method} {ref.get('name')!r} → {real_sid}")
+
+    async def _send_voice_transcript(
+        self, server_sid: str, attachment_id, text: str, error: str | None = None
+    ) -> None:
+        # 語音輸入回填：把 audio 附件轉錄出的文字回傳 server（按 attachmentId 定位那條 user 消息）。
+        msg = {
+            "t": "voice_transcript",
+            "agentLinkId": self.agent_link_id,
+            "sessionId": server_sid,
+            "attachmentId": attachment_id,
+            "text": text or "",
+        }
+        if error:
+            msg["error"] = error
+        await self._send(msg)
+        tail = f", err={error}" if error else ""
+        print(f"· 語音轉錄回填 → server（{len(text or '')} 字{tail}）")
+
+    async def _emit_media_from_text(self, server_sid: str, text: str) -> None:
+        # 出站附件：agent 在正文用 MEDIA:/裸路徑標的文件 → 讀取 → media.attach 事件上送。
+        try:
+            paths = await asyncio.to_thread(_extract_media_files, text)
+        except Exception as exc:
+            print(f"[extract_media failed] {exc!r}", file=sys.stderr)
+            return
+        for path in paths:
+            try:
+                payload = await asyncio.to_thread(_read_media_file, path)
+            except Exception as exc:
+                print(f"[read media {path} failed] {exc!r}", file=sys.stderr)
+                continue
+            if payload is None:
+                continue
+            frame = {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {"type": "media.attach", "session_id": server_sid, "payload": payload},
+            }
+            await self._to_server(server_sid, frame)
+            print(f"· media.attach {payload['name']}（{payload['size']}B）→ {server_sid}")
+
+    async def _ensure_session(self, server_sid: str) -> str:
+        real = self._fwd.get(server_sid)
+        if real:
+            return real
+        assert self.gw is not None
+        # 續聊 vs 新建：先試 session.resume（導入/既有的 Hermes 會話 → 帶上下文續聊），
+        # 失敗（session not found = Macchiato 新建的會話）才 session.create。
+        try:
+            res = await self.gw.request("session.resume", {"session_id": server_sid})
+            real = (res or {}).get("session_id") or server_sid
+            print(f"· resumed hermes session {real}（帶上下文續聊）")
+        except GatewayError:
+            res = await self.gw.create_session()
+            real = res.get("session_id")
+            print(f"· created hermes session {real} ← server {server_sid}")
+        self._fwd[server_sid] = real
+        self._rev[real] = server_sid
+        return real
+
+    async def _send(self, msg: dict) -> None:
+        if self.ws is not None:
+            await self.ws.send(json.dumps(msg, ensure_ascii=False))
+
+    async def _start_push_socket(self) -> None:
+        """§17 主動投遞：本地 unix socket 接 Hermes macchiato 插件的投遞請求 → 經 Link B 發 connector_push。"""
+        os.makedirs(os.path.dirname(PUSH_SOCK), exist_ok=True)
+        try:
+            if os.path.exists(PUSH_SOCK):
+                os.unlink(PUSH_SOCK)
+        except OSError:
+            pass
+        try:
+            self._push_server = await asyncio.start_unix_server(self._push_handler, path=PUSH_SOCK)
+            os.chmod(PUSH_SOCK, 0o600)  # 僅本用戶可投遞（本機 IPC）
+            print(f"· 主動投遞 socket 已啟（{PUSH_SOCK}）")
+        except Exception as exc:
+            print(f"[push socket 啟動失敗] {exc!r}", file=sys.stderr)
+
+    async def _push_handler(self, reader, writer) -> None:
+        """單條請求：讀一行 JSON {chatId,text,...} → 經 Link B 發 connector_push → 回 ack 行。"""
+        ack: dict = {"ok": False, "error": "unknown"}
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=10)
+            req = json.loads(line.decode("utf-8")) if line else {}
+            chat_id = str(req.get("chatId") or "")
+            text = req.get("text") or ""
+            if not chat_id or not text:
+                ack = {"ok": False, "error": "missing chatId/text"}
+            elif self.ws is None:
+                ack = {"ok": False, "error": "link B down", "retryable": True}
+            else:
+                self._push_seq += 1
+                pid = self._push_seq
+                msg = {
+                    "t": "connector_push",
+                    "agentLinkId": self.agent_link_id,
+                    "chatId": chat_id,
+                    "text": text,
+                    "pushId": pid,
+                }
+                if req.get("replyTo"):
+                    msg["replyTo"] = req["replyTo"]
+                if req.get("metadata"):
+                    msg["metadata"] = req["metadata"]
+                await self._send(msg)
+                print(f"· 主動投遞 → server（chat={chat_id[:24]}, push {pid}, {len(text)} 字）")
+                ack = {"ok": True, "messageId": f"push:{pid}"}
+        except asyncio.TimeoutError:
+            ack = {"ok": False, "error": "read timeout"}
+        except Exception as exc:
+            ack = {"ok": False, "error": repr(exc)}
+        try:
+            writer.write((json.dumps(ack) + "\n").encode("utf-8"))
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _advertise_import(self) -> None:
+        """ready 後：上報可導入的歷史會話數（web 據此彈提示卡）。"""
+        try:
+            n = await count_importable(self.gw)
+        except Exception as exc:
+            print(f"[import_available failed] {exc!r}", file=sys.stderr)
+            return
+        print(f"· 可導入歷史會話: {n}")
+        await self._send({"t": "import_available", "count": n})
+
+    async def _run_import(self) -> None:
+        """收到 import_start：枚舉磁盤歷史，分批 import_batch 回傳給 server。"""
+        print("· 收到 import_start，枚舉並分批回傳…")
+        try:
+            sessions = await enumerate_importable(self.gw)
+        except Exception as exc:
+            print(f"[import enumerate failed] {exc!r}", file=sys.stderr)
+            await self._send({"t": "import_batch", "sessions": [], "done": True})
+            return
+        if not sessions:
+            await self._send({"t": "import_batch", "sessions": [], "done": True})
+            return
+        for i in range(0, len(sessions), IMPORT_BATCH):
+            chunk = sessions[i : i + IMPORT_BATCH]
+            await self._send(
+                {"t": "import_batch", "sessions": chunk, "done": i + IMPORT_BATCH >= len(sessions)}
+            )
+            print(f"  → import_batch {i // IMPORT_BATCH + 1}: {len(chunk)} 會話")
+        print(f"✓ 導入回傳完成：{len(sessions)} 個會話")
+
+    # ── §15 全渠道持續鏡像（tail state.db → mirror_append）──────────────────
+
+    def _load_mirror_state(self) -> dict:
+        try:
+            with open(MIRROR_STATE) as f:
+                st = json.load(f)
+            st.setdefault("sessions", {})
+            return st
+        except (FileNotFoundError, ValueError):
+            return {"baseline": None, "sessions": {}}
+
+    def _save_mirror_state(self, st: dict) -> None:
+        try:
+            os.makedirs(os.path.dirname(MIRROR_STATE), exist_ok=True)
+            tmp = MIRROR_STATE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(st, f)
+            os.replace(tmp, MIRROR_STATE)
+        except Exception as exc:
+            print(f"[mirror state save failed] {exc!r}", file=sys.stderr)
+
+    # ── 健康自檢 / 上報（#1 兼容自檢 + #2 健康上報）─────────────────────────
+
+    def _log_compat(self) -> None:
+        ver = self._compat.get("hermes_version")
+        checks = self._compat.get("checks", {})
+        bad = {k: v for k, v in checks.items() if v is not True}
+        print(f"· Hermes 兼容自檢：version={ver}，{len(checks) - len(bad)}/{len(checks)} 通過")
+        for k, v in bad.items():
+            print(f"  ⚠️  {k} → {v}", file=sys.stderr)
+        if bad:
+            self._last_error = "compat: " + ", ".join(bad)
+            print(
+                "  ⚠️  Hermes 內部 API 不匹配（疑似 Hermes 自動更新）——相關功能可能失效！",
+                file=sys.stderr,
+            )
+
+    def _health(self) -> dict:
+        checks = self._compat.get("checks", {})
+        now = time.time()
+        return {
+            "ts": int(now),
+            "uptimeS": int(now - self._started_at),
+            "linkB": self._linkb_state,
+            "gatewayAlive": bool(self.gw and self.gw.is_alive()),
+            "hermesVersion": self._compat.get("hermes_version"),
+            "compatOk": bool(checks) and all(v is True for v in checks.values()),
+            "compat": checks,
+            "mirrorLastPollAgeS": (
+                int(now - self._mirror_last_run) if self._mirror_last_run else None
+            ),
+            "lastError": self._last_error,
+        }
+
+    def _write_health_file(self, h: dict) -> None:
+        try:
+            os.makedirs(os.path.dirname(HEALTH_FILE), exist_ok=True)
+            tmp = HEALTH_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(h, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, HEALTH_FILE)
+        except Exception as exc:
+            print(f"[health file write failed] {exc!r}", file=sys.stderr)
+
+    async def _health_loop(self) -> None:
+        """每 HEALTH_INTERVAL_S：寫本地 health.json + 發 connector_health（讓 server 看出降級）。"""
+        while True:
+            try:
+                await asyncio.sleep(HEALTH_INTERVAL_S)
+                h = self._health()
+                self._write_health_file(h)
+                # 鏡像看門狗：輪詢時延遠超預期 → 循環卡死/靜默退出 → 抓棧 + 重啟自愈。
+                age = h.get("mirrorLastPollAgeS")
+                if age is not None and age > MIRROR_STUCK_S:
+                    print(f"⚠️ 鏡像循環卡 {age}s（卡死/退出）→ dump 棧 + 重啟", file=sys.stderr)
+                    self._last_error = f"mirror stuck {age}s → restarted"
+                    if self._mirror_task is not None:
+                        try:
+                            self._mirror_task.print_stack(file=sys.stderr)  # 掛起點 / 退出異常
+                        except Exception:
+                            pass
+                        if not self._mirror_task.done():
+                            self._mirror_task.cancel()
+                    self._mirror_last_run = time.time()
+                    self._mirror_task = asyncio.create_task(self._mirror_loop())
+                n = await asyncio.to_thread(_gc_attachments)
+                if n:
+                    print(f"· GC 過期附件 {n} 個")
+                if self.ws is not None:
+                    await self._send(
+                        {"t": "connector_health", "agentLinkId": self.agent_link_id, "health": h}
+                    )
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                print(f"[health loop error] {exc!r}", file=sys.stderr)
+
+    def _mirror_handle_nack(self, batch_id) -> None:
+        """收到 server 的 mirror_nack：回退該批會話的水位線 → 下輪重發（#3 防丟）。"""
+        if self._mirror_st is None or batch_id is None:
+            return
+        for bid, rewind in self._mirror_rewind:
+            if bid == batch_id:
+                wm = self._mirror_st["sessions"]
+                for sid, old in rewind.items():
+                    wm[sid] = min(wm.get(sid, old), old)
+                self._save_mirror_state(self._mirror_st)
+                self._last_error = f"mirror_nack: batch {batch_id}"
+                print(
+                    f"· mirror_nack batch {batch_id}：回退 {len(rewind)} 會話水位線、下輪重發",
+                    file=sys.stderr,
+                )
+                return
+
+    def _mirror_entry(self, sid, title, source, archived, msgs, e2e):
+        """構造一個鏡像批次條目。E2E 會話（方案 A）：標題 + 各消息內容加密、打 e2e 標記，server 盲存。"""
+        if not e2e:
+            return {
+                "hermesSessionId": sid,
+                "title": title,
+                "source": source,
+                "archived": bool(archived),
+                "messages": msgs,
+            }
+        return {
+            "hermesSessionId": sid,
+            "title": self._e2e.encrypt_text(sid, title or ""),  # 標題也加密
+            "source": source,
+            "archived": bool(archived),
+            "e2e": True,
+            "messages": [
+                {
+                    "role": m["role"],
+                    "createdAt": m.get("createdAt"),
+                    "enc": self._e2e.encrypt_content(
+                        sid,
+                        {"text": m.get("text", ""), "reasoning": m.get("reasoning"), "tools": m.get("tools")},
+                    ),
+                }
+                for m in msgs
+            ],
+        }
+
+    async def _mirror_loop(self) -> None:
+        """tail state.db：把其他渠道（Discord/Telegram/…）的新消息 mirror_append 給 server。"""
+        st = self._mirror_st = self._load_mirror_state()
+        if st.get("baseline") is None:
+            st["baseline"] = await current_max_id()  # 基線=當前 max；只鏡像此後的新消息
+            self._save_mirror_state(st)
+            print(f"· 鏡像基線 messages.id={st['baseline']}")
+        baseline, wm = st["baseline"], st["sessions"]
+        titles = st.setdefault("titles", {})  # 已發 server 的標題：偵測 Hermes 回合後才取名 → 純標題更新
+        while True:
+            try:
+                await asyncio.sleep(MIRROR_POLL_S)
+                self._mirror_last_run = time.time()
+                if self.ws is None:
+                    continue
+                batch, touched, title_updates = [], {}, {}
+                for sid, source, title, archived, maxid in await changed_sessions():
+                    # sid = state.db 會話 id。自驅會話（Macchiato 新建）的 state.db id 是 Hermes 分配的
+                    # 運行時 id（_rev 鍵）≠ server 持久化 hermesSessionId；而 K_S 按持久化 id 鍵控、
+                    # mirror 也須用持久化 id 才能落回原會話 → 先映射回 pid 來判 E2E / 加密 / 標識。
+                    # 讀消息與水位線仍按 state.db 的 sid（消息落在它下面）。
+                    pid = self._rev.get(sid, sid)
+                    e2e = self._e2e.is_e2e(pid)  # §19：E2E 會話走加密鏡像（方案 A），不跳過
+                    if (sid in self._rev or sid in self._fwd) and not e2e:
+                        # 非 E2E 自驅會話不鏡像（live 已投遞）。_rev 鍵=resume 的**運行時 id**；_fwd 鍵=
+                        # **持久化 id**（server 發的 hermesSessionId）。續聊 Discord 會話時運行時 id ≠
+                        # 持久化 id、消息落持久化 id 下、鏡像看到的是它，故須連 _fwd 一起查,否則重複投遞。
+                        # E2E 反例外：它的 live 已被 on_event 抑制 → 必須走加密鏡像才送得到。
+                        continue
+                    floor = wm.get(sid, baseline)
+                    has_new = maxid > floor
+                    job = cron_feed_target(source, title)
+                    if job is not None:
+                        if has_new:
+                            # cron → 訂閱 feed：只取 agent 文字報告，併進合成線 cron:<job>（§16）。
+                            msgs, new_wm = await tail_session(sid, floor)
+                            reports = [
+                                {"role": "agent", "text": m["text"], "createdAt": m.get("createdAt")}
+                                for m in msgs
+                                if m["role"] == "agent" and (m.get("text") or "").strip()
+                            ]
+                            if reports:
+                                batch.append({
+                                    "hermesSessionId": f"cron:{job}",
+                                    "title": job,
+                                    "source": "cron_feed",
+                                    "archived": False,
+                                    "messages": reports,
+                                })
+                            touched[sid] = new_wm
+                        continue
+                    if not keepable(source, title):
+                        continue
+                    if has_new:
+                        msgs, new_wm = await tail_session(sid, floor)
+                        if msgs:
+                            batch.append(self._mirror_entry(pid, title, source, archived, msgs, e2e))
+                            touched[sid] = new_wm
+                            title_updates[sid] = title
+                    elif sid in wm and (title or "").strip() and titles.get(sid) != title:
+                        # 已鏡像過（server 上存在）、無新消息、但標題變了（Hermes 回合後才取名）→
+                        # 純標題更新（空消息）；server 據此把占位「(鏡像會話)」改成真標題。用 sid in wm
+                        # 而非 titles，使升級前**積壓**的卡住會話（titles 尚無記錄）首輪也補上。
+                        # 不入 touched（不推水位線）。server 對非占位的會話自會 no-op。
+                        batch.append(self._mirror_entry(pid, title, source, archived, [], e2e))
+                        title_updates[sid] = title
+                if batch:
+                    self._mirror_batch_id += 1
+                    bid = self._mirror_batch_id
+                    rewind = {sid: wm.get(sid, baseline) for sid in touched}  # advance 前的舊 floor
+                    await self._send({
+                        "t": "mirror_append",
+                        "agentLinkId": self.agent_link_id,
+                        "batchId": bid,
+                        "sessions": batch,
+                    })
+                    self._mirror_rewind.append((bid, rewind))
+                    # 修 B：只在水位線未被併發 nack 回退時推進（否則回退會被覆蓋 → 丟）。
+                    for sid, new_wm in touched.items():
+                        if wm.get(sid, baseline) == rewind[sid]:
+                            wm[sid] = new_wm
+                    titles.update(title_updates)  # 發送成功才記，免得失敗後不再重發
+                    self._save_mirror_state(st)
+                    n = sum(len(s["messages"]) for s in batch)
+                    nt = sum(1 for s in batch if not s["messages"])
+                    extra = f"（含 {nt} 純標題更新）" if nt else ""
+                    print(f"· 鏡像 {len(batch)} 會話 / {n} 條 → server (batch {bid}){extra}")
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                print(f"[mirror loop error] {exc!r}", file=sys.stderr)
+
+    async def _on_server_msg(self, raw) -> None:
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        t = msg.get("t")
+        if t == "ready":
+            self._linkb_state = "connected"
+            print("✓ link B ready — 連接器上線，等待 server 下達")
+            await self._advertise_import()
+            return
+        if t == "auth_error":
+            reason = msg.get("reason")
+            self._linkb_state = f"auth_error: {reason}"
+            self._last_error = f"auth_error: {reason}"
+            print(
+                f"✗ auth_error: {reason}（服務將無法工作——可能 Hermes 升級致 proto 不符）",
+                file=sys.stderr,
+            )
+            return
+        if t == "ping":
+            if self.ws:
+                await self.ws.send(json.dumps({"t": "pong"}))
+            return
+        if t == "import_start":
+            await self._run_import()
+            return
+        if t == "mirror_nack":
+            self._mirror_handle_nack(msg.get("batchId"))
+            return
+        if t == "e2e_wrap_request":
+            # §19：iOS 開啟某會話 E2E / 新設備加入 → 生成或取出 K_S，封裝給各設備公鑰、回傳。
+            sid = msg.get("hermesSessionId")
+            if sid:
+                wrapped = self._e2e.wrap_for_devices(sid, msg.get("devices") or [])
+                await self._send({
+                    "t": "e2e_key",
+                    "agentLinkId": self.agent_link_id,
+                    "hermesSessionId": sid,
+                    "wrapped": wrapped,
+                })
+                print(f"· E2E：會話 {sid} 封裝 K_S 給 {len(wrapped)} 台設備")
+            return
+        if t != "tui":
+            return
+
+        frame = msg.get("frame") or {}
+        method = frame.get("method")
+        params = frame.get("params") or {}
+        server_sid = params.get("session_id") or msg.get("sessionId")
+        assert self.gw is not None
+
+        try:
+            if method == "prompt.submit":
+                real = await self._ensure_session(server_sid)
+                attachments = params.get("attachments") or []
+                parts = []
+                base = (params.get("text") or "").strip()
+                if base and self._e2e.is_e2e(server_sid):
+                    # §19 E2E：iOS 發來的是密文 → 解密後再提交 agent（gated，非 E2E 會話不走這）。
+                    try:
+                        base = self._e2e.decrypt_text(server_sid, base).strip()
+                    except Exception as exc:
+                        print(f"[E2E 解密 prompt 失敗 {server_sid}] {exc!r}", file=sys.stderr)
+                        base = ""  # 解不開 → 不把亂碼提交給 agent
+                if base:
+                    parts.append(base)
+                for ref in attachments:
+                    if ref.get("kind") == "audio":
+                        # 語音輸入：本地 STT 轉錄 → 回填 server（顯示在 user 氣泡）+ 拼進發給 agent 的文字。
+                        res = await asyncio.to_thread(_transcribe_attachment, ref)
+                        transcript = (res.get("text") or "").strip()
+                        await self._send_voice_transcript(
+                            server_sid, ref.get("id"), transcript, res.get("error")
+                        )
+                        if transcript:
+                            parts.append(transcript)
+                        continue
+                    try:
+                        await self._attach_to_session(real, ref)
+                    except Exception as exc:
+                        print(f"[attach failed {ref.get('name')!r}] {exc!r}", file=sys.stderr)
+                final_text = "\n\n".join(parts)
+                # 純語音且轉錄為空（STT 不可用/沒聽清）→ 不打擾 agent（server 已落兜底提示）。
+                non_audio = any(r.get("kind") != "audio" for r in attachments)
+                if final_text or non_audio or not attachments:
+                    try:
+                        await self.gw.submit_prompt(real, final_text)
+                    except GatewayError as exc:
+                        # 回合進行中（4009 session busy）→ steer 把跟進消息注入正在跑的回合（方案 D），
+                        # 不丟、不打斷；模型在下一次工具迭代時看到。純圖無文字無法 steer → 照舊上拋記日誌。
+                        if exc.code == 4009 and final_text:
+                            res = await self.gw.steer(real, final_text)
+                            print(f"· 回合進行中 → steer 注入跟進消息（status={(res or {}).get('status')}）")
+                        else:
+                            raise
+                    else:
+                        # 補償早到的中斷：prompt.submit 返回即「streaming」（回合在後台線程跑），
+                        # 此刻 interrupt 立即取消；turn_context 對剛起步的回合會保留此 interrupt。
+                        if server_sid in self._pending_interrupt:
+                            self._pending_interrupt.discard(server_sid)
+                            await self.gw.interrupt(real)
+                            print(f"· 補償早到中斷 → interrupt {real}（回合起步即取消）")
+                else:
+                    print("· 語音轉錄為空，跳過提交 agent（server 已落兜底）")
+            elif method == "approval.respond":
+                real = await self._ensure_session(server_sid)
+                await self.gw.request(
+                    "approval.respond",
+                    {"session_id": real, "choice": params.get("choice", "deny"), "all": params.get("all", False)},
+                )
+            elif method == "session.interrupt":
+                real = self._fwd.get(server_sid)
+                if real:
+                    await self.gw.interrupt(real)
+                else:
+                    # 回合真正開始前到達的中斷：會話映射尚未建立 → 別丟，記為 pending，
+                    # 等 prompt 建立映射、回合起步後一起取消（見 prompt.submit 末尾）。
+                    self._pending_interrupt.add(server_sid)
+                    print(f"· interrupt 早到（{server_sid} 未映射）→ pending", file=sys.stderr)
+            elif method == "session.create":
+                await self._ensure_session(server_sid)
+            elif method == "session.archive":
+                await self._set_hermes_archived(server_sid, bool(params.get("archived", True)))
+            # session.delete / others: ignore for now
+        except Exception as exc:
+            print(f"[dispatch {method} failed] {exc!r}", file=sys.stderr)
+
+
+async def _main() -> int:
+    server_url = os.environ.get("MACCHIATO_SERVER_URL")
+    token = os.environ.get("MACCHIATO_CONNECTOR_TOKEN")
+    agent_link_id = os.environ.get("MACCHIATO_AGENT_LINK_ID")
+
+    # 回落到 pair.py 存下的憑證（~/.macchiato/connector.json）。
+    cred_path = os.path.expanduser(os.environ.get("MACCHIATO_CRED", "~/.macchiato/connector.json"))
+    if (not token or not agent_link_id) and os.path.exists(cred_path):
+        with open(cred_path) as f:
+            cred = json.load(f)
+        token = token or cred.get("connector_token")
+        agent_link_id = agent_link_id or cred.get("agent_link_id")
+        server_url = server_url or cred.get("server_url")
+
+    server_url = server_url or "ws://localhost:8080/connector"
+    if not token or not agent_link_id:
+        print(
+            "FAIL: 未配對。先跑 pair.py，或設 MACCHIATO_CONNECTOR_TOKEN/MACCHIATO_AGENT_LINK_ID。",
+            file=sys.stderr,
+        )
+        return 2
+    c = Connector(server_url, token, agent_link_id)
+    try:
+        await c.run()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(_main()))
