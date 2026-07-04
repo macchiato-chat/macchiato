@@ -1,7 +1,7 @@
 """§19 per-session E2E 密鑰管理（連接器側，見 docs/e2e.md）。
 
 職責：持有各 E2E 會話的會話密鑰 K_S、封裝給設備、加解密內容。
-K_S 存 `~/.macchiato/e2e.json`（0600，在可信的 Pi 上）。**某 hermesSessionId 在 store 里 = 該會話已開 E2E。**
+K_S 存 `~/.macchiato/e2e.json`（0600，在用戶自己的機器上）。**某 hermesSessionId 在 store 里 = 該會話已開 E2E。**
 """
 
 import base64

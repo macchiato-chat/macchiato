@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Macchiato connector pairing — bind THIS Pi to your Macchiato account (design.md §5).
+Macchiato connector pairing — bind THIS machine to your Macchiato account (design.md §5).
 
 Flow:
   1. open WSS to the App Server, send pair_request → server returns a one-time code

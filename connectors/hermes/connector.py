@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Macchiato Pi connector — bridges real Hermes (via GatewayClient / tui_gateway)
+Macchiato Hermes connector — bridges real Hermes (via GatewayClient / tui_gateway)
 to the App Server over Link B (the server's `/connector` WSS).
 
 Link B contract (services/server/src/linkB + packages/protocol/src/link.ts):
