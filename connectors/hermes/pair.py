@@ -54,10 +54,10 @@ def _show_code(code: str, fresh: bool) -> None:
     except Exception:
         pass
     print("\n" + "=" * 54)
-    print("  配對碼" + ("（已換新）" if fresh else "") + "：")
+    print("  Pairing code" + (" (refreshed)" if fresh else "") + ":")
     print(f"        >>>  {code}  <<<")
-    print(f"  在 {WEB_URL} 登錄帳戶 → 「綁定 / 配對 Hermes」→ 輸入此碼。")
-    print("=" * 54 + "\n等待 App 認領…", flush=True)
+    print(f"  Sign in at {WEB_URL} → \"Pair connector\" → enter this code.")
+    print("=" * 54 + "\nWaiting for you to claim it…", flush=True)
 
 
 async def _attempt(label: str, fresh: bool) -> str:
@@ -91,8 +91,8 @@ async def _attempt(label: str, fresh: bool) -> str:
                         os.remove(CODE_FILE)
                     except OSError:
                         pass
-                    print(f"\n✓ 配對成功！agent_link={msg['agentLinkId']}")
-                    print(f"  憑證已存到 {CRED_PATH}（connector_token 僅此一次明文）。")
+                    print(f"\n✓ Paired! agent_link={msg['agentLinkId']}")
+                    print(f"  Credentials saved to {CRED_PATH} (connector_token shown in plaintext only this once).")
                     return "paired"
         finally:
             ref.cancel()
@@ -113,10 +113,10 @@ async def main() -> int:
             if outcome == "auth_error":
                 return 1
         except (websockets.exceptions.ConnectionClosed, OSError, asyncio.TimeoutError) as exc:
-            print(f"· 連接斷開（{type(exc).__name__}），重連並換新碼…", file=sys.stderr, flush=True)
+            print(f"· Connection dropped ({type(exc).__name__}), reconnecting with a fresh code…", file=sys.stderr, flush=True)
             fresh = True
             continue
-    print("\nFAIL: 配對窗口超時未認領，請重跑。", file=sys.stderr)
+    print("\nFAIL: pairing window expired unclaimed — re-run to try again.", file=sys.stderr)
     return 1
 
 

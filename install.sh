@@ -51,25 +51,25 @@ find_hermes_python() {
 }
 
 PY="$(find_hermes_python)"
-[ -n "$PY" ] || fail "找不到 Hermes。請先用官方腳本安裝 Hermes（curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash），或設 HERMES_PYTHON=<Hermes venv 的 python 路徑> 後重跑。"
-"$PY" -c "import websockets" 2>/dev/null || fail "Hermes venv 缺 websockets（連接器依賴）。跑: $PY -m pip install websockets"
+[ -n "$PY" ] || fail "Hermes not found. Install it first (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash), or set HERMES_PYTHON=<path to your Hermes venv python> and re-run."
+"$PY" -c "import websockets" 2>/dev/null || fail "Hermes venv is missing websockets (required). Run: $PY -m pip install websockets"
 say "Hermes Python: $PY"
 
 # ── 2. download connector ──────────────────────────────────────────────────
-say "下載連接器 → $APP_DIR"
+say "Downloading connector → $APP_DIR"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 curl -sSL "$REPO_TARBALL" | tar -xz -C "$TMP" --strip-components=1
-[ -d "$TMP/connectors/hermes" ] || fail "下載的倉庫裡沒有 connectors/hermes（倉庫結構變了？）"
+[ -d "$TMP/connectors/hermes" ] || fail "Downloaded repo has no connectors/hermes (repo layout changed?)"
 mkdir -p "$APP_DIR"
 cp "$TMP"/connectors/hermes/*.py "$APP_DIR/"
 
 # ── 3. pair (first time only) ──────────────────────────────────────────────
 if [ ! -f "$CRED" ]; then
-  say "首次安裝：開始配對（在 Macchiato 網頁/App 輸入下面顯示的配對碼）"
-  "$PY" "$APP_DIR/pair.py" || fail "配對未完成。重跑本腳本繼續。"
+  say "First install: pairing (enter the code below at macchiato.chat)"
+  "$PY" "$APP_DIR/pair.py" || fail "Pairing not completed. Re-run this script to continue."
 else
-  say "已有憑證（$CRED），跳過配對"
+  say "Credentials found ($CRED), skipping pairing"
 fi
 
 # ── 4. systemd user service ────────────────────────────────────────────────
@@ -92,10 +92,10 @@ WantedBy=default.target
 UNIT
   systemctl --user daemon-reload
   systemctl --user enable --now "$UNIT_NAME"
-  # 無人值守機器建議: loginctl enable-linger $USER（開機即啟，無需登錄）
-  say "服務已啟動 ✓   看日誌: journalctl --user -u $UNIT_NAME -f"
+  # Headless box? Run: loginctl enable-linger $USER (start at boot without login)
+  say "Service started ✓   Logs: journalctl --user -u $UNIT_NAME -f"
 else
-  say "非 systemd 環境：請自行常駐運行  $PY $APP_DIR/connector.py"
+  say "No systemd here — keep this running yourself:  $PY $APP_DIR/connector.py"
 fi
 
-say "完成！打開 Macchiato，對話會開始同步。"
+say "Done! Open Macchiato — your conversations will start syncing."

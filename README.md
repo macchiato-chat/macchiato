@@ -40,10 +40,6 @@ The installer will:
 
 > Headless box? Run `loginctl enable-linger $USER` once so the service starts at boot without a login.
 
-### 中文安裝說明
-
-在跑 Hermes 的那台機器上執行上面的一行命令。腳本會自動找到 Hermes、下載連接器、顯示**配對碼**（在 [macchiato.chat](https://macchiato.chat) 登錄後輸入認領）、並裝成 systemd 常駐服務。日誌：`journalctl --user -u macchiato-connector -f`。
-
 ### Manual install
 
 ```bash
