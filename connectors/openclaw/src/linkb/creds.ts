@@ -13,8 +13,8 @@ export interface Creds {
   label?: string;
 }
 
-export const DEFAULT_SERVER_URL = "wss://macchiato-server.fly.dev/connector";
-export const DEFAULT_WEB_URL = "https://macchiato-web.fly.dev";
+export const DEFAULT_SERVER_URL = "wss://api.macchiato.chat/connector";
+export const DEFAULT_WEB_URL = "https://macchiato.chat";
 
 /** 憑證文件路徑（每次讀 env, 便於測試覆蓋）。 */
 export function credPath(): string {
