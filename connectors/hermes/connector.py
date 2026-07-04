@@ -731,10 +731,9 @@ class Connector:
                     pid = self._rev.get(sid, sid)
                     e2e = self._e2e.is_e2e(pid)  # §19：E2E 會話走加密鏡像（方案 A），不跳過
                     if (sid in self._rev or sid in self._fwd) and not e2e:
-                        # 非 E2E 自驅會話不鏡像（live 已投遞）。_rev 鍵=resume 的**運行時 id**；_fwd 鍵=
-                        # **持久化 id**（server 發的 hermesSessionId）。續聊 Discord 會話時運行時 id ≠
-                        # 持久化 id、消息落持久化 id 下、鏡像看到的是它，故須連 _fwd 一起查,否則重複投遞。
-                        # E2E 反例外：它的 live 已被 on_event 抑制 → 必須走加密鏡像才送得到。
+                        # 續聊 Discord 會話（source=discord，經 tui 驅動）：運行時 id ≠ 持久化 id、消息落
+                        # 持久化 id 下、鏡像看到的是它，故連 _fwd 一起查,否則重複投遞。macchiato 新建會話
+                        # （source=tui）已由 SKIP_SOURCES 結構化跳過，不靠這裡。
                         continue
                     floor = wm.get(sid, baseline)
                     has_new = maxid > floor

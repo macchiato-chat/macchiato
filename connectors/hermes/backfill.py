@@ -24,13 +24,18 @@ STATE_DB = os.path.expanduser("~/.hermes/state.db")
 STALE_TURN_S = float(os.environ.get("MACCHIATO_STALE_TURN_S", "600"))  # 末行 tool_calls 久未結算→視為崩、強制結算
 
 # Sources that are automation, not human↔agent conversations.
-SKIP_SOURCES = {"cron", "scheduled", "system"}
+# "tui" = 連接器自己經 tui_gateway 驅動的會話（Macchiato 新建對話）→ 已由 live/drive 路徑投遞，
+# 絕不能再鏡像（否則 server 用 state.db 的運行時 id 另建一條 → 同一對話翻倍；同事實測的 bug）。
+# 用戶本機終端的 tui 會話也一併不鏡像（終端是本地、非外部消息平台）。結構化識別，取代舊的
+# _rev/_fwd id 映射跳過——後者在 Hermes 0.18+ 失效：create_session 返回的 gateway 句柄 ≠ state.db
+# 會話 id，mirror 看的是後者，永遠匹配不上。
+SKIP_SOURCES = {"cron", "scheduled", "system", "tui"}
 # Belt-and-suspenders title filter (cron markers + our own test sessions).
 TITLE_SKIP_RE = re.compile(
     r"running as a scheduled cron|scheduled cron|^\[?\s*IMPORTANT: ?You are running|\btest\b|測試|用一句話|用一句话",
     re.I,
 )
-# Hermes prefixes the sender handle on platform messages (Discord: "[alice] hi").
+# Hermes prefixes the sender handle on platform messages (Discord: "[briansun] 早").
 # Strip a leading short [handle] tag (no internal spaces) so imported chats read cleanly.
 # Deliberately won't match "[The user sent a voice message …]" (has spaces) — separate wrapper.
 _SENDER_TAG_RE = re.compile(r"^\[[^\]\s]{1,30}\]\s*")
