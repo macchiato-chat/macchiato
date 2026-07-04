@@ -24,19 +24,34 @@ say()  { printf '\033[1;35m[macchiato]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[macchiato] FAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ── 1. locate Hermes python ────────────────────────────────────────────────
+# 順序：env 覆蓋 → 官方 one-liner 佈局 → pipx 佈局 → 從 PATH 上的 `hermes` 入口反解 venv。
 find_hermes_python() {
   if [ -n "${HERMES_PYTHON:-}" ]; then echo "$HERMES_PYTHON"; return; fi
   local cand
   for cand in \
+    /usr/local/lib/hermes-agent/venv/bin/python \
+    "$HOME/.local/lib/hermes-agent/venv/bin/python" \
     "$HOME/.local/share/pipx/venvs/hermes-agent/bin/python" \
     "$HOME/.local/pipx/venvs/hermes-agent/bin/python"; do
     [ -x "$cand" ] && { echo "$cand"; return; }
   done
+  # 通用：`hermes` 在 PATH 上 → 可能是 bash wrapper（exec ".../venv/bin/hermes"）或 python console-script
+  local h target py
+  h="$(command -v hermes 2>/dev/null || true)"
+  if [ -n "$h" ] && [ -f "$h" ]; then
+    target="$(sed -n 's/^exec "\{0,1\}\([^" ]*\)"\{0,1\}.*/\1/p' "$h" | head -1)"   # bash wrapper 的 exec 目標
+    [ -z "$target" ] && target="$(sed -n '1s/^#!//p' "$h" | awk '{print $1}')"      # console-script 的 shebang
+    if [ -n "$target" ]; then
+      py="$(dirname "$target")/python"
+      [ -x "$py" ] && { echo "$py"; return; }
+      case "$target" in *python*) [ -x "$target" ] && { echo "$target"; return; } ;; esac
+    fi
+  fi
   echo ""
 }
 
 PY="$(find_hermes_python)"
-[ -n "$PY" ] || fail "找不到 Hermes（hermes-agent pipx venv）。請先安裝 Hermes，或設 HERMES_PYTHON=<venv 的 python 路徑> 後重跑。"
+[ -n "$PY" ] || fail "找不到 Hermes。請先用官方腳本安裝 Hermes（curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash），或設 HERMES_PYTHON=<Hermes venv 的 python 路徑> 後重跑。"
 "$PY" -c "import websockets" 2>/dev/null || fail "Hermes venv 缺 websockets（連接器依賴）。跑: $PY -m pip install websockets"
 say "Hermes Python: $PY"
 
