@@ -33,6 +33,8 @@ The installer will:
 
 **Requirements:** a working [Hermes](https://github.com/NousResearch) or [OpenClaw](https://openclaw.ai) install and a Macchiato account.
 
+**Updating:** re-run the same one-line installer. It re-downloads the latest connector, keeps your existing pairing, and restarts the service so the new version takes effect immediately — no re-pairing needed.
+
 **Platforms & Hermes install methods:**
 - **Linux (incl. Raspberry Pi, WSL2)** — fully supported; systemd service installed automatically.
 - **macOS** — supported; no systemd, so the installer prints a command to keep the connector running yourself (launchd support planned).

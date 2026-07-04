@@ -44,8 +44,11 @@ install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
     echo "WantedBy=default.target"
   } > "$UNIT_DIR/$1.service"
   systemctl --user daemon-reload
-  systemctl --user enable --now "$1.service"
-  say "Service $1 started ✓   Logs: journalctl --user -u $1 -f"
+  systemctl --user enable "$1.service"
+  # restart (not just start) so re-running the installer to UPDATE actually loads the
+  # freshly-downloaded code — an already-running service ignores `start`.
+  systemctl --user restart "$1.service"
+  say "Service $1 running ✓   Update anytime by re-running this installer. Logs: journalctl --user -u $1 -f"
 }
 
 # ── shared: download repo once ──────────────────────────────────────────────
