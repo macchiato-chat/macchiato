@@ -95,6 +95,13 @@ install_hermes() {
     say "Hermes credentials found, skipping pairing"
   fi
   install_unit "macchiato-connector" "$PY $APP/connector.py"
+  # Platform plugin: lets Hermes proactively deliver to Macchiato (best effort)
+  if [ -d "$TMP/connectors/hermes/plugin/macchiato" ]; then
+    mkdir -p "$HOME/.hermes/plugins"
+    cp -r "$TMP/connectors/hermes/plugin/macchiato" "$HOME/.hermes/plugins/"
+    command -v hermes >/dev/null 2>&1 && hermes plugins enable macchiato >/dev/null 2>&1 || true
+    say "Hermes 'macchiato' platform plugin installed — restart your Hermes gateway to load it"
+  fi
 }
 
 # ═════════════════════════════ OpenClaw ═════════════════════════════════════

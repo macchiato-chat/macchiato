@@ -1,0 +1,17 @@
+name: macchiato-platform
+label: Macchiato
+kind: platform
+version: 1.0.0
+description: >
+  Macchiato channel adapter (Hermes platform plugin). Registers Macchiato as a
+  Hermes channel so the agent can proactively / on a schedule deliver messages
+  to your Macchiato app (reminders, cron reports, notifications). Thin shell:
+  each send hands the message to the local macchiato connector over a unix
+  socket; the connector forwards it to the Macchiato server over its
+  authenticated link. Outbound-only (inbound goes through the connector).
+author: Macchiato
+optional_env:
+  - name: MACCHIATO_PUSH_SOCK
+    description: "Connector push socket path (default ~/.macchiato/push.sock)"
+    prompt: "Macchiato push socket path"
+    password: false

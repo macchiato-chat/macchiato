@@ -28,7 +28,8 @@ The installer will:
 1. auto-detect your agent(s) — Hermes and/or OpenClaw,
 2. download the connector to `~/.macchiato/app/`,
 3. show a **pairing code** — enter it at [macchiato.chat](https://macchiato.chat) to claim this connector,
-4. install a `systemd` user service so it runs 24/7.
+4. install a `systemd` user service so it runs 24/7,
+5. install the agent-side plugin (Hermes platform plugin / OpenClaw channel plugin) so your agent can message you proactively — restart your agent's gateway to load it.
 
 **Requirements:** a working [Hermes](https://github.com/NousResearch) or [OpenClaw](https://openclaw.ai) install and a Macchiato account.
 
