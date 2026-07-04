@@ -30,7 +30,13 @@ The installer will:
 3. show a **pairing code** — enter it at [macchiato.chat](https://macchiato.chat) to claim this connector,
 4. install a `systemd` user service so it runs 24/7.
 
-**Requirements:** Linux with systemd (Raspberry Pi OS, Debian, Ubuntu…), a working [Hermes](https://github.com/NousResearch) install (pipx), and a Macchiato account.
+**Requirements:** a working [Hermes](https://github.com/NousResearch) install and a Macchiato account.
+
+**Platforms & Hermes install methods:**
+- **Linux (incl. Raspberry Pi, WSL2)** — fully supported; systemd service installed automatically.
+- **macOS** — supported; no systemd, so the installer prints a command to keep the connector running yourself (launchd support planned).
+- **Windows (native)** — not supported yet; please run Hermes + connector under **WSL2**.
+- Hermes installed via the **official one-liner, pipx, pip, or uv** are all auto-detected (any layout where `hermes` is on PATH works). Exotic setups: set `HERMES_PYTHON=<path to your Hermes venv's python>`.
 
 > Headless box? Run `loginctl enable-linger $USER` once so the service starts at boot without a login.
 
