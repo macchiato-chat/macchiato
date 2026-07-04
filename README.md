@@ -8,16 +8,16 @@ Macchiato connects the AI agent running on **your** hardware (a Raspberry Pi, a 
 
 - 📱 **iOS + Web** — chat, voice input, push notifications
 - 🔄 **Full mirror** — conversations your agent has on Discord / Telegram / cron jobs show up here too, live
-- 🤖 **Agent-first** — built for [Hermes](https://github.com/NousResearch) today; OpenClaw connector coming next
+- 🤖 **Agent-first** — connectors for [Hermes](https://github.com/NousResearch) and [OpenClaw](https://openclaw.ai), one-line install for both
 - 🔒 **Your keys, your box** — the agent, its memory, and its API keys never leave your machine; this connector is the only bridge
 
 This repository distributes the **connector** — the small service you run next to your agent — plus its documentation and issue tracker.
 
 ---
 
-## Install (Hermes)
+## Install
 
-On the machine where Hermes runs:
+On the machine where your agent (Hermes or OpenClaw) runs:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh | bash
@@ -25,12 +25,12 @@ curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/instal
 
 The installer will:
 
-1. find your Hermes install (the connector runs on Hermes' own Python),
+1. auto-detect your agent(s) — Hermes and/or OpenClaw,
 2. download the connector to `~/.macchiato/app/`,
 3. show a **pairing code** — enter it at [macchiato.chat](https://macchiato.chat) to claim this connector,
 4. install a `systemd` user service so it runs 24/7.
 
-**Requirements:** a working [Hermes](https://github.com/NousResearch) install and a Macchiato account.
+**Requirements:** a working [Hermes](https://github.com/NousResearch) or [OpenClaw](https://openclaw.ai) install and a Macchiato account.
 
 **Platforms & Hermes install methods:**
 - **Linux (incl. Raspberry Pi, WSL2)** — fully supported; systemd service installed automatically.

@@ -1,0 +1,14 @@
+# Macchiato OpenClaw Connector — systemd user unit (installed by install.sh)
+[Unit]
+Description=Macchiato OpenClaw Connector
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/.macchiato/openclaw-app
+ExecStart=%h/.macchiato/openclaw-app/node_modules/.bin/tsx src/index.ts
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target

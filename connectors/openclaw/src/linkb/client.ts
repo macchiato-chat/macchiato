@@ -1,0 +1,121 @@
+/**
+ * Link B 客戶端：用憑證連 Macchiato server。
+ *   開 WSS → hello{connectorToken, agentLinkId, proto} → 等 ready → 收發幀（mirror_append / tui / e2e …）。
+ * 自動重連；響應 server 的 ping/pong；auth_error 視為憑證失效（停連, 需重新配對）。
+ */
+import WebSocket from "ws";
+import { LINK_B_PROTO } from "./proto";
+import type { Creds } from "./creds";
+
+export type FrameHandler = (msg: Record<string, unknown>) => void;
+
+const RECONNECT_MS = 3000;
+
+export class LinkBClient {
+  private ws: WebSocket | null = null;
+  private closed = false;
+  private ready = false;
+  private readonly handlers = new Set<FrameHandler>();
+  private firstReady: (() => void) | null = null;
+  private readonly readyOnce: Promise<void>;
+
+  constructor(private readonly creds: Creds) {
+    this.readyOnce = new Promise((r) => (this.firstReady = r));
+  }
+
+  get agentLinkId(): string {
+    return this.creds.agentLinkId;
+  }
+  get isReady(): boolean {
+    return this.ready;
+  }
+
+  /** 監聽 server → 連接器的幀（tui / mirror_nack / e2e_wrap_request …；ready/auth_error/ping 已內部處理）。 */
+  onFrame(h: FrameHandler): () => void {
+    this.handlers.add(h);
+    return () => this.handlers.delete(h);
+  }
+
+  /** 連接 + hello + 等首次 ready。 */
+  async start(): Promise<void> {
+    this.connect();
+    await this.readyOnce;
+  }
+
+  private connect(): void {
+    const ws = new WebSocket(this.creds.serverUrl, { handshakeTimeout: 20000 });
+    this.ws = ws;
+    ws.on("open", () => {
+      ws.send(
+        JSON.stringify({
+          t: "hello",
+          connectorToken: this.creds.connectorToken,
+          agentLinkId: this.creds.agentLinkId,
+          proto: LINK_B_PROTO,
+        }),
+      );
+    });
+    ws.on("message", (raw) => this.handleFrame(raw));
+    ws.on("close", () => this.onClose());
+    ws.on("error", () => {
+      /* 'close' 隨後觸發, 統一在 onClose 重連 */
+    });
+  }
+
+  private handleFrame(raw: WebSocket.RawData): void {
+    let msg: Record<string, unknown>;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    switch (msg.t) {
+      case "ready":
+        this.ready = true;
+        if (this.firstReady) {
+          this.firstReady();
+          this.firstReady = null;
+        }
+        console.log("✓ Link B ready — connected to Macchiato");
+        return;
+      case "auth_error":
+        console.error(`Link B auth_error: ${msg.reason} (credentials revoked? re-pair needed)`);
+        this.close();
+        return;
+      case "ping":
+        this.send({ t: "pong" });
+        return;
+      default: {
+        // 入站幀可觀測（排障關鍵：能一眼看出 server 到底發沒發、發了什麼）
+        const method = (msg.frame as { method?: string } | undefined)?.method;
+        console.log(`← linkB ${String(msg.t)}${method ? ` ${method}` : ""}${msg.sessionId ? ` sid=${String(msg.sessionId).slice(0, 40)}` : ""}`);
+        for (const h of this.handlers) {
+          try {
+            h(msg);
+          } catch {
+            /* 監聽器自負其責 */
+          }
+        }
+      }
+    }
+  }
+
+  /** 發一個 Link B 幀；未連接則丟棄（鏡像有自己的水位線/nack 回退, 不在此緩存）。 */
+  send(msg: Record<string, unknown>): void {
+    const ws = this.ws;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  }
+
+  private onClose(): void {
+    this.ready = false;
+    if (this.closed) return;
+    setTimeout(() => {
+      if (!this.closed) this.connect();
+    }, RECONNECT_MS);
+  }
+
+  close(): void {
+    this.closed = true;
+    this.ws?.close();
+  }
+}

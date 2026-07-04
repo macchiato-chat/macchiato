@@ -1,0 +1,23 @@
+{
+  "name": "macchiato-openclaw-connector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bridges your local OpenClaw agent to Macchiato — mirror, drive, proactive push, per-session E2E.",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "pair": "MACCHIATO_PAIR_ONLY=1 tsx src/index.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "tsx": "^4.19.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.8"
+  }
+}

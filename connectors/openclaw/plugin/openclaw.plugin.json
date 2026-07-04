@@ -1,0 +1,30 @@
+{
+  "id": "macchiato",
+  "name": "Macchiato",
+  "description": "Deliver proactive messages to the Macchiato app via the local connector",
+  "channels": [
+    "macchiato"
+  ],
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false
+  },
+  "channelConfigs": {
+    "macchiato": {
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "label": "Macchiato",
+      "description": "Proactive delivery to the Macchiato app (via local connector)"
+    }
+  }
+}
