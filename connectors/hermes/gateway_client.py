@@ -28,9 +28,10 @@ import os
 import sys
 from typing import Any, Callable, Optional
 
-DEFAULT_HERMES_PYTHON = os.path.expanduser(
-    "~/.local/share/pipx/venvs/hermes-agent/bin/python"
-)
+# 連接器按設計就跑在 Hermes venv 的 python 上（install.sh / systemd 用它啟動）→ spawn
+# tui_gateway 默認用**自己這個解釋器**（sys.executable），任何安裝佈局（one-liner/pipx/pip/uv）
+# 都對。可用 HERMES_PYTHON 環境變量覆蓋。（舊版寫死 pipx 路徑，one-liner 用戶會掛。）
+DEFAULT_HERMES_PYTHON = sys.executable
 
 # StreamReader line-buffer limit. tui_gateway frames (e.g. message.complete with
 # a large reply, or a big tool result) can exceed asyncio's 64KB default and
