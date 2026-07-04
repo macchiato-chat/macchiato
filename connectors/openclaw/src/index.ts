@@ -14,6 +14,27 @@ import { Mirror } from "./openclaw/mirror";
 import { PushHandler } from "./push/handler";
 import { E2EKeyStore } from "./e2e/keys";
 import { HealthLoop } from "./health";
+import { spawn } from "node:child_process";
+
+// §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
+const CONNECTOR_VERSION = "1.0.0";
+const INSTALL_URL =
+  process.env.MACCHIATO_INSTALL_URL ||
+  "https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh";
+
+/** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
+function runSelfUpdate(): void {
+  console.error("· self_update received → pulling latest & restarting in the background…");
+  try {
+    const child = spawn("bash", ["-c", `curl -sSL ${INSTALL_URL} | MACCHIATO_ONLY=openclaw bash`], {
+      detached: true, // 脫離本進程，免得服務重啟殺自己時中斷更新
+      stdio: "ignore",
+    });
+    child.unref();
+  } catch (e) {
+    console.error("[self_update failed]", (e as Error).message);
+  }
+}
 
 async function main(): Promise<void> {
   // 1. 憑證 / 配對
@@ -41,6 +62,7 @@ async function main(): Promise<void> {
   linkb.onFrame((msg) => {
     if (msg.t === "mirror_nack" && typeof msg.batchId === "number") mirror.handleNack(msg.batchId);
     else if (msg.t === "import_start") void runImport(gw, linkb); // web「re-import」→ 回灌全量歷史
+    else if (msg.t === "self_update") runSelfUpdate(); // §update：一鍵更新
     else if (msg.t === "e2e_wrap_request" && typeof msg.hermesSessionId === "string") {
       // §19：iOS 開啟 E2E / 新設備 → 生成/取 K_S、封裝給各設備、回 e2e_key
       const wrapped = e2e.wrapForDevices(msg.hermesSessionId, (msg.devices as any[]) ?? []);
@@ -61,7 +83,7 @@ async function main(): Promise<void> {
   push.start();
 
   // 7. 健康上報 + 鏡像看門狗
-  const health = new HealthLoop(gw, linkb, mirror, "0.1.0");
+  const health = new HealthLoop(gw, linkb, mirror, CONNECTOR_VERSION);
   health.start();
 
   const shutdown = (): void => {

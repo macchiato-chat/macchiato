@@ -17,7 +17,7 @@ export interface HealthSnapshot {
   mirrorLastPollAgeS: number;
   lastError: string | null;
   kind: "openclaw";
-  version: string;
+  connectorVersion: string; // §update：server 據此判 updateAvailable（欄位名對齊 protocol）
 }
 
 export function buildHealth(gw: OpenClawGateway, mirror: Mirror, version: string): HealthSnapshot {
@@ -27,7 +27,7 @@ export function buildHealth(gw: OpenClawGateway, mirror: Mirror, version: string
     mirrorLastPollAgeS: Math.round((Date.now() - mirror.lastPollAt) / 1000),
     lastError: mirror.lastError,
     kind: "openclaw",
-    version,
+    connectorVersion: version,
   };
 }
 

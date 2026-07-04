@@ -33,7 +33,9 @@ import json
 import mimetypes
 import os
 import re
+import shlex
 import shutil
+import subprocess
 import sys
 import time
 import urllib.request
@@ -54,6 +56,14 @@ from backfill import (
 )
 
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
+# §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
+# 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
+CONNECTOR_VERSION = "1.0.0"
+# 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
+INSTALL_URL = os.environ.get(
+    "MACCHIATO_INSTALL_URL",
+    "https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh",
+)
 IMPORT_BATCH = 20
 # §15 全渠道持續鏡像（tail state.db）—— **核心功能，常開、不可關閉**。
 MIRROR_POLL_S = float(os.environ.get("MACCHIATO_MIRROR_POLL_S", "2"))  # 輪詢間隔（小=更即時、多步回合更增量）
@@ -616,7 +626,25 @@ class Connector:
                 int(now - self._mirror_last_run) if self._mirror_last_run else None
             ),
             "lastError": self._last_error,
+            "connectorVersion": CONNECTOR_VERSION,  # §update：server 據此判 updateAvailable
         }
+
+    def _self_update(self) -> None:
+        """§update：收到 server 的 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。
+        systemd 重啟會殺掉本進程並起新版；非 systemd（手動跑）則只更新文件、下次重啟生效。"""
+        print("· 收到 self_update → 後台拉最新版並重啟…", file=sys.stderr)
+        try:
+            # detached：脫離本進程，免得服務重啟殺自己時把更新也中斷
+            subprocess.Popen(
+                f"curl -sSL {shlex.quote(INSTALL_URL)} | MACCHIATO_ONLY=hermes bash",
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            print(f"[self_update failed] {exc!r}", file=sys.stderr)
+            self._last_error = f"self_update failed: {exc}"
 
     def _write_health_file(self, h: dict) -> None:
         try:
@@ -827,6 +855,9 @@ class Connector:
             return
         if t == "mirror_nack":
             self._mirror_handle_nack(msg.get("batchId"))
+            return
+        if t == "self_update":
+            self._self_update()
             return
         if t == "e2e_wrap_request":
             # §19：iOS 開啟某會話 E2E / 新設備加入 → 生成或取出 K_S，封裝給各設備公鑰、回傳。
