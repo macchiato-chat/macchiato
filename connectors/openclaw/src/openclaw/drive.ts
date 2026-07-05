@@ -17,19 +17,11 @@
  */
 import type { LinkBClient } from "../linkb/client";
 import type { OpenClawGateway, GatewayEvent } from "./gateway";
-import { MACCHIATO_PREFIX, type Mirror } from "./mirror";
+import { keyForSid, sidForKey, type Mirror } from "./mirror";
 import type { E2EKeyStore } from "../e2e/keys";
 
-/**
- * ⚠️ OpenClaw 會把 session key **轉小寫**（真機實測：發 `…:01KWNFM8…`, 事件回來是 `…:01kwnfm8…`）。
- * 故 key 一律用小寫生成/比對；server 的原始 sid（大寫 ULID）由 Drive.sidByKey 找回。
- */
-export function keyForSid(sid: string): string {
-  return (sid.startsWith("agent:") ? sid : MACCHIATO_PREFIX + sid).toLowerCase();
-}
-export function sidForKey(key: string): string {
-  return key.startsWith(MACCHIATO_PREFIX) ? key.slice(MACCHIATO_PREFIX.length) : key;
-}
+// key ↔ sid 映射移居 mirror.ts（E2E 回灌也要用）；re-export 保持既有導入面不變。
+export { keyForSid, sidForKey };
 
 export class Drive {
   /** key → runId（回合進行中）。 */

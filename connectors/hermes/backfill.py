@@ -313,12 +313,13 @@ def _tail_session_sync(sid: str, since_id: int) -> tuple:
             if role == "user":
                 c = _strip_sender_tag(content)
                 if c.strip():
-                    folded.append(({"role": "user", "text": c, "createdAt": ts}, rid))
+                    # §9 srcId=state.db 消息 id（穩定）→ server 據此去重連接器崩潰重發
+                    folded.append(({"role": "user", "text": c, "createdAt": ts, "srcId": str(rid)}, rid))
             elif role == "assistant":
                 tools = _parse_tool_calls(tc, tool_res)
                 has_reason = bool(reasoning and str(reasoning).strip())
                 if content.strip() or has_reason or tools:
-                    m = {"role": "agent", "text": content, "createdAt": ts}
+                    m = {"role": "agent", "text": content, "createdAt": ts, "srcId": str(rid)}
                     if has_reason:
                         m["reasoning"] = reasoning
                     if tools:
@@ -346,6 +347,35 @@ def _tail_session_sync(sid: str, since_id: int) -> tuple:
         return new_msgs, new_wm
     finally:
         con.close()
+
+
+def _session_snapshot_sync(sid: str):
+    """§19 D2 轉換回灌：某會話的**全量已結算**歷史 + 覆蓋的最大 raw id + 元數據。
+    會話不在 state.db → None（如自驅 tui 會話 id 未解析，見 E2E-5）。"""
+    con = _connect()
+    try:
+        row = con.execute(
+            "select source, title, archived from sessions where id=?", (sid,)
+        ).fetchone()
+        if row is None:
+            return None
+        source, title, archived = row
+        if not (title and title.strip()):
+            title = _derive_title(con, sid)
+    finally:
+        con.close()
+    msgs, cover = _tail_session_sync(sid, 0)
+    return {
+        "source": source,
+        "title": title,
+        "archived": bool(archived),
+        "messages": msgs,
+        "cover": cover,
+    }
+
+
+async def session_snapshot(sid: str):
+    return await asyncio.to_thread(_session_snapshot_sync, sid)
 
 
 async def current_max_id() -> int:

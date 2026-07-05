@@ -45,6 +45,11 @@ export class E2EKeyStore {
     return this.keys.has(sid);
   }
 
+  /** 關閉 E2E：刪該會話 K_S（會話回明文路徑；server 側密封包由 server 清）。無則 no-op。 */
+  remove(sid: string): void {
+    if (this.keys.delete(sid)) this.save();
+  }
+
   /** 返回該會話 K_S；首次（開啟 E2E）即生成並持久化。 */
   getOrCreateKey(sid: string): Buffer {
     let k = this.keys.get(sid);

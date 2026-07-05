@@ -809,6 +809,7 @@ class Connector:
                 {
                     "role": m["role"],
                     "createdAt": m.get("createdAt"),
+                    **({"srcId": m["srcId"]} if m.get("srcId") else {}),  # §9：srcId 是元數據、不加密，保留供去重
                     "enc": self._e2e.encrypt_content(
                         sid,
                         {"text": m.get("text", ""), "reasoning": m.get("reasoning"), "tools": m.get("tools")},

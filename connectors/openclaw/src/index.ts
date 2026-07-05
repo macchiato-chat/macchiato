@@ -68,6 +68,11 @@ async function main(): Promise<void> {
       const wrapped = e2e.wrapForDevices(msg.hermesSessionId, (msg.devices as any[]) ?? []);
       linkb.send({ t: "e2e_key", agentLinkId: linkb.agentLinkId, hermesSessionId: msg.hermesSessionId, wrapped });
       console.log(`· E2E: session ${msg.hermesSessionId} — wrapped K_S for ${wrapped.length} device(s)`);
+      // §19 D2 新開啟：全量歷史重加密回灌, server 原地替換明文
+      if (msg.backfill) void mirror.backfillE2E(msg.hermesSessionId);
+    } else if (msg.t === "e2e_disable_request" && typeof msg.hermesSessionId === "string") {
+      // §19 關閉：明文回灌（server 恢復可讀+投影）→ 成功後刪本地 K_S
+      void mirror.backfillE2E(msg.hermesSessionId, "disable");
     }
   });
   await linkb.start();
