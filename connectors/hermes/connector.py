@@ -488,16 +488,18 @@ class Connector:
         print(f"· 語音轉錄回填 → server（{len(text or '')} 字{tail}）")
 
     async def _ai_retitle(self, server_sid: str) -> None:
-        """#94 路 A：讀該會話 state.db 首條真人消息 → 用 Hermes 的 Anthropic key 跑 haiku 生成標題
-        → emit session.title。E2E 跳過(明文洩漏);key 從 ~/.hermes/.env 或環境讀(按 token 計費)。"""
+        """#94：UI 發起 AI 重新命名。**復用 Hermes 自己的 title_generator**（用它配置的
+        `title_generation` 模型,provider:auto = 用戶自己的設置,支持訂閱;絕不 hardcode
+        provider/model——見根 CLAUDE.md 鐵律）。讀該會話首條 user+assistant → generate_title
+        → emit session.title。E2E 跳過(明文洩漏)。"""
         if self._e2e.is_e2e(server_sid):
             return
         try:
             real = self._stored.get(server_sid) or self._fwd.get(server_sid, server_sid)
-            first = await asyncio.to_thread(self._first_user_text, real)
-            if not first:
+            user, asst = await asyncio.to_thread(self._first_exchange, real)
+            if not user:
                 return
-            title = await asyncio.to_thread(self._gen_title_anthropic, first)
+            title = await asyncio.to_thread(self._hermes_gen_title, user, asst)
             if not title:
                 return
             await self._to_server(
@@ -509,62 +511,37 @@ class Connector:
             print(f"[ai_retitle failed for {server_sid}] {exc!r}", file=sys.stderr)
 
     @staticmethod
-    def _first_user_text(state_sid: str) -> str:
-        """state.db 該會話首條真人消息（去 sender tag、清洗）。"""
+    def _first_exchange(state_sid: str) -> tuple[str, str]:
+        """state.db 該會話首條真人消息 + 首條 assistant 回覆（去 sender tag、清洗）。"""
         import sqlite3
 
         db = os.path.expanduser("~/.hermes/state.db")
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        user, asst = "", ""
         try:
-            for (content,) in con.execute(
-                "select content from messages where session_id=? and role='user' order by id", (state_sid,)
+            for role, content in con.execute(
+                "select role, content from messages where session_id=? and role in ('user','assistant') order by id",
+                (state_sid,),
             ):
                 t = " ".join(_strip_sender_tag(str(content or "")).split())
-                if t.strip():
-                    return t[:800]
-            return ""
+                if role == "user" and not user and t.strip():
+                    user = t[:1000]
+                elif role == "assistant" and user and not asst and t.strip():
+                    asst = t[:1000]
+                if user and asst:
+                    break
+            return user, asst
         finally:
             con.close()
 
     @staticmethod
-    def _anthropic_key() -> str | None:
-        key = os.environ.get("ANTHROPIC_API_KEY")
-        if key:
-            return key
+    def _hermes_gen_title(user: str, assistant: str) -> str:
+        """復用 Hermes 自帶起名（同 venv import）：用 Hermes 配置的 title_generation 模型。
+        main_runtime=None → Hermes 回退到其輔助 LLM 客戶端（按用戶 config 的 provider:auto）。"""
         try:
-            for line in open(os.path.expanduser("~/.hermes/.env"), encoding="utf-8"):
-                m = re.match(r"^ANTHROPIC_API_KEY\s*=\s*(.+)$", line)
-                if m:
-                    return m.group(1).strip()
-        except OSError:
-            pass
-        return None
+            from agent.title_generator import generate_title
 
-    @classmethod
-    def _gen_title_anthropic(cls, first_user_text: str) -> str:
-        """haiku 生成 3-6 詞摘要標題（清洗去引號/前綴）。失敗→空(調用側跳過)。"""
-        key = cls._anthropic_key()
-        if not key:
-            print("[ai_retitle] 無 ANTHROPIC_API_KEY,跳過", file=sys.stderr)
-            return ""
-        try:
-            import anthropic
-
-            client = anthropic.Anthropic(api_key=key)
-            resp = client.messages.create(
-                model=os.environ.get("MACCHIATO_TITLE_MODEL", "claude-haiku-4-5-20251001"),
-                max_tokens=32,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        "Generate a concise conversation title (3-6 words, no quotes, same language as the "
-                        f'message) for a conversation opening with:\n\n"{first_user_text}"\n\nReply with ONLY the title.'
-                    ),
-                }],
-            )
-            raw = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
-            title = raw.split("\n")[0].strip().strip('"\'`「」《》').removeprefix("Title:").removeprefix("標題:").strip()
-            return title[:60]
+            return (generate_title(user, assistant or "", main_runtime=None) or "")[:80]
         except Exception as exc:
             print(f"[ai_retitle gen failed] {exc!r}", file=sys.stderr)
             return ""
