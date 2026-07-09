@@ -18,7 +18,6 @@
 import type { LinkBClient } from "../linkb/client";
 import type { OpenClawGateway, GatewayEvent } from "./gateway";
 import { keyForSid, sidForKey, type Mirror } from "./mirror";
-import { generateTitle } from "./titles";
 import type { E2EKeyStore } from "../e2e/keys";
 
 // key ↔ sid 映射移居 mirror.ts（E2E 回灌也要用）；re-export 保持既有導入面不變。
@@ -58,21 +57,6 @@ export class Drive {
     return this.driven.has(key);
   }
 
-  /** #94 AI 重命名:讀該會話 .jsonl 首條真人消息 → OpenRouter 生成 → emit session.title。E2E 跳過。 */
-  private async aiRetitle(sid: string): Promise<void> {
-    if (this.e2e?.isE2E(sid)) return;
-    if (!this.mirror) return;
-    try {
-      const first = await this.mirror.firstUserText(sid);
-      if (!first) return;
-      const title = await generateTitle(first);
-      if (!title) return;
-      this.emit(sid, "session.title", { title });
-      console.log(`· AI 重新命名「${title}」→ ${sid}`);
-    } catch (e) {
-      console.error(`[ai_retitle failed for ${sid}] ${(e as Error).message}`);
-    }
-  }
 
   private emit(sid: string, type: string, payload: Record<string, unknown>): void {
     this.linkb.send({
@@ -132,9 +116,6 @@ export class Drive {
           return;
         case "session.create":
           this.markDriven(key, sid); // 會話本體由首次 chat.send 自動建
-          return;
-        case "session.retitle":
-          void this.aiRetitle(sid); // #94:讀 .jsonl 首條 → OpenRouter 生成 → session.title
           return;
         default:
           return; // 其它方法 v1 忽略

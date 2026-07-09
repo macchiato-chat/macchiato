@@ -288,6 +288,7 @@ class Connector:
         self._fwd: dict[str, str] = {}  # server session id -> real hermes session id
         self._rev: dict[str, str] = {}  # real hermes session id -> server session id
         self._pending_interrupt: set[str] = set()  # 回合映射建立前到達的 session.interrupt：別丟，等回合起步即取消
+        self._titled: set[str] = set()  # #94：已自動生成過標題的 server_sid（防會話內重複）
         self._sdb = None  # 懶加載的 Hermes SessionDB（session.archive 用，寫 state.db.archived）
         self._mirror_task = None  # §15 持續鏡像 tailer 任務
         self._health_task = None  # 健康上報任務
@@ -487,63 +488,51 @@ class Connector:
         tail = f", err={error}" if error else ""
         print(f"· 語音轉錄回填 → server（{len(text or '')} 字{tail}）")
 
-    async def _ai_retitle(self, server_sid: str) -> None:
-        """#94：UI 發起 AI 重新命名。**復用 Hermes 自己的 title_generator**（用它配置的
-        `title_generation` 模型,provider:auto = 用戶自己的設置,支持訂閱;絕不 hardcode
-        provider/model——見根 CLAUDE.md 鐵律）。讀該會話首條 user+assistant → generate_title
-        → emit session.title。E2E 跳過(明文洩漏)。"""
-        if self._e2e.is_e2e(server_sid):
-            return
+    async def _auto_title(self, server_sid: str, first_user_text: str) -> None:
+        """#94：Macchiato 發起的會話首次發話 → 立即生成標題(越早越好)。**復用 Hermes 自己的
+        title_generator**（用它配置的 `title_generation` 模型,provider:auto = 用戶自己的設置,支持
+        訂閱;絕不 hardcode provider/model——見根 CLAUDE.md 鐵律）。已有非空標題則跳過(重啟後不重生)。"""
         try:
             real = self._stored.get(server_sid) or self._fwd.get(server_sid, server_sid)
-            user, asst = await asyncio.to_thread(self._first_exchange, real)
-            if not user:
-                return
-            title = await asyncio.to_thread(self._hermes_gen_title, user, asst)
+            if await asyncio.to_thread(self._has_title, real):
+                return  # 已有標題(用戶設的/上次生成的)→ 不重生
+            title = await asyncio.to_thread(self._hermes_gen_title, first_user_text)
             if not title:
                 return
             await self._to_server(
                 server_sid,
                 {"jsonrpc": "2.0", "method": "event", "params": {"type": "session.title", "session_id": server_sid, "payload": {"title": title}}},
             )
-            print(f"· AI 重新命名「{title}」→ {server_sid}", file=sys.stderr)
+            print(f"· 自動生成標題「{title}」→ {server_sid}", file=sys.stderr)
         except Exception as exc:
-            print(f"[ai_retitle failed for {server_sid}] {exc!r}", file=sys.stderr)
+            print(f"[auto_title failed for {server_sid}] {exc!r}", file=sys.stderr)
 
     @staticmethod
-    def _first_exchange(state_sid: str) -> tuple[str, str]:
-        """state.db 該會話首條真人消息 + 首條 assistant 回覆（去 sender tag、清洗）。"""
+    def _has_title(state_sid: str) -> bool:
+        """state.db 該會話是否已有非空標題（重啟後避免重生;渠道會話 Hermes 已起名）。"""
         import sqlite3
 
         db = os.path.expanduser("~/.hermes/state.db")
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        user, asst = "", ""
         try:
-            for role, content in con.execute(
-                "select role, content from messages where session_id=? and role in ('user','assistant') order by id",
-                (state_sid,),
-            ):
-                t = " ".join(_strip_sender_tag(str(content or "")).split())
-                if role == "user" and not user and t.strip():
-                    user = t[:1000]
-                elif role == "assistant" and user and not asst and t.strip():
-                    asst = t[:1000]
-                if user and asst:
-                    break
-            return user, asst
+            row = con.execute("select title from sessions where id=?", (state_sid,)).fetchone()
+            return bool(row and (row[0] or "").strip())
+        except Exception:
+            return False
         finally:
             con.close()
 
     @staticmethod
-    def _hermes_gen_title(user: str, assistant: str) -> str:
+    def _hermes_gen_title(user: str) -> str:
         """復用 Hermes 自帶起名（同 venv import）：用 Hermes 配置的 title_generation 模型。
-        main_runtime=None → Hermes 回退到其輔助 LLM 客戶端（按用戶 config 的 provider:auto）。"""
+        main_runtime=None → Hermes 回退到其輔助 LLM 客戶端（按用戶 config 的 provider:auto）。
+        越早生成 → 只有首條 user 文本(assistant 傳空,generate_title 仍能起名,實測可用)。"""
         try:
             from agent.title_generator import generate_title
 
-            return (generate_title(user, assistant or "", main_runtime=None) or "")[:80]
+            return (generate_title(user, "", main_runtime=None) or "")[:80]
         except Exception as exc:
-            print(f"[ai_retitle gen failed] {exc!r}", file=sys.stderr)
+            print(f"[auto_title gen failed] {exc!r}", file=sys.stderr)
             return ""
 
     async def _emit_media_from_text(self, server_sid: str, text: str) -> None:
@@ -1121,6 +1110,12 @@ class Connector:
                 attachments = params.get("attachments") or []
                 parts = []
                 base = (params.get("text") or "").strip()
+                # #94：Macchiato 發起的會話(全走 prompt.submit;渠道會話是鏡像來的、不走這)首次發話 →
+                # **立即**用首條 user 文本自動生成標題(越早越好),復用 Hermes 自身 title_generator。
+                # E2E 跳過(明文);已標題過(state.db 有標題)跳過。_titled 防會話內重複。
+                if base and server_sid not in self._titled and not self._e2e.is_e2e(server_sid):
+                    self._titled.add(server_sid)
+                    asyncio.create_task(self._auto_title(server_sid, base))
                 if base and self._e2e.is_e2e(server_sid):
                     # §19 E2E：iOS 發來的是密文 → 解密後再提交 agent（gated，非 E2E 會話不走這）。
                     try:
@@ -1187,9 +1182,7 @@ class Connector:
                 await self._ensure_session(server_sid)
             elif method == "session.archive":
                 await self._set_hermes_archived(server_sid, bool(params.get("archived", True)))
-            elif method == "session.retitle":
-                # #94：UI 發起 AI 重新命名。讀 state.db 首條真人消息 → haiku 生成 → session.title。
-                asyncio.create_task(self._ai_retitle(server_sid))
+            # session.retitle 已廢棄:改由首次 prompt.submit 自動生成標題(見上)。
             # session.delete / others: ignore for now
         except Exception as exc:
             print(f"[dispatch {method} failed] {exc!r}", file=sys.stderr)
