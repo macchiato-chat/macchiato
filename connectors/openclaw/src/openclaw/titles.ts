@@ -1,67 +1,16 @@
 /**
- * #94 路 A:OpenClaw AI 重命名——讀 OpenClaw 的 OpenRouter key(~/.openclaw/secrets.json 的
- * `models/openrouter`,SecretRef 解析後的明文)→ 調 OpenRouter(OpenAI 兼容)生成摘要標題。
- * 成本:按 token 計費(用戶自己的 OpenRouter key;罕見手動操作,可忽略)。
+ * #94 OpenClaw AI 重命名標題生成。
+ *
+ * ⚠️ 遵守根 CLAUDE.md 鐵律:連接器**絕不寫死 provider/model**。OpenClaw 的難處:
+ *   - 它有內置 LLM 起名(`generateThreadTitle`),但 gateway 不暴露、且是版本哈希路徑下的內部函數
+ *     (需 cfg + 解析好的 model 對象),連接器無法穩定 import(升級即斷)——不像 Hermes 有乾淨的
+ *     `agent.title_generator.generate_title` 可同 venv 復用。
+ *   - 用戶默認 model(如 `openai/gpt-5.5`)連接器自己解析不到 provider;訂閱類更無可直接調的 key。
+ * 故此處**安全降級為首句截斷**(零 LLM、零假設、對所有用戶都對)。真正的「用 OpenClaw 自身模型
+ * 生成摘要」待 gateway 暴露方法或連接器路由過 agent(見 issue #103)。
  */
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 
-/** 從 secrets.json 取 OpenRouter key(env MACCHIATO_OPENROUTER_KEY 優先,便於覆蓋/測試)。 */
-export function openRouterKey(): string | null {
-  if (process.env.MACCHIATO_OPENROUTER_KEY) return process.env.MACCHIATO_OPENROUTER_KEY;
-  try {
-    const s = JSON.parse(readFileSync(join(homedir(), ".openclaw/secrets.json"), "utf8"));
-    const k = s?.models?.openrouter ?? s?.authProfiles?.openrouter;
-    return typeof k === "string" && k ? k : null;
-  } catch {
-    return null;
-  }
-}
-
-/** 清洗模型輸出:首行、去引號/前綴、截長。 */
-function clean(raw: string): string {
-  return (raw.split("\n")[0] ?? "")
-    .replace(/^["'`「」《》\s]+|["'`「」《》\s]+$/g, "")
-    .replace(/^(title|標題|标题)[:：]\s*/i, "")
-    .slice(0, 60)
-    .trim();
-}
-
-const TITLE_MODEL = process.env.MACCHIATO_TITLE_MODEL || "google/gemini-2.5-flash";
-
-/** 生成標題;無 key/失敗 → 空(調用側回退截斷)。 */
-export async function generateTitle(firstUserText: string): Promise<string> {
-  const key = openRouterKey();
-  if (!key) {
-    console.error("[titles] 無 OpenRouter key,跳過 AI 重命名");
-    return "";
-  }
-  try {
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        model: TITLE_MODEL,
-        max_tokens: 32,
-        messages: [
-          {
-            role: "user",
-            content:
-              `Generate a concise conversation title (3-6 words, no quotes, same language as the message) ` +
-              `for a conversation opening with:\n\n"${firstUserText}"\n\nReply with ONLY the title.`,
-          },
-        ],
-      }),
-    });
-    if (!res.ok) {
-      console.error(`[titles] OpenRouter HTTP ${res.status}`);
-      return "";
-    }
-    const j = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-    return clean(j.choices?.[0]?.message?.content ?? "");
-  } catch (e) {
-    console.error(`[titles] 生成失敗: ${(e as Error).message}`);
-    return "";
-  }
+/** 首句截斷標題(清洗空白,截 56 字)。 */
+export function generateTitle(firstUserText: string): string {
+  return firstUserText.replace(/\s+/g, " ").trim().slice(0, 56);
 }
