@@ -57,6 +57,7 @@ from backfill import (
     keepable,
     cron_feed_target,
     session_snapshot,
+    _strip_sender_tag,
 )
 
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
@@ -486,6 +487,88 @@ class Connector:
         tail = f", err={error}" if error else ""
         print(f"· 語音轉錄回填 → server（{len(text or '')} 字{tail}）")
 
+    async def _ai_retitle(self, server_sid: str) -> None:
+        """#94 路 A：讀該會話 state.db 首條真人消息 → 用 Hermes 的 Anthropic key 跑 haiku 生成標題
+        → emit session.title。E2E 跳過(明文洩漏);key 從 ~/.hermes/.env 或環境讀(按 token 計費)。"""
+        if self._e2e.is_e2e(server_sid):
+            return
+        try:
+            real = self._stored.get(server_sid) or self._fwd.get(server_sid, server_sid)
+            first = await asyncio.to_thread(self._first_user_text, real)
+            if not first:
+                return
+            title = await asyncio.to_thread(self._gen_title_anthropic, first)
+            if not title:
+                return
+            await self._to_server(
+                server_sid,
+                {"jsonrpc": "2.0", "method": "event", "params": {"type": "session.title", "session_id": server_sid, "payload": {"title": title}}},
+            )
+            print(f"· AI 重新命名「{title}」→ {server_sid}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[ai_retitle failed for {server_sid}] {exc!r}", file=sys.stderr)
+
+    @staticmethod
+    def _first_user_text(state_sid: str) -> str:
+        """state.db 該會話首條真人消息（去 sender tag、清洗）。"""
+        import sqlite3
+
+        db = os.path.expanduser("~/.hermes/state.db")
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            for (content,) in con.execute(
+                "select content from messages where session_id=? and role='user' order by id", (state_sid,)
+            ):
+                t = " ".join(_strip_sender_tag(str(content or "")).split())
+                if t.strip():
+                    return t[:800]
+            return ""
+        finally:
+            con.close()
+
+    @staticmethod
+    def _anthropic_key() -> str | None:
+        key = os.environ.get("ANTHROPIC_API_KEY")
+        if key:
+            return key
+        try:
+            for line in open(os.path.expanduser("~/.hermes/.env"), encoding="utf-8"):
+                m = re.match(r"^ANTHROPIC_API_KEY\s*=\s*(.+)$", line)
+                if m:
+                    return m.group(1).strip()
+        except OSError:
+            pass
+        return None
+
+    @classmethod
+    def _gen_title_anthropic(cls, first_user_text: str) -> str:
+        """haiku 生成 3-6 詞摘要標題（清洗去引號/前綴）。失敗→空(調用側跳過)。"""
+        key = cls._anthropic_key()
+        if not key:
+            print("[ai_retitle] 無 ANTHROPIC_API_KEY,跳過", file=sys.stderr)
+            return ""
+        try:
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=key)
+            resp = client.messages.create(
+                model=os.environ.get("MACCHIATO_TITLE_MODEL", "claude-haiku-4-5-20251001"),
+                max_tokens=32,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "Generate a concise conversation title (3-6 words, no quotes, same language as the "
+                        f'message) for a conversation opening with:\n\n"{first_user_text}"\n\nReply with ONLY the title.'
+                    ),
+                }],
+            )
+            raw = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+            title = raw.split("\n")[0].strip().strip('"\'`「」《》').removeprefix("Title:").removeprefix("標題:").strip()
+            return title[:60]
+        except Exception as exc:
+            print(f"[ai_retitle gen failed] {exc!r}", file=sys.stderr)
+            return ""
+
     async def _emit_media_from_text(self, server_sid: str, text: str) -> None:
         # 出站附件：agent 在正文用 MEDIA:/裸路徑標的文件 → 讀取 → media.attach 事件上送。
         try:
@@ -710,6 +793,7 @@ class Connector:
             ),
             "lastError": self._last_error,
             "connectorVersion": CONNECTOR_VERSION,  # §update：server 據此判 updateAvailable
+            "kind": "hermes",  # #94：client gate 專屬功能（如 AI 重命名）
         }
 
     def _self_update(self) -> None:
@@ -1126,6 +1210,9 @@ class Connector:
                 await self._ensure_session(server_sid)
             elif method == "session.archive":
                 await self._set_hermes_archived(server_sid, bool(params.get("archived", True)))
+            elif method == "session.retitle":
+                # #94：UI 發起 AI 重新命名。讀 state.db 首條真人消息 → haiku 生成 → session.title。
+                asyncio.create_task(self._ai_retitle(server_sid))
             # session.delete / others: ignore for now
         except Exception as exc:
             print(f"[dispatch {method} failed] {exc!r}", file=sys.stderr)
