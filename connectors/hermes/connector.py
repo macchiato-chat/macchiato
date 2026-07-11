@@ -63,7 +63,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.3.0"
+CONNECTOR_VERSION = "1.3.1"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -824,14 +824,50 @@ class Connector:
         }
 
     def _self_update(self) -> None:
-        """§update：收到 server 的 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。
+        """§update：收到 server 的 self_update → **驗證鏈全過才執行**（#1 供應鏈加固）：
+        release.json+.sig 內嵌公鑰驗簽 → 拒絕降級 → install.sh sha256 對上清單 → 從本地
+        臨時文件跑（非 curl|bash 管道），清單經 MACCHIATO_MANIFEST 傳入供逐文件校驗。
         systemd 重啟會殺掉本進程並起新版；非 systemd（手動跑）則只更新文件、下次重啟生效。"""
-        print("· 收到 self_update → 後台拉最新版並重啟…", file=sys.stderr)
+        print("· 收到 self_update → 驗證發布簽名…", file=sys.stderr)
         try:
+            import tempfile
+            import urllib.request
+
+            import release_verify as rv
+
+            base = os.environ.get(
+                "MACCHIATO_RELEASE_BASE",
+                "https://raw.githubusercontent.com/macchiato-chat/macchiato/main",
+            )
+
+            def fetch(path: str) -> bytes:
+                url = f"{base}/{path}"
+                if not url.startswith("https://"):
+                    raise ValueError(f"拒絕非 https:{url}")
+                with urllib.request.urlopen(url, timeout=30) as r:  # noqa: S310(https 已強制)
+                    return r.read()
+
+            manifest_bytes = fetch("release.json")
+            m = rv.verify_manifest(manifest_bytes, fetch("release.json.sig").decode())
+            rv.check_not_downgrade(m["version"], CONNECTOR_VERSION)
+            install_sh = fetch("install.sh")
+            want = m["files"].get("install.sh")
+            got = rv.sha256_hex(install_sh)
+            if not want or got != want:
+                raise ValueError(f"install.sh sha256 不符(清單 {want} ≠ 實際 {got})")
+            d = tempfile.mkdtemp(prefix="macchiato-update-")
+            sh_path = os.path.join(d, "install.sh")
+            mf_path = os.path.join(d, "release.json")
+            with open(sh_path, "wb") as f:
+                f.write(install_sh)
+            with open(mf_path, "wb") as f:
+                f.write(manifest_bytes)
+            print(f"· 簽名/版本/哈希全過(v{m['version']})→ 後台安裝…", file=sys.stderr)
+            env = dict(os.environ, MACCHIATO_ONLY="hermes", MACCHIATO_MANIFEST=mf_path)
             # detached：脫離本進程，免得服務重啟殺自己時把更新也中斷
             subprocess.Popen(
-                f"curl -sSL {shlex.quote(INSTALL_URL)} | MACCHIATO_ONLY=hermes bash",
-                shell=True,
+                ["bash", sh_path],
+                env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,

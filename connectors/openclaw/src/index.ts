@@ -14,26 +14,18 @@ import { Mirror } from "./openclaw/mirror";
 import { PushHandler } from "./push/handler";
 import { E2EKeyStore } from "./e2e/keys";
 import { HealthLoop } from "./health";
+import { runVerifiedSelfUpdate } from "./selfupdate";
 import { spawn } from "node:child_process";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.3.0";
-const INSTALL_URL =
-  process.env.MACCHIATO_INSTALL_URL ||
-  "https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh";
+const CONNECTOR_VERSION = "1.3.1";
 
 /** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
 function runSelfUpdate(): void {
-  console.error("· self_update received → pulling latest & restarting in the background…");
-  try {
-    const child = spawn("bash", ["-c", `curl -sSL ${INSTALL_URL} | MACCHIATO_ONLY=openclaw bash`], {
-      detached: true, // 脫離本進程，免得服務重啟殺自己時中斷更新
-      stdio: "ignore",
-    });
-    child.unref();
-  } catch (e) {
-    console.error("[self_update failed]", (e as Error).message);
-  }
+  // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。
+  runVerifiedSelfUpdate("openclaw", CONNECTOR_VERSION).catch((e) =>
+    console.error("[self_update failed]", (e as Error).message),
+  );
 }
 
 async function main(): Promise<void> {

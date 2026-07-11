@@ -12,24 +12,16 @@ import { Mirror } from "./cc/mirror";
 import { announceImportAvailable, runImport } from "./cc/history-import";
 import { Drive, workDir } from "./cc/drive";
 import { HealthLoop } from "./health";
+import { runVerifiedSelfUpdate } from "./selfupdate";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.3.0";
-const INSTALL_URL =
-  process.env.MACCHIATO_INSTALL_URL ||
-  "https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh";
+const CONNECTOR_VERSION = "1.3.1";
 
 function runSelfUpdate(): void {
-  console.error("· self_update received → pulling latest & restarting in the background…");
-  try {
-    const child = spawn("bash", ["-c", `curl -sSL ${INSTALL_URL} | MACCHIATO_ONLY=claude-code bash`], {
-      detached: true,
-      stdio: "ignore",
-    });
-    child.unref();
-  } catch (e) {
-    console.error("[self_update failed]", (e as Error).message);
-  }
+  // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。
+  runVerifiedSelfUpdate("claude-code", CONNECTOR_VERSION).catch((e) =>
+    console.error("[self_update failed]", (e as Error).message),
+  );
 }
 
 async function main(): Promise<void> {
