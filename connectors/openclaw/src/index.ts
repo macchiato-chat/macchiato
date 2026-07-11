@@ -17,7 +17,7 @@ import { HealthLoop } from "./health";
 import { spawn } from "node:child_process";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.0.0";
+const CONNECTOR_VERSION = "1.3.0";
 const INSTALL_URL =
   process.env.MACCHIATO_INSTALL_URL ||
   "https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh";

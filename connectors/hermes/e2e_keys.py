@@ -49,6 +49,13 @@ class E2EKeyStore:
                 self._save()
             return self._keys[sid]
 
+    def remove(self, sid: str) -> None:
+        """關閉 E2E：刪該會話 K_S（會話回明文路徑；server 側密封包由 server 清）。無則 no-op。"""
+        with self._lock:
+            if sid in self._keys:
+                del self._keys[sid]
+                self._save()
+
     # ── 密鑰分發 ──────────────────────────────────────────────────────────
     def wrap_for_devices(self, sid: str, devices: list) -> list:
         """把 K_S 封裝給每台設備公鑰 → [{deviceId, sealed}]。壞公鑰跳過。"""

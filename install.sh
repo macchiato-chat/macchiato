@@ -2,13 +2,14 @@
 # Macchiato Connector — one-line installer
 #   curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh | bash
 #
-# Auto-detects which agent(s) you run — Hermes and/or OpenClaw — and installs the
-# matching connector(s): download → pair (one-time code) → systemd user service.
+# Auto-detects which agent(s) you run — Hermes, OpenClaw and/or Claude Code — and installs
+# the matching connector(s): download → pair (one-time code) → systemd user service.
 #
 # Env overrides:
 #   MACCHIATO_SERVER_URL   (default wss://api.macchiato.chat/connector)
 #   HERMES_PYTHON          (path to the python inside your Hermes venv, if auto-detect fails)
-#   MACCHIATO_ONLY         ("hermes" | "openclaw" — skip auto-detect, install just one)
+#   MACCHIATO_CLAUDE_BIN   (absolute path to the claude CLI, if auto-detect fails)
+#   MACCHIATO_ONLY         ("hermes" | "openclaw" | "claude-code" — skip auto-detect, install just one)
 
 set -euo pipefail
 
@@ -38,6 +39,9 @@ install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
     echo "Restart=always"
     echo "RestartSec=5"
     echo "Environment=PYTHONUNBUFFERED=1"
+    if [ -n "${MACCHIATO_UNIT_EXTRA_ENV:-}" ]; then
+      while IFS= read -r kv; do [ -n "$kv" ] && echo "Environment=$kv"; done <<< "$MACCHIATO_UNIT_EXTRA_ENV"
+    fi
     [ -n "${MACCHIATO_SERVER_URL:-}" ] && echo "Environment=MACCHIATO_SERVER_URL=$MACCHIATO_SERVER_URL"
     echo
     echo "[Install]"
@@ -133,21 +137,57 @@ install_openclaw() {
   fi
 }
 
+# ═════════════════════════════ Claude Code ══════════════════════════════════
+find_claude_bin() {
+  if [ -n "${MACCHIATO_CLAUDE_BIN:-}" ]; then echo "$MACCHIATO_CLAUDE_BIN"; return; fi
+  local cand
+  cand="$(command -v claude 2>/dev/null || true)"
+  [ -n "$cand" ] && { echo "$cand"; return; }
+  for cand in "$HOME/.local/bin/claude" /usr/local/bin/claude /opt/homebrew/bin/claude; do
+    [ -x "$cand" ] && { echo "$cand"; return; }
+  done
+  echo ""
+}
+
+install_claude_code() {
+  local APP="$HOME/.macchiato/claude-code-app" CRED="$HOME/.macchiato/claude-code-connector.json" CLAUDE
+  CLAUDE="$(find_claude_bin)"
+  [ -n "$CLAUDE" ] || fail "Claude Code CLI not found. Install it first (https://claude.com/claude-code), or set MACCHIATO_CLAUDE_BIN and re-run."
+  command -v node >/dev/null 2>&1 || fail "node not found (the Claude Code connector requires Node 20+)"
+  command -v npm >/dev/null 2>&1 || fail "npm not found"
+  say "Claude Code connector → $APP  (claude: $CLAUDE)"
+  mkdir -p "$APP"
+  cp -r "$TMP"/connectors/claude-code/src "$TMP"/connectors/claude-code/package.json "$TMP"/connectors/claude-code/tsconfig.json "$APP/"
+  (cd "$APP" && npm install --omit=dev --silent) || fail "npm install failed in $APP"
+  if [ ! -f "$CRED" ]; then
+    say "Pairing Claude Code connector (enter the code below at macchiato.chat)"
+    (cd "$APP" && MACCHIATO_PAIR_ONLY=1 MACCHIATO_CLAUDE_BIN="$CLAUDE" ./node_modules/.bin/tsx src/index.ts) || fail "Pairing not completed. Re-run this script to continue."
+  else
+    say "Claude Code credentials found, skipping pairing"
+  fi
+  # PATH: user systemd units often miss ~/.local/bin → the connector could not find the claude CLI.
+  MACCHIATO_UNIT_EXTRA_ENV="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+MACCHIATO_CLAUDE_BIN=$CLAUDE"     install_unit "macchiato-claude-code-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
+}
+
 # ── detect + run ─────────────────────────────────────────────────────────────
 ONLY="${MACCHIATO_ONLY:-}"
-HAS_HERMES=0; HAS_OPENCLAW=0
+HAS_HERMES=0; HAS_OPENCLAW=0; HAS_CLAUDE=0
 [ -n "$(find_hermes_python)" ] && HAS_HERMES=1
 { command -v openclaw >/dev/null 2>&1 || [ -f "$HOME/.openclaw/openclaw.json" ]; } && HAS_OPENCLAW=1
+[ -n "$(find_claude_bin)" ] && HAS_CLAUDE=1
 
 case "$ONLY" in
-  hermes)   install_hermes ;;
-  openclaw) install_openclaw ;;
+  hermes)      install_hermes ;;
+  openclaw)    install_openclaw ;;
+  claude-code) install_claude_code ;;
   "")
-    [ "$HAS_HERMES" = 1 ] || [ "$HAS_OPENCLAW" = 1 ] || fail "No supported agent found (Hermes or OpenClaw). Install one first — see README."
+    [ "$HAS_HERMES" = 1 ] || [ "$HAS_OPENCLAW" = 1 ] || [ "$HAS_CLAUDE" = 1 ] || fail "No supported agent found (Hermes, OpenClaw or Claude Code). Install one first — see README."
     [ "$HAS_HERMES" = 1 ]   && install_hermes
     [ "$HAS_OPENCLAW" = 1 ] && install_openclaw
+    [ "$HAS_CLAUDE" = 1 ]   && install_claude_code
     ;;
-  *) fail "MACCHIATO_ONLY must be 'hermes' or 'openclaw'" ;;
+  *) fail "MACCHIATO_ONLY must be 'hermes', 'openclaw' or 'claude-code'" ;;
 esac
 
 say "Done! Open Macchiato — your conversations will start syncing."

@@ -1,0 +1,15 @@
+# Macchiato Claude Code Connector — systemd user unit (installed by install.sh)
+[Unit]
+Description=Macchiato Claude Code Connector
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/.macchiato/claude-code-app
+ExecStart=%h/.macchiato/claude-code-app/node_modules/.bin/tsx src/index.ts
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

@@ -3,6 +3,7 @@
  * 握手/方法/事件均以 scripts/probe-gateway.ts 的活測為準, 見 docs/ARCHITECTURE.md「活測確認的協議」。
  */
 import WebSocket from "ws";
+import { backoffMs, shouldAlert } from "../backoff";
 import { resolveGatewayConfig, type GatewayConfig } from "./config";
 
 export interface GatewayEvent {
@@ -12,7 +13,6 @@ export interface GatewayEvent {
 }
 export type EventHandler = (evt: GatewayEvent) => void;
 
-const RECONNECT_MS = 3000;
 const REQ_TIMEOUT_MS = 15000;
 const CHALLENGE_WAIT_MS = 200;
 
@@ -33,6 +33,8 @@ export class OpenClawGateway {
   /** 最近一次握手的 hello-ok（protocol / features.methods / features.events …）。 */
   helloOk: any = null;
   private connected = false;
+  /** #3 連續重連失敗計數(握手成功歸零)——health 據此上浮「gateway 連不上 + 次數」。 */
+  reconnectFailures = 0;
 
   get isConnected(): boolean {
     return this.connected;
@@ -80,6 +82,7 @@ export class OpenClawGateway {
       userAgent: "macchiato-openclaw-connector/0.1",
     });
     this.connected = true;
+    this.reconnectFailures = 0; // #3 連上歸零
     if (this.firstConnect) {
       this.firstConnect();
       this.firstConnect = null;
@@ -137,9 +140,14 @@ export class OpenClawGateway {
     }
     this.pending.clear();
     if (this.closed) return;
+    // #3 指數退避(3s→60s+抖動);連續失敗每 5 次吼一聲,並經 reconnectFailures 上浮 health。
+    this.reconnectFailures += 1;
+    if (shouldAlert(this.reconnectFailures)) {
+      console.error(`⚠️ OpenClaw gateway 連續 ${this.reconnectFailures} 次重連失敗(gateway 沒在跑?),繼續退避重試…`);
+    }
     setTimeout(() => {
       if (!this.closed) this.connect();
-    }, RECONNECT_MS);
+    }, backoffMs(this.reconnectFailures - 1));
   }
 
   close(): void {

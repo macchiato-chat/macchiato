@@ -8,7 +8,7 @@ Macchiato connects the AI agent running on **your** hardware (a Raspberry Pi, a 
 
 - 📱 **iOS + Web** — chat, voice input, push notifications
 - 🔄 **Full mirror** — conversations your agent has on Discord / Telegram / cron jobs show up here too, live
-- 🤖 **Agent-first** — connectors for [Hermes](https://github.com/NousResearch) and [OpenClaw](https://openclaw.ai), one-line install for both
+- 🤖 **Agent-first** — connectors for [Hermes](https://github.com/NousResearch), [OpenClaw](https://openclaw.ai) and [Claude Code](https://claude.com/claude-code), one-line install for all
 - 🔒 **Your keys, your box** — the agent, its memory, and its API keys never leave your machine; this connector is the only bridge
 
 This repository distributes the **connector** — the small service you run next to your agent — plus its documentation and issue tracker.
@@ -17,7 +17,7 @@ This repository distributes the **connector** — the small service you run next
 
 ## Install
 
-On the machine where your agent (Hermes or OpenClaw) runs:
+On the machine where your agent (Hermes, OpenClaw or Claude Code) runs:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh | bash
@@ -25,13 +25,13 @@ curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/instal
 
 The installer will:
 
-1. auto-detect your agent(s) — Hermes and/or OpenClaw,
+1. auto-detect your agent(s) — Hermes, OpenClaw and/or Claude Code,
 2. download the connector to `~/.macchiato/app/`,
 3. show a **pairing code** — enter it at [macchiato.chat](https://macchiato.chat) to claim this connector,
 4. install a `systemd` user service so it runs 24/7,
 5. install the agent-side plugin (Hermes platform plugin / OpenClaw channel plugin) so your agent can message you proactively — restart your agent's gateway to load it.
 
-**Requirements:** a working [Hermes](https://github.com/NousResearch) or [OpenClaw](https://openclaw.ai) install and a Macchiato account.
+**Requirements:** a working [Hermes](https://github.com/NousResearch), [OpenClaw](https://openclaw.ai) or [Claude Code](https://claude.com/claude-code) install and a Macchiato account.
 
 **Updating:** re-run the same one-line installer. It re-downloads the latest connector, keeps your existing pairing, and restarts the service so the new version takes effect immediately — no re-pairing needed.
 

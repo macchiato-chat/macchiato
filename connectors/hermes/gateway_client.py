@@ -78,6 +78,7 @@ class GatewayClient:
         self._supervise_task: Optional[asyncio.Task] = None
         self._ready = asyncio.Event()
         self._closed = False
+        self.restart_failures = 0  # #3 連續重啟失敗計數(健康上報告警)
 
     # ---- lifecycle ----------------------------------------------------------
 
@@ -114,7 +115,10 @@ class GatewayClient:
         self._supervise_task = asyncio.create_task(self._supervise())
 
     async def _supervise(self) -> None:
-        """Respawn the gateway subprocess if it dies unexpectedly; notify via on_restart."""
+        """Respawn the gateway subprocess if it dies unexpectedly; notify via on_restart.
+        #3:重啟失敗指數退避(3→60s)——配置壞掉時此前每 3s 死磕無限緊循環;
+        restart_failures 供健康上報告警(連續失敗次數上浮 app)。"""
+        backoff = 3.0
         while not self._closed:
             proc = self._proc
             if proc is None:
@@ -131,9 +135,16 @@ class GatewayClient:
                 await self._spawn()
                 await asyncio.wait_for(self._ready.wait(), 20.0)
             except Exception as exc:
-                print(f"[gateway restart failed: {exc!r}; retry in 3s]", file=sys.stderr)
-                await asyncio.sleep(3)
+                self.restart_failures += 1
+                print(
+                    f"[gateway restart failed ×{self.restart_failures}: {exc!r}; retry in {backoff:.0f}s]",
+                    file=sys.stderr,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
                 continue
+            backoff = 3.0
+            self.restart_failures = 0  # 起來了 → 歸零
             print("[gateway restarted; ready]", file=sys.stderr)
             if self.on_restart is not None:
                 try:

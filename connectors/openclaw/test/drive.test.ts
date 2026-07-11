@@ -1,20 +1,38 @@
 import { describe, it, expect } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Drive, keyForSid, sidForKey } from "../src/openclaw/drive";
 import { MACCHIATO_PREFIX } from "../src/openclaw/mirror";
+import { titlegenKey } from "../src/openclaw/titles";
 
-function makeDrive() {
+function makeDrive(opts: { titleMode?: string } = {}) {
+  // #113:標題持久集隔離到臨時文件;默認 off(專項測試才開),免干擾既有 calls/sent 斷言
+  process.env.MACCHIATO_OPENCLAW_TITLED = join(mkdtempSync(join(tmpdir(), "oc-titled-")), "titled.json");
+  process.env.MACCHIATO_OPENCLAW_TITLE_MODE = opts.titleMode ?? "off";
   const calls: { method: string; params: any }[] = [];
   const gw: any = {
     handlers: [] as any[],
     onEvent(h: any) {
       this.handlers.push(h);
+      return () => {
+        const i = this.handlers.indexOf(h);
+        if (i >= 0) this.handlers.splice(i, 1);
+      };
     },
     async request(method: string, params: any) {
       calls.push({ method, params });
+      // #113:titlegen 的 agent RPC → 異步回 chat final 事件(復刻真 gateway 行為)
+      if (method === "agent" && typeof params?.sessionKey === "string") {
+        setTimeout(() => {
+          gw.fire({ event: "chat", payload: { sessionKey: params.sessionKey, state: "final",
+            message: { role: "assistant", content: [{ type: "text", text: "「重構支付錯誤處理」" }] } } });
+        }, 5);
+      }
       return { status: "started", runId: "r1" };
     },
     fire(evt: any) {
-      for (const h of this.handlers) h(evt);
+      for (const h of [...this.handlers]) h(evt);
     },
   };
   const sent: any[] = [];
@@ -149,11 +167,68 @@ describe("drive 上行翻譯（chat/lifecycle → tui EVENT）", () => {
   });
 });
 
+describe("#60 附件降級回執", () => {
+  it("非 audio 附件 → review.summary 提示(此前靜默丟失);正文照常送達", async () => {
+    const { linkb, calls, sent } = makeDrive();
+    await linkb.deliver(tui("prompt.submit", "01SID", {
+      text: "看看這張圖",
+      attachments: [{ id: "a1", kind: "image" }, { id: "a2", kind: "file" }],
+    }));
+    const line = sent.find((m) => m.frame?.params?.type === "review.summary");
+    expect(line?.frame.params.payload.summary).toContain("2 個附件");
+    expect(calls.find((c) => c.method === "chat.send")?.params.message).toBe("看看這張圖"); // 正文照發
+  });
+
+  it("純 audio 附件不觸發回執(語音走 #89 雲端 STT/降級回執,不重複提示)", async () => {
+    const { linkb, sent } = makeDrive();
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "語音", attachments: [{ id: "v1", kind: "audio" }] }));
+    expect(sent.filter((m) => m.frame?.params?.type === "review.summary")).toEqual([]);
+    expect(sent.find((m) => m.t === "voice_transcript")).toBeTruthy(); // 語音降級回執照舊
+  });
+});
+
+describe("#113 自動標題(經用戶自己的 agent,隱藏 titlegen 會話)", () => {
+  it("首個 prompt → agent RPC(titlegen key,deliver:false)→ chat final → session.title(清洗過)", async () => {
+    const { linkb, calls, sent } = makeDrive({ titleMode: "summary" });
+    await linkb.deliver(tui("prompt.submit", "01TITLESID", { text: "帮我重构支付模块的错误处理" }));
+    await new Promise((r) => setTimeout(r, 40)); // 等 fake final 事件回來
+    const agentCalls = calls.filter((c) => c.method === "agent");
+    expect(agentCalls).toHaveLength(1);
+    expect(agentCalls[0].params.sessionKey).toBe(titlegenKey("01TITLESID")); // macchiato: 前綴 → 鏡像/導入跳過
+    expect(agentCalls[0].params.deliver).toBe(false);
+    const titleEvt = sent.find((m) => m.frame?.params?.type === "session.title");
+    expect(titleEvt?.frame.params.payload.title).toBe("重構支付錯誤處理"); // 引號已清洗
+    expect(titleEvt?.sessionId).toBe("01TITLESID");
+    // 同會話再來 prompt → 不重生(titled 持久集)
+    await linkb.deliver(tui("prompt.submit", "01TITLESID", { text: "繼續" }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls.filter((c) => c.method === "agent")).toHaveLength(1);
+  });
+
+  it("鏡像來的會話(agent: key)不生成——它有自己的頻道標題", async () => {
+    const { linkb, calls } = makeDrive({ titleMode: "summary" });
+    await linkb.deliver(tui("prompt.submit", "agent:main:discord:channel:7", { text: "頻道續聊" }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls.filter((c) => c.method === "agent")).toHaveLength(0);
+  });
+
+  it("titlegen 會話的 final 事件不會被 drive 誤翻譯成消息(非 driven → 忽略)", async () => {
+    const { linkb, sent } = makeDrive({ titleMode: "summary" });
+    await linkb.deliver(tui("prompt.submit", "01TITLESID2", { text: "你好" }));
+    await new Promise((r) => setTimeout(r, 40));
+    // titlegen 會話的 chat final 只產生 session.title,不產生 message.* 幀
+    const msgFrames = sent.filter((m) => String(m.frame?.params?.type ?? "").startsWith("message."));
+    expect(msgFrames).toEqual([]);
+  });
+});
+
 describe("drive E2E（§19 方案 A）", () => {
   async function makeE2E() {
     const { mkdtempSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
+    process.env.MACCHIATO_OPENCLAW_TITLED = join(mkdtempSync(join(tmpdir(), "oc-titled-")), "titled.json");
+    process.env.MACCHIATO_OPENCLAW_TITLE_MODE = "off"; // #113 E2E 測試不摻標題
     const { E2EKeyStore } = await import("../src/e2e/keys");
     const store = new E2EKeyStore(join(mkdtempSync(join(tmpdir(), "occ-de2e-")), "e2e.json"));
     const calls: any[] = [];

@@ -18,6 +18,7 @@
 import type { LinkBClient } from "../linkb/client";
 import type { OpenClawGateway, GatewayEvent } from "./gateway";
 import { keyForSid, sidForKey, type Mirror } from "./mirror";
+import { generateTitle, loadTitled, saveTitled } from "./titles";
 import type { E2EKeyStore } from "../e2e/keys";
 
 // key ↔ sid 映射移居 mirror.ts（E2E 回灌也要用）；re-export 保持既有導入面不變。
@@ -39,6 +40,9 @@ export class Drive {
 
   /** E2E 會話：runId 前暫存的（已解密）用戶消息, 回合結束隨加密批一起投遞。 */
   private readonly pendingUser = new Map<string, string[]>();
+
+  /** #113 已自動生成過標題的 sid(持久,重啟不重生、不覆蓋用戶手改)。 */
+  private readonly titled = loadTitled();
 
   constructor(
     private readonly gw: OpenClawGateway,
@@ -83,6 +87,33 @@ export class Drive {
     try {
       switch (frame.method) {
         case "prompt.submit": {
+          // #73/#89 語音優雅降級：OpenClaw 無 STT——audio 附件立即回「未能轉錄」失敗回執，
+          // 否則 server 的「轉錄中…」占位永久卡住（CC 連接器同款修法）。新 server 已按
+          // health `stt:false` 預路由、不會下達音頻；這是對舊 server 的兜底。
+          const atts = Array.isArray(params.attachments)
+            ? (params.attachments as Array<{ id?: string; kind?: string }>)
+            : [];
+          for (const a of atts) {
+            if (a?.kind === "audio" && a.id) {
+              this.linkb.send({
+                t: "voice_transcript",
+                agentLinkId: this.linkb.agentLinkId,
+                sessionId: sid,
+                attachmentId: a.id,
+                text: "",
+                error: "stt_unavailable",
+              });
+            }
+          }
+          // #60 最小修:非 audio 附件(圖片/文件)OpenClaw 尚無媒體通道 → 明確降級回執。
+          // 此前**靜默丟失**——用戶以為 agent 看到了。E2E 跳過(不發明文行)。真支持待探
+          // gateway 媒體能力(chat.send 是否收 files),見 #60。
+          const dropped = atts.filter((a) => a?.kind && a.kind !== "audio").length;
+          if (dropped && !this.e2e?.isE2E(sid)) {
+            this.emit(sid, "review.summary", {
+              summary: `⚠️ OpenClaw 連接器暫不支持附件——已忽略 ${dropped} 個附件,僅文字送達 agent`,
+            });
+          }
           let text = String(params.text ?? "").trim();
           if (!text) return;
           if (this.e2e?.isE2E(sid)) {
@@ -99,6 +130,13 @@ export class Drive {
             this.pendingUser.set(key, arr);
           }
           this.markDriven(key, sid);
+          // #113 首個 prompt → 自動標題(越早越好,與 CC/Hermes 對齊)。僅 Macchiato 發起的會話
+          // (鏡像來的 agent: key 有自己的頻道標題);E2E 跳過(標題事件是明文,防洩漏)。
+          if (!sid.startsWith("agent:") && !this.e2e?.isE2E(sid) && !this.titled.has(sid)) {
+            this.titled.add(sid);
+            saveTitled(this.titled);
+            void this.autoTitle(sid, text);
+          }
           if (this.active.has(key)) {
             const r = await this.gw.request("sessions.steer", { key, message: text });
             console.log(`· Turn in progress → steering follow-up into (${key}, status=${r?.status})`);
@@ -122,6 +160,18 @@ export class Drive {
       }
     } catch (e) {
       console.error(`[drive ${frame.method} failed for ${sid}] ${(e as Error).message}`);
+    }
+  }
+
+  /** #113:經用戶自己的 agent 生成標題(titles.generateTitle,隱藏 titlegen 會話)→ session.title。 */
+  private async autoTitle(sid: string, firstUserText: string): Promise<void> {
+    try {
+      const title = await generateTitle(this.gw, sid, firstUserText);
+      if (!title) return;
+      this.emit(sid, "session.title", { title });
+      console.log(`· 生成標題「${title}」→ ${sid}`);
+    } catch (e) {
+      console.error(`[auto title failed for ${sid}] ${(e as Error).message}`);
     }
   }
 

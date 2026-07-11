@@ -7,6 +7,7 @@
 import type { LinkBClient } from "./linkb/client";
 import type { OpenClawGateway } from "./openclaw/gateway";
 import type { Mirror } from "./openclaw/mirror";
+import { smokeParseLatest } from "./openclaw/history-import";
 
 const HEALTH_INTERVAL_MS = Number(process.env.MACCHIATO_HEALTH_INTERVAL_MS) || 60_000;
 const MIRROR_STUCK_MS = Number(process.env.MACCHIATO_MIRROR_STUCK_MS) || 120_000;
@@ -18,16 +19,52 @@ export interface HealthSnapshot {
   lastError: string | null;
   kind: "openclaw";
   connectorVersion: string; // §update：server 據此判 updateAvailable（欄位名對齊 protocol）
+  /** #89：無本地 STT——server 據此把語音輸入直接路由到雲端 BYOK STT（不再下達音頻）。 */
+  stt: false;
+}
+
+/**
+ * #112 依賴的 gateway 方法(hello-ok features.methods 能力位校驗)。注意:sessions.steer 實測可用
+ * 但**不在**廣告方法表裡(§18 方案 D,2026-07-11 活測 191 個方法無它)——列入會誤報降級,故排除。
+ */
+const REQUIRED_METHODS = [
+  "chat.send",
+  "sessions.list",
+  "sessions.preview",
+  "sessions.abort",
+  "sessions.send",
+  "sessions.messages.subscribe",
+] as const;
+
+/** #112 深度兼容自檢(對齊 CC checkCompat):協議版本 + 能力位 + transcript 解析冒煙。 */
+export function checkCompat(gw: OpenClawGateway): { ok: boolean; reason?: string } {
+  const hello = gw.helloOk;
+  if (!hello) return { ok: false, reason: "gateway 未完成握手" };
+  if (hello.protocol !== 4) return { ok: false, reason: `gateway 協議 v${hello.protocol} ≠ 4` };
+  const methods = hello.features?.methods;
+  if (Array.isArray(methods)) {
+    const missing = REQUIRED_METHODS.filter((m) => !methods.includes(m));
+    if (missing.length) return { ok: false, reason: `gateway 缺方法: ${missing.join(", ")}(OpenClaw 升級改了 API?)` };
+  }
+  return smokeParseLatest();
 }
 
 export function buildHealth(gw: OpenClawGateway, mirror: Mirror, version: string): HealthSnapshot {
+  // #112:compat 失敗原因併入 lastError——app 顯示「降級 + 為什麼」,而非一個沉默的布爾。
+  const compat = checkCompat(gw);
+  // #3 gateway 連不上時,把「連了多少次」上浮(gatewayAlive=false 只說降級,不說為什麼)。
+  const gwDown =
+    !gw.isConnected && (gw.reconnectFailures ?? 0) >= 3
+      ? `gateway 連續 ${gw.reconnectFailures} 次重連失敗(OpenClaw 沒在跑?)`
+      : null;
   return {
     gatewayAlive: gw.isConnected,
-    compatOk: gw.helloOk?.protocol === 4, // 握手協議版本 = 兼容性信號
+    compatOk: compat.ok,
     mirrorLastPollAgeS: Math.round((Date.now() - mirror.lastPollAt) / 1000),
-    lastError: mirror.lastError,
+    lastError: gwDown ?? (compat.ok ? mirror.lastError : (compat.reason ?? "兼容自檢失敗")),
     kind: "openclaw",
     connectorVersion: version,
+    stt: false,
   };
 }
 

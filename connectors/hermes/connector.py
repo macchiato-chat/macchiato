@@ -63,7 +63,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.0.0"
+CONNECTOR_VERSION = "1.3.0"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -139,6 +139,24 @@ def _materialize_attachment(ref: dict) -> str:
                 raise ValueError(f"下載超過上限 {DOWNLOAD_MAX} 字節，已中止")
             f.write(chunk)
     return path
+
+
+_STT_AVAILABLE = None  # 惰性探測緩存（進程生命週期內不變）
+
+
+def _stt_available() -> bool:
+    """#89 語音轉錄能力探測（health 上報 `stt` 位，server 據此路由雲端 STT 回退鏈）。
+    voice_mode 可 import 即視為有——provider 未配好時 transcribe 運行期報錯，
+    server 收到失敗回執後仍會反應式回退（見 _transcribe_attachment 的 error 路徑）。"""
+    global _STT_AVAILABLE
+    if _STT_AVAILABLE is None:
+        try:
+            from tools.voice_mode import transcribe_recording  # noqa: F401
+
+            _STT_AVAILABLE = True
+        except Exception:
+            _STT_AVAILABLE = False
+    return _STT_AVAILABLE
 
 
 def _transcribe_attachment(ref: dict) -> dict:
@@ -269,6 +287,31 @@ def _check_hermes_compat() -> dict:
     return {"hermes_version": ver, "checks": checks}
 
 
+def _smoke_parse_state_db() -> str | None:
+    """#112 解析冒煙(對齊 CC smokeParseLatest):按鏡像/導入同款 schema 讀最新一條 assistant 消息、
+    跑同款 tool_calls 解析——Hermes 升級改 state.db schema / tool_calls 格式時,在靜默丟消息之前
+    把降級亮出來。無庫/空庫不判失敗(新機器)。返回 None=通過,str=降級原因。"""
+    try:
+        import backfill as _bf
+
+        if not os.path.exists(_bf.STATE_DB):
+            return None
+        con = _bf._connect()
+        try:
+            # schema 漂移(列改名/表改名)→ OperationalError;tool_calls 格式漂移 → 解析拋錯
+            row = con.execute(
+                "select role, content, reasoning, tool_calls from messages "
+                "where role='assistant' order by id desc limit 1"
+            ).fetchone()
+            if row is not None:
+                _bf._parse_tool_calls(row[3], {})
+        finally:
+            con.close()
+        return None
+    except Exception as exc:
+        return f"state.db 解析冒煙失敗(schema/格式漂移?): {exc!r}"
+
+
 class Connector:
     def __init__(
         self,
@@ -299,6 +342,7 @@ class Connector:
         self._mirror_last_run = None
         self._last_error = None
         self._compat: dict = {}
+        self._smoke_err: str | None = None  # #112 解析冒煙結果(健康循環定期刷新)
         self._mirror_st = None  # 鏡像水位線狀態（nack 回退也要訪問）
         self._mirror_batch_id = 0
         self._mirror_rewind = deque(maxlen=64)  # (batchId, {sid: 舊floor})，供 nack 回退
@@ -743,6 +787,21 @@ class Connector:
                 file=sys.stderr,
             )
 
+    def _degrade_reason(self) -> str | None:
+        """#112:compat 探測失敗項 / 解析冒煙失敗 → 一句可讀原因(app 顯示「降級+為什麼」,
+        而非一個沉默的布爾)。無降級 → None(lastError 回落鏡像錯誤)。"""
+        gw = self.gw
+        rf = getattr(gw, "restart_failures", 0) if gw is not None else 0
+        if rf >= 3:
+            return f"gateway 連續 {rf} 次重啟失敗(Hermes 配置壞了?)"  # #3
+        checks = self._compat.get("checks", {})
+        fails = [f"{k}: {v}" for k, v in checks.items() if v is not True]
+        if fails:
+            return ("compat " + "; ".join(fails))[:300]
+        if self._smoke_err:
+            return self._smoke_err[:300]
+        return None
+
     def _health(self) -> dict:
         checks = self._compat.get("checks", {})
         now = time.time()
@@ -752,14 +811,16 @@ class Connector:
             "linkB": self._linkb_state,
             "gatewayAlive": bool(self.gw and self.gw.is_alive()),
             "hermesVersion": self._compat.get("hermes_version"),
-            "compatOk": bool(checks) and all(v is True for v in checks.values()),
+            # #112:compat 探測 + 解析冒煙,任一失敗 → 降級
+            "compatOk": bool(checks) and all(v is True for v in checks.values()) and self._smoke_err is None,
             "compat": checks,
             "mirrorLastPollAgeS": (
                 int(now - self._mirror_last_run) if self._mirror_last_run else None
             ),
-            "lastError": self._last_error,
+            "lastError": self._degrade_reason() or self._last_error,
             "connectorVersion": CONNECTOR_VERSION,  # §update：server 據此判 updateAvailable
             "kind": "hermes",  # #94：client gate 專屬功能（如 AI 重命名）
+            "stt": _stt_available(),  # #89：語音轉錄能力位（false → server 走雲端 BYOK STT）
         }
 
     def _self_update(self) -> None:
@@ -794,6 +855,7 @@ class Connector:
         while True:
             try:
                 await asyncio.sleep(HEALTH_INTERVAL_S)
+                self._smoke_err = await asyncio.to_thread(_smoke_parse_state_db)  # #112
                 h = self._health()
                 self._write_health_file(h)
                 # 鏡像看門狗：輪詢時延遠超預期 → 循環卡死/靜默退出 → 抓棧 + 重啟自愈。

@@ -6,7 +6,7 @@
  *  - 合併：同頻道 id 的「歸檔 + 活躍」併成一條（hermesSessionId = agent:main:discord:channel:<id>）, 
  *    messages按 createdAt 排序 → 一條完整歷史。
  */
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { LinkBClient } from "../linkb/client";
@@ -17,6 +17,7 @@ import {
   extractChannelMeta,
   isCronSession,
   lineToMessage,
+  MACCHIATO_PREFIX,
   rawUserText,
   type MirrorMessage,
 } from "./mirror";
@@ -94,6 +95,38 @@ function parseFile(file: string): { messages: MirrorMessage[]; firstUserRaw: str
   return { messages, firstUserRaw };
 }
 
+/**
+ * #112 解析冒煙(對齊 CC compat.smokeParseLatest):拿最新 session .jsonl 真解析一遍——
+ * OpenClaw 升級改 transcript 格式時,在靜默丟消息之前把降級亮出來。無文件/空文件不判失敗(新機器)。
+ */
+export function smokeParseLatest(): { ok: boolean; reason?: string } {
+  try {
+    const files = listSessionFiles(sessionsDir());
+    if (!files.length) return { ok: true };
+    let latest = files[0]!;
+    let latestMtime = 0;
+    for (const f of files) {
+      try {
+        const mt = statSync(f).mtimeMs;
+        if (mt > latestMtime) {
+          latestMtime = mt;
+          latest = f;
+        }
+      } catch {
+        /* 跳過 */
+      }
+    }
+    const content = readFileSync(latest, "utf8").trim();
+    if (!content) return { ok: true }; // 空文件不判失敗
+    const { messages, firstUserRaw } = parseFile(latest);
+    if (!messages.length && !firstUserRaw)
+      return { ok: false, reason: `最新 transcript 解析零產出(格式可能漂移): ${basename(latest)}` };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: `transcript 解析冒煙拋錯: ${(e as Error).message}` };
+  }
+}
+
 /** 深度收集可導入會話（活躍 + 歸檔, 按頻道合併、按時間排序）。 */
 async function collectImportSessions(gw: OpenClawGateway): Promise<ImportSession[]> {
   const active = await activeSessions(gw);
@@ -111,6 +144,8 @@ async function collectImportSessions(gw: OpenClawGateway): Promise<ImportSession
     const a = active.get(sessionId);
     if (a) {
       if (isCronSession(a.key)) continue;
+      // #113 macchiato: 前綴會話不導入——driven 會話 live 已入庫(再導=重複);titlegen 是隱藏會話。
+      if (a.key?.toLowerCase().startsWith(MACCHIATO_PREFIX)) continue;
       hermesSessionId = a.key;
       title = deriveTitle(a);
       source = deriveSource(a);
