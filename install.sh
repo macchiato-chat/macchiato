@@ -10,6 +10,8 @@
 #   HERMES_PYTHON          (path to the python inside your Hermes venv, if auto-detect fails)
 #   MACCHIATO_CLAUDE_BIN   (absolute path to the claude CLI, if auto-detect fails)
 #   MACCHIATO_ONLY         ("hermes" | "openclaw" | "claude-code" — skip auto-detect, install just one)
+#   MACCHIATO_MANIFEST     (path to a pre-verified release.json — self_update passes it;
+#                           every installed file is sha256-checked against it before use)
 
 set -euo pipefail
 
@@ -21,6 +23,27 @@ warn() { printf '\033[1;33m[macchiato]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[macchiato] FAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 
 have_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
+
+# ── supply-chain check (#1): when MACCHIATO_MANIFEST is set (signed release.json already
+# verified by the connector), every file we are about to install must hash-match it. ──
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+verify_tree() { # $1=dir under $TMP  $2=repo-relative prefix (e.g. connectors/hermes)
+  [ -z "${MACCHIATO_MANIFEST:-}" ] && return 0
+  local f rel want got n=0
+  while IFS= read -r -d '' f; do
+    rel="$2/${f#"$1"/}"
+    # release.json is generated with a fixed one-line-per-file format — grep is reliable here
+    want="$(grep -F "\"$rel\":" "$MACCHIATO_MANIFEST" | grep -oE '[0-9a-f]{64}' | head -1)"
+    [ -n "$want" ] || fail "release.json has no entry for $rel — refusing to install unlisted files"
+    got="$(sha256_of "$f")"
+    [ "$got" = "$want" ] || fail "sha256 mismatch for $rel (manifest $want ≠ downloaded $got) — aborting"
+    n=$((n+1))
+  done < <(find "$1" -type f -print0)
+  say "Manifest check ✓ $2 ($n files)"
+}
 
 install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
   if ! have_systemd; then
@@ -59,7 +82,7 @@ install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 say "Downloading Macchiato connectors…"
-curl -sSL "$REPO_TARBALL" | tar -xz -C "$TMP" --strip-components=1
+curl -sSL --fail --proto '=https' "$REPO_TARBALL" | tar -xz -C "$TMP" --strip-components=1
 [ -d "$TMP/connectors" ] || fail "Downloaded repo has no connectors/ (repo layout changed?)"
 
 # ═════════════════════════════ Hermes ═══════════════════════════════════════
@@ -93,6 +116,7 @@ install_hermes() {
   [ -n "$PY" ] || fail "Hermes not found. Install it first (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash), or set HERMES_PYTHON and re-run."
   "$PY" -c "import websockets" 2>/dev/null || fail "Hermes venv is missing websockets (required). Run: $PY -m pip install websockets"
   say "Hermes connector → $APP  (python: $PY)"
+  verify_tree "$TMP/connectors/hermes" "connectors/hermes"
   mkdir -p "$APP"
   cp "$TMP"/connectors/hermes/*.py "$APP/"
   if [ ! -f "$CRED" ]; then
@@ -117,6 +141,7 @@ install_openclaw() {
   command -v node >/dev/null 2>&1 || fail "node not found (OpenClaw requires Node — is OpenClaw actually installed?)"
   command -v npm >/dev/null 2>&1 || fail "npm not found"
   say "OpenClaw connector → $APP"
+  verify_tree "$TMP/connectors/openclaw" "connectors/openclaw"
   mkdir -p "$APP"
   cp -r "$TMP"/connectors/openclaw/src "$TMP"/connectors/openclaw/plugin "$TMP"/connectors/openclaw/package.json "$TMP"/connectors/openclaw/tsconfig.json "$APP/"
   (cd "$APP" && npm install --omit=dev --silent) || fail "npm install failed in $APP"
@@ -156,6 +181,7 @@ install_claude_code() {
   command -v node >/dev/null 2>&1 || fail "node not found (the Claude Code connector requires Node 20+)"
   command -v npm >/dev/null 2>&1 || fail "npm not found"
   say "Claude Code connector → $APP  (claude: $CLAUDE)"
+  verify_tree "$TMP/connectors/claude-code" "connectors/claude-code"
   mkdir -p "$APP"
   cp -r "$TMP"/connectors/claude-code/src "$TMP"/connectors/claude-code/package.json "$TMP"/connectors/claude-code/tsconfig.json "$APP/"
   (cd "$APP" && npm install --omit=dev --silent) || fail "npm install failed in $APP"
