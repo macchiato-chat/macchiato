@@ -161,6 +161,34 @@ describe("Mirror", () => {
     expect(resumed.length).toBeGreaterThan(0);
   });
 
+  it("driven 回合末標題寫回(custom-title,零消息)→ 不生成影子會話;真人續問才建", () => {
+    setupEnv();
+    writeFileSync(file, "");
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb);
+    (m as any).doPoll(); // baseline 空
+    m.setDriven(SID);
+    appendFileSync(file, userLine("為什麼重啟") + assistantLine("因為看門狗"));
+    (m as any).doPoll(); // driven → 快進,不投
+    m.fastForward(SID);
+    m.unsetDriven(SID);
+    // 回合末:CC 把生成的標題寫回 transcript(custom-title 行,零消息)——舊守衛(要 messages.length)
+    // 會讓它繞過、走 newTitle 分支憑空建會話(2026-07-13 實測復發的洞)。
+    appendFileSync(file, JSON.stringify({ type: "custom-title", customTitle: "P4改為拍手", sessionId: SID }) + "\n");
+    (m as any).doPoll();
+    expect(appends(sent)).toHaveLength(0); // 連 title-only 批都不能建會話
+    // 再落一塊 assistant 殘片,同樣不建
+    appendFileSync(file, assistantLine("(補齊收尾)"));
+    (m as any).doPoll();
+    expect(appends(sent)).toHaveLength(0);
+    // 但用戶真在終端續這個會話 → 恢復鏡像(帶上寫回的標題)
+    appendFileSync(file, userLine("那怎麼修"));
+    (m as any).doPoll();
+    const batch = (appends(sent).at(-1) as any)?.sessions?.[0];
+    expect(batch?.messages?.some((x: any) => x.text === "那怎麼修")).toBe(true);
+    expect(batch?.title).toBe("P4改為拍手"); // 寫回的標題被保留
+  });
+
   it("連接器啟動後新建的會話 → 從 0 全量鏡像(claude -p 短會話不丟)", async () => {
     setupEnv();
     const { linkb, sent } = fakeLinkb();

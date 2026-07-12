@@ -233,13 +233,16 @@ export class Mirror {
         const { entries, endOffset } = readEntries(file, off);
         if (!entries.length) break;
         const { messages, consumedUpTo, title } = foldEntries(entries, endOffset, Date.now(), batchMax());
-        // 「無真人消息就別建會話」判定：一批只有 assistant/工具、沒有一條 user → 不能靠它憑空
-        // 建一個 server 端會話。涵蓋兩類：(1) 內部 fork 檔（subagent/後台任務，繼承標題無真人行）;
-        // (2) **driven 會話回合末殘片**——live 已在 ULID 下投遞、鏡像只 fastForward 快進，最後一塊
-        // assistant 在快進之後才落盤，水位線已 >0。判據必須是「鏡像從未建過此會話」(`!titles[sid]`,
-        // driven 從不經鏡像 emit → titles 空)，而非 `off===0`(殘片時 off 已被快進推過 0，舊判據漏網
-        // → 冒出只有一條 agent 消息的影子會話，2026-07-12 實測)。真會話首批必含首條 user prompt。
-        if (!this.state.titles[sid] && messages.length && !messages.some((m) => m.role === "user")) {
+        // 「無真人消息就別建會話」判定：鏡像從未建過此會話（`!titles[sid]`）時,只有含 user 的批次
+        // 才允許**創建**它;沒有一條 user 的批次一律跳過。涵蓋三類 driven/fork 殘片,都會冒影子會話:
+        //   (1) 內部 fork 檔（subagent/後台任務，繼承標題無真人行）;
+        //   (2) driven 回合末殘片——live 已在 ULID 下投遞、鏡像只 fastForward 快進,最後一塊 assistant
+        //       在快進之後才落盤,水位線已被推過 0（2026-07-12 實測,故判據用 `!titles` 而非 `off===0`）;
+        //   (3) **標題寫回**——CC 回合末把生成的標題寫回 CLI transcript(custom-title 行),鏡像讀到一個
+        //       「只有 title、零消息」的批次,會走下面 `newTitle` 分支 emit 出去憑空建會話。故**不能加
+        //       `messages.length` 條件**（那樣 title-only 批次繞過守衛,2026-07-13 實測復發）。
+        // 真會話首批必含首條 user prompt,故不受影響;殘片會話後續出現真 user 即恢復全量鏡像。
+        if (!this.state.titles[sid] && !messages.some((m) => m.role === "user")) {
           this.internalAt.set(sid, size);
           break;
         }
