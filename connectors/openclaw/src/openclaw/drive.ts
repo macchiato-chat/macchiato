@@ -17,6 +17,7 @@
  */
 import { createHash } from "node:crypto";
 import type { LinkBClient } from "../linkb/client";
+import { fetchChatAttachment, type ChatAttachment } from "./attachments";
 import type { OpenClawGateway, GatewayEvent } from "./gateway";
 import { keyForSid, sidForKey, type Mirror } from "./mirror";
 import { generateTitle, loadTitled, saveTitled } from "./titles";
@@ -52,6 +53,9 @@ export class Drive {
   /** #5 重投等待中的 key;用戶中斷時據此標記取消——已叫停的 prompt 不許復活雙發。 */
   private readonly retryWaiting = new Set<string>();
   private readonly retryCancelled = new Set<string>();
+
+  /** #10:累計計數(進程生命週期),健康上報帶出。 */
+  readonly counters: Record<string, number> = { promptRetries: 0, promptRetryFails: 0, driveErrors: 0 };
 
   constructor(
     private readonly gw: OpenClawGateway,
@@ -114,18 +118,28 @@ export class Drive {
               });
             }
           }
-          // #60 最小修:非 audio 附件(圖片/文件)OpenClaw 尚無媒體通道 → 明確降級回執。
-          // 此前**靜默丟失**——用戶以為 agent 看到了。E2E 跳過(不發明文行)。真支持待探
-          // gateway 媒體能力(chat.send 是否收 files),見 #60。
-          const dropped = atts.filter((a) => a?.kind && a.kind !== "audio").length;
-          if (dropped && !this.e2e?.isE2E(sid)) {
+          // #60 真支持:非 audio 附件(圖片/文件)下載 → base64 → chat.send 的 attachments
+          // 參數(gateway 原生收,落 agent 工作區/圖片走視覺,默認 20MB 上限)。
+          // 單個失敗不擋正文,失敗的才發降級回執(E2E 跳過明文行——同舊)。
+          const media = atts.filter((a) => a?.kind && a.kind !== "audio");
+          const chatAtts: ChatAttachment[] = [];
+          let failed = 0;
+          for (const a of media) {
+            try {
+              chatAtts.push(await fetchChatAttachment(a as Record<string, unknown>));
+            } catch (e) {
+              failed += 1;
+              console.error(`[#60 attachment ${String((a as any).name ?? (a as any).id)} failed] ${(e as Error).message}`);
+            }
+          }
+          if (failed && !this.e2e?.isE2E(sid)) {
             this.emit(sid, "review.summary", {
-              summary: `⚠️ OpenClaw 連接器暫不支持附件——已忽略 ${dropped} 個附件,僅文字送達 agent`,
+              summary: `⚠️ ${failed} 個附件下載失敗已跳過(其餘 ${chatAtts.length} 個已送達 agent)`,
             });
           }
           let text = String(params.text ?? "").trim();
-          if (!text) return;
-          if (this.e2e?.isE2E(sid)) {
+          if (!text && !chatAtts.length) return;
+          if (text && this.e2e?.isE2E(sid)) {
             // §19：iOS 發來的是密文 → 解密再提交 agent；記下明文供回合結束的加密鏡像批
             try {
               text = this.e2e.decryptText(sid, text).trim();
@@ -133,7 +147,7 @@ export class Drive {
               console.error(`[E2E prompt decrypt failed for ${sid}] ${(e as Error).message}`);
               return;
             }
-            if (!text) return;
+            if (!text && !chatAtts.length) return;
             const arr = this.pendingUser.get(key) ?? [];
             arr.push(text);
             this.pendingUser.set(key, arr);
@@ -141,12 +155,12 @@ export class Drive {
           this.markDriven(key, sid);
           // #113 首個 prompt → 自動標題(越早越好,與 CC/Hermes 對齊)。僅 Macchiato 發起的會話
           // (鏡像來的 agent: key 有自己的頻道標題);E2E 跳過(標題事件是明文,防洩漏)。
-          if (!sid.startsWith("agent:") && !this.e2e?.isE2E(sid) && !this.titled.has(sid)) {
+          if (text && !sid.startsWith("agent:") && !this.e2e?.isE2E(sid) && !this.titled.has(sid)) {
             this.titled.add(sid);
             saveTitled(this.titled);
             void this.autoTitle(sid, text);
           }
-          await this.sendPrompt(key, sid, text);
+          await this.sendPrompt(key, sid, text, chatAtts);
           return;
         }
         case "session.interrupt":
@@ -164,26 +178,39 @@ export class Drive {
           return; // 其它方法 v1 忽略
       }
     } catch (e) {
+      this.counters.driveErrors += 1; // #10
       console.error(`[drive ${frame.method} failed for ${sid}] ${(e as Error).message}`);
     }
   }
 
-  /** #4:提交 prompt(回合進行中 → steer 注入);連接死於在途 → 排一次重投。 */
-  private async sendPrompt(key: string, sid: string, text: string): Promise<void> {
+  /** #4:提交 prompt(回合進行中 → steer 注入);連接死於在途 → 排一次重投。
+   * #60:attachments 隨 chat.send 送達(steer 無附件通道——回合進行中只 steer 文字+回執說明)。 */
+  private async sendPrompt(key: string, sid: string, text: string, attachments: ChatAttachment[] = []): Promise<void> {
     const idem = `mc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     try {
       if (this.active.has(key)) {
+        if (attachments.length && !this.e2e?.isE2E(sid)) {
+          this.emit(sid, "review.summary", {
+            summary: `⚠️ 回合進行中,${attachments.length} 個附件暫無法注入——僅文字已轉交 agent,回合結束後請重發附件`,
+          });
+        }
+        if (!text) return; // 純附件 + 回合進行中:無可 steer
         const r = await this.gw.request("sessions.steer", { key, message: text });
         console.log(`· Turn in progress → steering follow-up into (${key}, status=${r?.status})`);
       } else {
-        await this.gw.request("chat.send", { sessionKey: key, message: text, idempotencyKey: idem });
+        await this.gw.request("chat.send", {
+          sessionKey: key,
+          message: text,
+          idempotencyKey: idem,
+          ...(attachments.length ? { attachments } : {}),
+        });
       }
     } catch (e) {
       const m = (e as Error).message ?? "";
       // 只重投「連接死亡」類失敗(請求確定沒送達)。timeout 不重投:daemon 可能仍在處理,
       // steer 無冪等鍵,重投有雙發風險——寧丟勿雙發。業務錯誤(gateway error: …)照舊上拋記日誌。
       if (!m.includes("gateway connection lost") && !m.includes("gateway not connected")) throw e;
-      this.retryTask = this.retryPrompt(key, sid, text, idem);
+      this.retryTask = this.retryPrompt(key, sid, text, idem, attachments);
     }
   }
 
@@ -192,7 +219,7 @@ export class Drive {
    * ② chat.send 帶**原 idempotencyKey**——即使首發實際已進 daemon(理論窗口),OpenClaw 冪等去重。
    * 重投一律走 chat.send 不走 steer:斷線期間 lifecycle 事件丟失,active 表不可信;
    * 且重連通常意味 daemon 重啟、舊 run 已死。 */
-  private async retryPrompt(key: string, sid: string, text: string, idem: string): Promise<void> {
+  private async retryPrompt(key: string, sid: string, text: string, idem: string, attachments: ChatAttachment[] = []): Promise<void> {
     const rkey = `${sid}:${createHash("sha256").update(text).digest("hex")}`;
     if (this.promptRetried.has(rkey)) {
       console.error(`[#4 重投已用過,放棄 ${sid}]`);
@@ -218,9 +245,16 @@ export class Drive {
         console.error(`[#4 重投放棄:gateway 180s 未重連 ${sid}]`);
         return;
       }
-      await this.gw.request("chat.send", { sessionKey: key, message: text, idempotencyKey: idem });
+      await this.gw.request("chat.send", {
+        sessionKey: key,
+        message: text,
+        idempotencyKey: idem,
+        ...(attachments.length ? { attachments } : {}),
+      });
+      this.counters.promptRetries += 1; // #10
       console.log(`· #4 prompt 重投成功 (${key},gateway 死於在途,已補投)`);
     } catch (e) {
+      this.counters.promptRetryFails += 1; // #10
       console.error(`[#4 重投失敗,放棄 ${sid}] ${(e as Error).message}`);
     } finally {
       this.retryWaiting.delete(key);

@@ -83,6 +83,31 @@ export function permissionMode(): PermMode | undefined {
   return undefined;
 }
 
+/** #98 UI 四檔(協議 PermissionMode)。 */
+const UI_MODES = ["ask", "acceptEdits", "plan", "bypass"] as const;
+type UiMode = (typeof UI_MODES)[number];
+/** 文件編輯類工具——acceptEdits 檔在 canUseTool 內自動批(#116:SDK acceptEdits 被 canUseTool 覆蓋,故自實現)。 */
+const EDIT_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit", "ApplyPatch"]);
+/**
+ * #98 UI 四檔 → SDK permissionMode + canUseTool 策略(#116 探針背書)。
+ * - ask       → default,每工具問
+ * - acceptEdits → default,編輯類自動批、其餘問(不用 SDK acceptEdits:被 canUseTool 覆蓋)
+ * - plan      → plan,ExitPlanMode 經審批橋(#99)
+ * - bypass    → bypassPermissions,不調 canUseTool
+ */
+function mapUiMode(ui: UiMode): { sdk: PermMode | undefined; editAuto: boolean } {
+  switch (ui) {
+    case "ask":
+      return { sdk: "default", editAuto: false };
+    case "acceptEdits":
+      return { sdk: "default", editAuto: true };
+    case "plan":
+      return { sdk: "plan", editAuto: false };
+    case "bypass":
+      return { sdk: "bypassPermissions", editAuto: false };
+  }
+}
+
 /** #118 可推送 async iterable —— streaming-input 的 prompt 載體(#116 探針同款)。 */
 class PushStream<T> implements AsyncIterable<T> {
   private queue: T[] = [];
@@ -152,6 +177,8 @@ interface Channel {
   sid: string;
   /** 通道創建時的工作目錄(#105 變更 → 閒置/回合末重建通道生效)。 */
   cwd: string;
+  /** #98 通道創建時的權限模式(UI 檔或 env 兜底標記;變更 → 同 cwd 重建通道)。 */
+  permKey: string;
   input: PushStream<unknown>;
   q: Query;
   turn?: TurnCtx;
@@ -161,10 +188,14 @@ interface Channel {
 }
 
 export class Drive {
+  /** #10:累計計數(進程生命週期),健康上報帶出。 */
+  readonly counters: Record<string, number> = { driveErrors: 0, turnErrors: 0 };
   /** serverSid → CC session uuid（跨重啟持久）。 */
   private map: Record<string, string>;
   /** #105 serverSid → 會話工作目錄（session.create.cwd 下發；跨重啟持久，與 map 同文件 v2 存）。 */
   private cwds: Record<string, string>;
+  /** #98 serverSid → UI 權限檔（session.create.permissionMode 下發；持久，同文件存）。 */
+  private permModes: Record<string, string>;
   /** #118 sid → 長活通道。 */
   private readonly channels = new Map<string, Channel>();
   /** sid → 排隊的後續 prompt（回合進行中收到的;#118 起可含原生塊數組）。 */
@@ -190,6 +221,18 @@ export class Drive {
     const state = this.loadState();
     this.map = state.map;
     this.cwds = state.cwds;
+    this.permModes = state.permModes;
+  }
+
+  /** #98 該會話當前 SDK 權限模式 + 編輯自動批策略。UI 檔優先,回退 env(逃生門)。permKey=通道重建判據。 */
+  private resolvePerm(sid: string): { sdk: PermMode | undefined; editAuto: boolean; permKey: string } {
+    const ui = this.permModes[sid];
+    if (ui && (UI_MODES as readonly string[]).includes(ui)) {
+      const m = mapUiMode(ui as UiMode);
+      return { ...m, permKey: `ui:${ui}` };
+    }
+    const env = permissionMode();
+    return { sdk: env, editAuto: false, permKey: `env:${env ?? "ask"}` };
   }
 
   wire(): void {
@@ -240,6 +283,8 @@ export class Drive {
         kind: m.subagent_type ? "subagent" : "background",
         ...(m.subagent_type ? { subagent_type: String(m.subagent_type) } : {}),
         desc: String(m.description ?? "task").slice(0, 200),
+        // #138:發起任務的 Task 工具調用 id——server 據此把工具塊原地升格為 task 塊。
+        ...(m.tool_use_id ? { tool_use_id: String(m.tool_use_id) } : {}),
       });
     } else if (m.subtype === "task_progress") {
       const now = Date.now();
@@ -366,9 +411,20 @@ export class Drive {
             else delete this.cwds[sid];
             this.saveMap();
             console.log(`· session.create ${sid} cwd=${cwd || "(default)"}`);
-            // #118 cwd 是通道創建參數:閒置通道立即重建生效;回合進行中的留給回合末檢查。
-            const ch = this.channels.get(sid);
-            if (ch && !ch.turn && ch.cwd !== this.cwdFor(sid)) this.closeChannel(ch);
+          }
+          // #98 權限檔(upsert;隨時可改,不像 cwd)。空/非法 = 清回 env 默認。
+          const pm = typeof params.permissionMode === "string" ? params.permissionMode.trim() : "";
+          const validPm = (UI_MODES as readonly string[]).includes(pm) ? pm : "";
+          if (validPm ? this.permModes[sid] !== validPm : this.permModes[sid] !== undefined) {
+            if (validPm) this.permModes[sid] = validPm;
+            else delete this.permModes[sid];
+            this.saveMap();
+            console.log(`· session.create ${sid} permissionMode=${validPm || "(env default)"}`);
+          }
+          // #98/#118 cwd 或權限是通道創建參數:閒置通道立即重建生效;回合進行中的留給回合末。
+          const ch = this.channels.get(sid);
+          if (ch && !ch.turn && (ch.cwd !== this.cwdFor(sid) || ch.permKey !== this.resolvePerm(sid).permKey)) {
+            this.closeChannel(ch);
           }
           // 急校驗：壞目錄立刻回一行 system 提示（system 行不鎖 cwd，草稿仍可改），
           // 別等首條 prompt 才炸。E2E 跳過（不發明文行；startTurn 走加密回覆兜底）。
@@ -446,6 +502,7 @@ export class Drive {
           return;
       }
     } catch (e) {
+      this.counters.driveErrors += 1; // #10
       console.error(`[drive ${frame.method} failed for ${sid}] ${(e as Error).message}`);
     }
   }
@@ -475,7 +532,8 @@ export class Drive {
       return;
     }
     let ch = this.channels.get(sid);
-    if (ch && (ch.closing || ch.cwd !== cwd)) {
+    // #98 cwd 或權限檔變了 → 通道創建參數失效,重建(閒置通道立即,回合中的留到回合末)。
+    if (ch && (ch.closing || ch.cwd !== cwd || ch.permKey !== this.resolvePerm(sid).permKey)) {
       this.closeChannel(ch);
       ch = undefined;
     }
@@ -516,7 +574,9 @@ export class Drive {
     // 權限模式:MACCHIATO_CC_PERMISSION_MODE 設 bypassPermissions(全放行,不彈審批卡)/
     // acceptEdits 等 → 傳給 SDK(通道創建參數;#116:bypass 只能啟動時給,中途切換=重建通道)。
     // 提供 canUseTool 時 default/plan 的審批走它(#116 e/f:回調覆蓋 acceptEdits 自動批;bypass 不調)。
-    const permMode = permissionMode();
+    // #98 per-session 權限:UI 檔映射(#116 探針)——ask/acceptEdits=default SDK 模式(編輯自動批在
+    // canUseTool 內自實現)、plan=plan、bypass=bypassPermissions。回退 env 逃生門。
+    const perm = this.resolvePerm(sid);
     const input = new PushStream<unknown>();
     const q = query({
       prompt: input as AsyncIterable<never>,
@@ -525,7 +585,7 @@ export class Drive {
         ...(resume ? { resume } : {}),
         ...(claudeBinIsAbsolute() ? { pathToClaudeCodeExecutable: resolveClaudeBin() } : {}),
         ...(process.env.MACCHIATO_CC_MODEL ? { model: process.env.MACCHIATO_CC_MODEL } : {}),
-        ...(permMode ? { permissionMode: permMode } : {}),
+        ...(perm.sdk ? { permissionMode: perm.sdk } : {}),
         includePartialMessages: true,
         canUseTool: async (
           toolName: string,
@@ -538,11 +598,13 @@ export class Drive {
           // (探針驗證:AskUserQuestionInput 頂層有可選 answers,填上即出「questions answered」tool_result)。
           if (toolName === "AskUserQuestion") return await this.requestAnswers(sid, input, opts?.toolUseID);
           if (this.alwaysAllow.get(sid)?.has(toolName)) return { behavior: "allow" as const, updatedInput: input };
+          // #98 acceptEdits 檔:文件編輯類自動批(SDK acceptEdits 被 canUseTool 覆蓋,故此處自實現)。
+          if (perm.editAuto && EDIT_TOOLS.has(toolName)) return { behavior: "allow" as const, updatedInput: input };
           return await this.requestApproval(sid, toolName, input, opts);
         },
       },
     });
-    const ch: Channel = { sid, cwd, input, q, closing: false };
+    const ch: Channel = { sid, cwd, permKey: perm.permKey, input, q, closing: false };
     this.channels.set(sid, ch);
     void this.consume(ch);
     return ch;
@@ -557,6 +619,7 @@ export class Drive {
       }
     } catch (e) {
       err = e as Error;
+      this.counters.turnErrors += 1; // #10
     }
     this.onChannelEnd(ch, err);
   }
@@ -891,12 +954,16 @@ export class Drive {
     input: Record<string, unknown>,
     opts?: { toolUseID?: string; suggestions?: PermissionUpdate[]; title?: string; description?: string },
   ): Promise<PermissionResult> {
+    // #99 Plan 模式:ExitPlanMode 經此橋;input.plan=計劃全文 → 作卡片正文(而非工具名+JSON)。
+    const isPlan = toolName === "ExitPlanMode";
+    const planText = isPlan && typeof input?.plan === "string" ? (input.plan as string) : "";
     const argsPreview = JSON.stringify(input ?? {}).slice(0, 500);
     this.emit(sid, "approval.request", {
-      command: opts?.title || `${toolName} ${argsPreview}`,
+      command: isPlan ? "批准計劃並開始執行" : opts?.title || `${toolName} ${argsPreview}`,
       pattern_key: toolName,
       pattern_keys: [toolName],
-      description: opts?.description || `Claude Code wants to use ${toolName}`,
+      description: isPlan ? planText.slice(0, 8000) : opts?.description || `Claude Code wants to use ${toolName}`,
+      ...(isPlan ? { plan: planText.slice(0, 20000) } : {}),
       ...(opts?.toolUseID ? { request_id: opts.toolUseID } : {}),
     });
     return new Promise((resolve) => {
@@ -1006,25 +1073,26 @@ export class Drive {
   }
 
   /** 存檔：v2 = `{v:2, map, cwds}`（#105 起）；舊版是平面 `Record<sid, ccSid>`，讀時兼容。 */
-  private loadState(): { map: Record<string, string>; cwds: Record<string, string> } {
+  private loadState(): { map: Record<string, string>; cwds: Record<string, string>; permModes: Record<string, string> } {
     try {
       const parsed = JSON.parse(readFileSync(mapPath(), "utf8")) as Record<string, unknown>;
       if (parsed && parsed.v === 2) {
         return {
           map: (parsed.map ?? {}) as Record<string, string>,
           cwds: (parsed.cwds ?? {}) as Record<string, string>,
+          permModes: (parsed.permModes ?? {}) as Record<string, string>, // #98
         };
       }
-      return { map: (parsed ?? {}) as Record<string, string>, cwds: {} };
+      return { map: (parsed ?? {}) as Record<string, string>, cwds: {}, permModes: {} };
     } catch {
-      return { map: {}, cwds: {} };
+      return { map: {}, cwds: {}, permModes: {} };
     }
   }
   private saveMap(): void {
     try {
       mkdirSync(dirname(mapPath()), { recursive: true });
       const tmp = `${mapPath()}.tmp`;
-      writeFileSync(tmp, JSON.stringify({ v: 2, map: this.map, cwds: this.cwds }));
+      writeFileSync(tmp, JSON.stringify({ v: 2, map: this.map, cwds: this.cwds, permModes: this.permModes }));
       renameSync(tmp, mapPath());
     } catch (e) {
       console.error("[session map save failed]", (e as Error).message);

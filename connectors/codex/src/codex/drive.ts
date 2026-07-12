@@ -64,6 +64,8 @@ interface Turn {
 }
 
 export class Drive {
+  /** #10:累計計數(進程生命週期),健康上報帶出。 */
+  readonly counters: Record<string, number> = { driveErrors: 0 };
   /** serverSid → codex thread uuid(跨重啟持久)。 */
   private map: Record<string, string>;
   /** serverSid → 會話工作目錄。 */
@@ -186,6 +188,7 @@ export class Drive {
           return;
       }
     } catch (e) {
+      this.counters.driveErrors += 1; // #10
       console.error(`[drive ${frame.method} failed for ${sid}] ${(e as Error).message}`);
     }
   }

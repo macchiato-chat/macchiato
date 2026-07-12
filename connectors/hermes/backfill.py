@@ -45,6 +45,25 @@ def _strip_sender_tag(text: str) -> str:
     return _SENDER_TAG_RE.sub("", text or "", count=1)
 
 
+# #12:Hermes 語音消息在 state.db 裡是 wrapper 形態(2026-07-12 實庫取樣):
+#   [The user sent a voice message~ Here's what they said: "原話"]\n\n[handle] (The user sent a message with no text content)
+# 展示只留「原話」;隨語音附帶的真實文字(若有)保留。
+_VOICE_WRAPPER_RE = re.compile(
+    r"\[The user sent a voice message~ Here's what they said: \"(.*?)\"\]", re.S
+)
+_VOICE_NO_TEXT_RE = re.compile(
+    r"\[[^\]\s]{1,30}\]\s*\(The user sent a message with no text content\)"
+)
+
+
+def _unwrap_voice(text: str) -> str:
+    if "voice message~" not in (text or ""):
+        return text or ""
+    t = _VOICE_WRAPPER_RE.sub(lambda m: m.group(1), text)
+    t = _VOICE_NO_TEXT_RE.sub("", t)
+    return t.strip()
+
+
 def _connect() -> sqlite3.Connection:
     return sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True)
 
@@ -73,7 +92,7 @@ def _derive_title(con: sqlite3.Connection, sid: str) -> str:
         (sid,),
     ).fetchone()
     if row and row[0]:
-        t = " ".join(_strip_sender_tag(str(row[0])).split())
+        t = " ".join(_strip_sender_tag(_unwrap_voice(str(row[0]))).split())
         return (t[:48] + "…") if len(t) > 48 else t
     return "(導入會話)"
 
@@ -135,7 +154,7 @@ def _read_messages(con: sqlite3.Connection, sid: str) -> list:
     ):
         content = content or ""
         if role == "user":
-            content = _strip_sender_tag(content)
+            content = _strip_sender_tag(_unwrap_voice(content))
             if content.strip():
                 out.append({"role": "user", "text": content, "createdAt": ts})
         else:  # assistant
@@ -277,14 +296,32 @@ def _current_max_id_sync() -> int:
         con.close()
 
 
-def _changed_sessions_sync() -> list:
-    """每個會話的 (sid, source, title, archived, max_msg_id)；caller 用各自水位線比對。"""
+def _changed_sessions_sync(since: int = 0) -> list:
+    """每個會話的 (sid, source, title, archived, max_msg_id)；caller 用各自水位線比對。
+    #8:傳 since=全局最小水位線收窄掃描(只回有新消息的會話);0=全量(重啟推進等場景)。"""
     con = _connect()
     try:
         return con.execute(
             "select s.id, s.source, s.title, s.archived, max(m.id) "
             "from sessions s join messages m on m.session_id = s.id "
-            "where m.role in ('user','assistant','tool') group by s.id"
+            "where m.role in ('user','assistant','tool') and m.id > ? group by s.id",
+            (since,),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def _sessions_meta_sync(sids: list) -> list:
+    """(sid, source, title, archived) 批量補查——#8 收窄後,無新消息的已鏡像會話仍需
+    偵測純標題更新(Hermes 回合後才取名),用主鍵 IN 輕量取 meta(無 messages join)。"""
+    if not sids:
+        return []
+    ph = ",".join("?" * len(sids))
+    con = _connect()
+    try:
+        return con.execute(
+            f"select id, source, title, archived from sessions where id in ({ph})",
+            list(sids),
         ).fetchall()
     finally:
         con.close()
@@ -311,7 +348,7 @@ def _tail_session_sync(sid: str, since_id: int) -> tuple:
         for rid, role, content, reasoning, tc, tcid, ts, fr in rows:
             content = content or ""
             if role == "user":
-                c = _strip_sender_tag(content)
+                c = _strip_sender_tag(_unwrap_voice(content))
                 if c.strip():
                     # §9 srcId=state.db 消息 id（穩定）→ server 據此去重連接器崩潰重發
                     folded.append(({"role": "user", "text": c, "createdAt": ts, "srcId": str(rid)}, rid))
@@ -382,8 +419,29 @@ async def current_max_id() -> int:
     return await asyncio.to_thread(_current_max_id_sync)
 
 
-async def changed_sessions() -> list:
-    return await asyncio.to_thread(_changed_sessions_sync)
+async def changed_sessions(since: int = 0) -> list:
+    return await asyncio.to_thread(_changed_sessions_sync, since)
+
+
+async def sessions_meta(sids: list) -> list:
+    return await asyncio.to_thread(_sessions_meta_sync, sids)
+
+
+def _turn_rows_sync(sid: str, since: int) -> list:
+    """#13:某會話 id > since 的 (id, role) 行——回合結束後定位本回合寫進 state.db 的行。"""
+    con = _connect()
+    try:
+        return con.execute(
+            "select id, role from messages where session_id=? and id>? "
+            "and role in ('user','assistant') order by id",
+            (sid, since),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+async def turn_rows(sid: str, since: int) -> list:
+    return await asyncio.to_thread(_turn_rows_sync, sid, since)
 
 
 async def tail_session(sid: str, since_id: int) -> tuple:

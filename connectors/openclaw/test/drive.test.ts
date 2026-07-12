@@ -167,16 +167,45 @@ describe("drive 上行翻譯（chat/lifecycle → tui EVENT）", () => {
   });
 });
 
-describe("#60 附件降級回執", () => {
-  it("非 audio 附件 → review.summary 提示(此前靜默丟失);正文照常送達", async () => {
+describe("#60 附件入站", () => {
+  it("下載失敗 → review.summary 降級回執(不再靜默);正文照常送達", async () => {
     const { linkb, calls, sent } = makeDrive();
     await linkb.deliver(tui("prompt.submit", "01SID", {
       text: "看看這張圖",
-      attachments: [{ id: "a1", kind: "image" }, { id: "a2", kind: "file" }],
+      attachments: [{ id: "a1", kind: "image", url: "not-a-url" }, { id: "a2", kind: "file", url: "ftp://x" }],
     }));
+    await new Promise((r) => setImmediate(r)); // onServerFrame 是 fire-and-forget,等附件 await 鏈跑完
     const line = sent.find((m) => m.frame?.params?.type === "review.summary");
-    expect(line?.frame.params.payload.summary).toContain("2 個附件");
-    expect(calls.find((c) => c.method === "chat.send")?.params.message).toBe("看看這張圖"); // 正文照發
+    expect(line?.frame.params.payload.summary).toContain("2 個附件下載失敗");
+    const send = calls.find((c) => c.method === "chat.send");
+    expect(send?.params.message).toBe("看看這張圖"); // 正文照發
+    expect(send?.params.attachments).toBeUndefined(); // 全失敗 → 不帶空數組
+  });
+
+  it("下載成功 → chat.send 帶 attachments(base64),無降級回執(真 localhost 下載鏈路)", async () => {
+    const { createServer } = await import("node:http");
+    const srv = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "image/png" });
+      res.end(Buffer.from("hi"));
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+    const port = (srv.address() as any).port;
+    try {
+      const { linkb, calls, sent } = makeDrive();
+      await linkb.deliver(tui("prompt.submit", "01SID", {
+        text: "看圖",
+        attachments: [{ id: "a1", kind: "image", name: "x.png", mime: "image/png",
+                        url: `http://127.0.0.1:${port}/x.png` }],
+      }));
+      await new Promise((r) => setTimeout(r, 200)); // 等真下載完成
+      const send = calls.find((c) => c.method === "chat.send");
+      expect(send?.params.attachments).toEqual([
+        { mimeType: "image/png", fileName: "x.png", content: Buffer.from("hi").toString("base64") },
+      ]);
+      expect(sent.filter((m) => m.frame?.params?.type === "review.summary")).toEqual([]);
+    } finally {
+      srv.close();
+    }
   });
 
   it("純 audio 附件不觸發回執(語音走 #89 雲端 STT/降級回執,不重複提示)", async () => {

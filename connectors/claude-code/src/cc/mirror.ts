@@ -16,6 +16,8 @@ import { foldEntries, projectsDir, readEntries, type CCMessage } from "./transcr
 
 const POLL_MS = Number(process.env.MACCHIATO_CC_POLL_MS) || 5000;
 const REWIND_KEEP = 256; // 首輪全量一個大會話可連發多批，rewind 要留夠深供 nack 回退
+/** #9:轉錄文件消失多久後裁掉水位線/標題(默認 7 天;CC 清理舊轉錄後 uuid 不復用,不會回歸)。 */
+const PRUNE_MS = Number(process.env.MACCHIATO_MIRROR_PRUNE_MS) || 7 * 24 * 3600 * 1000;
 /** 單批最多消息數（防單帧超 server maxPayload）。運行時讀 env,便於測試覆蓋。 */
 const batchMax = (): number => Number(process.env.MACCHIATO_CC_BATCH_MAX) || 150;
 
@@ -79,6 +81,8 @@ export function discoverSessions(root = projectsDir()): SessionFile[] {
 interface State {
   offsets: Record<string, number>; // sid → 字節水位線
   titles: Record<string, string>; // sid → 已發標題（變了才補發）
+  /** #9:sid 的轉錄文件首次消失的時刻;回歸即清,超 PRUNE_MS 連 offsets/titles 一起裁。 */
+  missingAt?: Record<string, number>;
 }
 
 export class Mirror {
@@ -106,6 +110,8 @@ export class Mirror {
   private readonly quietPolls = new Map<string, number>();
   lastPollAt = Date.now();
   lastError: string | null = null;
+  /** #10:累計計數(進程生命週期),健康上報帶出。 */
+  readonly counters: Record<string, number> = { mirrorBatches: 0, mirrorMessages: 0, mirrorNacks: 0, mirrorErrors: 0 };
   private polling = false;
 
   constructor(
@@ -163,6 +169,7 @@ export class Mirror {
   handleNack(batchId: number): void {
     const e = this.rewind.find((r) => r.id === batchId);
     if (!e) return;
+    this.counters.mirrorNacks += 1; // #10
     for (const [k, off] of Object.entries(e.prev)) this.state.offsets[k] = off;
     this.save();
     console.warn(`· mirror_nack batch ${batchId} → rewinding watermark for resend`);
@@ -176,6 +183,7 @@ export class Mirror {
       this.lastError = null;
     } catch (e) {
       this.lastError = (e as Error).message;
+      this.counters.mirrorErrors += 1; // #10
       console.error("[mirror poll]", this.lastError);
     } finally {
       this.lastPollAt = Date.now();
@@ -188,7 +196,9 @@ export class Mirror {
 
     const now = Date.now();
     const activity: Array<{ hermesSessionId: string; busy: boolean }> = [];
-    for (const { sid, file } of discoverSessions()) {
+    const found = discoverSessions();
+    this.prune(new Set(found.map((s) => s.sid)), now);
+    for (const { sid, file } of found) {
       let size: number;
       try {
         size = statSync(file).size;
@@ -211,8 +221,9 @@ export class Mirror {
         this.quietPolls.delete(sid);
         continue;
       }
-      // 已判定的內部 fork 檔且沒長 → 不重讀。
-      if ((this.state.offsets[sid] ?? 0) === 0 && this.internalAt.get(sid) === size) continue;
+      // 已判定的內部 fork 檔/driven 殘片且沒長 → 不重讀（判據是「鏡像從未建過此會話」，
+      // 見下方；driven 殘片水位線已被快進到 >0，不能用 offset===0 判）。
+      if (!this.state.titles[sid] && this.internalAt.get(sid) === size) continue;
 
       // 追平：單會話分批發（每批 ≤ BATCH_MAX 條），單帧只裝一條會話 → 防超 server maxPayload(8MiB)。
       let guard = 0;
@@ -222,9 +233,13 @@ export class Mirror {
         const { entries, endOffset } = readEntries(file, off);
         if (!entries.length) break;
         const { messages, consumedUpTo, title } = foldEntries(entries, endOffset, Date.now(), batchMax());
-        // 內部 fork 檔判定：首批（水位線 0）折出的消息裡沒有一條真人消息 → subagent/後台任務
-        // 的 fork 轉錄（真會話首批必含首條 user prompt）。跳過、不推水位線。
-        if (off === 0 && messages.length && !messages.some((m) => m.role === "user")) {
+        // 「無真人消息就別建會話」判定：一批只有 assistant/工具、沒有一條 user → 不能靠它憑空
+        // 建一個 server 端會話。涵蓋兩類：(1) 內部 fork 檔（subagent/後台任務，繼承標題無真人行）;
+        // (2) **driven 會話回合末殘片**——live 已在 ULID 下投遞、鏡像只 fastForward 快進，最後一塊
+        // assistant 在快進之後才落盤，水位線已 >0。判據必須是「鏡像從未建過此會話」(`!titles[sid]`,
+        // driven 從不經鏡像 emit → titles 空)，而非 `off===0`(殘片時 off 已被快進推過 0，舊判據漏網
+        // → 冒出只有一條 agent 消息的影子會話，2026-07-12 實測)。真會話首批必含首條 user prompt。
+        if (!this.state.titles[sid] && messages.length && !messages.some((m) => m.role === "user")) {
           this.internalAt.set(sid, size);
           break;
         }
@@ -278,6 +293,8 @@ export class Mirror {
       sessions: [entry],
       batchId: this.batchId,
     });
+    this.counters.mirrorBatches += 1; // #10
+    this.counters.mirrorMessages += Array.isArray((entry as any).messages) ? (entry as any).messages.length : 0;
   }
 
   /** 構造批次條目；E2E 會話走加密（標題+內容盲存，srcId 是元數據保留）。 */
@@ -335,19 +352,48 @@ export class Mirror {
     console.log(`· E2E backfill(${mode}) sent for ${sid} (${msgs.length} messages)`);
   }
 
-  private load(): State {
-    try {
-      const s = JSON.parse(readFileSync(statePath(), "utf8")) as State;
-      return { offsets: s.offsets ?? {}, titles: s.titles ?? {} };
-    } catch {
-      return { offsets: {}, titles: {} };
+  /** #9:offsets/titles 無界增長治理——轉錄文件消失連續 PRUNE_MS 才裁(短暫缺席回歸即清)。
+   * 被裁 sid 理論上不回歸(uuid 不復用);萬一回歸,走「未知會話從 0 全量」語義,srcId 去重兜住。 */
+  private prune(liveSids: Set<string>, now: number): void {
+    const ma = (this.state.missingAt ??= {});
+    let pruned = 0;
+    for (const sid of Object.keys(this.state.offsets)) {
+      if (liveSids.has(sid)) {
+        delete ma[sid];
+        continue;
+      }
+      const since = (ma[sid] ??= now);
+      if (now - since > PRUNE_MS) {
+        delete this.state.offsets[sid];
+        delete this.state.titles[sid];
+        delete ma[sid];
+        pruned += 1;
+      }
     }
+    for (const sid of Object.keys(ma)) if (!(sid in this.state.offsets)) delete ma[sid];
+    if (pruned) console.log(`· #9 裁剪 ${pruned} 個已消失轉錄的水位線(剩 ${Object.keys(this.state.offsets).length})`);
+  }
+
+  private load(): State {
+    // #6 同款兜底:主文件損壞/丟失 → 試 .bak(上一版)。CC 的未知會話語義是「從 0 全量 +
+    // srcId 去重」,重置代價是全量重發而非丟消息,但 .bak 能把重發也省了。
+    for (const [p, isBak] of [[statePath(), false], [`${statePath()}.bak`, true]] as Array<[string, boolean]>) {
+      try {
+        const s = JSON.parse(readFileSync(p, "utf8")) as State;
+        if (isBak) console.error(`⚠️ ${statePath()} 損壞/丟失 → 已從 .bak 恢復`);
+        return { offsets: s.offsets ?? {}, titles: s.titles ?? {}, missingAt: s.missingAt ?? {} };
+      } catch {
+        /* 下一個候選 */
+      }
+    }
+    return { offsets: {}, titles: {}, missingAt: {} };
   }
   private save(): void {
     try {
       mkdirSync(dirname(statePath()), { recursive: true });
       const tmp = `${statePath()}.tmp`;
       writeFileSync(tmp, JSON.stringify(this.state));
+      if (existsSync(statePath())) renameSync(statePath(), `${statePath()}.bak`); // #6:上一版留作 .bak
       renameSync(tmp, statePath()); // 原子寫（審計 #6 的教訓：別半截損壞）
     } catch {
       /* 持久化失敗不致命 */

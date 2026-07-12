@@ -5,6 +5,7 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { LinkBClient } from "./linkb/client";
+import type { Drive } from "./cc/drive";
 import type { Mirror } from "./cc/mirror";
 import { projectsDir } from "./cc/transcripts";
 import { checkCompat } from "./cc/compat";
@@ -23,6 +24,8 @@ export interface HealthSnapshot {
   /** #89：無本地 STT——server 據此把語音輸入直接路由到雲端 BYOK STT（不再下達音頻）。 */
   stt: false;
   cliVersion?: string;
+  /** #10:累計計數(進程生命週期)——鏡像條數/nack/驅動錯誤,一次性的丟/重複才看得見。 */
+  counters?: Record<string, number>;
 }
 
 export class HealthLoop {
@@ -34,6 +37,7 @@ export class HealthLoop {
     private readonly linkb: LinkBClient,
     private readonly mirror: Mirror,
     private readonly version: string,
+    private readonly drive?: Drive, // #10:驅動錯誤計數來源
   ) {}
 
   start(): void {
@@ -71,6 +75,7 @@ export class HealthLoop {
       connectorVersion: this.version,
       stt: false,
       ...(this.cliVersion ? { cliVersion: this.cliVersion } : {}),
+      counters: { ...this.mirror.counters, ...(this.drive?.counters ?? {}) }, // #10
     };
     if (ageS * 1000 > MIRROR_STUCK_MS) {
       console.error(`⚠️ Mirror poll stalled for ${ageS}s → restarting mirror`);

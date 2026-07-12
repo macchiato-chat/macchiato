@@ -6,6 +6,7 @@
  */
 import type { LinkBClient } from "./linkb/client";
 import type { OpenClawGateway } from "./openclaw/gateway";
+import type { Drive } from "./openclaw/drive";
 import type { Mirror } from "./openclaw/mirror";
 import { smokeParseLatest } from "./openclaw/history-import";
 
@@ -21,6 +22,8 @@ export interface HealthSnapshot {
   connectorVersion: string; // §update：server 據此判 updateAvailable（欄位名對齊 protocol）
   /** #89：無本地 STT——server 據此把語音輸入直接路由到雲端 BYOK STT（不再下達音頻）。 */
   stt: false;
+  /** #10:累計計數(進程生命週期)——鏡像條數/nack/重投/錯誤,一次性的丟/重複才看得見。 */
+  counters?: Record<string, number>;
 }
 
 /**
@@ -49,7 +52,7 @@ export function checkCompat(gw: OpenClawGateway): { ok: boolean; reason?: string
   return smokeParseLatest();
 }
 
-export function buildHealth(gw: OpenClawGateway, mirror: Mirror, version: string): HealthSnapshot {
+export function buildHealth(gw: OpenClawGateway, mirror: Mirror, version: string, drive?: Drive): HealthSnapshot {
   // #112:compat 失敗原因併入 lastError——app 顯示「降級 + 為什麼」,而非一個沉默的布爾。
   const compat = checkCompat(gw);
   // #3 gateway 連不上時,把「連了多少次」上浮(gatewayAlive=false 只說降級,不說為什麼)。
@@ -65,6 +68,7 @@ export function buildHealth(gw: OpenClawGateway, mirror: Mirror, version: string
     kind: "openclaw",
     connectorVersion: version,
     stt: false,
+    counters: { ...mirror.counters, ...(drive?.counters ?? {}) }, // #10
   };
 }
 
@@ -76,6 +80,7 @@ export class HealthLoop {
     private readonly linkb: LinkBClient,
     private readonly mirror: Mirror,
     private readonly version: string,
+    private readonly drive?: Drive, // #10:重投/驅動錯誤計數來源
   ) {}
 
   start(): void {
@@ -88,7 +93,7 @@ export class HealthLoop {
   }
 
   tick(): void {
-    const h = buildHealth(this.gw, this.mirror, this.version);
+    const h = buildHealth(this.gw, this.mirror, this.version, this.drive);
     // 鏡像看門狗：poll 停擺 → 重啟自愈（interval 丟失/異常鏈斷裂等）
     if (h.mirrorLastPollAgeS * 1000 > MIRROR_STUCK_MS) {
       console.error(`⚠️ Mirror poll stalled for ${h.mirrorLastPollAgeS}s → restarting mirror`);

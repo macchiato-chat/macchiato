@@ -114,3 +114,96 @@ describe("mirror readNewMessages（增量 + 半行邊界）", () => {
     }
   });
 });
+
+describe("#6/#9 狀態文件兜底與裁剪", () => {
+  it("#6 saveStateFile 輪替 .bak;主文件損壞/丟失 → loadStateFile 從 .bak 恢復", async () => {
+    const { loadStateFile, saveStateFile } = await import("../src/openclaw/mirror");
+    const d = mkdtempSync(join(tmpdir(), "oc-state-"));
+    const p = join(d, "mirror.json");
+    const revive = (raw: any) => ({ offsets: raw.offsets ?? {} });
+    saveStateFile(p, { offsets: { k: 9 } });
+    saveStateFile(p, { offsets: { k: 12 } }); // 第二次保存 → 上一版落 .bak
+    writeFileSync(p, "{corrupted"); // 主文件損壞
+    expect(loadStateFile(p, revive, () => ({ offsets: {} })).offsets.k).toBe(9);
+    rmSync(p); // 主文件丟失同樣兜底
+    expect(loadStateFile(p, revive, () => ({ offsets: {} })).offsets.k).toBe(9);
+    rmSync(`${p}.bak`); // 雙亡 → 才重置
+    expect(loadStateFile(p, revive, () => ({ offsets: {} })).offsets).toEqual({});
+  });
+
+  it("#9 prune:消失超期才裁;在列即清 missingAt;短暫缺席不裁", async () => {
+    const { Mirror } = await import("../src/openclaw/mirror");
+    process.env.MACCHIATO_OPENCLAW_MIRROR = join(mkdtempSync(join(tmpdir(), "oc-prune-")), "m.json");
+    const m: any = new Mirror({ onEvent: () => () => {} } as any, { agentLinkId: "al" } as any);
+    m.state = {
+      offsets: { live: 5, gone_old: 7, gone_new: 8 },
+      missingAt: { gone_old: Date.now() - 8 * 24 * 3600 * 1000 }, // 消失 8 天 > 7 天閾值
+    };
+    m.prune(new Set(["live"]));
+    expect(Object.keys(m.state.offsets).sort()).toEqual(["gone_new", "live"]); // 超期的裁掉
+    expect(m.state.missingAt.gone_new).toBeTruthy(); // 新消失的記時、暫不裁
+    m.prune(new Set(["live", "gone_new"])); // gone_new 回歸
+    expect(m.state.missingAt.gone_new).toBeUndefined(); // 回歸即清
+    expect(m.state.offsets.gone_new).toBe(8);
+  });
+});
+
+describe("#61 工具調用/思考塊入鏡像", () => {
+  const line = (o: any) => JSON.stringify(o);
+  const asst = (blocks: any[], ts = Date.now()) =>
+    ({ type: "message", message: { role: "assistant", content: blocks, timestamp: ts } });
+  const toolRes = (cid: string, text: string, isError = false) =>
+    ({ type: "message", message: { role: "toolResult", toolCallId: cid, isError,
+       content: [{ type: "text", text }], timestamp: Date.now() } });
+
+  it("lineToMessage:thinking → reasoning、toolCall → tools(帶 input);純工具消息不再被丟", async () => {
+    const { lineToMessage } = await import("../src/openclaw/mirror");
+    const m = lineToMessage(asst([
+      { type: "thinking", thinking: "想一下" },
+      { type: "toolCall", id: "c1", name: "web_fetch", arguments: { url: "https://x" } },
+      { type: "text", text: "查到了" },
+    ]))!;
+    expect(m.reasoning).toBe("想一下");
+    expect(m.tools).toEqual([{ callId: "c1", name: "web_fetch", state: "ok", input: { url: "https://x" } }]);
+    expect(m.text).toBe("查到了");
+    // 只有 toolCall、無文字的 assistant 行:此前被 !text.trim() 丟棄 → 現在保留
+    expect(lineToMessage(asst([{ type: "toolCall", id: "c2", name: "exec" }]))).toBeTruthy();
+  });
+
+  it("foldMessages:toolResult 按 callId 折入 output;isError → state=error", async () => {
+    const { foldMessages } = await import("../src/openclaw/mirror");
+    const { messages } = foldMessages([
+      asst([{ type: "toolCall", id: "c1", name: "exec" }, { type: "text", text: "跑一下" }]),
+      toolRes("c1", "命令輸出"),
+      asst([{ type: "toolCall", id: "c2", name: "web_fetch" }]),
+      toolRes("c2", "404", true),
+    ]);
+    expect(messages[0].tools![0]).toMatchObject({ callId: "c1", output: "命令輸出", state: "ok" });
+    expect(messages[1].tools![0]).toMatchObject({ callId: "c2", output: "404", state: "error" });
+  });
+
+  it("readNewMessages hold-back:尾部 toolCall 未結算 → 不發、offset 停行首;結果到齊後整條發出", async () => {
+    const { readNewMessages } = await import("../src/openclaw/mirror");
+    const d = mkdtempSync(join(tmpdir(), "oc-fold-"));
+    const f = join(d, "s.jsonl");
+    const l1 = line({ type: "message", message: { role: "user", content: [{ type: "text", text: "查天氣" }], timestamp: Date.now() } });
+    const l2 = line(asst([{ type: "toolCall", id: "c1", name: "web_fetch" }]));
+    writeFileSync(f, l1 + "\n" + l2 + "\n");
+    const r1 = readNewMessages(f, 0);
+    expect(r1.messages.map((m) => m.role)).toEqual(["user"]); // agent 未結算 → hold-back
+    expect(r1.newOffset).toBe(Buffer.byteLength(l1, "utf8") + 1); // offset 停在 agent 行首
+    writeFileSync(f, l1 + "\n" + l2 + "\n" + line(toolRes("c1", "晴 25°C")) + "\n");
+    const r2 = readNewMessages(f, r1.newOffset);
+    expect(r2.messages.length).toBe(1);
+    expect(r2.messages[0].tools![0].output).toBe("晴 25°C"); // 下輪連結果一起出
+  });
+
+  it("readNewMessages:未結算但太舊(agent 崩)→ 照發不卡死", async () => {
+    const { readNewMessages } = await import("../src/openclaw/mirror");
+    const d = mkdtempSync(join(tmpdir(), "oc-stale-"));
+    const f = join(d, "s.jsonl");
+    writeFileSync(f, line(asst([{ type: "toolCall", id: "c1", name: "exec" }], Date.now() - 3600_000)) + "\n");
+    const r = readNewMessages(f, 0);
+    expect(r.messages.length).toBe(1); // 超 STALE 照發
+  });
+});

@@ -8,7 +8,7 @@
  *  - .jsonl.zst(7 天後壓縮)v1 跳過(已過 baseline,不影響增量;history-import 記數不靜默丟)。
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { LinkBClient } from "../linkb/client";
@@ -17,6 +17,8 @@ import { readNewMessages, sessionsRoot, type CodexMessage } from "./transcripts"
 
 const POLL_MS = Number(process.env.MACCHIATO_CODEX_POLL_MS) || 5000;
 const REWIND_KEEP = 32;
+/** #9:rollout 文件消失多久後裁掉水位線(默認 7 天;uuid 不復用,不會回歸)。 */
+const PRUNE_MS = Number(process.env.MACCHIATO_MIRROR_PRUNE_MS) || 7 * 24 * 3600 * 1000;
 
 function statePath(): string {
   return process.env.MACCHIATO_CODEX_MIRROR || join(homedir(), ".macchiato/codex-mirror.json");
@@ -94,6 +96,8 @@ function srcIdFor(threadId: string, m: CodexMessage): string {
 interface State {
   offsets: Record<string, number>; // threadId → 字節水位線
   ords: Record<string, number>; // threadId → 下一起始行號(ord 連續)
+  /** #9:threadId 的 rollout 首次消失的時刻;回歸即清,超 PRUNE_MS 連 offsets/ords 一起裁。 */
+  missingAt?: Record<string, number>;
 }
 
 export class Mirror {
@@ -104,6 +108,8 @@ export class Mirror {
   private readonly drivenIds = new Set<string>();
   lastPollAt = Date.now();
   lastError: string | null = null;
+  /** #10:累計計數(進程生命週期),健康上報帶出。 */
+  readonly counters: Record<string, number> = { mirrorBatches: 0, mirrorMessages: 0, mirrorNacks: 0, mirrorErrors: 0 };
   private polling = false;
   /** 首輪 poll 已建立基線——之後新出現的 rollout 從頭鏡像(而非跳過)。 */
   private baselined = false;
@@ -153,6 +159,7 @@ export class Mirror {
   handleNack(batchId: number): void {
     const e = this.rewind.find((r) => r.id === batchId);
     if (!e) return;
+    this.counters.mirrorNacks += 1; // #10
     for (const [k, off] of Object.entries(e.prev)) this.state.offsets[k] = off;
     for (const [k, o] of Object.entries(e.prevOrd)) this.state.ords[k] = o;
     this.save();
@@ -167,6 +174,7 @@ export class Mirror {
       this.lastError = null;
     } catch (e) {
       this.lastError = (e as Error).message;
+      this.counters.mirrorErrors += 1; // #10
       console.error("[mirror poll error]", this.lastError);
     } finally {
       this.polling = false;
@@ -177,6 +185,7 @@ export class Mirror {
   private pollOnce(): void {
     if (!this.linkb.isReady) return;
     const { rollouts } = discoverRollouts();
+    this.pruneState(new Set(rollouts.map((r) => r.threadId)));
     const batch: any[] = [];
     const prev: Record<string, number> = {};
     const prevOrd: Record<string, number> = {};
@@ -240,6 +249,8 @@ export class Mirror {
       this.rewind.push({ id: this.batchId, prev, prevOrd });
       if (this.rewind.length > REWIND_KEEP) this.rewind.shift();
       this.linkb.send({ t: "mirror_append", agentLinkId: this.linkb.agentLinkId, sessions: batch, batchId: this.batchId });
+      this.counters.mirrorBatches += 1; // #10
+      this.counters.mirrorMessages += batch.reduce((a: number, s: any) => a + (s.messages?.length ?? 0), 0);
     }
     this.save();
   }
@@ -281,18 +292,49 @@ export class Mirror {
     if (mode === "disable") this.e2e.remove(threadId);
   }
 
-  private load(): State {
-    try {
-      const s = JSON.parse(readFileSync(statePath(), "utf8"));
-      return { offsets: s.offsets ?? {}, ords: s.ords ?? {} };
-    } catch {
-      return { offsets: {}, ords: {} };
+  /** #9:offsets/ords 無界增長治理——rollout 消失連續 PRUNE_MS 才裁(7 天後壓縮 .zst 即「消失」)。
+   * uuid 不復用,被裁 id 不會回歸;萬一回歸走「首見 baseline」既有語義,不重發不誤丟。 */
+  private pruneState(liveIds: Set<string>): void {
+    const ma = (this.state.missingAt ??= {});
+    const now = Date.now();
+    let pruned = 0;
+    for (const id of Object.keys(this.state.offsets)) {
+      if (liveIds.has(id)) {
+        delete ma[id];
+        continue;
+      }
+      const since = (ma[id] ??= now);
+      if (now - since > PRUNE_MS) {
+        delete this.state.offsets[id];
+        delete this.state.ords[id];
+        delete ma[id];
+        pruned += 1;
+      }
     }
+    for (const id of Object.keys(ma)) if (!(id in this.state.offsets)) delete ma[id];
+    if (pruned) console.log(`· #9 裁剪 ${pruned} 個已消失 rollout 的水位線(剩 ${Object.keys(this.state.offsets).length})`);
+  }
+
+  private load(): State {
+    // #6 同款兜底:主文件損壞/丟失 → 試 .bak(上一版);雙亡才重置(重建 baseline,存量跳過)。
+    for (const [p, isBak] of [[statePath(), false], [`${statePath()}.bak`, true]] as Array<[string, boolean]>) {
+      try {
+        const s = JSON.parse(readFileSync(p, "utf8"));
+        if (isBak) console.error(`⚠️ ${statePath()} 損壞/丟失 → 已從 .bak 恢復水位線`);
+        return { offsets: s.offsets ?? {}, ords: s.ords ?? {}, missingAt: s.missingAt ?? {} };
+      } catch {
+        /* 下一個候選 */
+      }
+    }
+    return { offsets: {}, ords: {} };
   }
   private save(): void {
     try {
       mkdirSync(dirname(statePath()), { recursive: true });
-      writeFileSync(statePath(), JSON.stringify(this.state));
+      const tmp = `${statePath()}.tmp`;
+      writeFileSync(tmp, JSON.stringify(this.state));
+      if (existsSync(statePath())) renameSync(statePath(), `${statePath()}.bak`); // #6:上一版留 .bak
+      renameSync(tmp, statePath()); // 原子寫
     } catch {
       /* 持久化失敗不致命 */
     }

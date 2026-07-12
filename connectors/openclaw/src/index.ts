@@ -18,7 +18,7 @@ import { runVerifiedSelfUpdate } from "./selfupdate";
 import { spawn } from "node:child_process";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.4.0";
+const CONNECTOR_VERSION = "1.5.1";
 
 /** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
 function runSelfUpdate(): void {
@@ -80,7 +80,7 @@ async function main(): Promise<void> {
   push.start();
 
   // 7. 健康上報 + 鏡像看門狗
-  const health = new HealthLoop(gw, linkb, mirror, CONNECTOR_VERSION);
+  const health = new HealthLoop(gw, linkb, mirror, CONNECTOR_VERSION, drive); // #10:計數上報
   health.start();
 
   const shutdown = (): void => {

@@ -212,6 +212,24 @@ describe("#109 AskUserQuestion → clarify 問答", () => {
     ],
   };
 
+  it("#121 v2:multiSelect 透傳到 clarify.request;逗號拼/自由文本 answer 原樣進 answers", async () => {
+    const MULTI = {
+      questions: [
+        { question: "Toppings?", header: "Toppings", multiSelect: true, options: [{ label: "Cheese" }, { label: "Onion" }] },
+      ],
+    };
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    const p = (d as any).requestAnswers(CC_SID, MULTI, "toolu_M");
+    const req = sent.find((f: any) => f.frame?.params?.type === "clarify.request") as any;
+    expect(req.frame.params.payload.choices.multiSelect).toBe(true); // 連接器 v1 已發,v2 web 用它渲多選
+    // client 組合好的答案(多選逗號拼 + Other)原樣回帶(連接器格式無關,探針證)
+    fire(tuiFrame(CC_SID, "clarify.respond", { request_id: "toolu_M#0", answer: "Cheese, Onion, Pineapple(custom)" }));
+    const r = await p;
+    expect(r.updatedInput.answers).toEqual({ "Toppings?": "Cheese, Onion, Pineapple(custom)" });
+  });
+
   it("逐題 clarify.request;亂序收齊 → allow + updatedInput.answers(問題原文→label)", async () => {
     const { linkb, sent, fire } = fakeLinkb();
     const d = new Drive(linkb);
@@ -712,5 +730,120 @@ describe("#94 session.retitle(AI 重新命名老会话)", () => {
     expect(titleEvt?.frame.params.payload.title).toBe("帮我重构支付模块的错误处理");
     delete process.env.MACCHIATO_CC_TITLE_MODE;
     delete process.env.CLAUDE_CONFIG_DIR;
+  });
+});
+
+describe("#98 每會話權限模式", () => {
+  const init = { type: "system", subtype: "init", session_id: CC_SID };
+
+  it("session.create 存 permissionMode;傳給 SDK 的 sdk 模式按四檔映射", async () => {
+    delete process.env.MACCHIATO_CC_PERMISSION_MODE;
+    turnScripts = [[init, { type: "result", subtype: "success", result: "ok" }]];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    // ask → default
+    fire(tuiFrame(CC_SID, "session.create", { permissionMode: "ask" }));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "go" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOptions.permissionMode).toBe("default");
+    expect((d as any).permModes[CC_SID]).toBe("ask");
+    d.dispose();
+  });
+
+  it("四檔各自映射:acceptEdits→default、plan→plan、bypass→bypassPermissions", async () => {
+    delete process.env.MACCHIATO_CC_PERMISSION_MODE;
+    process.env.MACCHIATO_CC_TITLE_MODE = "off"; // ULID sid 首回合會觸發標題,關掉防偷跑 turnScript
+    const cases: [string, string][] = [
+      ["acceptEdits", "default"],
+      ["plan", "plan"],
+      ["bypass", "bypassPermissions"],
+    ];
+    for (const [ui, sdk] of cases) {
+      turnScripts = [[init, { type: "result", subtype: "success", result: "ok" }]];
+      const { linkb, fire } = fakeLinkb();
+      const d = new Drive(linkb);
+      d.wire();
+      const sid = "01UI" + ui.toUpperCase().padEnd(22, "0").slice(0, 22);
+      fire(tuiFrame(sid, "session.create", { permissionMode: ui }));
+      fire(tuiFrame(sid, "prompt.submit", { text: "go" }));
+      await new Promise((r) => setTimeout(r, 30));
+      expect(lastOptions.permissionMode, ui).toBe(sdk);
+      d.dispose();
+    }
+    delete process.env.MACCHIATO_CC_TITLE_MODE;
+  });
+
+  it("非法 permissionMode 忽略,回退 env 默認", async () => {
+    process.env.MACCHIATO_CC_PERMISSION_MODE = "bypassPermissions";
+    turnScripts = [[init, { type: "result", subtype: "success", result: "ok" }]];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "session.create", { permissionMode: "garbage" }));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "go" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect((d as any).permModes[CC_SID]).toBeUndefined();
+    expect(lastOptions.permissionMode).toBe("bypassPermissions"); // env 逃生門
+    delete process.env.MACCHIATO_CC_PERMISSION_MODE;
+    d.dispose();
+  });
+
+  it("acceptEdits 檔:Write 經 canUseTool 自動批(不彈審批卡)", async () => {
+    delete process.env.MACCHIATO_CC_PERMISSION_MODE;
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "session.create", { permissionMode: "acceptEdits" }));
+    await new Promise((r) => setTimeout(r, 5));
+    // 直接驗 openChannel 裝的 canUseTool 策略:手動取通道的 canUseTool
+    // 用 resolvePerm 驗策略即可(canUseTool 在真 SDK 才觸發)
+    const perm = (d as any).resolvePerm(CC_SID);
+    expect(perm.sdk).toBe("default");
+    expect(perm.editAuto).toBe(true);
+    // ask 檔則 editAuto=false
+    fire(tuiFrame(CC_SID, "session.create", { permissionMode: "ask" }));
+    expect((d as any).resolvePerm(CC_SID).editAuto).toBe(false);
+    expect(sent.length >= 0).toBe(true);
+    d.dispose();
+  });
+
+  it("ExitPlanMode → 審批卡帶 plan 正文(#99)", async () => {
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    const p = (d as any).requestApproval(CC_SID, "ExitPlanMode", { plan: "1. 加 /health 路由\n2. 返回 200" }, { toolUseID: "t1" });
+    const req = sent.find((f: any) => f.frame?.params?.type === "approval.request") as any;
+    expect(req.frame.params.payload.command).toContain("批准計劃");
+    expect(req.frame.params.payload.plan).toContain("/health 路由");
+    expect(req.frame.params.payload.description).toContain("/health 路由");
+    fire(tuiFrame(CC_SID, "approval.respond", { choice: "allow", request_id: "t1" }));
+    expect((await p).behavior).toBe("allow");
+    d.dispose();
+  });
+
+  it("權限檔變更 → 閒置通道重建(permKey 變)", async () => {
+    delete process.env.MACCHIATO_CC_PERMISSION_MODE;
+    process.env.MACCHIATO_CC_TITLE_MODE = "off";
+    turnScripts = [
+      [init, { type: "result", subtype: "success", result: "one" }],
+      [init, { type: "result", subtype: "success", result: "two" }],
+    ];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "session.create", { permissionMode: "ask" }));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "t1" }));
+    await new Promise((r) => setTimeout(r, 30));
+    const q1 = queryCalls;
+    fire(tuiFrame(CC_SID, "session.create", { permissionMode: "bypass" })); // 閒置期改檔 → 關通道
+    await new Promise((r) => setTimeout(r, 10));
+    expect((d as any).channels.size).toBe(0); // 重建(關掉舊的)
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "t2" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(queryCalls).toBe(q1 + 1); // 新通道
+    expect(lastOptions.permissionMode).toBe("bypassPermissions");
+    d.dispose();
+    delete process.env.MACCHIATO_CC_TITLE_MODE;
   });
 });

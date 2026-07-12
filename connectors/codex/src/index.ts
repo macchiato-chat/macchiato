@@ -15,7 +15,7 @@ import { HealthLoop } from "./health";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.4.0";
+const CONNECTOR_VERSION = "1.5.1";
 
 function runSelfUpdate(): void {
   // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。
@@ -59,7 +59,7 @@ async function main(): Promise<void> {
   announceImportAvailable(linkb); // app 的「導入」入口據此顯示
   mirror.start();
 
-  const health = new HealthLoop(linkb, mirror, CONNECTOR_VERSION);
+  const health = new HealthLoop(linkb, mirror, CONNECTOR_VERSION, drive); // #10:計數上報
   health.start();
 
   console.log(`✓ Codex connector running (workdir for new sessions: ${workDir()})`);

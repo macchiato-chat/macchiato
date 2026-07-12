@@ -53,7 +53,9 @@ from backfill import (
     count_importable,
     enumerate_importable,
     changed_sessions,
+    sessions_meta,
     tail_session,
+    turn_rows,
     current_max_id,
     keepable,
     cron_feed_target,
@@ -63,7 +65,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.4.0"
+CONNECTOR_VERSION = "1.5.1"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -73,6 +75,7 @@ IMPORT_BATCH = 20
 # §15 全渠道持續鏡像（tail state.db）—— **核心功能，常開、不可關閉**。
 MIRROR_POLL_S = float(os.environ.get("MACCHIATO_MIRROR_POLL_S", "2"))  # 輪詢間隔（小=更即時、多步回合更增量）
 MIRROR_STATE = os.path.expanduser("~/.macchiato/mirror.json")  # 鏡像水位線持久化
+MIRROR_PRUNE_S = float(os.environ.get("MACCHIATO_MIRROR_PRUNE_S", str(30 * 24 * 3600)))  # #9 水位線閒置多久可裁
 # 自驅會話 id 映射持久化：server sid（ULID）→ state.db 會話 id（gateway session_key）。
 # Hermes 0.18+ 的 create_session 返回 stored_session_id = state.db 行 id ≠ 運行時句柄；
 # 沒有這張表，自驅會話的 E2E 加密鏡像投遞 / 重啟後帶上下文續聊 / 歸檔回寫都對不上號。
@@ -334,6 +337,11 @@ class Connector:
         self._titled: set[str] = set()  # #94：已自動生成過標題的 server_sid（防會話內重複）
         self._prompt_retried: set = set()  # #4：已重投過的 (sid, text 哈希)——每條 prompt 最多重投一次，防雙發
         self._retry_tasks: dict = {}  # #4/#5：sid → 在途重投任務。用戶中斷時取消之——已停的 prompt 不許復活
+        # #10:累計計數(進程生命週期)。健康上報帶出——一次性的丟/重複/重投靠狀態快照看不見。
+        self._counters: dict = {}
+        # #13:server_sid → prompt.submit 時的全庫 max 行 id。回合結束後,> 它的行即本回合
+        # 寫進 state.db 的行——其 id 回填給 server 作 live 消息的 dedup_key(與鏡像 srcId 同鍵)。
+        self._turn_floor: dict = {}
         self._sdb = None  # 懶加載的 Hermes SessionDB（session.archive 用，寫 state.db.archived）
         self._mirror_task = None  # §15 持續鏡像 tailer 任務
         self._health_task = None  # 健康上報任務
@@ -376,6 +384,9 @@ class Connector:
                 text = (params.get("payload") or {}).get("text") or ""
                 if text:
                     loop.create_task(self._emit_media_from_text(server_sid, text))
+                # #13:回合結束 → 回填本回合消息的源身份(state.db 行 id → live dedup_key)
+                if server_sid in self._turn_floor:
+                    loop.create_task(self._backfill_srcids(server_sid))
 
         self.gw = GatewayClient(
             on_event=on_event,
@@ -457,6 +468,7 @@ class Connector:
         self._fwd.clear()
         self._rev.clear()
         self._pending_interrupt.clear()  # 重啟後舊回合已死，早到的 pending 中斷作廢
+        self._count("gatewayRestarts")  # #10
         print("· gateway 重啟，已清空 session 映射")
         # 修 A：_rev 一清，鏡像就不再跳過這些會話 → 會把 live 已投遞的消息重發成重複。
         # 把它們的鏡像水位線推到當前 max（重啟後不重發舊消息；之後的 Discord 續聊仍會鏡像）。
@@ -692,11 +704,50 @@ class Connector:
                 else:
                     raise
             print(f"· #4 prompt 重投成功 {server_sid}(gateway 死於在途,已補投)")
+            self._count("promptRetries")  # #10
         except Exception as exc:
+            self._count("promptRetryFails")  # #10
             print(f"[#4 重投失敗,放棄 {server_sid}] {exc!r}", file=sys.stderr)
         finally:
             # #5:出賬。CancelledError(用戶中斷取消重投)不落 except Exception,直接穿透——正確。
             self._retry_tasks.pop(server_sid, None)
+
+    async def _backfill_srcids(self, server_sid: str) -> None:
+        """#13 統一消息身份:回合結束後,把本回合寫進 state.db 的行 id 回填給 server,
+        作 live 消息的 dedup_key(與鏡像 srcId 收斂同鍵)——此後鏡像重發同源內容
+        (gateway 重啟水位線競態 / nack 重試)被唯一索引吃掉,live × mirror 不再雙份。
+        Hermes 在 message.complete **之後**才把回合消息批量寫庫 → 輪詢等行出現(≤10s)。"""
+        floor = self._turn_floor.get(server_sid)
+        stored = self._stored.get(server_sid)
+        if floor is None or not stored:
+            return
+        try:
+            deadline = time.monotonic() + float(os.environ.get("MACCHIATO_SRCID_WAIT_S", "10"))
+            rows: list = []
+            while True:
+                rows = await turn_rows(stored, floor)
+                if any(r[1] == "assistant" for r in rows) or time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(0.5)
+            items = []
+            last_user = max((r[0] for r in rows if r[1] == "user"), default=None)
+            last_assistant = max((r[0] for r in rows if r[1] == "assistant"), default=None)
+            if last_user is not None:
+                items.append({"role": "user", "srcId": str(last_user)})
+            if last_assistant is not None:
+                items.append({"role": "agent", "srcId": str(last_assistant)})
+            if not items:
+                return
+            self._turn_floor[server_sid] = max(r[0] for r in rows)  # 下回合 floor 順勢推進
+            await self._send({
+                "t": "message_srcid",
+                "agentLinkId": self.agent_link_id,
+                "sessionId": server_sid,
+                "items": items,
+            })
+            self._count("srcidBackfills")  # #10
+        except Exception as exc:
+            print(f"[#13 srcid 回填失敗(忽略) {server_sid}] {exc!r}", file=sys.stderr)
 
     async def _send(self, msg: dict) -> None:
         """斷線期間**緩衝**、ready 後按序補發(此前直接丟——server 部署重啟撞上進行中回合,
@@ -805,13 +856,26 @@ class Connector:
     # ── §15 全渠道持續鏡像（tail state.db → mirror_append）──────────────────
 
     def _load_mirror_state(self) -> dict:
-        try:
-            with open(MIRROR_STATE) as f:
-                st = json.load(f)
-            st.setdefault("sessions", {})
-            return st
-        except (FileNotFoundError, ValueError):
-            return {"baseline": None, "sessions": {}}
+        # #6:主文件損壞/丟失 → 先試 .bak(每次保存輪替的上一版,最多落後一批)。
+        # 直接重設基線會把「舊水位線→現在」之間的消息永久跳過;.bak 只是舊一點,
+        # 重發由 server srcId 去重兜住——寧可重發,不可靜默丟。
+        for path, is_bak in ((MIRROR_STATE, False), (MIRROR_STATE + ".bak", True)):
+            try:
+                with open(path) as f:
+                    st = json.load(f)
+                st.setdefault("sessions", {})
+                if is_bak:
+                    print(
+                        f"⚠️ mirror.json 損壞/丟失 → 已從 .bak 恢復水位線（{path}）。"
+                        "如是有意重置請連 .bak 一併刪除。",
+                        file=sys.stderr,
+                    )
+                return st
+            except (FileNotFoundError, ValueError) as exc:
+                if not isinstance(exc, FileNotFoundError):
+                    print(f"[mirror state 損壞 {path}] {exc!r}", file=sys.stderr)
+                continue
+        return {"baseline": None, "sessions": {}}
 
     def _save_mirror_state(self, st: dict) -> None:
         try:
@@ -819,6 +883,9 @@ class Connector:
             tmp = MIRROR_STATE + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(st, f)
+            # #6:輪替備份——上一版留作 .bak,主文件損壞時兜底(見 _load_mirror_state)。
+            if os.path.exists(MIRROR_STATE):
+                os.replace(MIRROR_STATE, MIRROR_STATE + ".bak")
             os.replace(tmp, MIRROR_STATE)
         except Exception as exc:
             print(f"[mirror state save failed] {exc!r}", file=sys.stderr)
@@ -854,6 +921,13 @@ class Connector:
             return self._smoke_err[:300]
         return None
 
+    def _count(self, key: str, n: int = 1) -> None:
+        """#10:累計計數。懶初始化——#129 的教訓:別讓 __new__ 手搭的測試對象缺屬性就炸。"""
+        c = getattr(self, "_counters", None)
+        if c is None:
+            c = self._counters = {}
+        c[key] = c.get(key, 0) + n
+
     def _health(self) -> dict:
         checks = self._compat.get("checks", {})
         now = time.time()
@@ -873,6 +947,7 @@ class Connector:
             "connectorVersion": CONNECTOR_VERSION,  # §update：server 據此判 updateAvailable
             "kind": "hermes",  # #94：client gate 專屬功能（如 AI 重命名）
             "stt": _stt_available(),  # #89：語音轉錄能力位（false → server 走雲端 BYOK STT）
+            "counters": dict(getattr(self, "_counters", {}) or {}),  # #10：累計計數（進程生命週期）
         }
 
     def _self_update(self) -> None:
@@ -982,6 +1057,7 @@ class Connector:
                 for sid, old in rewind.items():
                     wm[sid] = min(wm.get(sid, old), old)
                 self._save_mirror_state(self._mirror_st)
+                self._count("mirrorNacks")  # #10
                 self._last_error = f"mirror_nack: batch {batch_id}"
                 print(
                     f"· mirror_nack batch {batch_id}：回退 {len(rewind)} 會話水位線、下輪重發",
@@ -1025,6 +1101,30 @@ class Connector:
             self._mirror_lock = asyncio.Lock()
         return self._mirror_lock
 
+    def _prune_mirror_state(self, st: dict) -> None:
+        """#9:裁掉長期不活躍的水位線,mirror.json 不再無界增長。
+
+        安全性:閒置 ≥MIRROR_PRUNE_S 的會話早已鏡像到頂(floor==max)。裁掉後其 floor 記進
+        pruned_floor(取全體被裁者最大值);未知會話的 floor 回退 max(baseline, pruned_floor)——
+        被裁會話若復活,新消息 id 必大於裁剪時的全庫 max ≥ pruned_floor → 不丟不重。
+        代價:從未鏡像過的被過濾會話若日後變 keepable,只補 pruned_floor 之後的消息
+        (少量陳年消息不回填,可接受)。titles/touched_at 同步清理。"""
+        wm, ta = st["sessions"], st.setdefault("touched_at", {})
+        now = time.time()
+        for sid in wm:
+            ta.setdefault(sid, int(now))  # 升級前的舊條目:從現在起算齡(寬限一個週期)
+        stale = [sid for sid in list(ta) if sid not in wm or now - ta[sid] > MIRROR_PRUNE_S]
+        pruned = 0
+        for sid in stale:
+            if sid in wm:
+                st["pruned_floor"] = max(st.get("pruned_floor", 0), wm.pop(sid))
+                pruned += 1
+            ta.pop(sid, None)
+            st.setdefault("titles", {}).pop(sid, None)
+        if pruned:
+            self._save_mirror_state(st)
+            print(f"· #9 裁剪 {pruned} 個閒置水位線（剩 {len(wm)}，pruned_floor={st['pruned_floor']}）")
+
     async def _mirror_loop(self) -> None:
         """tail state.db：把其他渠道（Discord/Telegram/…）的新消息 mirror_append 給 server。"""
         st = self._mirror_st = self._load_mirror_state()
@@ -1034,10 +1134,15 @@ class Connector:
             print(f"· 鏡像基線 messages.id={st['baseline']}")
         baseline, wm = st["baseline"], st["sessions"]
         titles = st.setdefault("titles", {})  # 已發 server 的標題：偵測 Hermes 回合後才取名 → 純標題更新
+        self._prune_mirror_state(st)  # #9:啟動時裁一次
+        last_prune = time.time()
         while True:
             try:
                 await asyncio.sleep(MIRROR_POLL_S)
                 self._mirror_last_run = time.time()
+                if time.time() - last_prune > 24 * 3600:  # #9:長駐進程每日裁一次
+                    self._prune_mirror_state(st)
+                    last_prune = time.time()
                 if self.ws is None:
                     continue
                 # 與 _e2e_backfill_history 互斥：回灌快照/替換期間不得按舊水位線追加（重複投遞）。
@@ -1046,11 +1151,23 @@ class Connector:
             except asyncio.CancelledError:
                 return
             except Exception as exc:
+                self._count("mirrorErrors")  # #10
                 print(f"[mirror loop error] {exc!r}", file=sys.stderr)
 
     async def _mirror_poll_once(self, st, baseline, wm, titles) -> None:
         batch, touched, title_updates = [], {}, {}
-        for sid, source, title, archived, maxid in await changed_sessions():
+        # #9:未知會話的 floor 回退 max(baseline, pruned_floor)——被裁會話復活不重發舊消息。
+        default_floor = max(baseline, st.get("pruned_floor", 0))
+        # #8:掃描下界=全體 floor 的最小值——只讓 sqlite 回「有新消息」的會話,
+        # 不再每 2s 對全部歷史會話做 max(m.id) 聚合。
+        global_min = min([default_floor, *wm.values()]) if wm else default_floor
+        rows = list(await changed_sessions(global_min))
+        seen = {r[0] for r in rows}
+        # 收窄後,無新消息的已鏡像會話不再出現 → 純標題更新(Hermes 回合後才取名)用主鍵
+        # IN 輕量補查 meta,maxid=None 走下面的 has_new=False 分支,行為與收窄前一致。
+        missing = [s for s in wm if s not in seen]
+        rows += [(s, src, t, a, None) for s, src, t, a in await sessions_meta(missing)]
+        for sid, source, title, archived, maxid in rows:
             # sid = state.db 會話 id。自驅會話（Macchiato 新建）的 state.db id（= gateway
             # session_key，經 _stored 持久映射）≠ server 持久化 hermesSessionId；K_S 按持久化
             # id 鍵控、mirror 也須用持久化 id 才能落回原會話 → 先映射回 pid（運行時 _rev 或
@@ -1062,8 +1179,8 @@ class Connector:
                 # 持久化 id 下、鏡像看到的是它，故連 _fwd 一起查,否則重複投遞。macchiato 新建會話
                 # （source=tui，_stored_rev 鍵）由 live 路徑獨佔投遞，同樣跳過。
                 continue
-            floor = wm.get(sid, baseline)
-            has_new = maxid > floor
+            floor = wm[sid] if sid in wm else default_floor
+            has_new = maxid is not None and maxid > floor
             job = cron_feed_target(source, title)
             if job is not None:
                 if has_new:
@@ -1104,7 +1221,7 @@ class Connector:
         if batch:
             self._mirror_batch_id += 1
             bid = self._mirror_batch_id
-            rewind = {sid: wm.get(sid, baseline) for sid in touched}  # advance 前的舊 floor
+            rewind = {sid: (wm[sid] if sid in wm else default_floor) for sid in touched}  # advance 前的舊 floor
             await self._send({
                 "t": "mirror_append",
                 "agentLinkId": self.agent_link_id,
@@ -1113,12 +1230,16 @@ class Connector:
             })
             self._mirror_rewind.append((bid, rewind))
             # 修 B：只在水位線未被併發 nack 回退時推進（否則回退會被覆蓋 → 丟）。
+            ta = st.setdefault("touched_at", {})
             for sid, new_wm in touched.items():
-                if wm.get(sid, baseline) == rewind[sid]:
+                if (wm[sid] if sid in wm else default_floor) == rewind[sid]:
                     wm[sid] = new_wm
+                    ta[sid] = int(time.time())  # #9:記活躍時間,供裁剪判齡
             titles.update(title_updates)  # 發送成功才記，免得失敗後不再重發
             self._save_mirror_state(st)
             n = sum(len(s["messages"]) for s in batch)
+            self._count("mirrorBatches")  # #10
+            self._count("mirrorMessages", n)
             nt = sum(1 for s in batch if not s["messages"])
             extra = f"（含 {nt} 純標題更新）" if nt else ""
             print(f"· 鏡像 {len(batch)} 會話 / {n} 條 → server (batch {bid}){extra}")
@@ -1302,6 +1423,13 @@ class Connector:
                 # 純語音且轉錄為空（STT 不可用/沒聽清）→ 不打擾 agent（server 已落兜底提示）。
                 non_audio = any(r.get("kind") != "audio" for r in attachments)
                 if final_text or non_audio or not attachments:
+                    # #13:記回合 floor——此後 > floor 的 state.db 行即本回合所寫,
+                    # 回合結束(message.complete)按它定位行 id 回填 live 消息身份。
+                    if self._stored.get(server_sid) and not self._e2e.is_e2e(server_sid):
+                        try:
+                            self._turn_floor[server_sid] = await current_max_id()
+                        except Exception:
+                            pass  # 拿不到 floor → 本回合不回填,會話級跳過照舊兜底
                     try:
                         await self.gw.submit_prompt(real, final_text)
                     except GatewayDied:
@@ -1358,6 +1486,7 @@ class Connector:
         except Exception as exc:
             # 兜底保連接器不被單幀弄死;但打全 traceback——#129 那次 AttributeError(編程錯誤)
             # 只剩一行 repr,測試斷言拿到空列表卻看不出錯在哪行。
+            self._count("dispatchErrors")  # #10
             print(f"[dispatch {method} failed] {exc!r}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
 

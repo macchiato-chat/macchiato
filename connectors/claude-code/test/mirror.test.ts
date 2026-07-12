@@ -20,6 +20,18 @@ function userLine(text: string): string {
   );
 }
 
+function assistantLine(text: string): string {
+  return (
+    JSON.stringify({
+      type: "assistant",
+      uuid: uuid(),
+      sessionId: SID,
+      timestamp: "2026-07-05T10:00:01.000Z",
+      message: { id: `a-${n}`, role: "assistant", content: [{ type: "text", text }] },
+    }) + "\n"
+  );
+}
+
 interface Sent {
   frames: Record<string, unknown>[];
 }
@@ -119,6 +131,34 @@ describe("Mirror", () => {
     // 無新批(僅 baseline 可能發過 0 條)
     const batches = appends(sent).filter((f: any) => f.sessions?.[0]?.messages?.length > 0);
     expect(batches).toHaveLength(0);
+  });
+
+  it("driven 回合末殘片(fastForward 後才落盤的 assistant)→ 不生成影子會話;真人續問才恢復", () => {
+    setupEnv();
+    writeFileSync(file, "");
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb);
+    (m as any).doPoll(); // baseline 空文件
+    // 驅動回合:live 路徑在 ULID 下投遞 user+assistant,鏡像側只快進
+    m.setDriven(SID);
+    appendFileSync(file, userLine("為什麼重啟") + assistantLine("因為觸發了硬體看門狗"));
+    (m as any).doPoll(); // driven → 快進水位線,不投
+    // 回合末:fastForward 越過本回合 + 解除 driven
+    m.fastForward(SID);
+    m.unsetDriven(SID);
+    // 競態:最終 assistant 塊在 fastForward 之後才落盤(殘片,無 user 行)
+    appendFileSync(file, assistantLine("(補齊的收尾)"));
+    (m as any).doPoll();
+    // 不得憑空建一個只有 agent 消息的影子會話
+    const ghost = appends(sent).filter((f: any) => f.sessions?.[0]?.messages?.length > 0);
+    expect(ghost).toHaveLength(0);
+    // 但用戶真在終端續這個會話(新 user 回合)→ 鏡像恢復、建會話
+    appendFileSync(file, userLine("那怎麼修"));
+    (m as any).doPoll();
+    const resumed = appends(sent).filter((f: any) =>
+      f.sessions?.[0]?.messages?.some((x: any) => x.text === "那怎麼修"),
+    );
+    expect(resumed.length).toBeGreaterThan(0);
   });
 
   it("連接器啟動後新建的會話 → 從 0 全量鏡像(claude -p 短會話不丟)", async () => {
@@ -232,5 +272,33 @@ describe("Mirror #56 mirror_activity", () => {
       { hermesSessionId: SID, busy: true },
       { hermesSessionId: SID, busy: true },
     ]);
+  });
+});
+
+describe("#6/#9 狀態文件兜底與裁剪", () => {
+  it("#6 主文件損壞 → 從 .bak 恢復;#9 prune 消失超期才裁", () => {
+    const d = mkdtempSync(join(tmpdir(), "cc-state-"));
+    process.env.MACCHIATO_CC_MIRROR = join(d, "mirror.json");
+    const linkb: any = { agentLinkId: "AL", isReady: true, send: () => {}, onFrame: () => () => {} };
+    const m1: any = new Mirror(linkb);
+    m1.state = { offsets: { a: 9 }, titles: { a: "t" }, missingAt: {} };
+    m1.save();
+    m1.state = { offsets: { a: 12 }, titles: { a: "t" }, missingAt: {} };
+    m1.save(); // 上一版落 .bak
+    writeFileSync(join(d, "mirror.json"), "{corrupted");
+    const m2: any = new Mirror(linkb);
+    expect(m2.state.offsets.a).toBe(9); // #6:.bak 恢復,不重置
+
+    // #9:prune
+    m2.state = {
+      offsets: { live: 1, gone_old: 2, gone_new: 3 },
+      titles: { live: "L", gone_old: "G" },
+      missingAt: { gone_old: Date.now() - 8 * 24 * 3600 * 1000 },
+    };
+    m2.prune(new Set(["live"]), Date.now());
+    expect(Object.keys(m2.state.offsets).sort()).toEqual(["gone_new", "live"]);
+    expect(m2.state.titles.gone_old).toBeUndefined(); // titles 同步清
+    m2.prune(new Set(["live", "gone_new"]), Date.now()); // 回歸即清 missingAt
+    expect(m2.state.missingAt.gone_new).toBeUndefined();
   });
 });

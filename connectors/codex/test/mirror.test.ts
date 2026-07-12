@@ -23,3 +23,35 @@ describe("codex mirror 派生", () => {
     expect(deriveMeta(JSON.stringify({ type: "session_meta", payload: {} })).title).toBe("Codex");
   });
 });
+
+describe("#6/#9 狀態文件兜底與裁剪", () => {
+  it("#6 主文件損壞 → 從 .bak 恢復;#9 prune 消失超期才裁", async () => {
+    const { Mirror } = await import("../src/codex/mirror");
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const d = mkdtempSync(join(tmpdir(), "codex-state-"));
+    process.env.MACCHIATO_CODEX_MIRROR = join(d, "mirror.json");
+    const linkb: any = { agentLinkId: "AL", isReady: true, send: () => {}, onFrame: () => () => {} };
+    const m1: any = new Mirror(linkb);
+    m1.state = { offsets: { a: 9 }, ords: { a: 3 }, missingAt: {} };
+    m1.save();
+    m1.state = { offsets: { a: 12 }, ords: { a: 5 }, missingAt: {} };
+    m1.save(); // 上一版落 .bak
+    writeFileSync(join(d, "mirror.json"), "{corrupted");
+    const m2: any = new Mirror(linkb);
+    expect(m2.state.offsets.a).toBe(9); // #6:.bak 恢復
+    expect(m2.state.ords.a).toBe(3);
+
+    m2.state = {
+      offsets: { live: 1, gone_old: 2, gone_new: 3 },
+      ords: { live: 1, gone_old: 2 },
+      missingAt: { gone_old: Date.now() - 8 * 24 * 3600 * 1000 },
+    };
+    m2.pruneState(new Set(["live"]));
+    expect(Object.keys(m2.state.offsets).sort()).toEqual(["gone_new", "live"]);
+    expect(m2.state.ords.gone_old).toBeUndefined(); // ords 同步清
+    m2.pruneState(new Set(["live", "gone_new"]));
+    expect(m2.state.missingAt.gone_new).toBeUndefined(); // 回歸即清
+  });
+});
