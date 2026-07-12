@@ -2,14 +2,15 @@
 # Macchiato Connector — one-line installer
 #   curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh | bash
 #
-# Auto-detects which agent(s) you run — Hermes, OpenClaw and/or Claude Code — and installs
+# Auto-detects which agent(s) you run — Hermes, OpenClaw, Claude Code and/or Codex — and installs
 # the matching connector(s): download → pair (one-time code) → systemd user service.
 #
 # Env overrides:
 #   MACCHIATO_SERVER_URL   (default wss://api.macchiato.chat/connector)
 #   HERMES_PYTHON          (path to the python inside your Hermes venv, if auto-detect fails)
 #   MACCHIATO_CLAUDE_BIN   (absolute path to the claude CLI, if auto-detect fails)
-#   MACCHIATO_ONLY         ("hermes" | "openclaw" | "claude-code" — skip auto-detect, install just one)
+#   MACCHIATO_CODEX_BIN    (absolute path to the codex CLI, if auto-detect fails)
+#   MACCHIATO_ONLY         ("hermes" | "openclaw" | "claude-code" | "codex" — skip auto-detect, install just one)
 #   MACCHIATO_MANIFEST     (path to a pre-verified release.json — self_update passes it;
 #                           every installed file is sha256-checked against it before use)
 
@@ -196,24 +197,60 @@ install_claude_code() {
 MACCHIATO_CLAUDE_BIN=$CLAUDE"     install_unit "macchiato-claude-code-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
 }
 
+# ═════════════════════════════ Codex ════════════════════════════════════════
+find_codex_bin() {
+  if [ -n "${MACCHIATO_CODEX_BIN:-}" ]; then echo "$MACCHIATO_CODEX_BIN"; return; fi
+  local cand
+  cand="$(command -v codex 2>/dev/null || true)"
+  [ -n "$cand" ] && { echo "$cand"; return; }
+  for cand in "$HOME/.local/bin/codex" /usr/local/bin/codex /opt/homebrew/bin/codex "$HOME/.npm-global/bin/codex"; do
+    [ -x "$cand" ] && { echo "$cand"; return; }
+  done
+  echo ""
+}
+
+install_codex() {
+  local APP="$HOME/.macchiato/codex-app" CRED="$HOME/.macchiato/codex-connector.json" CODEX
+  CODEX="$(find_codex_bin)"
+  [ -n "$CODEX" ] || fail "Codex CLI not found. Install it first (https://developers.openai.com/codex), or set MACCHIATO_CODEX_BIN and re-run."
+  command -v node >/dev/null 2>&1 || fail "node not found (the Codex connector requires Node 20+)"
+  command -v npm >/dev/null 2>&1 || fail "npm not found"
+  say "Codex connector → $APP  (codex: $CODEX)"
+  verify_tree "$TMP/connectors/codex" "connectors/codex"
+  mkdir -p "$APP"
+  cp -r "$TMP"/connectors/codex/src "$TMP"/connectors/codex/package.json "$TMP"/connectors/codex/tsconfig.json "$APP/"
+  (cd "$APP" && npm install --omit=dev --silent) || fail "npm install failed in $APP"
+  if [ ! -f "$CRED" ]; then
+    say "Pairing Codex connector (enter the code below at macchiato.chat)"
+    (cd "$APP" && MACCHIATO_PAIR_ONLY=1 MACCHIATO_CODEX_BIN="$CODEX" ./node_modules/.bin/tsx src/index.ts) || fail "Pairing not completed. Re-run this script to continue."
+  else
+    say "Codex credentials found, skipping pairing"
+  fi
+  MACCHIATO_UNIT_EXTRA_ENV="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+MACCHIATO_CODEX_BIN=$CODEX"     install_unit "macchiato-codex-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
+}
+
 # ── detect + run ─────────────────────────────────────────────────────────────
 ONLY="${MACCHIATO_ONLY:-}"
-HAS_HERMES=0; HAS_OPENCLAW=0; HAS_CLAUDE=0
+HAS_HERMES=0; HAS_OPENCLAW=0; HAS_CLAUDE=0; HAS_CODEX=0
 [ -n "$(find_hermes_python)" ] && HAS_HERMES=1
 { command -v openclaw >/dev/null 2>&1 || [ -f "$HOME/.openclaw/openclaw.json" ]; } && HAS_OPENCLAW=1
 [ -n "$(find_claude_bin)" ] && HAS_CLAUDE=1
+[ -n "$(find_codex_bin)" ] && HAS_CODEX=1
 
 case "$ONLY" in
   hermes)      install_hermes ;;
   openclaw)    install_openclaw ;;
   claude-code) install_claude_code ;;
+  codex)       install_codex ;;
   "")
-    [ "$HAS_HERMES" = 1 ] || [ "$HAS_OPENCLAW" = 1 ] || [ "$HAS_CLAUDE" = 1 ] || fail "No supported agent found (Hermes, OpenClaw or Claude Code). Install one first — see README."
+    [ "$HAS_HERMES" = 1 ] || [ "$HAS_OPENCLAW" = 1 ] || [ "$HAS_CLAUDE" = 1 ] || [ "$HAS_CODEX" = 1 ] || fail "No supported agent found (Hermes, OpenClaw, Claude Code or Codex). Install one first — see README."
     [ "$HAS_HERMES" = 1 ]   && install_hermes
     [ "$HAS_OPENCLAW" = 1 ] && install_openclaw
     [ "$HAS_CLAUDE" = 1 ]   && install_claude_code
+    [ "$HAS_CODEX" = 1 ]    && install_codex
     ;;
-  *) fail "MACCHIATO_ONLY must be 'hermes', 'openclaw' or 'claude-code'" ;;
+  *) fail "MACCHIATO_ONLY must be 'hermes', 'openclaw', 'claude-code' or 'codex'" ;;
 esac
 
 say "Done! Open Macchiato — your conversations will start syncing."
