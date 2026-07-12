@@ -37,6 +37,9 @@ function fakeLinkb(): { linkb: any; sent: Sent } {
   };
 }
 
+/** 只看鏡像內容幀(#56 起 poll 還會發 mirror_activity,別讓幀序斷言被打亂)。 */
+const appends = (sent: Sent) => sent.frames.filter((f: any) => f.t === "mirror_append");
+
 describe("Mirror", () => {
   let file: string;
 
@@ -60,14 +63,14 @@ describe("Mirror", () => {
     const m = new Mirror(linkb);
     (m as any).doPoll();
     // 全量:歷史消息都發出來(不再只發標題)
-    const all = sent.frames.flatMap((f: any) => f.sessions[0].messages);
+    const all = appends(sent).flatMap((f: any) => f.sessions[0].messages);
     expect(all.map((x: any) => x.text)).toEqual(["old history", "second"]);
     expect(all[0].srcId).toMatch(/^0{8}-/);
-    expect((sent.frames[0] as any).sessions[0].source).toBe("claude-code");
+    expect((appends(sent)[0] as any).sessions[0].source).toBe("claude-code");
     // 增量:新消息
     appendFileSync(file, userLine("new message"));
     (m as any).doPoll();
-    const last = (sent.frames.at(-1) as any).sessions[0];
+    const last = (appends(sent).at(-1) as any).sessions[0];
     expect(last.messages.map((x: any) => x.text)).toEqual(["new message"]);
   });
 
@@ -82,9 +85,9 @@ describe("Mirror", () => {
     (m as any).doPoll();
     delete process.env.MACCHIATO_CC_BATCH_MAX;
     // 25 條 / 10 每批 → 3 帧,每帧單會話
-    expect(sent.frames.length).toBe(3);
-    for (const f of sent.frames) expect((f as any).sessions).toHaveLength(1);
-    const total = sent.frames.flatMap((f: any) => f.sessions[0].messages);
+    expect(appends(sent).length).toBe(3);
+    for (const f of appends(sent)) expect((f as any).sessions).toHaveLength(1);
+    const total = appends(sent).flatMap((f: any) => f.sessions[0].messages);
     expect(total).toHaveLength(25);
     expect(total.map((x: any) => x.text)).toEqual(Array.from({ length: 25 }, (_, i) => `m${i}`));
   });
@@ -97,10 +100,10 @@ describe("Mirror", () => {
     (m as any).doPoll(); // baseline(空文件無標題,無批)
     appendFileSync(file, userLine("msg1"));
     (m as any).doPoll();
-    const batchId = (sent.frames.at(-1) as any).batchId;
+    const batchId = (appends(sent).at(-1) as any).batchId;
     m.handleNack(batchId);
     (m as any).doPoll();
-    const last = (sent.frames.at(-1) as any).sessions[0];
+    const last = (appends(sent).at(-1) as any).sessions[0];
     expect(last.messages[0].text).toBe("msg1"); // 重發
   });
 
@@ -114,7 +117,7 @@ describe("Mirror", () => {
     appendFileSync(file, userLine("driven content"));
     (m as any).doPoll();
     // 無新批(僅 baseline 可能發過 0 條)
-    const batches = sent.frames.filter((f: any) => f.sessions?.[0]?.messages?.length > 0);
+    const batches = appends(sent).filter((f: any) => f.sessions?.[0]?.messages?.length > 0);
     expect(batches).toHaveLength(0);
   });
 
@@ -126,7 +129,7 @@ describe("Mirror", () => {
     await new Promise((r) => setTimeout(r, 5)); // 確保 birthtime > startedAt
     writeFileSync(file, userLine("fresh q") + userLine("follow"));
     (m as any).doPoll();
-    const batch = (sent.frames.at(-1) as any)?.sessions?.[0];
+    const batch = (appends(sent).at(-1) as any)?.sessions?.[0];
     expect(batch?.messages).toHaveLength(2); // 全文都在,沒被 baseline 吃掉
     expect(batch.messages[0].text).toBe("fresh q");
     expect(batch.title).toBe("fresh q"); // 無 custom-title 時用首條 user 當標題
@@ -148,11 +151,11 @@ describe("Mirror", () => {
     const m = new Mirror(linkb);
     (m as any).doPoll();
     (m as any).doPoll(); // 第二輪:檔沒長,不重讀也不發
-    expect(sent.frames.filter((f: any) => f.sessions?.[0]?.messages?.length > 0)).toHaveLength(0);
+    expect(appends(sent).filter((f: any) => f.sessions?.[0]?.messages?.length > 0)).toHaveLength(0);
     // 用戶真在該會話說話 → 全量鏡像(含此前的 agent 消息)
     appendFileSync(file, userLine("real human"));
     (m as any).doPoll();
-    const batch = (sent.frames.at(-1) as any)?.sessions?.[0];
+    const batch = (appends(sent).at(-1) as any)?.sessions?.[0];
     expect(batch?.messages?.map((x: any) => x.text)).toEqual(["task output", "real human"]);
   });
 
@@ -164,7 +167,70 @@ describe("Mirror", () => {
     (m as any).doPoll(); // baseline
     appendFileSync(file, JSON.stringify({ type: "custom-title", customTitle: "Renamed", sessionId: SID }) + "\n");
     (m as any).doPoll();
-    const last = (sent.frames.at(-1) as any).sessions[0];
+    const last = (appends(sent).at(-1) as any).sessions[0];
     expect(last.title).toBe("Renamed");
+  });
+});
+
+// ---- #56 二期:鏡像側工作態(mirror_activity) ----
+
+function inflightToolLine(): string {
+  return (
+    JSON.stringify({
+      type: "assistant",
+      uuid: uuid(),
+      sessionId: SID,
+      timestamp: new Date().toISOString(),
+      message: {
+        id: "m-inflight",
+        role: "assistant",
+        content: [{ type: "tool_use", id: "t-if", name: "Bash", input: { command: "sleep 999" } }],
+        stop_reason: "tool_use",
+      },
+    }) + "\n"
+  );
+}
+
+describe("Mirror #56 mirror_activity", () => {
+  let file = "";
+  function setup(): { linkb: any; sent: Sent; m: Mirror } {
+    const cfg = mkdtempSync(join(tmpdir(), "cc-act-"));
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
+    mkdirSync(join(cfg, "projects", "-home-x"), { recursive: true });
+    file = join(cfg, "projects", "-home-x", `${SID}.jsonl`);
+    writeFileSync(file, userLine("hi"));
+    const { linkb, sent } = fakeLinkb();
+    return { linkb, sent, m: new Mirror(linkb) };
+  }
+  const acts = (sent: Sent) =>
+    sent.frames.filter((f: any) => f.t === "mirror_activity").flatMap((f: any) => f.sessions as any[]);
+
+  it("增長 → busy;連續 2 輪安靜 → idle(防抖);首見不算增長", () => {
+    const { sent, m } = setup();
+    (m as any).doPoll(); // 首見:全量鏡像但 prevSize 未知 → 不亮
+    expect(acts(sent)).toEqual([]);
+    appendFileSync(file, userLine("user speaks"));
+    (m as any).doPoll(); // 增長 → busy
+    expect(acts(sent)).toEqual([{ hermesSessionId: SID, busy: true }]);
+    (m as any).doPoll(); // 安靜第 1 輪:防抖,不動
+    expect(acts(sent)).toHaveLength(1);
+    (m as any).doPoll(); // 安靜第 2 輪 → idle
+    expect(acts(sent)).toEqual([
+      { hermesSessionId: SID, busy: true },
+      { hermesSessionId: SID, busy: false },
+    ]);
+  });
+
+  it("尾部工具未結算(in-flight)且 90s 內有增長 → 每輪重申 busy", () => {
+    const { sent, m } = setup();
+    (m as any).doPoll();
+    appendFileSync(file, inflightToolLine());
+    (m as any).doPoll(); // 增長 → busy
+    (m as any).doPoll(); // 無增長但 in-flight 且 90s 內 → 重申 busy
+    expect(acts(sent)).toEqual([
+      { hermesSessionId: SID, busy: true },
+      { hermesSessionId: SID, busy: true },
+    ]);
   });
 });

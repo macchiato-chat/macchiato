@@ -1,16 +1,16 @@
 /**
- * Claude Code 連接器入口：
+ * Codex 連接器入口：
  *   憑證（未配對則先配對）→ 連 Macchiato Link B → 啟動鏡像 + 驅動 + 健康。
- * 跑：pnpm --filter @macchiato/claude-code-connector start
+ * 跑：pnpm --filter @macchiato/codex-connector start
  */
 import { spawn } from "node:child_process";
 import { loadCreds } from "./linkb/creds";
 import { LinkBClient } from "./linkb/client";
 import { runPairing } from "./linkb/pairing";
 import { E2EKeyStore } from "./e2e/keys";
-import { Mirror } from "./cc/mirror";
-import { announceImportAvailable, runImport } from "./cc/history-import";
-import { Drive, workDir } from "./cc/drive";
+import { Mirror } from "./codex/mirror";
+import { announceImportAvailable, runImport } from "./codex/history-import";
+import { Drive, workDir } from "./codex/drive";
 import { HealthLoop } from "./health";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 
@@ -19,7 +19,7 @@ const CONNECTOR_VERSION = "1.4.0";
 
 function runSelfUpdate(): void {
   // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。
-  runVerifiedSelfUpdate("claude-code", CONNECTOR_VERSION).catch((e) =>
+  runVerifiedSelfUpdate("codex", CONNECTOR_VERSION).catch((e) =>
     console.error("[self_update failed]", (e as Error).message),
   );
 }
@@ -62,7 +62,7 @@ async function main(): Promise<void> {
   const health = new HealthLoop(linkb, mirror, CONNECTOR_VERSION);
   health.start();
 
-  console.log(`✓ Claude Code connector running (workdir for new sessions: ${workDir()})`);
+  console.log(`✓ Codex connector running (workdir for new sessions: ${workDir()})`);
 
   const shutdown = (): void => {
     console.log("\n· Shutting down…");

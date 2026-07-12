@@ -278,3 +278,81 @@ describe("drive E2E（§19 方案 A）", () => {
     expect(sent.filter((m) => m.t === "tui").map((m) => m.frame.params.type)).toEqual(["message.start"]);
   });
 });
+
+describe("#4 prompt 級重試(gateway 死於在途)", () => {
+  function makeRetryDrive(behavior: (call: { method: string; params: any }, n: number) => any) {
+    process.env.MACCHIATO_OPENCLAW_TITLED = join(mkdtempSync(join(tmpdir(), "oc-titled-")), "titled.json");
+    process.env.MACCHIATO_OPENCLAW_TITLE_MODE = "off";
+    const calls: { method: string; params: any }[] = [];
+    const gw: any = {
+      isConnected: true, // 重投循環立即通過(不等 1s 輪詢)
+      handlers: [] as any[],
+      onEvent(h: any) { this.handlers.push(h); return () => {}; },
+      async request(method: string, params: any) {
+        const call = { method, params };
+        calls.push(call);
+        return behavior(call, calls.length);
+      },
+    };
+    const linkb: any = {
+      agentLinkId: "al1",
+      handlers: [] as any[],
+      onFrame(h: any) { this.handlers.push(h); },
+      send() {},
+      async deliver(m: any) { for (const h of this.handlers) await h(m); },
+    };
+    const drive = new Drive(gw, linkb);
+    drive.wire();
+    return { drive, linkb, calls };
+  }
+
+  it("連接死於 chat.send 在途 → 重連後重投一次,且復用原 idempotencyKey", async () => {
+    const { drive, linkb, calls } = makeRetryDrive((_c, n) => {
+      if (n === 1) throw new Error("gateway connection lost");
+      return { status: "started" };
+    });
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "別石沉" }));
+    expect(drive.retryTask).toBeTruthy(); // 已排重投
+    await drive.retryTask;
+    expect(calls.map((c) => c.method)).toEqual(["chat.send", "chat.send"]);
+    expect(calls[1].params.message).toBe("別石沉");
+    expect(calls[1].params.idempotencyKey).toBe(calls[0].params.idempotencyKey); // OpenClaw 側冪等去重
+  });
+
+  it("去重:重投路徑再死 → 同 (sid,文本) 不再二投,寧丟勿雙發", async () => {
+    const { drive, linkb, calls } = makeRetryDrive(() => {
+      throw new Error("gateway connection lost"); // 永遠死
+    });
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "hi" }));
+    await drive.retryTask; // 第一次重投:失敗、記賬
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "hi" }));
+    await drive.retryTask; // 第二次:賬上有 → 直接放棄
+    expect(calls.filter((c) => c.method === "chat.send").length).toBe(3); // 首發×2 + 重投×1
+  });
+
+  it("業務錯誤不重投(只重投連接死亡類)", async () => {
+    const { drive, linkb, calls } = makeRetryDrive(() => {
+      throw new Error('gateway error: {"code":"BAD_REQUEST"}');
+    });
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "hi" }));
+    expect(drive.retryTask).toBeNull();
+    expect(calls.length).toBe(1); // 僅首發,無重投
+  });
+
+  it("#5 重投等待期用戶中斷 → 重投被取消,不復活", async () => {
+    let connected = false;
+    const { drive, linkb, calls } = (() => {
+      const r = makeRetryDrive(() => {
+        throw new Error("gateway connection lost");
+      });
+      Object.defineProperty((r.drive as any).gw, "isConnected", { get: () => connected });
+      return r;
+    })();
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "hi" })); // 首發死 → 排重投(等重連)
+    await linkb.deliver(tui("session.interrupt", "01SID")); // 用戶中斷(abort 也會失敗,無妨)
+    connected = true; // 隨後 gateway 重連
+    await drive.retryTask;
+    // 首發 chat.send ×1 + interrupt 的 sessions.abort ×1;重投**沒有**發生
+    expect(calls.filter((c) => c.method === "chat.send").length).toBe(1);
+  });
+});

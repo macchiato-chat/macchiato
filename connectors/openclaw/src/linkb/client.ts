@@ -16,6 +16,10 @@ export class LinkBClient {
   private ready = false;
   /** #3 連續重連失敗計數(ready 歸零;指數退避 + 每 5 次告警)。 */
   private failures = 0;
+  /** 斷線期間的出站幀緩衝(重連 ready 後 flush)——server 部署重啟撞上進行中回合時,
+   * 回覆/標題曾被 send() 靜默丟掉(2026-07-12 影子會話實測)。有界:滿了丟最舊。 */
+  private readonly pending: string[] = [];
+  private static readonly PENDING_MAX = 500;
   private readonly handlers = new Set<FrameHandler>();
   private firstReady: (() => void) | null = null;
   private readonly readyOnce: Promise<void>;
@@ -74,6 +78,7 @@ export class LinkBClient {
       case "ready":
         this.ready = true;
         this.failures = 0; // #3 連上歸零
+        this.flushPending();
         if (this.firstReady) {
           this.firstReady();
           this.firstReady = null;
@@ -102,10 +107,29 @@ export class LinkBClient {
     }
   }
 
-  /** 發一個 Link B 幀；未連接則丟棄（鏡像有自己的水位線/nack 回退, 不在此緩存）。 */
+  /**
+   * 發一個 Link B 幀;斷線期間**緩衝**、ready 後按序 flush(此前直接丟——server 每次部署
+   * 重啟都會把撞上的回合尾巴丟掉,會話卡成「影子」)。鏡像幀例外:有自己的水位線/nack
+   * 回退,緩衝反而會與重發重複 → 照舊丟棄。
+   */
   send(msg: Record<string, unknown>): void {
     const ws = this.ws;
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+    if (ws && ws.readyState === WebSocket.OPEN && this.ready) {
+      ws.send(JSON.stringify(msg));
+      return;
+    }
+    if (msg.t === "mirror_append" || msg.t === "connector_health" || msg.t === "pong") return; // 有自愈/時效性,不緩衝
+    if (this.pending.length >= LinkBClient.PENDING_MAX) this.pending.shift(); // 有界:丟最舊
+    this.pending.push(JSON.stringify(msg));
+  }
+
+  /** ready 後把斷線期間積壓的幀按序補發。 */
+  private flushPending(): void {
+    if (!this.pending.length) return;
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    console.log(`· Link B 重連 → 補發斷線期間積壓的 ${this.pending.length} 幀`);
+    for (const f of this.pending.splice(0)) ws.send(f);
   }
 
   private onClose(): void {

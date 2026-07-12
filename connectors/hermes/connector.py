@@ -33,20 +33,21 @@ import json
 import mimetypes
 import os
 import re
-import shlex
-import shutil
 import ipaddress
 import socket
 import subprocess
 import sys
 import time
+import traceback
 import urllib.request
 from collections import deque
 from urllib.parse import urlparse
 
 import websockets
 
-from gateway_client import GatewayClient, GatewayError
+import hashlib
+
+from gateway_client import GatewayClient, GatewayDied, GatewayError
 from e2e_keys import E2EKeyStore
 from backfill import (
     count_importable,
@@ -57,13 +58,12 @@ from backfill import (
     keepable,
     cron_feed_target,
     session_snapshot,
-    _strip_sender_tag,
 )
 
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.3.1"
+CONNECTOR_VERSION = "1.4.0"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -332,6 +332,8 @@ class Connector:
         self._rev: dict[str, str] = {}  # real hermes session id -> server session id
         self._pending_interrupt: set[str] = set()  # 回合映射建立前到達的 session.interrupt：別丟，等回合起步即取消
         self._titled: set[str] = set()  # #94：已自動生成過標題的 server_sid（防會話內重複）
+        self._prompt_retried: set = set()  # #4：已重投過的 (sid, text 哈希)——每條 prompt 最多重投一次，防雙發
+        self._retry_tasks: dict = {}  # #4/#5：sid → 在途重投任務。用戶中斷時取消之——已停的 prompt 不許復活
         self._sdb = None  # 懶加載的 Hermes SessionDB（session.archive 用，寫 state.db.archived）
         self._mirror_task = None  # §15 持續鏡像 tailer 任務
         self._health_task = None  # 健康上報任務
@@ -346,6 +348,7 @@ class Connector:
         self._mirror_st = None  # 鏡像水位線狀態（nack 回退也要訪問）
         self._mirror_batch_id = 0
         self._mirror_rewind = deque(maxlen=64)  # (batchId, {sid: 舊floor})，供 nack 回退
+        self._out_pending: deque = deque(maxlen=500)  # 斷線期間出站幀緩衝(ready 後補發;有界丟最舊)
         self._e2e = E2EKeyStore()  # §19 per-session E2E 密鑰管理（持 K_S、封裝給設備、加解密內容）
         self._mirror_lock = None  # 鏡像輪詢 ↔ E2E 歷史回灌互斥（防舊 floor 追加與整段替換競態）
         # 自驅會話持久映射（server sid ↔ state.db id）。跨進程/gateway 重啟保留——E2E 鏡像投遞、
@@ -431,17 +434,10 @@ class Connector:
             await self.gw.close()
 
     async def _to_server(self, server_sid: str, frame: dict) -> None:
-        if self.ws is None:
-            return
-        try:
-            await self.ws.send(
-                json.dumps(
-                    {"t": "tui", "agentLinkId": self.agent_link_id, "sessionId": server_sid, "frame": frame},
-                    ensure_ascii=False,
-                )
-            )
-        except Exception as exc:
-            print(f"[to_server failed] {exc!r}", file=sys.stderr)
+        # 統一走 _send:斷線期間緩衝、ready 後補發(live 回合尾巴不再因 server 部署而丟)
+        await self._send(
+            {"t": "tui", "agentLinkId": self.agent_link_id, "sessionId": server_sid, "frame": frame}
+        )
 
     def _on_gateway_restart(self) -> None:
         # gateway 重啟後，舊 session 映射失效（新 gateway 無這些活躍會話）→ 清空，
@@ -656,9 +652,65 @@ class Connector:
         self._rev[real] = server_sid
         return real
 
+    async def _retry_prompt(self, server_sid: str, text: str, attachments: list | None = None) -> None:
+        """#4 prompt 級重試:gateway 死於 prompt.submit 在途 → 等重啟就緒後重投一次。
+
+        安全性:GatewayDied = 請求確定沒收到響應,且在途回合隨 gateway 進程一起死了
+        (turn 跑在 gateway 進程內)——重投不會造成 agent 跑兩個回合。
+        去重:同 (會話, 文本哈希) 只重投**一次**——重投路徑再死已是連環故障,寧丟勿雙發
+        (且 state.db 可能已落過一次 user 消息,二投會刷屏)。
+        映射:_on_gateway_restart 已清 _fwd/_rev → _ensure_session 走持久映射 resume,帶上下文。
+        非 audio 附件重新 attach(舊 gateway 進程裡 attach 的隨進程丟了);audio 的轉錄已折進 text。
+        """
+        key = (server_sid, hashlib.sha256(text.encode("utf-8")).hexdigest())
+        if key in self._prompt_retried:
+            print(f"[#4 重投已用過,放棄 {server_sid}]", file=sys.stderr)
+            return
+        if len(self._prompt_retried) > 512:  # 防無界(正常情況下極少進來)
+            self._prompt_retried.clear()
+        self._prompt_retried.add(key)
+        try:
+            deadline = time.monotonic() + 180  # 覆蓋 supervise 的重啟退避(3→60s);配置壞掉則放棄
+            while time.monotonic() < deadline:
+                if self.gw is not None and self.gw.ready():
+                    break
+                await asyncio.sleep(1.0)
+            else:
+                print(f"[#4 重投放棄:gateway 180s 未就緒 {server_sid}]", file=sys.stderr)
+                return
+            real = await self._ensure_session(server_sid)
+            for ref in attachments or []:
+                try:
+                    await self._attach_to_session(real, ref)
+                except Exception as exc:
+                    print(f"[#4 重投 attach 失敗 {ref.get('name')!r}] {exc!r}", file=sys.stderr)
+            try:
+                await self.gw.submit_prompt(real, text)
+            except GatewayError as exc:
+                if exc.code == 4009 and text:
+                    await self.gw.steer(real, text)
+                else:
+                    raise
+            print(f"· #4 prompt 重投成功 {server_sid}(gateway 死於在途,已補投)")
+        except Exception as exc:
+            print(f"[#4 重投失敗,放棄 {server_sid}] {exc!r}", file=sys.stderr)
+        finally:
+            # #5:出賬。CancelledError(用戶中斷取消重投)不落 except Exception,直接穿透——正確。
+            self._retry_tasks.pop(server_sid, None)
+
     async def _send(self, msg: dict) -> None:
+        """斷線期間**緩衝**、ready 後按序補發(此前直接丟——server 部署重啟撞上進行中回合,
+        回覆/標題被靜默丟掉,會話卡成「影子」,2026-07-12 實測)。鏡像/健康/pong 有自愈或時效性,照舊丟。"""
+        data = json.dumps(msg, ensure_ascii=False)
         if self.ws is not None:
-            await self.ws.send(json.dumps(msg, ensure_ascii=False))
+            try:
+                await self.ws.send(data)
+                return
+            except Exception as exc:
+                print(f"[send failed → 緩衝] {exc!r}", file=sys.stderr)
+        if msg.get("t") in ("mirror_append", "connector_health", "pong"):
+            return
+        self._out_pending.append(data)
 
     async def _start_push_socket(self) -> None:
         """§17 主動投遞：本地 unix socket 接 Hermes macchiato 插件的投遞請求 → 經 Link B 發 connector_push。"""
@@ -844,7 +896,7 @@ class Connector:
                 url = f"{base}/{path}"
                 if not url.startswith("https://"):
                     raise ValueError(f"拒絕非 https:{url}")
-                with urllib.request.urlopen(url, timeout=30) as r:  # noqa: S310(https 已強制)
+                with urllib.request.urlopen(url, timeout=30) as r:  # noqa: S310  # https 已強制
                     return r.read()
 
             manifest_bytes = fetch("release.json")
@@ -1147,6 +1199,14 @@ class Connector:
         if t == "ready":
             self._linkb_state = "connected"
             print("✓ link B ready — 連接器上線，等待 server 下達")
+            if self._out_pending and self.ws is not None:
+                n = len(self._out_pending)
+                try:
+                    while self._out_pending:
+                        await self.ws.send(self._out_pending.popleft())
+                    print(f"· 重連 → 補發斷線期間積壓的 {n} 幀")
+                except Exception as exc:
+                    print(f"[積壓補發失敗,剩 {len(self._out_pending)}] {exc!r}", file=sys.stderr)
             await self._advertise_import()
             return
         if t == "auth_error":
@@ -1244,6 +1304,14 @@ class Connector:
                 if final_text or non_audio or not attachments:
                     try:
                         await self.gw.submit_prompt(real, final_text)
+                    except GatewayDied:
+                        # #4:gateway 死於 prompt 在途——請求確定沒完成(在途回合也隨進程死了)。
+                        # 後台等 gateway 重啟就緒後重投一次(去重見 _retry_prompt),你那句話不再石沉。
+                        # 不 await:重啟可能要幾十秒,別堵住 Link B 的分派循環。
+                        non_audio_refs = [r for r in attachments if r.get("kind") != "audio"]
+                        self._retry_tasks[server_sid] = asyncio.create_task(
+                            self._retry_prompt(server_sid, final_text, non_audio_refs)
+                        )
                     except GatewayError as exc:
                         # 回合進行中（4009 session busy）→ steer 把跟進消息注入正在跑的回合（方案 D），
                         # 不丟、不打斷；模型在下一次工具迭代時看到。純圖無文字無法 steer → 照舊上拋記日誌。
@@ -1268,6 +1336,11 @@ class Connector:
                     {"session_id": real, "choice": params.get("choice", "deny"), "all": params.get("all", False)},
                 )
             elif method == "session.interrupt":
+                # #5:重投等待期(#4)收到中斷 → 取消重投——用戶已叫停的 prompt 不許復活雙發。
+                rt = self._retry_tasks.pop(server_sid, None)
+                if rt is not None and not rt.done():
+                    rt.cancel()
+                    print(f"· 用戶中斷 → 取消待重投 prompt({server_sid})")
                 real = self._fwd.get(server_sid)
                 if real:
                     await self.gw.interrupt(real)
@@ -1283,7 +1356,10 @@ class Connector:
             # session.retitle 已廢棄:改由首次 prompt.submit 自動生成標題(見上)。
             # session.delete / others: ignore for now
         except Exception as exc:
+            # 兜底保連接器不被單幀弄死;但打全 traceback——#129 那次 AttributeError(編程錯誤)
+            # 只剩一行 repr,測試斷言拿到空列表卻看不出錯在哪行。
             print(f"[dispatch {method} failed] {exc!r}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
 
 
 async def _main() -> int:

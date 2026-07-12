@@ -15,6 +15,7 @@
  * ⚠️ 續聊渠道會話（discord key）的回覆是否會同時投遞到該渠道 —— chat.send 無 deliver 參數
  *（sessions.send 也實測拒收 deliver）, 待真機驗證；probe 證明無綁定 key 是乾淨的。
  */
+import { createHash } from "node:crypto";
 import type { LinkBClient } from "../linkb/client";
 import type { OpenClawGateway, GatewayEvent } from "./gateway";
 import { keyForSid, sidForKey, type Mirror } from "./mirror";
@@ -43,6 +44,14 @@ export class Drive {
 
   /** #113 已自動生成過標題的 sid(持久,重啟不重生、不覆蓋用戶手改)。 */
   private readonly titled = loadTitled();
+
+  /** #4 已重投過的 `sid:text哈希`——每條 prompt 最多重投一次,寧丟勿雙發。 */
+  private readonly promptRetried = new Set<string>();
+  /** #4 最近一次重投任務(測試 await 用;生產無人等)。 */
+  retryTask: Promise<void> | null = null;
+  /** #5 重投等待中的 key;用戶中斷時據此標記取消——已叫停的 prompt 不許復活雙發。 */
+  private readonly retryWaiting = new Set<string>();
+  private readonly retryCancelled = new Set<string>();
 
   constructor(
     private readonly gw: OpenClawGateway,
@@ -137,19 +146,15 @@ export class Drive {
             saveTitled(this.titled);
             void this.autoTitle(sid, text);
           }
-          if (this.active.has(key)) {
-            const r = await this.gw.request("sessions.steer", { key, message: text });
-            console.log(`· Turn in progress → steering follow-up into (${key}, status=${r?.status})`);
-          } else {
-            await this.gw.request("chat.send", {
-              sessionKey: key,
-              message: text,
-              idempotencyKey: `mc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            });
-          }
+          await this.sendPrompt(key, sid, text);
           return;
         }
         case "session.interrupt":
+          // #5:重投等待期(#4)收到中斷 → 標記取消重投。
+          if (this.retryWaiting.has(key)) {
+            this.retryCancelled.add(key);
+            console.log(`· 用戶中斷 → 取消待重投 prompt(${key})`);
+          }
           await this.gw.request("sessions.abort", { key });
           return;
         case "session.create":
@@ -160,6 +165,66 @@ export class Drive {
       }
     } catch (e) {
       console.error(`[drive ${frame.method} failed for ${sid}] ${(e as Error).message}`);
+    }
+  }
+
+  /** #4:提交 prompt(回合進行中 → steer 注入);連接死於在途 → 排一次重投。 */
+  private async sendPrompt(key: string, sid: string, text: string): Promise<void> {
+    const idem = `mc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      if (this.active.has(key)) {
+        const r = await this.gw.request("sessions.steer", { key, message: text });
+        console.log(`· Turn in progress → steering follow-up into (${key}, status=${r?.status})`);
+      } else {
+        await this.gw.request("chat.send", { sessionKey: key, message: text, idempotencyKey: idem });
+      }
+    } catch (e) {
+      const m = (e as Error).message ?? "";
+      // 只重投「連接死亡」類失敗(請求確定沒送達)。timeout 不重投:daemon 可能仍在處理,
+      // steer 無冪等鍵,重投有雙發風險——寧丟勿雙發。業務錯誤(gateway error: …)照舊上拋記日誌。
+      if (!m.includes("gateway connection lost") && !m.includes("gateway not connected")) throw e;
+      this.retryTask = this.retryPrompt(key, sid, text, idem);
+    }
+  }
+
+  /** #4 prompt 級重試:等 gateway 重連後重投一次。
+   * 去重雙保險:① promptRetried 本地記賬,同 (sid, 文本) 只重投一次;
+   * ② chat.send 帶**原 idempotencyKey**——即使首發實際已進 daemon(理論窗口),OpenClaw 冪等去重。
+   * 重投一律走 chat.send 不走 steer:斷線期間 lifecycle 事件丟失,active 表不可信;
+   * 且重連通常意味 daemon 重啟、舊 run 已死。 */
+  private async retryPrompt(key: string, sid: string, text: string, idem: string): Promise<void> {
+    const rkey = `${sid}:${createHash("sha256").update(text).digest("hex")}`;
+    if (this.promptRetried.has(rkey)) {
+      console.error(`[#4 重投已用過,放棄 ${sid}]`);
+      return;
+    }
+    if (this.promptRetried.size > 512) this.promptRetried.clear(); // 防無界(正常極少進來)
+    this.promptRetried.add(rkey);
+    this.retryWaiting.add(key);
+    try {
+      const deadline = Date.now() + 180_000; // 覆蓋重連退避(3→60s);gateway 真沒了則放棄
+      while (Date.now() < deadline && !this.gw.isConnected) {
+        if (this.retryCancelled.has(key)) {
+          console.log(`[#5 重投已被用戶中斷取消 ${sid}]`);
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      if (this.retryCancelled.has(key)) {
+        console.log(`[#5 重投已被用戶中斷取消 ${sid}]`);
+        return;
+      }
+      if (!this.gw.isConnected) {
+        console.error(`[#4 重投放棄:gateway 180s 未重連 ${sid}]`);
+        return;
+      }
+      await this.gw.request("chat.send", { sessionKey: key, message: text, idempotencyKey: idem });
+      console.log(`· #4 prompt 重投成功 (${key},gateway 死於在途,已補投)`);
+    } catch (e) {
+      console.error(`[#4 重投失敗,放棄 ${sid}] ${(e as Error).message}`);
+    } finally {
+      this.retryWaiting.delete(key);
+      this.retryCancelled.delete(key);
     }
   }
 

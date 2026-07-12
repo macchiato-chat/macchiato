@@ -50,6 +50,12 @@ class GatewayError(Exception):
         self.message = message
 
 
+class GatewayDied(GatewayError):
+    """#4:gateway 進程死亡/傳輸中斷導致的請求失敗——請求**確定沒有完成**（沒收到響應），
+    且死亡把在途回合一併帶走。與業務錯誤（gateway 正常回的 error 幀）區分開,
+    上層可安全重投(prompt 級重試)。注意 close() 的「client closed」不算——那是主動關停。"""
+
+
 class GatewayClient:
     def __init__(
         self,
@@ -130,7 +136,7 @@ class GatewayClient:
             for task in (self._reader_task, self._stderr_task):
                 if task is not None:
                     task.cancel()
-            self._fail_all(GatewayError(-1, "gateway restarting"))
+            self._fail_all(GatewayDied(-1, "gateway restarting"))
             try:
                 await self._spawn()
                 await asyncio.wait_for(self._ready.wait(), 20.0)
@@ -155,6 +161,10 @@ class GatewayClient:
     def is_alive(self) -> bool:
         """gateway 子進程是否在運行（健康上報用）。"""
         return self._proc is not None and self._proc.returncode is None
+
+    def ready(self) -> bool:
+        """進程活著且已收到 gateway.ready（重啟期間為 False）。#4 prompt 重投等這個。"""
+        return self.is_alive() and self._ready.is_set()
 
     async def close(self) -> None:
         if self._closed:
@@ -207,7 +217,7 @@ class GatewayClient:
         except asyncio.CancelledError:
             return
         finally:
-            self._fail_all(GatewayError(-1, "gateway stdout closed"))
+            self._fail_all(GatewayDied(-1, "gateway stdout closed"))
 
     async def _read_stderr(self) -> None:
         assert self._proc and self._proc.stderr
@@ -272,8 +282,13 @@ class GatewayClient:
         self._pending[rid] = fut
 
         frame = {"jsonrpc": "2.0", "method": method, "params": params or {}, "id": rid}
-        proc.stdin.write((json.dumps(frame, ensure_ascii=False) + "\n").encode("utf-8"))
-        await proc.stdin.drain()
+        try:
+            proc.stdin.write((json.dumps(frame, ensure_ascii=False) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+        except (OSError, ConnectionError) as exc:
+            # 死亡窗口期寫入死管道(supervise 尚未換新進程)→ 同樣是「確定沒送達」,歸 GatewayDied。
+            self._pending.pop(rid, None)
+            raise GatewayDied(-1, f"gateway write failed: {exc!r}")
 
         try:
             return await asyncio.wait_for(fut, timeout or self.request_timeout)

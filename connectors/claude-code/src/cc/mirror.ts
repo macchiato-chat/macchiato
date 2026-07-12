@@ -94,6 +94,16 @@ export class Mirror {
    * 自動恢復全量鏡像。修「後台任務輸出冒出同名新會話」（2026-07-11 實測）。
    */
   private readonly internalAt = new Map<string, number>();
+  /**
+   * #56 二期：鏡像側工作態偵測（終端側回合沒有流式事件，busy 只有輪詢看得出）。
+   * busy = 文件較上輪增長 ∨（尾部未結算 且 距最近增長 <90s——防 agent 死於工具中途的
+   * 30 分鐘殭屍動畫；長工具靜默期會提前歸靜、結果落盤再亮，取捨）。連續 2 輪安靜才轉 idle
+   * （防抖）；busy 期間每輪重申（server 端 20s TTL 兜底連接器崩潰）。全部內存態，重啟重測。
+   */
+  private readonly lastSizeAt = new Map<string, number>();
+  private readonly lastGrowthAt = new Map<string, number>();
+  private readonly busySids = new Set<string>();
+  private readonly quietPolls = new Map<string, number>();
   lastPollAt = Date.now();
   lastError: string | null = null;
   private polling = false;
@@ -176,6 +186,8 @@ export class Mirror {
   private doPoll(): void {
     if (!this.linkb.isReady) return;
 
+    const now = Date.now();
+    const activity: Array<{ hermesSessionId: string; busy: boolean }> = [];
     for (const { sid, file } of discoverSessions()) {
       let size: number;
       try {
@@ -183,12 +195,20 @@ export class Mirror {
       } catch {
         continue;
       }
+      // #56 增長偵測（首見——含連接器剛啟動——不算增長，避免啟動即全體亮）。
+      const prevSize = this.lastSizeAt.get(sid);
+      this.lastSizeAt.set(sid, size);
+      const grew = prevSize !== undefined && size !== prevSize;
+      if (grew) this.lastGrowthAt.set(sid, now);
       // 未知會話 → 從 0 全量鏡像（完整歷史，這是相對官方 remote control 的核心——自動看到所有會話；
       // 不再 baseline 到文件末依賴手動 import。srcId 去重保證重發安全、新會話為空插入順序正確）。
       if (!(sid in this.state.offsets)) this.state.offsets[sid] = 0;
 
       if (this.drivenSids.has(sid)) {
         this.state.offsets[sid] = size; // live 獨佔投遞：只快進
+        // driven 回合的工作態由 live 路徑權威投遞——鏡像側靜默讓路（不發 false 防踩 live 的 true）。
+        this.busySids.delete(sid);
+        this.quietPolls.delete(sid);
         continue;
       }
       // 已判定的內部 fork 檔且沒長 → 不重讀。
@@ -221,6 +241,28 @@ export class Mirror {
         if (consumedUpTo <= off) break; // 無進展（尾部全 in-flight）→ 下輪 poll
         this.state.offsets[sid] = consumedUpTo;
       }
+
+      // #56 工作態結算（內部 fork 檔不算——它們不是 server 端的真會話）。
+      if (!this.internalAt.has(sid)) {
+        const inFlight = (this.state.offsets[sid] ?? 0) < size;
+        const recentGrowth = now - (this.lastGrowthAt.get(sid) ?? 0) < 90_000;
+        if (grew || (inFlight && recentGrowth)) {
+          this.quietPolls.set(sid, 0);
+          this.busySids.add(sid);
+          activity.push({ hermesSessionId: sid, busy: true }); // 轉變即生效、重申供 server TTL 續命
+        } else if (this.busySids.has(sid)) {
+          const quiet = (this.quietPolls.get(sid) ?? 0) + 1;
+          this.quietPolls.set(sid, quiet);
+          if (quiet >= 2) {
+            this.busySids.delete(sid);
+            this.quietPolls.delete(sid);
+            activity.push({ hermesSessionId: sid, busy: false });
+          }
+        }
+      }
+    }
+    if (activity.length) {
+      this.linkb.send({ t: "mirror_activity", agentLinkId: this.linkb.agentLinkId, sessions: activity });
     }
     this.save();
   }
