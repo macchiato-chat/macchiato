@@ -189,6 +189,20 @@ describe("Mirror", () => {
     expect(batch?.title).toBe("P4改為拍手"); // 寫回的標題被保留
   });
 
+  it("第二道守衛:driven 過的 CLI 會話,即便有 user 續問也不單獨建鏡像會話;兜底計數恆 0", () => {
+    setupEnv();
+    writeFileSync(file, "");
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb);
+    m.markDrivenUuid(SID); // 標記:此 CLI uuid 被 Macchiato 驅動過
+    (m as any).doPoll();
+    // 終端裡真人續問(有 user)——但因為是 driven 過的 uuid,鏡像永不單獨建會話
+    writeFileSync(file, userLine("終端續問") + assistantLine("回覆"));
+    (m as any).doPoll();
+    expect(appends(sent)).toHaveLength(0);
+    expect(m.counters.mirrorGhostBlocked).toBe(0); // 主守衛悄悄攔在 emit 前,絆線不觸發
+  });
+
   it("連接器啟動後新建的會話 → 從 0 全量鏡像(claude -p 短會話不丟)", async () => {
     setupEnv();
     const { linkb, sent } = fakeLinkb();

@@ -227,6 +227,9 @@ export class Drive {
     this.cwds = state.cwds;
     this.permModes = state.permModes;
     this.models = state.models;
+    // 影子兜底:啟動時把既有 ULID→CLI 映射的 CLI uuid 全灌給鏡像(跨重啟持久),鏡像據此永不給
+    // 這些「被驅動過」的 CLI 會話單獨建會話(防重啟後污染態丟失又復發)。
+    for (const cc of Object.values(this.map)) this.mirror?.markDrivenUuid(cc);
   }
 
   /** #98 該會話當前 SDK 權限模式 + 編輯自動批策略。UI 檔優先,回退 env(逃生門)。permKey=通道重建判據。 */
@@ -682,7 +685,8 @@ export class Drive {
         this.map[sid] = m.session_id;
         this.saveMap();
       }
-      this.mirror?.setDriven(m.session_id);
+      this.mirror?.setDriven(m.session_id); // 本回合 live 獨佔(per-turn)
+      this.mirror?.markDrivenUuid(m.session_id); // 影子兜底:永久登記此 CLI uuid 為「被驅動過」
       return;
     }
     // #97 後台任務(subagent + run_in_background bash 統一走 task_*):展示進度/完成。E2E 會話

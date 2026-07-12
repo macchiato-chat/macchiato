@@ -92,6 +92,13 @@ export class Mirror {
   private readonly rewind: Array<{ id: number; prev: Record<string, number> }> = [];
   private readonly drivenSids = new Set<string>();
   /**
+   * 影子 session 兜底(第二道防護,2026-07-13):**曾被 Macchiato 驅動過**的 CLI 會話 uuid(持久,
+   * 由 Drive 從 ULID→CLI 映射灌入,跨重啟)。driven 會話的正文由 live 在 ULID 下獨佔投遞,鏡像
+   * **永遠不該**給這些 uuid 單獨建會話——不管是殘片還是終端續問(極少見,取捨)。與「無 user 不建」
+   * 是雙保險;真觸發 emit 即記 mirrorGhostBlocked 計數 + 錯誤日誌(自檢告警,漏了當場可見)。
+   */
+  private readonly drivenUuids = new Set<string>();
+  /**
    * 內部 fork 檔（subagent / 後台任務）：CC 會把它們寫成獨立 <uuid>.jsonl（繼承父會話標題
    * 元數據、**無任何真人消息**）。首次鏡像（水位線 0）折不出 user 消息 → 判內部檔，跳過且
    * 不推水位線；記 size，檔沒長就不重讀。若將來用戶真在該會話說話（size 變 + 出現 user），
@@ -111,7 +118,13 @@ export class Mirror {
   lastPollAt = Date.now();
   lastError: string | null = null;
   /** #10:累計計數(進程生命週期),健康上報帶出。 */
-  readonly counters: Record<string, number> = { mirrorBatches: 0, mirrorMessages: 0, mirrorNacks: 0, mirrorErrors: 0 };
+  readonly counters: Record<string, number> = {
+    mirrorBatches: 0,
+    mirrorMessages: 0,
+    mirrorNacks: 0,
+    mirrorErrors: 0,
+    mirrorGhostBlocked: 0, // 影子 session 兜底:攔下的「為 driven CLI 會話憑空建會話」次數(正常應恆 0)
+  };
   private polling = false;
 
   constructor(
@@ -137,6 +150,12 @@ export class Mirror {
 
   setDriven(sid: string): void {
     this.drivenSids.add(sid);
+  }
+
+  /** 影子兜底(2026-07-13):登記「曾被 Macchiato 驅動」的 CLI 會話 uuid(持久)。Drive 在 init 存
+   * ULID→CLI 映射時、及啟動時從既有映射批量灌入。鏡像據此永不給這些 uuid 單獨建會話。 */
+  markDrivenUuid(cliUuid: string): void {
+    if (cliUuid) this.drivenUuids.add(cliUuid);
   }
 
   /**
@@ -242,7 +261,9 @@ export class Mirror {
         //       「只有 title、零消息」的批次,會走下面 `newTitle` 分支 emit 出去憑空建會話。故**不能加
         //       `messages.length` 條件**（那樣 title-only 批次繞過守衛,2026-07-13 實測復發）。
         // 真會話首批必含首條 user prompt,故不受影響;殘片會話後續出現真 user 即恢復全量鏡像。
-        if (!this.state.titles[sid] && !messages.some((m) => m.role === "user")) {
+        // 第二道(2026-07-13):`drivenUuids.has(sid)` —— 曾被 Macchiato 驅動的 CLI 會話**永不**單獨建
+        // 鏡像會話(其正文由 live 在 ULID 下獨佔投遞),連「有 user 的終端續問」也不建(極少見,取捨)。
+        if (!this.state.titles[sid] && (this.drivenUuids.has(sid) || !messages.some((m) => m.role === "user"))) {
           this.internalAt.set(sid, size);
           break;
         }
@@ -253,8 +274,18 @@ export class Mirror {
         const candidate = title ?? (this.state.titles[sid] ? undefined : firstUser);
         const newTitle = candidate && candidate !== this.state.titles[sid] ? candidate : undefined;
         if (messages.length || newTitle) {
-          this.sendOne(sid, this.entry(sid, newTitle ?? this.state.titles[sid] ?? "Claude Code", messages), off);
-          if (newTitle) this.state.titles[sid] = newTitle;
+          // 兜底自檢(2026-07-13):若竟為 driven CLI 會話走到「首次 emit(=建會話)」,說明上面兩道守衛
+          // 有洞——這正是影子 session。阻止落地 + 記 mirrorGhostBlocked(健康上報帶出;正常恆 0,非 0=有洞
+          // 當場可見)+ 錯誤日誌。正常路徑上這永遠不觸發(主守衛已攔)——它是防未來回歸的絆線。
+          if (!this.state.titles[sid] && this.drivenUuids.has(sid)) {
+            this.counters.mirrorGhostBlocked += 1;
+            console.error(
+              `[mirror] ⚠️ 影子 session 兜底觸發:阻止為 driven CLI 會話 ${sid} 憑空建鏡像會話(守衛有洞?mirrorGhostBlocked=${this.counters.mirrorGhostBlocked})`,
+            );
+          } else {
+            this.sendOne(sid, this.entry(sid, newTitle ?? this.state.titles[sid] ?? "Claude Code", messages), off);
+            if (newTitle) this.state.titles[sid] = newTitle;
+          }
         }
         if (consumedUpTo <= off) break; // 無進展（尾部全 in-flight）→ 下輪 poll
         this.state.offsets[sid] = consumedUpTo;
