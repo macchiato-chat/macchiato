@@ -28,7 +28,7 @@ The installer will:
 1. auto-detect your agent(s) — Hermes, OpenClaw, Claude Code and/or Codex,
 2. download the connector to `~/.macchiato/app/`,
 3. show a **pairing code** — enter it at [macchiato.chat](https://macchiato.chat) to claim this connector,
-4. install a `systemd` user service so it runs 24/7,
+4. install a background service so it runs 24/7 (Linux: `systemd` user service; macOS: launchd LaunchAgent),
 5. install the agent-side plugin (Hermes platform plugin / OpenClaw channel plugin) so your agent can message you proactively — restart your agent's gateway to load it.
 
 **Requirements:** a working [Hermes](https://github.com/NousResearch), [OpenClaw](https://openclaw.ai) or [Claude Code](https://claude.com/claude-code) or [Codex](https://developers.openai.com/codex) install and a Macchiato account.
@@ -37,7 +37,7 @@ The installer will:
 
 **Platforms & Hermes install methods:**
 - **Linux (incl. Raspberry Pi, WSL2)** — fully supported; systemd service installed automatically.
-- **macOS** — supported; no systemd, so the installer prints a command to keep the connector running yourself (launchd support planned).
+- **macOS** — fully supported; the installer sets up a launchd LaunchAgent automatically (logs: `~/.macchiato/logs/`).
 - **Windows (native)** — not supported yet; please run Hermes + connector under **WSL2**.
 - Hermes installed via the **official one-liner, pipx, pip, or uv** are all auto-detected (any layout where `hermes` is on PATH works). Exotic setups: set `HERMES_PYTHON=<path to your Hermes venv's python>`.
 

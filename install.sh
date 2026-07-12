@@ -3,7 +3,8 @@
 #   curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh | bash
 #
 # Auto-detects which agent(s) you run — Hermes, OpenClaw, Claude Code and/or Codex — and installs
-# the matching connector(s): download → pair (one-time code) → systemd user service.
+# the matching connector(s): download → pair (one-time code) → background service
+# (Linux: systemd user service; macOS: launchd LaunchAgent).
 #
 # Env overrides:
 #   MACCHIATO_SERVER_URL   (default wss://api.macchiato.chat/connector)
@@ -24,6 +25,63 @@ warn() { printf '\033[1;33m[macchiato]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[macchiato] FAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 
 have_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
+have_launchd() { [ "$(uname -s)" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; }
+
+# macOS (#15): launchd LaunchAgent — KeepAlive restarts on crash/exit (same semantics
+# as systemd Restart=always; self-update exits after swapping code and relies on this).
+install_launchd_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
+  local label="chat.macchiato.$1"
+  local agents="$HOME/Library/LaunchAgents" logs="$HOME/.macchiato/logs"
+  local plist="$agents/$label.plist"
+  mkdir -p "$agents" "$logs"
+  # launchd gives agents a minimal PATH — resolve node's dir at install time so
+  # `#!/usr/bin/env node` shebangs (tsx) keep working. Hermes python is absolute already.
+  local path_env="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+  command -v node >/dev/null 2>&1 && path_env="$(dirname "$(command -v node)"):$path_env"
+  # Honor MACCHIATO_UNIT_EXTRA_ENV (same contract as the systemd branch): PATH lines are
+  # merged in front of our default; other KEY=VALUE lines become their own plist entries.
+  local extra_env=""
+  if [ -n "${MACCHIATO_UNIT_EXTRA_ENV:-}" ]; then
+    while IFS= read -r kv; do
+      [ -n "$kv" ] || continue
+      case "$kv" in
+        PATH=*) path_env="${kv#PATH=}:$path_env" ;;
+        *) extra_env="$extra_env    <key>${kv%%=*}</key><string>${kv#*=}</string>
+" ;;
+      esac
+    done <<< "$MACCHIATO_UNIT_EXTRA_ENV"
+  fi
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    echo '<plist version="1.0"><dict>'
+    echo "  <key>Label</key><string>$label</string>"
+    echo '  <key>ProgramArguments</key><array>'
+    local arg
+    for arg in $2; do echo "    <string>$arg</string>"; done # our ExecStarts are simple "bin path" pairs
+    echo '  </array>'
+    [ -n "${3:-}" ] && echo "  <key>WorkingDirectory</key><string>$3</string>"
+    echo '  <key>RunAtLoad</key><true/>'
+    echo '  <key>KeepAlive</key><true/>'
+    echo '  <key>EnvironmentVariables</key><dict>'
+    echo "    <key>PATH</key><string>$path_env</string>"
+    echo '    <key>PYTHONUNBUFFERED</key><string>1</string>'
+    [ -n "$extra_env" ] && printf '%s' "$extra_env"
+    [ -n "${MACCHIATO_SERVER_URL:-}" ] && echo "    <key>MACCHIATO_SERVER_URL</key><string>$MACCHIATO_SERVER_URL</string>"
+    echo '  </dict>'
+    echo "  <key>StandardOutPath</key><string>$logs/$1.log</string>"
+    echo "  <key>StandardErrorPath</key><string>$logs/$1.log</string>"
+    echo '</dict></plist>'
+  } > "$plist"
+  local domain
+  domain="gui/$(id -u)"
+  # bootout first so re-running the installer to UPDATE loads the fresh code (mirrors
+  # the systemd `restart` note below); ignore "not loaded" on first install.
+  launchctl bootout "$domain/$label" 2>/dev/null || true
+  launchctl bootstrap "$domain" "$plist" || fail "launchctl bootstrap failed for $label (try: launchctl bootstrap $domain $plist)"
+  launchctl enable "$domain/$label" 2>/dev/null || true
+  say "LaunchAgent $label running ✓   Update anytime by re-running this installer. Logs: tail -f $logs/$1.log"
+}
 
 # ── supply-chain check (#1): when MACCHIATO_MANIFEST is set (signed release.json already
 # verified by the connector), every file we are about to install must hash-match it. ──
@@ -48,7 +106,11 @@ verify_tree() { # $1=dir under $TMP  $2=repo-relative prefix (e.g. connectors/he
 
 install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
   if ! have_systemd; then
-    warn "No systemd here — keep this running yourself:  $2"
+    if have_launchd; then
+      install_launchd_unit "$@"
+      return 0
+    fi
+    warn "No systemd or launchd here — keep this running yourself:  $2"
     return 0
   fi
   mkdir -p "$UNIT_DIR"
