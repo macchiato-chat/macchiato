@@ -70,6 +70,8 @@ export class Drive {
   private map: Record<string, string>;
   /** serverSid → 會話工作目錄。 */
   private cwds: Record<string, string>;
+  /** #143 serverSid → 會話 model(session.create.model 下發;持久,同文件存)。 */
+  private models: Record<string, string>;
   /** sid → 進行中回合。 */
   private readonly active = new Map<string, Turn>();
   /** sid → 排隊的後續 prompt。 */
@@ -88,7 +90,16 @@ export class Drive {
     const st = this.loadState();
     this.map = st.map;
     this.cwds = st.cwds;
+    this.models = st.models;
     this.titled = st.titled;
+  }
+
+  /**
+   * #143 該會話當前 model:per-session 選擇優先,回退 env `MACCHIATO_CODEX_MODEL`,都無 →
+   * undefined(不傳 -m,用 codex 自身配置默認)。絕不 hardcode(鐵律)——只透傳用戶所選。
+   */
+  private modelFor(sid: string): string | undefined {
+    return this.models[sid] || process.env.MACCHIATO_CODEX_MODEL || undefined;
   }
 
   wire(): void {
@@ -179,6 +190,13 @@ export class Drive {
             else delete this.cwds[sid];
             this.saveMap();
           }
+          // #143 model(upsert;隨時可改)。空 = 清回連接器默認(env / codex 配置)。自由字符串,只透傳。
+          const md = typeof params.model === "string" ? params.model.trim() : "";
+          if (md ? this.models[sid] !== md : this.models[sid] !== undefined) {
+            if (md) this.models[sid] = md;
+            else delete this.models[sid];
+            this.saveMap();
+          }
           if (cwd && !this.e2e?.isE2E(sid) && !isDir(this.cwdFor(sid))) {
             this.emit(sid, "review.summary", { summary: `⚠️ 工作目錄不存在或不是目錄:${this.cwdFor(sid)}(連接器主機上)` });
           }
@@ -206,10 +224,13 @@ export class Drive {
     const isFirstMacchiatoTurn = !resume && !UUID_RE.test(sid) && !isE2E;
     if (isFirstMacchiatoTurn && !this.titled.has(sid)) void this.maybeTitle(sid, text);
 
-    // exec 級標誌(--json/-s/-C/--skip-git-repo-check)是 `exec` 的選項,必須放在 `resume`
+    // exec 級標誌(--json/-s/-C/--skip-git-repo-check/-m)是 `exec` 的選項,必須放在 `resume`
     // 子命令**之前**(codex exec resume 不接這些,實測 2026-07-12)。
-    //   codex exec --json --skip-git-repo-check -s <sandbox> -C <cwd> [resume <id>] <prompt>
+    //   codex exec --json --skip-git-repo-check -s <sandbox> -C <cwd> [-m <model>] [resume <id>] <prompt>
     const args = ["exec", "--json", "--skip-git-repo-check", "-s", sandboxMode(), "-C", cwd];
+    // #143 per-session model(空 = 不傳 -m,用 codex 自身配置默認;絕不 hardcode)。放 resume 之前。
+    const model = this.modelFor(sid);
+    if (model) args.push("-m", model);
     if (resume) args.push("resume", resume);
     args.push(text);
     const proc = spawn(resolveCodexBin(), args, {
@@ -371,19 +392,32 @@ export class Drive {
     this.linkb.send({ t: "mirror_append", agentLinkId: this.linkb.agentLinkId, sessions: [{ hermesSessionId: sid, source: "codex", e2e: true, messages: msgs }] });
   }
 
-  private loadState(): { map: Record<string, string>; cwds: Record<string, string>; titled: Set<string> } {
+  private loadState(): {
+    map: Record<string, string>;
+    cwds: Record<string, string>;
+    models: Record<string, string>;
+    titled: Set<string>;
+  } {
     try {
       const p = JSON.parse(readFileSync(mapPath(), "utf8"));
-      return { map: p.map ?? {}, cwds: p.cwds ?? {}, titled: new Set<string>(Array.isArray(p.titled) ? p.titled : []) };
+      return {
+        map: p.map ?? {},
+        cwds: p.cwds ?? {},
+        models: p.models ?? {}, // #143
+        titled: new Set<string>(Array.isArray(p.titled) ? p.titled : []),
+      };
     } catch {
-      return { map: {}, cwds: {}, titled: new Set() };
+      return { map: {}, cwds: {}, models: {}, titled: new Set() };
     }
   }
   private saveMap(): void {
     try {
       mkdirSync(dirname(mapPath()), { recursive: true });
       const tmp = `${mapPath()}.tmp`;
-      writeFileSync(tmp, JSON.stringify({ v: 1, map: this.map, cwds: this.cwds, titled: [...this.titled] }));
+      writeFileSync(
+        tmp,
+        JSON.stringify({ v: 1, map: this.map, cwds: this.cwds, models: this.models, titled: [...this.titled] }),
+      );
       renameSync(tmp, mapPath());
     } catch (e) {
       console.error("[session map save failed]", (e as Error).message);

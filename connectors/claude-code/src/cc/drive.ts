@@ -179,6 +179,8 @@ interface Channel {
   cwd: string;
   /** #98 通道創建時的權限模式(UI 檔或 env 兜底標記;變更 → 同 cwd 重建通道)。 */
   permKey: string;
+  /** #143 通道創建時的 model(per-session 選擇或 env 兜底;變更 → 重建通道)。 */
+  modelKey: string;
   input: PushStream<unknown>;
   q: Query;
   turn?: TurnCtx;
@@ -196,6 +198,8 @@ export class Drive {
   private cwds: Record<string, string>;
   /** #98 serverSid → UI 權限檔（session.create.permissionMode 下發；持久，同文件存）。 */
   private permModes: Record<string, string>;
+  /** #143 serverSid → 會話 model（session.create.model 下發；持久，同文件存）。 */
+  private models: Record<string, string>;
   /** #118 sid → 長活通道。 */
   private readonly channels = new Map<string, Channel>();
   /** sid → 排隊的後續 prompt（回合進行中收到的;#118 起可含原生塊數組）。 */
@@ -222,6 +226,7 @@ export class Drive {
     this.map = state.map;
     this.cwds = state.cwds;
     this.permModes = state.permModes;
+    this.models = state.models;
   }
 
   /** #98 該會話當前 SDK 權限模式 + 編輯自動批策略。UI 檔優先,回退 env(逃生門)。permKey=通道重建判據。 */
@@ -233,6 +238,18 @@ export class Drive {
     }
     const env = permissionMode();
     return { sdk: env, editAuto: false, permKey: `env:${env ?? "ask"}` };
+  }
+
+  /**
+   * #143 該會話當前 model:per-session 選擇優先,回退 env `MACCHIATO_CC_MODEL`(逃生門),
+   * 都無 → undefined(不傳 model,用 CLI 配置默認)。絕不 hardcode(鐵律)——列表由 web 端提供,
+   * 連接器只透傳用戶所選。返回 undefined 時通道 modelKey="default"。
+   */
+  private resolveModel(sid: string): string | undefined {
+    const ui = this.models[sid];
+    if (ui) return ui;
+    const env = process.env.MACCHIATO_CC_MODEL;
+    return env || undefined;
   }
 
   wire(): void {
@@ -421,9 +438,24 @@ export class Drive {
             this.saveMap();
             console.log(`· session.create ${sid} permissionMode=${validPm || "(env default)"}`);
           }
-          // #98/#118 cwd 或權限是通道創建參數:閒置通道立即重建生效;回合進行中的留給回合末。
+          // #143 model(upsert;隨時可改)。空 = 清回連接器默認(env / CLI 配置)。自由字符串——
+          // 不校驗枚舉(支持別名 opus/sonnet/haiku 或完整 id),連接器只透傳。
+          const md = typeof params.model === "string" ? params.model.trim() : "";
+          if (md ? this.models[sid] !== md : this.models[sid] !== undefined) {
+            if (md) this.models[sid] = md;
+            else delete this.models[sid];
+            this.saveMap();
+            console.log(`· session.create ${sid} model=${md || "(default)"}`);
+          }
+          // #98/#118/#143 cwd/權限/model 是通道創建參數:閒置通道立即重建生效;回合進行中的留給回合末。
           const ch = this.channels.get(sid);
-          if (ch && !ch.turn && (ch.cwd !== this.cwdFor(sid) || ch.permKey !== this.resolvePerm(sid).permKey)) {
+          if (
+            ch &&
+            !ch.turn &&
+            (ch.cwd !== this.cwdFor(sid) ||
+              ch.permKey !== this.resolvePerm(sid).permKey ||
+              ch.modelKey !== (this.resolveModel(sid) ?? "default"))
+          ) {
             this.closeChannel(ch);
           }
           // 急校驗：壞目錄立刻回一行 system 提示（system 行不鎖 cwd，草稿仍可改），
@@ -532,8 +564,14 @@ export class Drive {
       return;
     }
     let ch = this.channels.get(sid);
-    // #98 cwd 或權限檔變了 → 通道創建參數失效,重建(閒置通道立即,回合中的留到回合末)。
-    if (ch && (ch.closing || ch.cwd !== cwd || ch.permKey !== this.resolvePerm(sid).permKey)) {
+    // #98/#143 cwd/權限檔/model 變了 → 通道創建參數失效,重建(閒置通道立即,回合中的留到回合末)。
+    if (
+      ch &&
+      (ch.closing ||
+        ch.cwd !== cwd ||
+        ch.permKey !== this.resolvePerm(sid).permKey ||
+        ch.modelKey !== (this.resolveModel(sid) ?? "default"))
+    ) {
       this.closeChannel(ch);
       ch = undefined;
     }
@@ -577,6 +615,7 @@ export class Drive {
     // #98 per-session 權限:UI 檔映射(#116 探針)——ask/acceptEdits=default SDK 模式(編輯自動批在
     // canUseTool 內自實現)、plan=plan、bypass=bypassPermissions。回退 env 逃生門。
     const perm = this.resolvePerm(sid);
+    const model = this.resolveModel(sid); // #143 per-session model(回退 env);undefined = CLI 默認
     const input = new PushStream<unknown>();
     const q = query({
       prompt: input as AsyncIterable<never>,
@@ -584,7 +623,7 @@ export class Drive {
         cwd, // #105 per-session 工作目錄（cwdFor 已解析，回退連接器默認）
         ...(resume ? { resume } : {}),
         ...(claudeBinIsAbsolute() ? { pathToClaudeCodeExecutable: resolveClaudeBin() } : {}),
-        ...(process.env.MACCHIATO_CC_MODEL ? { model: process.env.MACCHIATO_CC_MODEL } : {}),
+        ...(model ? { model } : {}), // #143 per-session model(空 = 不傳,用 CLI 配置默認)
         ...(perm.sdk ? { permissionMode: perm.sdk } : {}),
         includePartialMessages: true,
         canUseTool: async (
@@ -604,7 +643,7 @@ export class Drive {
         },
       },
     });
-    const ch: Channel = { sid, cwd, permKey: perm.permKey, input, q, closing: false };
+    const ch: Channel = { sid, cwd, permKey: perm.permKey, modelKey: model ?? "default", input, q, closing: false };
     this.channels.set(sid, ch);
     void this.consume(ch);
     return ch;
@@ -1073,7 +1112,12 @@ export class Drive {
   }
 
   /** 存檔：v2 = `{v:2, map, cwds}`（#105 起）；舊版是平面 `Record<sid, ccSid>`，讀時兼容。 */
-  private loadState(): { map: Record<string, string>; cwds: Record<string, string>; permModes: Record<string, string> } {
+  private loadState(): {
+    map: Record<string, string>;
+    cwds: Record<string, string>;
+    permModes: Record<string, string>;
+    models: Record<string, string>;
+  } {
     try {
       const parsed = JSON.parse(readFileSync(mapPath(), "utf8")) as Record<string, unknown>;
       if (parsed && parsed.v === 2) {
@@ -1081,18 +1125,22 @@ export class Drive {
           map: (parsed.map ?? {}) as Record<string, string>,
           cwds: (parsed.cwds ?? {}) as Record<string, string>,
           permModes: (parsed.permModes ?? {}) as Record<string, string>, // #98
+          models: (parsed.models ?? {}) as Record<string, string>, // #143
         };
       }
-      return { map: (parsed ?? {}) as Record<string, string>, cwds: {}, permModes: {} };
+      return { map: (parsed ?? {}) as Record<string, string>, cwds: {}, permModes: {}, models: {} };
     } catch {
-      return { map: {}, cwds: {}, permModes: {} };
+      return { map: {}, cwds: {}, permModes: {}, models: {} };
     }
   }
   private saveMap(): void {
     try {
       mkdirSync(dirname(mapPath()), { recursive: true });
       const tmp = `${mapPath()}.tmp`;
-      writeFileSync(tmp, JSON.stringify({ v: 2, map: this.map, cwds: this.cwds, permModes: this.permModes }));
+      writeFileSync(
+        tmp,
+        JSON.stringify({ v: 2, map: this.map, cwds: this.cwds, permModes: this.permModes, models: this.models }),
+      );
       renameSync(tmp, mapPath());
     } catch (e) {
       console.error("[session map save failed]", (e as Error).message);

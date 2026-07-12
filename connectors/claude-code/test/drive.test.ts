@@ -100,6 +100,7 @@ beforeEach(() => {
   };
   process.env.MACCHIATO_CC_SESSIONS = join(mkdtempSync(join(tmpdir(), "cc-dr-")), "sessions.json");
   delete process.env.MACCHIATO_CC_IDLE_S;
+  delete process.env.MACCHIATO_CC_MODEL; // #143 防測試間污染(連接器服務設了它)
 });
 
 describe("Drive", () => {
@@ -844,6 +845,57 @@ describe("#98 每會話權限模式", () => {
     expect(queryCalls).toBe(q1 + 1); // 新通道
     expect(lastOptions.permissionMode).toBe("bypassPermissions");
     d.dispose();
+    delete process.env.MACCHIATO_CC_TITLE_MODE;
+  });
+
+  it("#143 model 變更 → 閒置通道重建 + SDK options.model", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "off";
+    turnScripts = [
+      [init, { type: "result", subtype: "success", result: "one" }],
+      [init, { type: "result", subtype: "success", result: "two" }],
+    ];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "session.create", { model: "opus" }));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "t1" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOptions.model).toBe("opus");
+    const q1 = queryCalls;
+    fire(tuiFrame(CC_SID, "session.create", { model: "sonnet" })); // 閒置期改 model → 關通道
+    await new Promise((r) => setTimeout(r, 10));
+    expect((d as any).channels.size).toBe(0); // 重建(關掉舊的)
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "t2" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(queryCalls).toBe(q1 + 1); // 新通道
+    expect(lastOptions.model).toBe("sonnet");
+    d.dispose();
+    delete process.env.MACCHIATO_CC_TITLE_MODE;
+  });
+
+  it("#143 無 per-session model → 回退 env MACCHIATO_CC_MODEL;都無 → 不傳 model", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "off";
+    // (a) 有 env → 用 env
+    process.env.MACCHIATO_CC_MODEL = "haiku";
+    turnScripts = [[init, { type: "result", subtype: "success", result: "a" }]];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOptions.model).toBe("haiku");
+    d.dispose();
+    // (b) 無 env、無 per-session → options 不含 model(用 CLI 配置默認)
+    delete process.env.MACCHIATO_CC_MODEL;
+    lastOptions = null;
+    turnScripts = [[init, { type: "result", subtype: "success", result: "b" }]];
+    const { linkb: lb2, fire: fire2 } = fakeLinkb();
+    const d2 = new Drive(lb2);
+    d2.wire();
+    fire2(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOptions.model).toBeUndefined();
+    d2.dispose();
     delete process.env.MACCHIATO_CC_TITLE_MODE;
   });
 });
