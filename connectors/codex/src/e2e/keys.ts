@@ -1,6 +1,7 @@
 /**
- * §19 per-session E2E 密鑰管理（OpenClaw 連接器側, 對應 Python e2e_keys.py）。
- * K_S 存 ~/.macchiato/claude-code-e2e.json（0600, 原子寫；與 Hermes 的 e2e.json 分開）。
+ * §19 per-session E2E 密鑰管理（Codex 連接器側, 對應 Python e2e_keys.py）。
+ * K_S 存 ~/.macchiato/codex-e2e.json（0600, 原子寫；與 Hermes/CC/OpenClaw 的 keystore 分開——
+ * #144:fork 自 CC 時曾誤共用 claude-code-e2e.json,兩個常駐進程整檔原子重寫會互相覆蓋 K_S）。
  * **某 hermesSessionId 在 store 里 = 該會話已開 E2E。** 鍵 = server 的 hermesSessionId（原始大小寫）。
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -9,7 +10,7 @@ import { dirname, join } from "node:path";
 import * as ec from "./crypto";
 
 export function e2eStorePath(): string {
-  return process.env.MACCHIATO_CLAUDE_CODE_E2E_STORE || join(homedir(), ".macchiato/claude-code-e2e.json");
+  return process.env.MACCHIATO_CODEX_E2E_STORE || join(homedir(), ".macchiato/codex-e2e.json");
 }
 
 export interface DevicePub {

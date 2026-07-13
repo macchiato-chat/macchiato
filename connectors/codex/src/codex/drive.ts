@@ -23,6 +23,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { resolveCodexBin } from "./codex-bin";
 import { generateTitle } from "./titles";
+import { materializeAttachment } from "./attachments";
 import type { LinkBClient } from "../linkb/client";
 import type { E2EKeyStore } from "../e2e/keys";
 import type { Mirror } from "./mirror";
@@ -72,12 +73,18 @@ export class Drive {
   private cwds: Record<string, string>;
   /** #143 serverSid → 會話 model(session.create.model 下發;持久,同文件存)。 */
   private models: Record<string, string>;
+  /** #200 在途回合 sid 集(持久):回合起加、止刪;進程死於回合中途 → 下次啟動提示重發。 */
+  private pending: Set<string>;
+  /** #200 上個進程死時遺留的在途回合(構造載入即清盤;flushAbandonedTurns 在 ready 後告知)。 */
+  private abandonedTurns: string[] = [];
   /** sid → 進行中回合。 */
   private readonly active = new Map<string, Turn>();
   /** sid → 排隊的後續 prompt。 */
   private readonly queued = new Map<string, string[]>();
   /** sid → E2E 回合暫存的(已解密)用戶消息。 */
   private readonly pendingUser = new Map<string, string[]>();
+  /** #145 sid → 本回合被 session.interrupt 中斷(result 定性 interrupted 而非 complete)。 */
+  private readonly interruptedSids = new Set<string>();
   /** #113 已生成標題的 sid(持久)。 */
   private titled: Set<string>;
   private genTitle: string | undefined;
@@ -92,6 +99,19 @@ export class Drive {
     this.cwds = st.cwds;
     this.models = st.models;
     this.titled = st.titled;
+    this.abandonedTurns = st.pending;
+    this.pending = new Set();
+    if (st.pending.length) this.saveMap();
+  }
+
+  /** #200:對上個進程死時被殺的在途回合回 system 提示(Link B ready 後由 index.ts 調;冪等)。 */
+  flushAbandonedTurns(): void {
+    const sids = this.abandonedTurns;
+    this.abandonedTurns = [];
+    for (const sid of sids) {
+      if (this.e2e?.isE2E(sid)) continue;
+      this.emit(sid, "review.summary", { summary: "⚠️ 連接器剛重啟,上一條消息可能沒跑完——請重發一次。" });
+    }
   }
 
   /**
@@ -141,18 +161,29 @@ export class Drive {
       switch (frame.method) {
         case "prompt.submit": {
           let text = String(params.text ?? "").trim();
-          // 附件:Codex exec 無原生媒體通道 → 圖片/文件降級回執(同 OpenClaw #60);audio 走雲端 STT。
-          const atts = Array.isArray(params.attachments) ? (params.attachments as Array<{ id?: string; kind?: string }>) : [];
+          // #146 附件:codex exec 無原生媒體通道 → 「落盤 + 路徑注入 prompt」讓 codex 用讀檔工具訪問
+          // (SSRF 防護/100MB 上限見 attachments.ts,移植自 CC);audio 走雲端 STT 回退鏈。
+          const atts = Array.isArray(params.attachments)
+            ? (params.attachments as Array<{ id?: string; kind?: string; name?: string; mime?: string; url?: string }>)
+            : [];
+          const attachNotes: string[] = [];
           for (const a of atts) {
             if (a?.kind === "audio" && a.id) {
               this.linkb.send({ t: "voice_transcript", agentLinkId: this.linkb.agentLinkId, sessionId: sid, attachmentId: a.id, text: "", error: "stt_unavailable" });
+              continue;
+            }
+            if (!a?.url) continue;
+            try {
+              const p = await materializeAttachment(a);
+              attachNotes.push(`[Macchiato 附件 ${a.name ?? "file"}(${a.mime ?? "?"})已保存到:${p}]`);
+            } catch (e) {
+              console.error(`[attachment failed for ${sid}] ${(e as Error).message}`);
+              if (!this.e2e?.isE2E(sid)) {
+                this.emit(sid, "review.summary", { summary: `⚠️ 附件 ${a.name ?? ""} 下載失敗:${(e as Error).message.slice(0, 120)}` });
+              }
             }
           }
-          const dropped = atts.filter((a) => a?.kind && a.kind !== "audio").length;
-          if (dropped && !this.e2e?.isE2E(sid)) {
-            this.emit(sid, "review.summary", { summary: `⚠️ Codex 連接器暫不支持附件——已忽略 ${dropped} 個附件,僅文字送達` });
-          }
-          if (!text) return;
+          if (!text && !attachNotes.length) return;
           if (this.e2e?.isE2E(sid)) {
             try {
               text = this.e2e.decryptText(sid, text).trim();
@@ -165,6 +196,7 @@ export class Drive {
             arr.push(text);
             this.pendingUser.set(sid, arr);
           }
+          if (attachNotes.length) text = [text, ...attachNotes].filter(Boolean).join("\n\n"); // #146 路徑注入
           if (this.active.has(sid)) {
             const q = this.queued.get(sid) ?? [];
             q.push(text);
@@ -178,9 +210,12 @@ export class Drive {
         case "session.interrupt": {
           const t = this.active.get(sid);
           if (t) {
+            this.interruptedSids.add(sid); // #145 隨後的 close 定性 interrupted,不再冒充「正常完成」
             t.proc.kill("SIGTERM");
             console.log(`· Interrupted turn for ${sid}`);
           }
+          // #145 停止 = 全停:排隊的後續 prompt 一併作廢(否則停完馬上又起一回合,違反預期)。
+          this.queued.delete(sid);
           return;
         }
         case "session.create": {
@@ -249,6 +284,8 @@ export class Drive {
       toolItems: new Map(),
     };
     this.active.set(sid, turn);
+    this.pending.add(sid); // #200
+    this.saveMap();
 
     proc.stdout!.on("data", (chunk: Buffer) => {
       turn.stdoutBuf += chunk.toString("utf8");
@@ -346,8 +383,12 @@ export class Drive {
     if (turn.completed) return;
     turn.completed = true;
     this.active.delete(sid);
+    this.pending.delete(sid); // #200
+    this.saveMap();
+    const interrupted = this.interruptedSids.delete(sid);
+    // #145:code===null = 被信號殺(用戶中斷 / 外部 kill 如 earlyoom)→ interrupted,不冒充 complete。
     const err = code !== 0 && code !== null;
-    const status = err ? "error" : "complete";
+    const status = err ? "error" : interrupted || code === null ? "interrupted" : "complete";
     const finalText = turn.agentText;
     if (turn.isE2E) {
       this.sendE2ETurn(sid, finalText);
@@ -397,6 +438,7 @@ export class Drive {
     cwds: Record<string, string>;
     models: Record<string, string>;
     titled: Set<string>;
+    pending: string[];
   } {
     try {
       const p = JSON.parse(readFileSync(mapPath(), "utf8"));
@@ -405,9 +447,10 @@ export class Drive {
         cwds: p.cwds ?? {},
         models: p.models ?? {}, // #143
         titled: new Set<string>(Array.isArray(p.titled) ? p.titled : []),
+        pending: Array.isArray(p.pending) ? (p.pending as string[]) : [], // #200
       };
     } catch {
-      return { map: {}, cwds: {}, models: {}, titled: new Set() };
+      return { map: {}, cwds: {}, models: {}, titled: new Set(), pending: [] };
     }
   }
   private saveMap(): void {
@@ -416,7 +459,7 @@ export class Drive {
       const tmp = `${mapPath()}.tmp`;
       writeFileSync(
         tmp,
-        JSON.stringify({ v: 1, map: this.map, cwds: this.cwds, models: this.models, titled: [...this.titled] }),
+        JSON.stringify({ v: 1, map: this.map, cwds: this.cwds, models: this.models, titled: [...this.titled], pending: [...this.pending] }),
       );
       renameSync(tmp, mapPath());
     } catch (e) {

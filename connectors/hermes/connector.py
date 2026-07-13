@@ -65,7 +65,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.8"
+CONNECTOR_VERSION = "1.5.9"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -337,6 +337,10 @@ class Connector:
         self._titled: set[str] = set()  # #94：已自動生成過標題的 server_sid（防會話內重複）
         self._prompt_retried: set = set()  # #4：已重投過的 (sid, text 哈希)——每條 prompt 最多重投一次，防雙發
         self._retry_tasks: dict = {}  # #4/#5：sid → 在途重投任務。用戶中斷時取消之——已停的 prompt 不許復活
+        # #148:per-session 串行任務鏈(sid → 鏈尾 task)。prompt.submit 的慢工作(resume 往返/
+        # 附件下載 100MB/STT)不再內聯 await 在讀循環裡——某會話的一條慢消息此前會 head-of-line
+        # 阻塞**所有**會話的派發。同會話仍串行(鏈式 await 前任),跨會話並發。
+        self._session_chains: dict = {}
         # #10:累計計數(進程生命週期)。健康上報帶出——一次性的丟/重複/重投靠狀態快照看不見。
         self._counters: dict = {}
         # #13:server_sid → prompt.submit 時的全庫 max 行 id。回合結束後,> 它的行即本回合
@@ -1331,6 +1335,32 @@ class Connector:
                 f"（水位線→{snap['cover']}）"
             )
 
+    def _dispatch_session(self, server_sid: str, coro_factory) -> None:
+        """#148:把慢工作掛到該會話的串行鏈上。讀循環立刻返回;同會話按序、跨會話並發。
+        前任異常不斷鏈(已各自記日誌/計數);鏈尾完成且仍是尾 → 清條目防字典緩慢積長。"""
+        prev = self._session_chains.get(server_sid)
+
+        async def run():
+            if prev is not None:
+                try:
+                    await prev
+                except Exception:
+                    pass  # 前任已自行記錄
+            try:
+                await coro_factory()
+            except Exception as exc:
+                self._count("dispatchErrors")  # #10
+                print(f"[dispatch failed prompt.submit {server_sid}] {exc!r}", file=sys.stderr)
+
+        task = asyncio.create_task(run())
+        self._session_chains[server_sid] = task
+
+        def _cleanup(t):
+            if self._session_chains.get(server_sid) is t:
+                self._session_chains.pop(server_sid, None)
+
+        task.add_done_callback(_cleanup)
+
     async def _on_server_msg(self, raw) -> None:
         try:
             msg = json.loads(raw)
@@ -1405,78 +1435,82 @@ class Connector:
 
         try:
             if method == "prompt.submit":
-                real = await self._ensure_session(server_sid)
-                attachments = params.get("attachments") or []
-                parts = []
-                base = (params.get("text") or "").strip()
-                # #94：Macchiato 發起的會話(全走 prompt.submit;渠道會話是鏡像來的、不走這)首次發話 →
-                # **立即**用首條 user 文本自動生成標題(越早越好),復用 Hermes 自身 title_generator。
-                # E2E 跳過(明文);已標題過(state.db 有標題)跳過。_titled 防會話內重複。
-                if base and server_sid not in self._titled and not self._e2e.is_e2e(server_sid):
-                    self._titled.add(server_sid)
-                    asyncio.create_task(self._auto_title(server_sid, base))
-                if base and self._e2e.is_e2e(server_sid):
-                    # §19 E2E：iOS 發來的是密文 → 解密後再提交 agent（gated，非 E2E 會話不走這）。
-                    try:
-                        base = self._e2e.decrypt_text(server_sid, base).strip()
-                    except Exception as exc:
-                        print(f"[E2E 解密 prompt 失敗 {server_sid}] {exc!r}", file=sys.stderr)
-                        base = ""  # 解不開 → 不把亂碼提交給 agent
-                if base:
-                    parts.append(base)
-                for ref in attachments:
-                    if ref.get("kind") == "audio":
-                        # 語音輸入：本地 STT 轉錄 → 回填 server（顯示在 user 氣泡）+ 拼進發給 agent 的文字。
-                        res = await asyncio.to_thread(_transcribe_attachment, ref)
-                        transcript = (res.get("text") or "").strip()
-                        await self._send_voice_transcript(
-                            server_sid, ref.get("id"), transcript, res.get("error")
-                        )
-                        if transcript:
-                            parts.append(transcript)
-                        continue
-                    try:
-                        await self._attach_to_session(real, ref)
-                    except Exception as exc:
-                        print(f"[attach failed {ref.get('name')!r}] {exc!r}", file=sys.stderr)
-                final_text = "\n\n".join(parts)
-                # 純語音且轉錄為空（STT 不可用/沒聽清）→ 不打擾 agent（server 已落兜底提示）。
-                non_audio = any(r.get("kind") != "audio" for r in attachments)
-                if final_text or non_audio or not attachments:
-                    # #13:記回合 floor——此後 > floor 的 state.db 行即本回合所寫,
-                    # 回合結束(message.complete)按它定位行 id 回填 live 消息身份。
-                    if self._stored.get(server_sid) and not self._e2e.is_e2e(server_sid):
+                # #148:慢路徑(resume 往返/附件下載/STT)出讀循環——經 per-session 串行鏈派發,
+                # 某會話的大附件/慢 STT 不再 head-of-line 阻塞其他會話。同會話仍按序。
+                async def _do_prompt(params=params, server_sid=server_sid):
+                    real = await self._ensure_session(server_sid)
+                    attachments = params.get("attachments") or []
+                    parts = []
+                    base = (params.get("text") or "").strip()
+                    # #94：Macchiato 發起的會話(全走 prompt.submit;渠道會話是鏡像來的、不走這)首次發話 →
+                    # **立即**用首條 user 文本自動生成標題(越早越好),復用 Hermes 自身 title_generator。
+                    # E2E 跳過(明文);已標題過(state.db 有標題)跳過。_titled 防會話內重複。
+                    if base and server_sid not in self._titled and not self._e2e.is_e2e(server_sid):
+                        self._titled.add(server_sid)
+                        asyncio.create_task(self._auto_title(server_sid, base))
+                    if base and self._e2e.is_e2e(server_sid):
+                        # §19 E2E：iOS 發來的是密文 → 解密後再提交 agent（gated，非 E2E 會話不走這）。
                         try:
-                            self._turn_floor[server_sid] = await current_max_id()
-                        except Exception:
-                            pass  # 拿不到 floor → 本回合不回填,會話級跳過照舊兜底
-                    try:
-                        await self.gw.submit_prompt(real, final_text)
-                    except GatewayDied:
-                        # #4:gateway 死於 prompt 在途——請求確定沒完成(在途回合也隨進程死了)。
-                        # 後台等 gateway 重啟就緒後重投一次(去重見 _retry_prompt),你那句話不再石沉。
-                        # 不 await:重啟可能要幾十秒,別堵住 Link B 的分派循環。
-                        non_audio_refs = [r for r in attachments if r.get("kind") != "audio"]
-                        self._retry_tasks[server_sid] = asyncio.create_task(
-                            self._retry_prompt(server_sid, final_text, non_audio_refs)
-                        )
-                    except GatewayError as exc:
-                        # 回合進行中（4009 session busy）→ steer 把跟進消息注入正在跑的回合（方案 D），
-                        # 不丟、不打斷；模型在下一次工具迭代時看到。純圖無文字無法 steer → 照舊上拋記日誌。
-                        if exc.code == 4009 and final_text:
-                            res = await self.gw.steer(real, final_text)
-                            print(f"· 回合進行中 → steer 注入跟進消息（status={(res or {}).get('status')}）")
+                            base = self._e2e.decrypt_text(server_sid, base).strip()
+                        except Exception as exc:
+                            print(f"[E2E 解密 prompt 失敗 {server_sid}] {exc!r}", file=sys.stderr)
+                            base = ""  # 解不開 → 不把亂碼提交給 agent
+                    if base:
+                        parts.append(base)
+                    for ref in attachments:
+                        if ref.get("kind") == "audio":
+                            # 語音輸入：本地 STT 轉錄 → 回填 server（顯示在 user 氣泡）+ 拼進發給 agent 的文字。
+                            res = await asyncio.to_thread(_transcribe_attachment, ref)
+                            transcript = (res.get("text") or "").strip()
+                            await self._send_voice_transcript(
+                                server_sid, ref.get("id"), transcript, res.get("error")
+                            )
+                            if transcript:
+                                parts.append(transcript)
+                            continue
+                        try:
+                            await self._attach_to_session(real, ref)
+                        except Exception as exc:
+                            print(f"[attach failed {ref.get('name')!r}] {exc!r}", file=sys.stderr)
+                    final_text = "\n\n".join(parts)
+                    # 純語音且轉錄為空（STT 不可用/沒聽清）→ 不打擾 agent（server 已落兜底提示）。
+                    non_audio = any(r.get("kind") != "audio" for r in attachments)
+                    if final_text or non_audio or not attachments:
+                        # #13:記回合 floor——此後 > floor 的 state.db 行即本回合所寫,
+                        # 回合結束(message.complete)按它定位行 id 回填 live 消息身份。
+                        if self._stored.get(server_sid) and not self._e2e.is_e2e(server_sid):
+                            try:
+                                self._turn_floor[server_sid] = await current_max_id()
+                            except Exception:
+                                pass  # 拿不到 floor → 本回合不回填,會話級跳過照舊兜底
+                        try:
+                            await self.gw.submit_prompt(real, final_text)
+                        except GatewayDied:
+                            # #4:gateway 死於 prompt 在途——請求確定沒完成(在途回合也隨進程死了)。
+                            # 後台等 gateway 重啟就緒後重投一次(去重見 _retry_prompt),你那句話不再石沉。
+                            # 不 await:重啟可能要幾十秒,別堵住 Link B 的分派循環。
+                            non_audio_refs = [r for r in attachments if r.get("kind") != "audio"]
+                            self._retry_tasks[server_sid] = asyncio.create_task(
+                                self._retry_prompt(server_sid, final_text, non_audio_refs)
+                            )
+                        except GatewayError as exc:
+                            # 回合進行中（4009 session busy）→ steer 把跟進消息注入正在跑的回合（方案 D），
+                            # 不丟、不打斷；模型在下一次工具迭代時看到。純圖無文字無法 steer → 照舊上拋記日誌。
+                            if exc.code == 4009 and final_text:
+                                res = await self.gw.steer(real, final_text)
+                                print(f"· 回合進行中 → steer 注入跟進消息（status={(res or {}).get('status')}）")
+                            else:
+                                raise
                         else:
-                            raise
+                            # 補償早到的中斷：prompt.submit 返回即「streaming」（回合在後台線程跑），
+                            # 此刻 interrupt 立即取消；turn_context 對剛起步的回合會保留此 interrupt。
+                            if server_sid in self._pending_interrupt:
+                                self._pending_interrupt.discard(server_sid)
+                                await self.gw.interrupt(real)
+                                print(f"· 補償早到中斷 → interrupt {real}（回合起步即取消）")
                     else:
-                        # 補償早到的中斷：prompt.submit 返回即「streaming」（回合在後台線程跑），
-                        # 此刻 interrupt 立即取消；turn_context 對剛起步的回合會保留此 interrupt。
-                        if server_sid in self._pending_interrupt:
-                            self._pending_interrupt.discard(server_sid)
-                            await self.gw.interrupt(real)
-                            print(f"· 補償早到中斷 → interrupt {real}（回合起步即取消）")
-                else:
-                    print("· 語音轉錄為空，跳過提交 agent（server 已落兜底）")
+                        print("· 語音轉錄為空，跳過提交 agent（server 已落兜底）")
+                self._dispatch_session(server_sid, _do_prompt)
             elif method == "approval.respond":
                 real = await self._ensure_session(server_sid)
                 await self.gw.request(

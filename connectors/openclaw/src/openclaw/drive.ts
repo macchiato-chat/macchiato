@@ -91,7 +91,7 @@ export class Drive {
     for (const [key, sid] of Object.entries(this.drivenPersist)) {
       this.driven.add(key);
       this.sidByKey.set(key, sid);
-      this.mirror?.setDriven(key);
+      this.mirror?.setDriven(key, sid);
     }
   }
 
@@ -132,7 +132,7 @@ export class Drive {
   private markDriven(key: string, sid: string): void {
     this.driven.add(key);
     this.sidByKey.set(key, sid);
-    this.mirror?.setDriven(key);
+    this.mirror?.setDriven(key, sid); // #147 帶真大小寫 sid(打撈的 mirror_append 用)
     if (this.drivenPersist[key] !== sid) {
       this.drivenPersist[key] = sid; // #202 持久:重啟後仍知道哪些 key 歸 live、對賬要覆蓋誰
       this.saveDriveState();

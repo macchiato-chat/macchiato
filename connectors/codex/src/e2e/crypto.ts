@@ -1,5 +1,5 @@
 /**
- * §19 per-session E2E 密碼原語（OpenClaw 連接器, Node 版）。
+ * §19 per-session E2E 密碼原語（Codex 連接器, Node 版;fork 自 CC/OpenClaw 同款）。
  *
  * 逐位對齊 docs/e2e.md §2 與 Python 連接器 services/hermes-connector/e2e_crypto.py、
  * iOS CryptoKit：**X25519 ECDH + HKDF-SHA256 + AES-256-GCM**。
