@@ -98,6 +98,8 @@ interface State {
   ords: Record<string, number>; // threadId → 下一起始行號(ord 連續)
   /** #9:threadId 的 rollout 首次消失的時刻;回歸即清,超 PRUNE_MS 連 offsets/ords 一起裁。 */
   missingAt?: Record<string, number>;
+  /** #161 墓碑:app 刪過的 thread,鏡像永不再撈(rollout 檔案不動)。 */
+  tombstones?: string[];
 }
 
 export class Mirror {
@@ -119,6 +121,16 @@ export class Mirror {
     private readonly e2e?: E2EKeyStore,
   ) {
     this.state = this.load();
+  }
+
+  /** #161 墓碑:永不再鏡像此 thread(持久;rollout 不動)。 */
+  tombstone(threadId: string): void {
+    const t = (this.state.tombstones ??= []);
+    if (!t.includes(threadId)) {
+      t.push(threadId);
+      this.save();
+      console.log(`· 墓碑 ${threadId}(鏡像永不再撈)`);
+    }
   }
 
   setDriven(threadId: string): void {
@@ -190,6 +202,7 @@ export class Mirror {
     const prev: Record<string, number> = {};
     const prevOrd: Record<string, number> = {};
     for (const { file, threadId } of rollouts) {
+      if (this.state.tombstones?.includes(threadId)) continue; // #161 app 刪過 → 永不再撈
       let content: string;
       try {
         content = readFileSync(file, "utf8");
@@ -321,7 +334,7 @@ export class Mirror {
       try {
         const s = JSON.parse(readFileSync(p, "utf8"));
         if (isBak) console.error(`⚠️ ${statePath()} 損壞/丟失 → 已從 .bak 恢復水位線`);
-        return { offsets: s.offsets ?? {}, ords: s.ords ?? {}, missingAt: s.missingAt ?? {} };
+        return { offsets: s.offsets ?? {}, ords: s.ords ?? {}, missingAt: s.missingAt ?? {}, tombstones: s.tombstones ?? [] }; // #161
       } catch {
         /* 下一個候選 */
       }

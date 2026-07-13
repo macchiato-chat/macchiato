@@ -65,7 +65,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.10"
+CONNECTOR_VERSION = "1.5.11"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -903,6 +903,7 @@ class Connector:
                 with open(path) as f:
                     st = json.load(f)
                 st.setdefault("sessions", {})
+                st.setdefault("tombstones", [])  # #161 墓碑:app 刪過的會話,鏡像永不再撈
                 if is_bak:
                     print(
                         f"⚠️ mirror.json 損壞/丟失 → 已從 .bak 恢復水位線（{path}）。"
@@ -1212,6 +1213,14 @@ class Connector:
             # id 鍵控、mirror 也須用持久化 id 才能落回原會話 → 先映射回 pid（運行時 _rev 或
             # 持久 _stored_rev）判 E2E / 加密 / 標識。讀消息與水位線仍按 state.db 的 sid。
             pid = self._rev.get(sid) or self._stored_rev.get(sid, sid)
+            # #161 墓碑:app 側刪過 → 鏡像永不再撈(不刪 agent 側檔案;水位線照推免積壓)。
+            tombs = st.get("tombstones", [])
+            if sid in tombs or pid in tombs:
+                # 直接推水位線(免拉低 global_min 掃描下界),不入 touched(那是「本批投遞的新水位」,
+                # 值語義是 new_wm 非 bool——入錯會污染 advance);持久化搭下次 save 的車。
+                if maxid is not None and maxid > wm.get(sid, 0):
+                    wm[sid] = maxid
+                continue
             e2e = self._e2e.is_e2e(pid)  # §19：E2E 會話走加密鏡像（方案 A），不跳過
             if (sid in self._rev or sid in self._fwd or sid in self._stored_rev) and not e2e:
                 # 續聊 Discord 會話（source=discord，經 tui 驅動）：運行時 id ≠ 持久化 id、消息落
@@ -1550,6 +1559,17 @@ class Connector:
                 await self._ensure_session(server_sid)
             elif method == "session.archive":
                 await self._set_hermes_archived(server_sid, bool(params.get("archived", True)))
+            elif method == "session.delete":
+                # #161 墓碑語義:app 刪會話 → 連接器記墓碑,鏡像永不再撈;**不刪** agent 側檔案
+                # (app 是遙控器,不該能燒掉主機的歷史)。server 側行已刪,這裡防「刪了又冒回來」。
+                if self._mirror_st is not None:
+                    tombs = self._mirror_st.setdefault("tombstones", [])
+                    real = self._stored.get(server_sid) or self._fwd.get(server_sid, server_sid)
+                    for t_id in {server_sid, real}:
+                        if t_id and t_id not in tombs:
+                            tombs.append(t_id)
+                    self._save_mirror_state(self._mirror_st)
+                    print(f"· session.delete {server_sid} → 墓碑(鏡像永不再撈)")
             elif method == "session.rename":
                 # #161 手動改名回寫:app 改標題 → 寫回 state.db,Hermes TUI 兩邊一致。
                 title = str(params.get("title") or "").strip()

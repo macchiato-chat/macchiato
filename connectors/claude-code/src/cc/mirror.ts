@@ -83,6 +83,8 @@ interface State {
   titles: Record<string, string>; // sid → 已發標題（變了才補發）
   /** #9:sid 的轉錄文件首次消失的時刻;回歸即清,超 PRUNE_MS 連 offsets/titles 一起裁。 */
   missingAt?: Record<string, number>;
+  /** #161 墓碑:app 刪過的會話(CLI uuid),鏡像永不再撈;不刪 transcript(app 是遙控器)。 */
+  tombstones?: string[];
 }
 
 export class Mirror {
@@ -152,6 +154,16 @@ export class Mirror {
     this.drivenSids.add(sid);
   }
 
+  /** #161 墓碑:永不再鏡像此 CLI 會話(持久;transcript 不動)。 */
+  tombstone(sid: string): void {
+    const t = (this.state.tombstones ??= []);
+    if (!t.includes(sid)) {
+      t.push(sid);
+      this.save();
+      console.log(`· 墓碑 ${sid}(鏡像永不再撈)`);
+    }
+  }
+
   /** 影子兜底(2026-07-13):登記「曾被 Macchiato 驅動」的 CLI 會話 uuid(持久)。Drive 在 init 存
    * ULID→CLI 映射時、及啟動時從既有映射批量灌入。鏡像據此永不給這些 uuid 單獨建會話。 */
   markDrivenUuid(cliUuid: string): void {
@@ -218,6 +230,7 @@ export class Mirror {
     const found = discoverSessions();
     this.prune(new Set(found.map((s) => s.sid)), now);
     for (const { sid, file } of found) {
+      if (this.state.tombstones?.includes(sid)) continue; // #161 app 刪過 → 永不再撈
       let size: number;
       try {
         size = statSync(file).size;
@@ -415,7 +428,7 @@ export class Mirror {
       try {
         const s = JSON.parse(readFileSync(p, "utf8")) as State;
         if (isBak) console.error(`⚠️ ${statePath()} 損壞/丟失 → 已從 .bak 恢復`);
-        return { offsets: s.offsets ?? {}, titles: s.titles ?? {}, missingAt: s.missingAt ?? {} };
+        return { offsets: s.offsets ?? {}, titles: s.titles ?? {}, missingAt: s.missingAt ?? {}, tombstones: s.tombstones ?? [] }; // #161
       } catch {
         /* 下一個候選 */
       }

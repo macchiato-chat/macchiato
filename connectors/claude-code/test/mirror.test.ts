@@ -241,6 +241,25 @@ describe("Mirror", () => {
     expect(batch?.messages?.map((x: any) => x.text)).toEqual(["task output", "real human"]);
   });
 
+  it("#161 墓碑:app 刪過的會話,鏡像永不再撈(即使有新內容);transcript 不動", () => {
+    setupEnv();
+    writeFileSync(file, userLine("正常內容"));
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb);
+    (m as any).doPoll();
+    expect(appends(sent).length).toBeGreaterThan(0); // 先正常鏡像
+    const before = appends(sent).length;
+    m.tombstone(SID);
+    appendFileSync(file, userLine("刪除後的新內容"));
+    (m as any).doPoll();
+    expect(appends(sent).length).toBe(before); // 墓碑後不再撈
+    // 持久:新 Mirror 實例(同狀態文件)照樣跳過
+    const { linkb: lb2, sent: s2 } = fakeLinkb();
+    const m2 = new Mirror(lb2);
+    (m2 as any).doPoll();
+    expect(appends(s2)).toHaveLength(0);
+  });
+
   it("標題變更(custom-title 流過)→ 補發純標題批", () => {
     setupEnv();
     writeFileSync(file, userLine("q"));

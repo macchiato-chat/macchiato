@@ -263,6 +263,12 @@ export class Drive {
           this.queued.delete(sid);
           return;
         }
+        case "session.delete": {
+          // #161 墓碑:app 刪會話 → 鏡像永不再撈;不刪 rollout(app 是遙控器)。
+          const tid = this.threadFor(sid);
+          if (tid) this.mirror?.tombstone(tid);
+          return;
+        }
         case "session.create": {
           const cwd = typeof params.cwd === "string" ? params.cwd.trim() : "";
           if (cwd ? this.cwds[sid] !== cwd : this.cwds[sid] !== undefined) {

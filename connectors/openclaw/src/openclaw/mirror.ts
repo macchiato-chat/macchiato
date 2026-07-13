@@ -306,6 +306,8 @@ interface State {
   offsets: Record<string, number>;
   /** #9:key 首次從 sessions.list 消失的時刻;回歸即清。超 PRUNE_MS → 連 offsets 一起裁。 */
   missingAt?: Record<string, number>;
+  /** #161 墓碑:app 刪過的會話 key,鏡像/打撈永不再撈(agent 側 .jsonl 不動)。 */
+  tombstones?: string[];
 }
 
 export class Mirror {
@@ -324,6 +326,16 @@ export class Mirror {
   /** #10:累計計數(進程生命週期),健康上報帶出。 */
   readonly counters: Record<string, number> = { mirrorBatches: 0, mirrorMessages: 0, mirrorNacks: 0, mirrorErrors: 0 };
   private polling = false;
+
+  /** #161 墓碑:永不再鏡像/打撈此 key(持久;agent 側檔案不動)。 */
+  tombstone(key: string): void {
+    const t = (this.state.tombstones ??= []);
+    if (!t.includes(key)) {
+      t.push(key);
+      this.save();
+      console.log(`· 墓碑 ${key}(鏡像永不再撈)`);
+    }
+  }
 
   setDriven(key: string, sid?: string): void {
     this.drivenKeys.add(key);
@@ -540,6 +552,7 @@ export class Mirror {
       const key: string | undefined = s.key;
       const sessionId: string | undefined = s.sessionId;
       if (!key || !sessionId || isCronSession(key)) continue; // cron 不鏡像（已在目標聊天裡）
+      if (this.state.tombstones?.includes(key)) continue; // #161 app 刪過 → 永不再撈(含打撈)
       if (key.startsWith(MACCHIATO_PREFIX) || this.drivenKeys.has(key)) {
         // #147 drive 的會話:文字由 live 投遞;鏡像打撈 tool/thinking(去正文)補進歷史,推進水位線。
         const f = join(dir, `${sessionId}.jsonl`);
@@ -642,7 +655,7 @@ export class Mirror {
   private load(): State {
     return loadStateFile(
       statePath(),
-      (raw) => ({ offsets: raw.offsets ?? {}, missingAt: raw.missingAt ?? {} }),
+      (raw) => ({ offsets: raw.offsets ?? {}, missingAt: raw.missingAt ?? {}, tombstones: raw.tombstones ?? [] }), // #161
       () => ({ offsets: {}, missingAt: {} }),
     );
   }

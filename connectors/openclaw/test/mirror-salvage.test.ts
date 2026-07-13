@@ -108,3 +108,16 @@ describe("#147 driven 會話 tool/thinking 打撈", () => {
     expect(appends(sent)).toHaveLength(2);
   });
 });
+
+describe("#161 墓碑", () => {
+  it("tombstone 後 poll 永不再撈(打撈同跳);持久跨實例", async () => {
+    const { mirror, file, sent } = setup();
+    writeFileSync(file, textMsg("正常", 1000) + toolMsg("帶工具", 2000));
+    await (mirror as any).pollOnce();
+    const before = appends(sent).length;
+    mirror.tombstone(KEY);
+    appendFileSync(file, toolMsg("刪後新內容", 3000));
+    await (mirror as any).pollOnce();
+    expect(appends(sent).length).toBe(before); // 不再撈
+  });
+});

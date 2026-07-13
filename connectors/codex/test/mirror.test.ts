@@ -55,3 +55,35 @@ describe("#6/#9 狀態文件兜底與裁剪", () => {
     expect(m2.state.missingAt.gone_new).toBeUndefined(); // 回歸即清
   });
 });
+
+describe("#161 墓碑", () => {
+  it("tombstone 後 rollout 永不再撈;持久(load 白名單帶 tombstones)", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, appendFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { Mirror } = await import("../src/codex/mirror");
+    const root = mkdtempSync(join(tmpdir(), "cx-tomb-"));
+    process.env.MACCHIATO_CODEX_SESSIONS_DIR = join(root, "sessions");
+    process.env.MACCHIATO_CODEX_MIRROR = join(root, "mirror.json");
+    const tid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeee61";
+    const dir = join(root, "sessions", "2026", "07", "14");
+    mkdirSync(dir, { recursive: true });
+    const f = join(dir, `rollout-2026-07-14T00-00-00-${tid}.jsonl`);
+    const line = (text: string) =>
+      JSON.stringify({ timestamp: "2026-07-14T00:00:01Z", type: "event_msg", payload: { type: "user_message", message: text } }) + "\n";
+    writeFileSync(f, "");
+    const sent: any[] = [];
+    const linkb: any = { agentLinkId: "al", isReady: true, send: (m: any) => sent.push(m), onFrame: () => () => {} };
+    const m = new Mirror(linkb);
+    (m as any).pollOnce ? await (m as any).pollOnce() : (m as any).doPoll(); // baseline
+    m.tombstone(tid);
+    appendFileSync(f, line("刪後內容"));
+    (m as any).pollOnce ? await (m as any).pollOnce() : (m as any).doPoll();
+    expect(sent.filter((x) => x.t === "mirror_append")).toHaveLength(0);
+    // 持久:新實例照樣跳
+    const sent2: any[] = [];
+    const m2 = new Mirror({ ...linkb, send: (x: any) => sent2.push(x) });
+    (m2 as any).pollOnce ? await (m2 as any).pollOnce() : (m2 as any).doPoll();
+    expect(sent2.filter((x) => x.t === "mirror_append")).toHaveLength(0);
+  });
+});

@@ -409,3 +409,24 @@ describe("#162 回合中帶附件的跟進", () => {
     expect(sends[1]!.params.message).toBe("看這張圖");
   });
 });
+
+describe("#158 出站附件", () => {
+  it("chat final 正文帶 MEDIA: 路徑 → media.attach 事件(base64 payload)", async () => {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const img = join(mkdtempSync(join(tmpdir(), "oc-m-")), "out.png");
+    writeFileSync(img, "IMGDATA");
+    const { gw, linkb, sent } = makeDrive();
+    const SID3 = "01OC158SID000000000000000A";
+    const KEY3 = `agent:main:macchiato:${SID3}`.toLowerCase();
+    await linkb.deliver(tui("prompt.submit", SID3, { text: "畫張圖" }));
+    gw.fire({ event: "chat", payload: { sessionKey: KEY3, state: "final", runId: "r1",
+      message: { role: "assistant", content: [{ type: "text", text: `畫好了\nMEDIA: ${img}` }] } } });
+    await new Promise((r) => setTimeout(r, 10));
+    const media = sent.find((f: any) => f.frame?.params?.type === "media.attach") as any;
+    expect(media).toBeTruthy();
+    expect(media.frame.params.payload).toMatchObject({ kind: "image", name: "out.png", mime: "image/png" });
+    expect(Buffer.from(media.frame.params.payload.data_b64, "base64").toString()).toBe("IMGDATA");
+  });
+});

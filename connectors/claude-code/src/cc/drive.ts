@@ -508,6 +508,13 @@ export class Drive {
         }
         case "session.archive":
           return; // #75:CC 無歸檔概念,顯式忽略(不落 default 靜默)
+        case "session.delete": {
+          // #161 墓碑:app 刪會話 → 鏡像永不再撈;不刪 CLI transcript(app 是遙控器,
+          // 不該能燒掉主機的歷史)。server 側行已刪,這裡防「刪了又冒回來」。
+          const cc = this.ccSidFor(sid) ?? (CC_UUID_RE.test(sid) ? sid : undefined);
+          if (cc) this.mirror?.tombstone(cc);
+          return;
+        }
         case "session.rename": {
           // #161 手動改名回寫:app 改標題 → 寫回 CLI transcript(custom-title),終端側同名。
           const title = typeof params.title === "string" ? params.title.trim() : "";

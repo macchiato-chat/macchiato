@@ -24,6 +24,7 @@ import { fetchChatAttachment, type ChatAttachment } from "./attachments";
 import type { OpenClawGateway, GatewayEvent } from "./gateway";
 import { keyForSid, sidForKey, type Mirror } from "./mirror";
 import { generateTitle, loadTitled, saveTitled } from "./titles";
+import { extractMediaPaths, readMediaFile } from "./media";
 import type { E2EKeyStore } from "../e2e/keys";
 
 // key ↔ sid 映射移居 mirror.ts（E2E 回灌也要用）；re-export 保持既有導入面不變。
@@ -222,6 +223,16 @@ export class Drive {
           }
           await this.gw.request("sessions.abort", { key });
           return;
+        case "session.delete": {
+          // #161 墓碑:app 刪會話 → 鏡像/打撈/對賬永不再碰;不刪 agent 側 .jsonl。
+          this.mirror?.tombstone(key);
+          if (this.drivenPersist[key]) {
+            delete this.drivenPersist[key]; // #202 對賬也停(reconcileAll 迭代 drivenPersist)
+            delete this.wmByKey[key];
+            this.saveDriveState();
+          }
+          return;
+        }
         case "session.create":
           this.markDriven(key, sid); // 會話本體由首次 chat.send 自動建
           return;
@@ -429,7 +440,23 @@ export class Drive {
         }
         this.emit(sid, "message.complete", { text });
         this.completed.add(runId);
+        this.emitMediaFromText(sid, text); // #158 出站附件(fire-and-forget;E2E 不走本分支)
       }
+    }
+  }
+
+  /** #158 出站附件:回覆正文裡 MEDIA:/裸路徑標的文件 → media.attach(Hermes 同款,server 通吃)。 */
+  private emitMediaFromText(sid: string, text: string): void {
+    try {
+      for (const path of extractMediaPaths(text)) {
+        const payload = readMediaFile(path);
+        if (!payload) continue;
+        this.emit(sid, "media.attach", payload as unknown as Record<string, unknown>);
+        console.log(`· media.attach ${payload.name}(${payload.size}B)→ ${sid}`);
+      }
+    } catch (e) {
+      this.counters.driveErrors += 1;
+      console.error(`[#158 media extract failed ${sid}] ${(e as Error).message}`);
     }
   }
 
