@@ -16,6 +16,9 @@
  *（sessions.send 也實測拒收 deliver）, 待真機驗證；probe 證明無綁定 key 是乾淨的。
  */
 import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 import type { LinkBClient } from "../linkb/client";
 import { fetchChatAttachment, type ChatAttachment } from "./attachments";
 import type { OpenClawGateway, GatewayEvent } from "./gateway";
@@ -25,6 +28,11 @@ import type { E2EKeyStore } from "../e2e/keys";
 
 // key ↔ sid 映射移居 mirror.ts（E2E 回灌也要用）；re-export 保持既有導入面不變。
 export { keyForSid, sidForKey };
+
+/** #202 drive 持久狀態文件(driven key→sid + 對賬水位線)。 */
+function driveStatePath(): string {
+  return process.env.MACCHIATO_OPENCLAW_DRIVE || join(homedir(), ".macchiato/openclaw-drive.json");
+}
 
 export class Drive {
   /** key → runId（回合進行中）。 */
@@ -39,6 +47,15 @@ export class Drive {
   private readonly driven = new Set<string>();
   /** 小寫 key → server 原始 sid（大寫 ULID）；回傳事件用它找回 server 認識的 sid。 */
   private readonly sidByKey = new Map<string, string>();
+  /**
+   * #202 對賬狀態(持久,跨重啟):驅動過的 key→sid + 每 key 已對賬的最大 __openclaw.seq 水位線。
+   * driven key 的投遞是 live 獨佔(鏡像跳過),live 漏收 gateway 廣播(WS 重連窗/進程死)= 該段丟。
+   * 對賬 = 重連/啟動時拉 chat.history(每條帶穩定 __openclaw.id + 單調 seq),把 seq>水位線的行
+   * 用 mirror_append+srcId 補投——已由 live 投遞且回合末回填過 srcId 的行撞 (session,dedup_key)
+   * 唯一索引被吃掉,不雙投;真漏的行被補上,不再丟。
+   */
+  private wmByKey: Record<string, number> = {};
+  private drivenPersist: Record<string, string> = {};
 
   /** E2E 會話：runId 前暫存的（已解密）用戶消息, 回合結束隨加密批一起投遞。 */
   private readonly pendingUser = new Map<string, string[]>();
@@ -62,12 +79,40 @@ export class Drive {
     private readonly linkb: LinkBClient,
     private readonly mirror?: Mirror,
     private readonly e2e?: E2EKeyStore,
-  ) {}
+  ) {
+    // #202 載入持久對賬狀態;歷史 driven key 重新登記(鏡像跳過 + 事件路由 + 對賬覆蓋)。
+    try {
+      const st = JSON.parse(readFileSync(driveStatePath(), "utf8")) as Record<string, unknown>;
+      this.drivenPersist = (st.driven ?? {}) as Record<string, string>;
+      this.wmByKey = (st.wm ?? {}) as Record<string, number>;
+    } catch {
+      /* 首跑/損壞 → 空狀態 */
+    }
+    for (const [key, sid] of Object.entries(this.drivenPersist)) {
+      this.driven.add(key);
+      this.sidByKey.set(key, sid);
+      this.mirror?.setDriven(key);
+    }
+  }
+
+  private saveDriveState(): void {
+    try {
+      const p = driveStatePath();
+      mkdirSync(dirname(p), { recursive: true });
+      const tmp = `${p}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ v: 1, driven: this.drivenPersist, wm: this.wmByKey }));
+      renameSync(tmp, p);
+    } catch (e) {
+      console.error("[drive state save failed]", (e as Error).message);
+    }
+  }
 
   /** 掛上兩側監聽（linkb.start 前調用）。 */
   wire(): void {
     this.linkb.onFrame((m) => void this.onServerFrame(m));
     this.gw.onEvent((e) => this.onGatewayEvent(e));
+    // #202 重連後對賬:斷連窗內漏收的廣播(live 唯一路)靠 chat.history 補齊。
+    this.gw.onConnected?.(() => void this.reconcileAll("reconnect"));
   }
 
   isDriven(key: string): boolean {
@@ -88,6 +133,10 @@ export class Drive {
     this.driven.add(key);
     this.sidByKey.set(key, sid);
     this.mirror?.setDriven(key);
+    if (this.drivenPersist[key] !== sid) {
+      this.drivenPersist[key] = sid; // #202 持久:重啟後仍知道哪些 key 歸 live、對賬要覆蓋誰
+      this.saveDriveState();
+    }
   }
 
   async onServerFrame(msg: Record<string, unknown>): Promise<void> {
@@ -307,6 +356,7 @@ export class Drive {
         this.acc.delete(runId);
         this.completed.delete(runId);
         this.mirror?.fastForward(key); // live 已投遞 → 鏡像水位線快進到文件末, 防雙投
+        void this.reconcileTurnEnd(key, sid); // #202 回填 srcId + 推水位線(fire-and-forget)
       }
       return;
     }
@@ -357,5 +407,104 @@ export class Drive {
         this.completed.add(runId);
       }
     }
+  }
+
+  // ── #202 對賬:live 漏收廣播 = driven key 唯一投遞路斷 → 靠 chat.history(穩定 id+seq)補齊 ──
+
+  /** chat.history → 規整行 {seq, id, role, text}(role 只留 user/assistant;無 id/seq 的行丟棄)。 */
+  private async historyRows(key: string): Promise<Array<{ seq: number; id: string; role: string; text: string }>> {
+    const r = await this.gw.request<{ messages?: any[] }>("chat.history", { sessionKey: key, limit: 50 });
+    const out: Array<{ seq: number; id: string; role: string; text: string }> = [];
+    for (const m of r?.messages ?? []) {
+      const meta = m?.__openclaw;
+      if (!meta || typeof meta.seq !== "number" || typeof meta.id !== "string") continue;
+      const role = typeof m.role === "string" ? m.role.toLowerCase() : "";
+      if (role !== "user" && role !== "assistant") continue; // 工具/系統行不入鏡像
+      const text =
+        typeof m.content === "string"
+          ? m.content
+          : (Array.isArray(m.content) ? m.content : [])
+              .filter((b: any) => b && b.type === "text" && typeof b.text === "string")
+              .map((b: any) => b.text)
+              .join("");
+      out.push({ seq: meta.seq, id: meta.id, role, text });
+    }
+    out.sort((a, b) => a.seq - b.seq);
+    return out;
+  }
+
+  /**
+   * 回合末(lifecycle end):把本回合落庫的行 id 回填給 server 作 live 消息的 dedup_key
+   * (#13 同款,Hermes 驗證過的模式),再推水位線。順序刻意:先回填、後推水位——若死在中間,
+   * 重啟對賬會重投 >wm 的行,但 srcId 已回填 → 撞唯一索引被吃掉,不雙投。
+   */
+  private async reconcileTurnEnd(key: string, sid: string): Promise<void> {
+    if (this.e2e?.isE2E(sid)) return; // E2E 走加密批,不參與明文對賬
+    try {
+      const rows = await this.historyRows(key);
+      const fresh = rows.filter((r) => r.seq > (this.wmByKey[key] ?? 0));
+      if (!fresh.length) return;
+      const lastUser = [...fresh].reverse().find((r) => r.role === "user");
+      const lastAssistant = [...fresh].reverse().find((r) => r.role === "assistant");
+      const items: Array<{ role: string; srcId: string }> = [];
+      if (lastUser) items.push({ role: "user", srcId: lastUser.id });
+      if (lastAssistant) items.push({ role: "agent", srcId: lastAssistant.id });
+      if (items.length) {
+        this.linkb.send({ t: "message_srcid", agentLinkId: this.linkb.agentLinkId, sessionId: sid, items });
+      }
+      this.wmByKey[key] = Math.max(...fresh.map((r) => r.seq));
+      this.saveDriveState();
+    } catch (e) {
+      this.counters.driveErrors += 1; // #10
+      console.error(`[#202 turn-end reconcile failed ${key}] ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * 對賬一個 driven key:seq>水位線的行 = live 沒投過(或投了但回填/推水位前死了)→
+   * mirror_append + srcId 補投;已投+已回填的撞唯一索引被 server 吃掉。E2E 會話跳過。
+   * Link B 未 ready 時整體跳過不推水位(mirror_append 不入斷線緩衝,發了即丟)。
+   */
+  async reconcileKey(key: string, sid: string): Promise<number> {
+    if (this.e2e?.isE2E(sid)) return 0;
+    if (!this.linkb.isReady) return 0;
+    const rows = await this.historyRows(key);
+    const fresh = rows.filter((r) => r.seq > (this.wmByKey[key] ?? 0) && r.text.trim());
+    if (fresh.length) {
+      this.linkb.send({
+        t: "mirror_append",
+        agentLinkId: this.linkb.agentLinkId,
+        sessions: [
+          {
+            hermesSessionId: sid,
+            source: "openclaw",
+            messages: fresh.map((r) => ({ role: r.role === "assistant" ? "agent" : "user", text: r.text, srcId: r.id })),
+          },
+        ],
+      });
+      console.log(`· #202 對賬 ${key}:補投 ${fresh.length} 行(seq>${this.wmByKey[key] ?? 0})`);
+    }
+    if (rows.length) {
+      this.wmByKey[key] = Math.max(this.wmByKey[key] ?? 0, ...rows.map((r) => r.seq));
+      this.saveDriveState();
+    }
+    return fresh.length;
+  }
+
+  /** 對賬全部 driven key(啟動時 index.ts 調 + gateway 重連時 wire 的 onConnected 調)。 */
+  async reconcileAll(reason: string): Promise<void> {
+    const entries = Object.entries(this.drivenPersist);
+    if (!entries.length) return;
+    if (!this.linkb.isReady) return; // 下次觸發再補(水位線沒動,不丟)
+    let delivered = 0;
+    for (const [key, sid] of entries) {
+      try {
+        delivered += await this.reconcileKey(key, sid);
+      } catch (e) {
+        this.counters.driveErrors += 1;
+        console.error(`[#202 reconcile failed ${key}] ${(e as Error).message}`);
+      }
+    }
+    if (delivered) console.log(`· #202 對賬(${reason}):共補投 ${delivered} 行`);
   }
 }

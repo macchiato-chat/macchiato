@@ -9,6 +9,7 @@ import { titlegenKey } from "../src/openclaw/titles";
 function makeDrive(opts: { titleMode?: string } = {}) {
   // #113:標題持久集隔離到臨時文件;默認 off(專項測試才開),免干擾既有 calls/sent 斷言
   process.env.MACCHIATO_OPENCLAW_TITLED = join(mkdtempSync(join(tmpdir(), "oc-titled-")), "titled.json");
+  process.env.MACCHIATO_OPENCLAW_DRIVE = join(mkdtempSync(join(tmpdir(), "oc-drive-")), "drive.json"); // #202 隔離對賬狀態
   process.env.MACCHIATO_OPENCLAW_TITLE_MODE = opts.titleMode ?? "off";
   const calls: { method: string; params: any }[] = [];
   const gw: any = {

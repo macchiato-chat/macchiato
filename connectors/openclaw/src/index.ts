@@ -18,7 +18,7 @@ import { runVerifiedSelfUpdate } from "./selfupdate";
 import { spawn } from "node:child_process";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.5.7";
+const CONNECTOR_VERSION = "1.5.8";
 
 /** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
 function runSelfUpdate(): void {
@@ -68,6 +68,10 @@ async function main(): Promise<void> {
     }
   });
   await linkb.start();
+
+  // #202 啟動對賬:連接器停機窗內 driven 會話漏投的行(含 #200 類「進程死於回合中途」的 final)
+  // 靠 chat.history(穩定 id+seq)補齊;已投+已回填 srcId 的撞唯一索引被 server 吃掉,不雙投。
+  void drive.reconcileAll("startup").catch((e) => console.error("[#202 startup reconcile]", (e as Error).message));
 
   // 4. 上報可導入歷史數（app 的「導入」入口據此顯示）
   await announceImportAvailable(gw, linkb).catch((e) => console.error("import_available failed:", e));

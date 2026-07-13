@@ -50,6 +50,13 @@ export class OpenClawGateway {
     return () => this.handlers.delete(h);
   }
 
+  /** #202 每次握手成功後回調(含重連)。斷連窗內的廣播已丟——訂閱方據此觸發對賬補齊。 */
+  private readonly connectedHandlers = new Set<() => void>();
+  onConnected(h: () => void): () => void {
+    this.connectedHandlers.add(h);
+    return () => this.connectedHandlers.delete(h);
+  }
+
   /** 連接並完成首次握手。 */
   async start(): Promise<void> {
     this.connect();
@@ -86,6 +93,13 @@ export class OpenClawGateway {
     if (this.firstConnect) {
       this.firstConnect();
       this.firstConnect = null;
+    }
+    for (const h of this.connectedHandlers) {
+      try {
+        h();
+      } catch {
+        /* 訂閱方自負其責 */
+      }
     }
   }
 

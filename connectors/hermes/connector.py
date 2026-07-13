@@ -65,7 +65,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.7"
+CONNECTOR_VERSION = "1.5.8"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -465,6 +465,16 @@ class Connector:
                 e2e_skip.add(real_id)
                 e2e_skip.add(server_sid)
         driven = [s for s in (list(self._rev.keys()) + list(self._fwd.keys())) if s not in e2e_skip]
+        # #203:清映射**前**捕獲每會話的 srcId 回填 floor(_turn_floor 按 server_sid 鍵;鏡像水位線按
+        # state.db sid 鍵)。floor = 最後一次成功回填 dedup_key 的行 → 快進絕不能越過它(floor 之後的行
+        # 可能已落庫但尚未 live 投遞/尚未回填——重啟瞬間的 in-flight 回合,推過去 = 靜默永久丟)。
+        floors: dict = {}
+        _tf = getattr(self, "_turn_floor", {})
+        _stored = getattr(self, "_stored", {})
+        for server_sid in list(self._fwd.keys()):
+            fl = _tf.get(server_sid)
+            if fl is not None:
+                floors[_stored.get(server_sid, server_sid)] = fl
         self._fwd.clear()
         self._rev.clear()
         self._pending_interrupt.clear()  # 重啟後舊回合已死，早到的 pending 中斷作廢
@@ -473,12 +483,18 @@ class Connector:
         # 修 A：_rev 一清，鏡像就不再跳過這些會話 → 會把 live 已投遞的消息重發成重複。
         # 把它們的鏡像水位線推到當前 max（重啟後不重發舊消息；之後的 Discord 續聊仍會鏡像）。
         if driven:
-            asyncio.create_task(self._advance_mirror_driven(driven))
+            asyncio.create_task(self._advance_mirror_driven(driven, floors))
 
-    async def _advance_mirror_driven(self, sids: list) -> None:
+    async def _advance_mirror_driven(self, sids: list, floors: dict | None = None) -> None:
+        """#203:快進上限 = min(當前 max, 該會話 srcId 回填 floor)。floor 之前的行必然「已 live 投遞
+        且已回填 dedup_key」——鏡像若重發撞 (session,dedup_key) 唯一索引被吃掉,不雙投;floor 之後的行
+        (重啟瞬間 in-flight / 尚未回填)留給鏡像照常 tail 補投——漏的救回來,不再靜默丟。無 floor
+        (本進程沒完成過回合)→ 不推:此前的行都在上個進程的回合末回填過,鏡像重發同樣被 dedup 吃掉。
+        (E2E 會話在調用方已排除——它們的水位線永不推,原有守衛不變。)"""
         if self._mirror_st is None:
             return
         wm = self._mirror_st["sessions"]
+        floors = floors or {}
         try:
             maxes = {r[0]: r[4] for r in await changed_sessions()}
         except Exception as exc:
@@ -487,12 +503,16 @@ class Connector:
         changed = False
         for sid in sids:
             mx = maxes.get(sid)
-            if mx is not None and mx > wm.get(sid, 0):
-                wm[sid] = mx
+            fl = floors.get(sid)
+            if mx is None or fl is None:
+                continue  # 非 state.db 會話 / 無回填 floor → 不推(鏡像重發靠 dedup 兜)
+            target = min(mx, fl)
+            if target > wm.get(sid, 0):
+                wm[sid] = target
                 changed = True
         if changed:
             self._save_mirror_state(self._mirror_st)
-            print(f"· 鏡像水位線推進 {len(sids)} 自驅會話（修 A：防重啟重發）", file=sys.stderr)
+            print(f"· 鏡像水位線推進(≤srcId floor)——重啟不重發、in-flight 行留給鏡像補投", file=sys.stderr)
 
     def _session_db(self):
         # 懶加載 Hermes 的 SessionDB（連接器跑在 hermes-agent venv 內，同一份 hermes_state）。
