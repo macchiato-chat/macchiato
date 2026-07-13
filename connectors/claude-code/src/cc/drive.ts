@@ -170,6 +170,11 @@ interface TurnCtx {
   lastError?: string; // #102 assistant.error(auth/billing/rate_limit…)→ 失敗行帶上
   isE2E: boolean;
   isFirstMacchiatoTurn: boolean;
+  /** #141 output tokens 累計:outputBase=已完成子消息之和,outputLive=當前子消息的 message_delta 累計;
+   *  總計=base+live。lastUsageEmitAt 節流 turn.usage 上報。 */
+  outputBase: number;
+  outputLive: number;
+  lastUsageEmitAt: number;
 }
 
 /** #118 一條長活通道(每活躍會話一條;閒置回收,resume 重建)。 */
@@ -628,6 +633,9 @@ export class Drive {
       acc: "",
       isE2E,
       isFirstMacchiatoTurn,
+      outputBase: 0,
+      outputLive: 0,
+      lastUsageEmitAt: 0,
     };
     this.pending.add(sid); // #200 在途回合登記(進程死在此後 → 下次啟動提示重發)
     this.saveMap();
@@ -703,6 +711,18 @@ export class Drive {
     this.emit(sid, "message.start", {});
   }
 
+  /**
+   * #141 節流上報累計 output tokens(base+live)。默認 ~700ms 一次防刷屏;`force=true`(子消息邊界)
+   * 立即發一次確保跨步進位不丟。E2E 跳過(web 鎖住,且保守不外露任何回合信號)。
+   */
+  private emitTurnUsage(sid: string, turn: TurnCtx, force = false): void {
+    if (turn.isE2E) return;
+    const now = Date.now();
+    if (!force && now - turn.lastUsageEmitAt < 700) return;
+    turn.lastUsageEmitAt = now;
+    this.emit(sid, "turn.usage", { output_tokens: turn.outputBase + turn.outputLive });
+  }
+
   private handleMessage(ch: Channel, m: any): void {
     const sid = ch.sid;
     const turn = ch.turn;
@@ -717,6 +737,10 @@ export class Drive {
       }
       this.mirror?.setDriven(m.session_id); // 本回合 live 獨佔(per-turn)
       this.mirror?.markDrivenUuid(m.session_id); // 影子兜底:永久登記此 CLI uuid 為「被驅動過」
+      // #201 每回合一個 init。若此刻無 active turn(上個回合已 done、通道閒置)——說明這是子任務完成後
+      // SDK 自動喚醒 agent 的續寫回合(無 prompt.submit)。建合成 turn 接住,否則後續內容被 !turn 丟棄。
+      // 正常回合:startTurn 已同步建好 ch.turn(見其註),故此處 !ch.turn 為假、不觸發。
+      if (!ch.turn && !ch.closing) this.startContinuationTurn(ch);
       return;
     }
     // #97 後台任務(subagent + run_in_background bash 統一走 task_*):展示進度/完成。E2E 會話
@@ -775,6 +799,13 @@ export class Drive {
         turn.tools.set(id, { name: String(b.name ?? "tool"), argsText: "" });
         this.startMsg(sid, turn);
         if (!turn.isE2E) this.emit(sid, "tool.start", { tool_id: id, name: String(b.name ?? "tool") });
+      } else if (ev.type === "message_delta") {
+        // #141 當前子消息的累積 output_tokens(Anthropic 流式標準:message_delta.usage 累加)。
+        const ot = ev.usage?.output_tokens;
+        if (typeof ot === "number") {
+          turn.outputLive = ot;
+          this.emitTurnUsage(sid, turn);
+        }
       }
       return;
     }
@@ -782,6 +813,13 @@ export class Drive {
       if (!turn || turn.completed) return;
       // #102 API 級錯誤分類(authentication_failed/billing_error/rate_limit/overloaded…)留給失敗行
       if (typeof m.error === "string") turn.lastError = m.error;
+      // #141 子消息完成:把其最終 output_tokens 折進 base、清 live(下個子消息 message_delta 重新累)。
+      const ot = m.message?.usage?.output_tokens;
+      if (typeof ot === "number") {
+        turn.outputBase += ot;
+        turn.outputLive = 0;
+        this.emitTurnUsage(sid, turn, true);
+      }
       // 完整 assistant API 消息：補齊 tool_use 的 args（deltas 裡是分片 json）
       for (const b of m.message?.content ?? []) {
         if (b?.type === "tool_use" && typeof b.id === "string" && turn.tools.has(b.id)) {
@@ -825,6 +863,39 @@ export class Drive {
       this.loggedUnknown.add(key);
       console.log(`[drive] 未處理的 SDK 消息 ${key}(首次,已忽略): ${JSON.stringify(m).slice(0, 400)}`);
     }
+  }
+
+  /**
+   * #201 SDK 自發喚醒的續寫回合:子任務(Task 子代理/後台)完成 → SDK 注入 `<task-notification>` 把
+   * agent 叫回來續寫。這種回合**沒有 prompt.submit**(無 user content),原本 handleMessage 的 `!turn`
+   * 分支會把它的 assistant/流/result 全丟(2026-07-13 實測:一份寫好的設計被扔、既不投 live 也不鏡像
+   * ——driven 會話鏡像本就跳過)。建一個合成 turn 讓內容照常走 message.start→delta→complete 投成一條新
+   * agent 消息。清舊閒置計時(防它 mid-回合關通道)、進 #200 pending;seen=true(非用戶投遞,無送達確認
+   * /重投語義)、isFirstMacchiatoTurn=false(不生成標題)。driven 會話鏡像跳過 → 這條是唯一路、不雙投。
+   */
+  private startContinuationTurn(ch: Channel): void {
+    const sid = ch.sid;
+    if (ch.idleTimer) {
+      clearTimeout(ch.idleTimer);
+      ch.idleTimer = undefined;
+    }
+    ch.turn = {
+      content: "",
+      tools: new Map(),
+      started: false,
+      completed: false,
+      seen: true,
+      retried: false,
+      acc: "",
+      isE2E: this.e2e?.isE2E(sid) ?? false,
+      isFirstMacchiatoTurn: false,
+      outputBase: 0, // #141
+      outputLive: 0,
+      lastUsageEmitAt: 0,
+    };
+    this.pending.add(sid); // #200 在途回合登記
+    this.saveMap();
+    console.log(`· ${sid} SDK 自發續寫回合(子任務完成自動喚醒)→ 建合成 turn 投遞`);
   }
 
   /** #118 回合定稿(result 到):message.complete + 鏡像快進 + 續投排隊/閒置計時。 */

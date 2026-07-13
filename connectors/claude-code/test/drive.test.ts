@@ -946,3 +946,30 @@ describe("#200 在途回合可見化(重啟提示重發)", () => {
     delete process.env.MACCHIATO_CC_TITLE_MODE;
   });
 });
+
+describe("#201 SDK 自發喚醒的續寫回合", () => {
+  it("無 prompt.submit 的續寫回合(子任務完成自動喚醒)→ 投遞成新 agent 消息", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "off";
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "第一回合" },
+      // ↓ 自動喚醒:又一個 init,但沒有新的 prompt.submit(模擬 task-notification 續寫)
+      { type: "system", subtype: "init", session_id: CC_SID },
+      {
+        type: "stream_event",
+        event: { type: "content_block_delta", delta: { type: "text_delta", text: "續寫的設計" } },
+      },
+      { type: "result", subtype: "success", result: "續寫的設計" },
+    ];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 50));
+    const completes = sent.filter((f: any) => f.frame?.params?.type === "message.complete");
+    expect(completes.length).toBe(2); // 第一回合 + 自動喚醒續寫(修復前只有 1,續寫被 !turn 丟棄)
+    expect((completes[1] as any).frame.params.payload.text).toBe("續寫的設計");
+    d.dispose();
+    delete process.env.MACCHIATO_CC_TITLE_MODE;
+  });
+});
