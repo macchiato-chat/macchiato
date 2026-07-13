@@ -899,3 +899,50 @@ describe("#98 每會話權限模式", () => {
     delete process.env.MACCHIATO_CC_TITLE_MODE;
   });
 });
+
+describe("#200 在途回合可見化(重啟提示重發)", () => {
+  const hasNotice = (sent: Record<string, unknown>[]) =>
+    sent.filter((f) => JSON.stringify(f).includes("連接器剛重啟")).length;
+
+  it("進程死在回合中途 → 下次啟動對該會話回「請重發」提示", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "off";
+    // 回合開始但不結束(init 後掛住)——模擬進程被殺在回合中途,pending 落盤
+    emitScript = [{ type: "system", subtype: "init", session_id: CC_SID }, { __wait: 9000 }];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+    // 「新進程」:同一狀態文件新建 Drive → flush 應對 CC_SID 提示重發
+    const { linkb: lb2, sent: sent2 } = fakeLinkb();
+    const d2 = new Drive(lb2);
+    d2.flushAbandonedTurns();
+    expect(hasNotice(sent2)).toBe(1);
+    // 冪等:再 flush 不重發
+    d2.flushAbandonedTurns();
+    expect(hasNotice(sent2)).toBe(1);
+    d.dispose();
+    d2.dispose();
+    delete process.env.MACCHIATO_CC_TITLE_MODE;
+  });
+
+  it("正常完成的回合 → 下次啟動不提示", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "off";
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 40)); // 回合跑完 → pending 清
+    const { linkb: lb2, sent: sent2 } = fakeLinkb();
+    const d2 = new Drive(lb2);
+    d2.flushAbandonedTurns();
+    expect(hasNotice(sent2)).toBe(0);
+    d.dispose();
+    d2.dispose();
+    delete process.env.MACCHIATO_CC_TITLE_MODE;
+  });
+});

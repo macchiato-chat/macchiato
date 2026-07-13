@@ -200,6 +200,14 @@ export class Drive {
   private permModes: Record<string, string>;
   /** #143 serverSid → 會話 model（session.create.model 下發；持久，同文件存）。 */
   private models: Record<string, string>;
+  /**
+   * #200 一期(可見化):**在途回合**的 sid 集(持久)。回合起加、止刪;進程死在回合中途 →
+   * 該 sid 留在盤上 → 下次啟動撈出、Link B ready 後回一條 system 提示「連接器重啟了,這條沒跑完,
+   * 請重發」,消滅「發消息無響應無報錯」的靜默失敗(設備重啟同理)。不做自動 resume(避雙投)。
+   */
+  private pending: Set<string>;
+  /** #200 上個進程死時遺留的在途回合(構造時從盤載入、當即清盤;flushAbandoned 在 ready 後告知)。 */
+  private abandonedTurns: string[] = [];
   /** #118 sid → 長活通道。 */
   private readonly channels = new Map<string, Channel>();
   /** sid → 排隊的後續 prompt（回合進行中收到的;#118 起可含原生塊數組）。 */
@@ -230,6 +238,26 @@ export class Drive {
     // 影子兜底:啟動時把既有 ULID→CLI 映射的 CLI uuid 全灌給鏡像(跨重啟持久),鏡像據此永不給
     // 這些「被驅動過」的 CLI 會話單獨建會話(防重啟後污染態丟失又復發)。
     for (const cc of Object.values(this.map)) this.mirror?.markDrivenUuid(cc);
+    // #200 上個進程死時盤上還留著的在途回合 = 被殺掉的回合。撈出待 flush(ready 後告知),當即清盤
+    // (新回合從空集重記,不與舊的混)。
+    this.abandonedTurns = state.pending;
+    this.pending = new Set();
+    if (state.pending.length) this.saveMap();
+  }
+
+  /**
+   * #200 一期:Link B ready 後,對「上個進程死時被殺的在途回合」回一條 system 提示,把靜默無響應變
+   * 成明確可操作(重發)。非 E2E 才發明文提示(E2E 不洩明文;其會話重發即可)。冪等——清空後不再發。
+   */
+  flushAbandonedTurns(): void {
+    const sids = this.abandonedTurns;
+    this.abandonedTurns = [];
+    for (const sid of sids) {
+      if (this.e2e?.isE2E(sid)) continue;
+      this.emit(sid, "review.summary", {
+        summary: "⚠️ 連接器剛重啟,上一條消息可能沒跑完——請重發一次。",
+      });
+    }
   }
 
   /** #98 該會話當前 SDK 權限模式 + 編輯自動批策略。UI 檔優先,回退 env(逃生門)。permKey=通道重建判據。 */
@@ -601,6 +629,8 @@ export class Drive {
       isE2E,
       isFirstMacchiatoTurn,
     };
+    this.pending.add(sid); // #200 在途回合登記(進程死在此後 → 下次啟動提示重發)
+    this.saveMap();
     ch.input.push({
       type: "user",
       message: { role: "user", content },
@@ -849,6 +879,8 @@ export class Drive {
       this.genTitle = undefined;
     }
     ch.turn = undefined;
+    this.pending.delete(sid); // #200 回合正常收尾 → 出在途集(有續投則 startTurn 再加回)
+    this.saveMap();
     // 排隊的後續 prompt → 同通道續投(startTurn 自檢 cwd 變更);沒有 → 閒置計時回收。
     const next = this.queued.get(sid)?.shift();
     if (!this.queued.get(sid)?.length) this.queued.delete(sid);
@@ -874,6 +906,8 @@ export class Drive {
     }
     const turn = ch.turn;
     ch.turn = undefined;
+    this.pending.delete(sid); // #200 通道收尾 → 出在途集(下面若走送達重投,startTurn 會再加回)
+    this.saveMap();
     if (turn && !turn.completed) {
       // 送達確認(#116 b):push 後 CLI 未及處理(未見任何事件)即死 → 重投一次(新通道 resume)。
       // 已見事件的回合:user 消息已落 transcript(#116 b 實測),重投=雙投,只能定稿 error。
@@ -1121,6 +1155,7 @@ export class Drive {
     cwds: Record<string, string>;
     permModes: Record<string, string>;
     models: Record<string, string>;
+    pending: string[];
   } {
     try {
       const parsed = JSON.parse(readFileSync(mapPath(), "utf8")) as Record<string, unknown>;
@@ -1130,11 +1165,12 @@ export class Drive {
           cwds: (parsed.cwds ?? {}) as Record<string, string>,
           permModes: (parsed.permModes ?? {}) as Record<string, string>, // #98
           models: (parsed.models ?? {}) as Record<string, string>, // #143
+          pending: Array.isArray(parsed.pending) ? (parsed.pending as string[]) : [], // #200
         };
       }
-      return { map: (parsed ?? {}) as Record<string, string>, cwds: {}, permModes: {}, models: {} };
+      return { map: (parsed ?? {}) as Record<string, string>, cwds: {}, permModes: {}, models: {}, pending: [] };
     } catch {
-      return { map: {}, cwds: {}, permModes: {}, models: {} };
+      return { map: {}, cwds: {}, permModes: {}, models: {}, pending: [] };
     }
   }
   private saveMap(): void {
@@ -1143,7 +1179,14 @@ export class Drive {
       const tmp = `${mapPath()}.tmp`;
       writeFileSync(
         tmp,
-        JSON.stringify({ v: 2, map: this.map, cwds: this.cwds, permModes: this.permModes, models: this.models }),
+        JSON.stringify({
+          v: 2,
+          map: this.map,
+          cwds: this.cwds,
+          permModes: this.permModes,
+          models: this.models,
+          pending: [...this.pending], // #200 在途回合
+        }),
       );
       renameSync(tmp, mapPath());
     } catch (e) {
