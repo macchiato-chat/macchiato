@@ -508,6 +508,13 @@ export class Drive {
         }
         case "session.archive":
           return; // #75:CC 無歸檔概念,顯式忽略(不落 default 靜默)
+        case "session.rename": {
+          // #161 手動改名回寫:app 改標題 → 寫回 CLI transcript(custom-title),終端側同名。
+          const title = typeof params.title === "string" ? params.title.trim() : "";
+          const cc = this.ccSidFor(sid);
+          if (title && cc) void renameSession(cc, title).catch(() => {});
+          return;
+        }
         case "session.retitle": {
           // #94 後續:UI 發起「AI 重新命名」。讀該會話 transcript → 生成 → emit session.title。
           void this.retitleFromTranscript(sid);

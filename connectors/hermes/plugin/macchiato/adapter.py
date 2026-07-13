@@ -83,8 +83,11 @@ class MacchiatoAdapter(BasePlatformAdapter):
         # Platform("macchiato") 觸發枚舉 _missing_ 動態建成員（無需改 Hermes 源碼）。
         super().__init__(config, Platform("macchiato"))
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         # 薄殼：不維持長連接，投遞時即連 socket。標記為已連接以便 gateway 路由投遞。
+        # is_reconnect：Hermes 0.18.0 起 gateway 一律以 connect(is_reconnect=...) 呼叫
+        # （gateway/run.py），缺這個 kwarg 會 TypeError → 平台永遠卡 retrying。帶預設值
+        # 向後相容 0.17；薄殼無長連接，重連與首連無差別，值本身用不上。
         self._mark_connected()
         logger.info("[macchiato] adapter ready (push via %s)", PUSH_SOCK)
         return True

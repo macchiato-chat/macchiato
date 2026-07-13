@@ -85,6 +85,8 @@ export interface MirrorMessage {
 const TOOL_OUTPUT_MAX = 10_000;
 /** #61:尾部未結算 toolCall 的 hold-back 時限——超過視為 agent 崩了,照發(對齊 Hermes STALE_TURN_S)。 */
 const STALE_TURN_MS = Number(process.env.MACCHIATO_STALE_TURN_S ?? 600) * 1000;
+/** #152:單會話單幀每批消息上限(對齊 CC ≈150;防超大 mirror_append 撞 server 8MiB/內存尖峰)。 */
+const BATCH_MAX = Number(process.env.MACCHIATO_OPENCLAW_BATCH_MAX ?? 150);
 
 /**
  * §9 鏡像去重身份：OpenClaw .jsonl 消息無穩定 id → 用內容指紋（role+text+createdAt 的 sha256 前綴）。
@@ -251,7 +253,7 @@ export function isCronSession(key: string | undefined): boolean {
  * #61:toolCall 與 toolResult 跨行折疊;尾部 agent 消息的 toolCall 還沒等到結果(回合
  * 進行中)→ hold-back:本輪不發、offset 停在它的行首,下輪連 toolResult 一起重讀。
  * 太舊(>STALE_TURN_MS,agent 中途崩)則照發,免得該會話鏡像永久卡死(對齊 Hermes 修 C)。 */
-export function readNewMessages(file: string, offset: number): { messages: MirrorMessage[]; newOffset: number } {
+export function readNewMessages(file: string, offset: number, maxMessages?: number): { messages: MirrorMessage[]; newOffset: number } {
   const size = statSync(file).size;
   if (size <= offset) return { messages: [], newOffset: offset };
   const buf = Buffer.allocUnsafe(size - offset);
@@ -279,6 +281,14 @@ export function readNewMessages(file: string, offset: number): { messages: Mirro
     }
   }
   const { messages, srcIndex } = foldMessages(objs);
+  // #152 batchMax:超出上限截斷到第 max 條,newOffset 指向首條未消費消息的行首(下輪 poll 續讀)。
+  // 截斷後的 toolResult 折疊已跨全窗完成——下輪重讀到孤兒 toolResult 行會被 foldMessages 丟棄,不重不漏。
+  if (maxMessages !== undefined && messages.length > maxMessages) {
+    return {
+      messages: messages.slice(0, maxMessages),
+      newOffset: lineStarts[srcIndex[maxMessages]!]!,
+    };
+  }
   const last = messages[messages.length - 1];
   if (last && last.role === "agent" && last.tools?.some((t) => t.output === undefined)) {
     const ts = typeof last.createdAt === "number" ? last.createdAt : Date.now();
@@ -524,6 +534,7 @@ export class Mirror {
     this.prune(new Set(sessions.map((s: any) => s.key).filter(Boolean)));
     const dir = sessionsDir();
     const batch: any[] = [];
+    const batchKeys: string[] = []; // #152 平行數組:每條 entry 的水位線鍵(salvage 條目 hermesSessionId≠key)
     const prev: Record<string, number> = {};
     for (const s of sessions) {
       const key: string | undefined = s.key;
@@ -538,6 +549,7 @@ export class Mirror {
           if (entry) {
             prev[key] = prevOff ?? 0;
             batch.push(entry);
+            batchKeys.push(key);
           }
         }
         continue;
@@ -551,7 +563,7 @@ export class Mirror {
         continue;
       }
       if (size <= off) continue;
-      const { messages, newOffset } = readNewMessages(file, off);
+      const { messages, newOffset } = readNewMessages(file, off, BATCH_MAX); // #152
       if (messages.length) {
         prev[key] = off;
         if (this.e2e?.isE2E(key)) {
@@ -573,6 +585,7 @@ export class Mirror {
               }),
             })),
           });
+          batchKeys.push(key);
         } else {
           batch.push({
             hermesSessionId: key,
@@ -580,22 +593,26 @@ export class Mirror {
             source: deriveSource(s),
             messages: messages.map((m) => ({ ...m, srcId: srcIdFor(m) })), // §9
           });
+          batchKeys.push(key);
         }
       }
       this.state.offsets[key] = newOffset;
     }
-    if (batch.length) {
+    // #152 單會話單幀(對齊 CC):每幀 ≤BATCH_MAX 條消息,rewind 也細化到單會話——nack 只回退撞壞的那條。
+    for (let bi = 0; bi < batch.length; bi++) {
+      const entry = batch[bi];
       this.batchId += 1;
-      this.rewind.push({ id: this.batchId, prev });
+      const k = batchKeys[bi]!; // 水位線鍵(≠ entry.hermesSessionId,salvage 條目用真大小寫 sid)
+      this.rewind.push({ id: this.batchId, prev: k in prev ? { [k]: prev[k]! } : {} });
       if (this.rewind.length > REWIND_KEEP) this.rewind.shift();
       this.linkb.send({
         t: "mirror_append",
         agentLinkId: this.linkb.agentLinkId,
-        sessions: batch,
+        sessions: [entry],
         batchId: this.batchId,
       });
       this.counters.mirrorBatches += 1; // #10
-      this.counters.mirrorMessages += batch.reduce((a, s) => a + (s.messages?.length ?? 0), 0);
+      this.counters.mirrorMessages += entry.messages?.length ?? 0;
     }
     this.save();
   }

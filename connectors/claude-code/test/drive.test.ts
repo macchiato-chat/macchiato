@@ -35,8 +35,11 @@ async function* yieldScript(script: Array<Record<string, unknown>>) {
   }
 }
 
+const renameCalls: Array<[string, string]> = [];
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
-  renameSession: async () => {},
+  renameSession: async (sid: string, title: string) => {
+    renameCalls.push([sid, title]);
+  },
   query: (args: { prompt: unknown; options: any }) => {
     lastOptions = args.options;
     queryCalls++;
@@ -971,5 +974,29 @@ describe("#201 SDK 自發喚醒的續寫回合", () => {
     expect((completes[1] as any).frame.params.payload.text).toBe("續寫的設計");
     d.dispose();
     delete process.env.MACCHIATO_CC_TITLE_MODE;
+  });
+});
+
+describe("#161 手動改名回寫", () => {
+  it("session.rename → renameSession(ccSid, title) 寫回 CLI transcript;無映射/空標題忽略", async () => {
+    renameCalls.length = 0;
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame("01ULIDRENAME000000000000AA", "prompt.submit", { text: "hi" })); // 建映射
+    await new Promise((r) => setTimeout(r, 30));
+    fire(tuiFrame("01ULIDRENAME000000000000AA", "session.rename", { title: "新標題" }));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(renameCalls).toContainEqual([CC_SID, "新標題"]);
+    // 空標題忽略
+    const n = renameCalls.length;
+    fire(tuiFrame("01ULIDRENAME000000000000AA", "session.rename", { title: "  " }));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(renameCalls.length).toBe(n);
+    d.dispose();
   });
 });

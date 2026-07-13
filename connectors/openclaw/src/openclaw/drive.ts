@@ -59,6 +59,8 @@ export class Drive {
 
   /** E2E 會話：runId 前暫存的（已解密）用戶消息, 回合結束隨加密批一起投遞。 */
   private readonly pendingUser = new Map<string, string[]>();
+  /** #162 回合中帶附件的跟進消息:整條排隊(steer 無附件通道),lifecycle end 自動 chat.send 送達。 */
+  private readonly pendingFollowUps = new Map<string, Array<{ sid: string; text: string; attachments: ChatAttachment[] }>>();
 
   /** #113 已自動生成過標題的 sid(持久,重啟不重生、不覆蓋用戶手改)。 */
   private readonly titled = loadTitled();
@@ -232,16 +234,37 @@ export class Drive {
     }
   }
 
+  /** #162:回合結束續投排隊的帶附件跟進(active 已清 → sendPrompt 走 chat.send 帶附件)。 */
+  private async flushFollowUps(key: string): Promise<void> {
+    const q = this.pendingFollowUps.get(key);
+    if (!q?.length) return;
+    this.pendingFollowUps.delete(key);
+    for (const f of q) {
+      try {
+        await this.sendPrompt(key, f.sid, f.text, f.attachments);
+      } catch (e) {
+        this.counters.driveErrors += 1;
+        console.error(`[#162 followup flush failed ${key}] ${(e as Error).message}`);
+      }
+    }
+  }
+
   /** #4:提交 prompt(回合進行中 → steer 注入);連接死於在途 → 排一次重投。
    * #60:attachments 隨 chat.send 送達(steer 無附件通道——回合進行中只 steer 文字+回執說明)。 */
   private async sendPrompt(key: string, sid: string, text: string, attachments: ChatAttachment[] = []): Promise<void> {
     const idem = `mc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     try {
       if (this.active.has(key)) {
-        if (attachments.length && !this.e2e?.isE2E(sid)) {
-          this.emit(sid, "review.summary", {
-            summary: `⚠️ 回合進行中,${attachments.length} 個附件暫無法注入——僅文字已轉交 agent,回合結束後請重發附件`,
-          });
+        if (attachments.length) {
+          // #162 steer 無附件通道 → 整條(文字+附件)排隊,回合結束自動 chat.send 送達——
+          // 不再丟附件叫用戶手動重發。代價:文字不 steer 進當前回合(隨附件下一回合到,與 codex 一致)。
+          const q = this.pendingFollowUps.get(key) ?? [];
+          q.push({ sid, text, attachments });
+          this.pendingFollowUps.set(key, q);
+          if (!this.e2e?.isE2E(sid)) {
+            this.emit(sid, "review.summary", { summary: `⏳ 回合進行中——帶附件的消息已排隊,本回合結束後自動送達` });
+          }
+          return;
         }
         if (!text) return; // 純附件 + 回合進行中:無可 steer
         const r = await this.gw.request("sessions.steer", { key, message: text });
@@ -357,6 +380,7 @@ export class Drive {
         this.completed.delete(runId);
         this.mirror?.fastForward(key); // live 已投遞 → 鏡像水位線快進到文件末, 防雙投
         void this.reconcileTurnEnd(key, sid); // #202 回填 srcId + 推水位線(fire-and-forget)
+        void this.flushFollowUps(key); // #162 排隊的帶附件跟進 → chat.send 續投
       }
       return;
     }

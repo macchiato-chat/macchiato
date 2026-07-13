@@ -2,6 +2,7 @@
  * 健康上報 + 鏡像看門狗（對齊 Hermes/OpenClaw 連接器）。
  * Claude Code 無常駐 gateway（SDK 按需 spawn CLI）→ gatewayAlive = transcript 目錄可讀 + CLI 在位。
  */
+import { gcAttachments } from "./cc/attachments";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { LinkBClient } from "./linkb/client";
@@ -62,6 +63,7 @@ export class HealthLoop {
   }
 
   tick(): void {
+    gcAttachments(); // #151 入站附件 TTL GC(節流在函數內)
     const ageS = Math.round((Date.now() - this.mirror.lastPollAt) / 1000);
     // #76 兼容自檢:版本門檻 + 最新 transcript 解析冒煙。不兼容 → compatOk=false(app 顯示降級),
     // 並把原因併入 lastError,別讓 CLI 升級悄悄破壞解析後靜默丟消息。

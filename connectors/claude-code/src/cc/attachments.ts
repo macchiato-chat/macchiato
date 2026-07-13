@@ -6,7 +6,7 @@
  * (或 http+localhost 的 dev 服務);https 目標解析後不得落私網/環回/link-local/保留段;下載 100MB 封頂。
  */
 import { lookup } from "node:dns/promises";
-import { createWriteStream, mkdirSync, readFileSync, statSync } from "node:fs";
+import { createWriteStream, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -130,4 +130,37 @@ export async function materializeAttachment(ref: AttachmentRefLike): Promise<str
   const out = createWriteStream(path);
   await pipeline(Readable.fromWeb(res.body as import("stream/web").ReadableStream), counter);
   return path;
+}
+
+
+/** #151 入站附件 TTL GC:prompt 早已消費,超時即刪(默認 6h,env 可調)。結構固定兩層
+ *  attachDir/<id>/<file>;刪過期文件、清空的 id 目錄。health tick 調用(節流 10min)。 */
+const ATTACH_TTL_MS = Number(process.env.MACCHIATO_CC_ATTACH_TTL_S || 6 * 3600) * 1000;
+let lastGcAt = 0;
+export function gcAttachments(now = Date.now()): number {
+  if (now - lastGcAt < 10 * 60_000) return 0;
+  lastGcAt = now;
+  let removed = 0;
+  let ids: string[] = [];
+  try {
+    ids = readdirSync(attachDir());
+  } catch {
+    return 0;
+  }
+  for (const id of ids) {
+    const dir = join(attachDir(), id);
+    try {
+      for (const f of readdirSync(dir)) {
+        const p = join(dir, f);
+        if (now - statSync(p).mtimeMs > ATTACH_TTL_MS) {
+          rmSync(p, { force: true });
+          removed += 1;
+        }
+      }
+      if (!readdirSync(dir).length) rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* 單目錄失敗不擋全局 */
+    }
+  }
+  return removed;
 }

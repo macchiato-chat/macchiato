@@ -386,3 +386,26 @@ describe("#4 prompt 級重試(gateway 死於在途)", () => {
     expect(calls.filter((c) => c.method === "chat.send").length).toBe(1);
   });
 });
+
+describe("#162 回合中帶附件的跟進", () => {
+  it("回合中帶附件 → 整條排隊(不 steer 不丟);lifecycle end → chat.send 帶附件自動送達", async () => {
+    const { drive, gw, linkb, calls, sent } = makeDrive();
+    const SID2 = "01OC162SID000000000000000A";
+    const KEY2 = `agent:main:macchiato:${SID2}`.toLowerCase();
+    await linkb.deliver(tui("prompt.submit", SID2, { text: "第一條" }));
+    gw.fire({ event: "agent", payload: { sessionKey: KEY2, stream: "lifecycle", runId: "r1", data: { phase: "start" } } });
+    // 回合中:帶附件的跟進(直接調 sendPrompt,模擬已下載的 chatAtts)。
+    await (drive as any).sendPrompt(KEY2, SID2, "看這張圖", [{ name: "a.png", mime: "image/png", content: "b64" }]);
+    expect(calls.filter((c) => c.method === "sessions.steer")).toHaveLength(0); // 沒 steer
+    expect(calls.filter((c) => c.method === "chat.send")).toHaveLength(1); // 只有第一條
+    const notice = sent.find((f: any) => JSON.stringify(f).includes("已排隊"));
+    expect(notice).toBeTruthy();
+    // 回合結束 → 自動續投(chat.send 帶附件)
+    gw.fire({ event: "agent", payload: { sessionKey: KEY2, stream: "lifecycle", runId: "r1", data: { phase: "end" } } });
+    await new Promise((r) => setTimeout(r, 20));
+    const sends = calls.filter((c) => c.method === "chat.send");
+    expect(sends).toHaveLength(2);
+    expect(sends[1]!.params.attachments).toHaveLength(1);
+    expect(sends[1]!.params.message).toBe("看這張圖");
+  });
+});

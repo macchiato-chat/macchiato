@@ -65,7 +65,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.9"
+CONNECTOR_VERSION = "1.5.10"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -527,6 +527,18 @@ class Connector:
             self._sdb = SessionDB()  # 默認 ~/.hermes/state.db；check_same_thread=False，可跨線程
         return self._sdb
 
+    async def _set_hermes_title(self, server_sid: str, title: str) -> None:
+        # #161 手動改名回寫(archive 同款路徑):自驅會話用持久映射的 state.db id;導入會話用原值。
+        real = self._stored.get(server_sid) or self._fwd.get(server_sid, server_sid)
+
+        def _do():
+            db = self._session_db()
+            sid = db.resolve_session_id(real) or real
+            return sid, db.set_session_title(sid, title)
+
+        sid, ok = await asyncio.to_thread(_do)
+        print(f"· session.rename {sid} → {title!r}({'ok' if ok else 'no-op'})")
+
     async def _set_hermes_archived(self, server_sid: str, archived: bool) -> None:
         # session.archive 是 server 造的合成方法、tui_gateway 沒有 → 連接器自己寫 state.db。
         # 自驅會話用持久映射的 state.db id（運行時句柄不是庫行）；導入會話 fallback 用原值。
@@ -809,6 +821,9 @@ class Connector:
             line = await asyncio.wait_for(reader.readline(), timeout=10)
             req = json.loads(line.decode("utf-8")) if line else {}
             chat_id = str(req.get("chatId") or "")
+            # #160 deliver-to-origin:chatId 若是本地 state.db 會話 id → 翻譯成 server sid
+            # (server 按 hermesSessionId 歸位原會話;翻不出原樣傳,home/自定義名照舊落收件箱)。
+            chat_id = self._stored_rev.get(chat_id, chat_id)
             text = req.get("text") or ""
             if not chat_id or not text:
                 ack = {"ok": False, "error": "missing chatId/text"}
@@ -1535,6 +1550,11 @@ class Connector:
                 await self._ensure_session(server_sid)
             elif method == "session.archive":
                 await self._set_hermes_archived(server_sid, bool(params.get("archived", True)))
+            elif method == "session.rename":
+                # #161 手動改名回寫:app 改標題 → 寫回 state.db,Hermes TUI 兩邊一致。
+                title = str(params.get("title") or "").strip()
+                if title:
+                    await self._set_hermes_title(server_sid, title)
             # session.retitle 已廢棄:改由首次 prompt.submit 自動生成標題(見上)。
             # session.delete / others: ignore for now
         except Exception as exc:

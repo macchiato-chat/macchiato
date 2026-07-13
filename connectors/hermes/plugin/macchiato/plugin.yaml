@@ -3,15 +3,13 @@ label: Macchiato
 kind: platform
 version: 1.0.0
 description: >
-  Macchiato channel adapter (Hermes platform plugin). Registers Macchiato as a
-  Hermes channel so the agent can proactively / on a schedule deliver messages
-  to your Macchiato app (reminders, cron reports, notifications). Thin shell:
-  each send hands the message to the local macchiato connector over a unix
-  socket; the connector forwards it to the Macchiato server over its
-  authenticated link. Outbound-only (inbound goes through the connector).
+  Macchiato 渠道適配器（Hermes 平台插件）。把 Macchiato 註冊成 Hermes 的一個渠道，
+  使 agent 能主動 / 延遲投遞回 Macchiato（提醒 / cron / 主動找你 / 系統通知）。
+  薄殼：每次 send 經本地 unix socket 把消息交給同機的 macchiato 連接器，由連接器經
+  已認證的 Link B 轉發給 Macchiato server。出站專用（入站走連接器 spawn 的 tui_gateway）。
 author: Macchiato
 optional_env:
   - name: MACCHIATO_PUSH_SOCK
-    description: "Connector push socket path (default ~/.macchiato/push.sock)"
+    description: "連接器主動投遞 unix socket 路徑（默認 ~/.macchiato/push.sock）"
     prompt: "Macchiato push socket path"
     password: false

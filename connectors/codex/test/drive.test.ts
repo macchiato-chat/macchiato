@@ -152,3 +152,80 @@ describe("#146 入站附件(落盤 + 路徑注入)", () => {
     expect(spawnArgs[0]![spawnArgs[0]!.length - 1]).toContain("/tmp/att/ok.pdf");
   });
 });
+
+describe("#153 工具保真 + reasoning 透出", () => {
+  const feed = (p: FakeProc, ev: any) => p.stdout.emit("data", Buffer.from(JSON.stringify(ev) + "\n"));
+  const events = (sent: any[]) => sent.filter((f) => f.frame?.params?.type).map((f) => f.frame.params);
+
+  it("command_execution → args.command + aggregated_output;exit≠0 標 error;reasoning 完成項 → reasoning.delta", async () => {
+    const { linkb, sent } = makeDrive();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "跑個命令" }));
+    const p = procs[0]!;
+    feed(p, { type: "item.completed", item: { id: "r1", type: "reasoning", text: "先想想" } });
+    feed(p, { type: "item.started", item: { id: "c1", type: "command_execution", command: "/bin/bash -lc 'ls'", status: "in_progress" } });
+    feed(p, { type: "item.completed", item: { id: "c1", type: "command_execution", command: "/bin/bash -lc 'ls'", aggregated_output: "file1\n", exit_code: 1, status: "completed" } });
+    feed(p, { type: "item.completed", item: { id: "m1", type: "agent_message", text: "跑完了" } });
+    p.emit("close", 0);
+    await new Promise((r) => setTimeout(r, 10));
+    const evs = events(sent);
+    const reasoning = evs.find((e) => e.type === "reasoning.delta");
+    expect(reasoning?.payload.text).toBe("先想想");
+    const tc = evs.find((e) => e.type === "tool.complete");
+    expect(tc?.payload.name).toBe("command");
+    expect(tc?.payload.args).toEqual({ command: "/bin/bash -lc 'ls'" }); // 修復前恆 {}
+    expect(tc?.payload.result_text).toBe("file1\n");
+    expect(tc?.payload.error).toBe("exit 1");
+  });
+
+  it("file_change / 未知類型:args 帶實料不再為空", async () => {
+    const { toolCardFor } = await import("../src/codex/drive");
+    const fc = toolCardFor({ id: "f1", type: "file_change", changes: [{ path: "a.ts", kind: "edit" }], status: "completed" });
+    expect(fc.args).toEqual({ changes: [{ path: "a.ts", kind: "edit" }] });
+    const unk = toolCardFor({ id: "x", type: "future_thing", detail: "y".repeat(600) });
+    expect(unk.name).toBe("future_thing");
+    expect(String(unk.args.detail)).toHaveLength(501); // 截斷 500+省略號
+  });
+});
+
+describe("#156 覆蓋缺口:排隊續投 + E2E send", () => {
+  it("回合中追加 prompt → 排隊;回合結束自動續投(新 proc,帶排隊文本)", async () => {
+    const { linkb } = makeDrive();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "第一條" }));
+    expect(procs).toHaveLength(1);
+    await linkb.deliver(tui("prompt.submit", SID, { text: "第二條(排隊)" }));
+    expect(procs).toHaveLength(1); // 回合中:不起新 proc
+    procs[0]!.stdout.emit("data", Buffer.from(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "答一" } }) + "\n"));
+    procs[0]!.emit("close", 0);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(procs).toHaveLength(2); // 續投起新 proc
+    expect(spawnArgs[1]![spawnArgs[1]!.length - 1]).toBe("第二條(排隊)");
+  });
+
+  it("E2E 會話:回合結束把 user+reply 加密成 mirror_append(不走明文 tui)", async () => {
+    const { linkb, sent } = makeDrive();
+    // 最小可逆「加密」樁:isE2E=true、encrypt/decrypt 直傳
+    const d2sent: any[] = [];
+    const e2e: any = {
+      isE2E: () => true,
+      decryptText: (_s: string, t: string) => t,
+      encryptContent: (_s: string, o: any) => "enc:" + JSON.stringify(o),
+    };
+    const { Drive } = await import("../src/codex/drive");
+    process.env.MACCHIATO_CODEX_SESSIONS = join(mkdtempSync(join(tmpdir(), "cx-e2e-")), "s.json");
+    const lb: any = { agentLinkId: "al", isReady: true, handlers: [], onFrame(h: any) { this.handlers.push(h); }, send: (m: any) => d2sent.push(m), async deliver(m: any) { for (const h of this.handlers) await h(m); } };
+    const d = new Drive(lb, undefined, e2e);
+    d.wire();
+    await lb.deliver(tui("prompt.submit", SID, { text: "秘密問題" }));
+    const p = procs[procs.length - 1]!;
+    p.stdout.emit("data", Buffer.from(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "秘密回答" } }) + "\n"));
+    p.emit("close", 0);
+    await new Promise((r) => setTimeout(r, 10));
+    // 明文 tui 事件不許有
+    expect(d2sent.filter((f) => f.t === "tui" && JSON.stringify(f).includes("秘密"))).toHaveLength(0);
+    const mf = d2sent.find((f) => f.t === "mirror_append");
+    expect(mf.sessions[0].e2e).toBe(true);
+    const roles = mf.sessions[0].messages.map((m: any) => m.role);
+    expect(roles).toEqual(["user", "agent"]);
+    expect(mf.sessions[0].messages[1].enc).toContain("秘密回答");
+  });
+});

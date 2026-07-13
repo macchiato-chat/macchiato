@@ -52,6 +52,51 @@ function sandboxMode(): string {
   return "workspace-write";
 }
 
+/**
+ * #153 工具卡取實料(活測 2026-07-14 形狀:command_execution 帶 command/aggregated_output/exit_code/status)。
+ * 按 item 子類型填 args/result/error;未知類型回退整個 item(去大字段)——別再恆 {}。
+ */
+export function toolCardFor(it: any): { name: string; args: Record<string, unknown>; resultText: string; error?: string } {
+  const type = String(it?.type ?? "tool");
+  if (type === "command_execution") {
+    const exit = typeof it.exit_code === "number" ? it.exit_code : undefined;
+    return {
+      name: "command",
+      args: { command: String(it.command ?? "") },
+      resultText: String(it.aggregated_output ?? ""),
+      ...(exit !== undefined && exit !== 0 ? { error: `exit ${exit}` } : {}),
+    };
+  }
+  if (type === "file_change") {
+    return {
+      name: "file_change",
+      args: { changes: it.changes ?? it.files ?? [] },
+      resultText: String(it.status ?? ""),
+      ...(String(it.status ?? "") === "failed" ? { error: "failed" } : {}),
+    };
+  }
+  if (type === "mcp_tool_call") {
+    const server = String(it.server ?? "");
+    const tool = String(it.tool ?? "");
+    return {
+      name: server || tool ? `mcp:${[server, tool].filter(Boolean).join(".")}` : "mcp_tool_call",
+      args: it.arguments && typeof it.arguments === "object" ? it.arguments : {},
+      resultText: String(it.result ?? it.status ?? ""),
+      ...(String(it.status ?? "") === "failed" ? { error: "failed" } : {}),
+    };
+  }
+  if (type === "web_search") {
+    return { name: "web_search", args: { query: String(it.query ?? "") }, resultText: String(it.status ?? "") };
+  }
+  // 未知類型:整個 item 去掉 id/type 與超長字段當 args——保住信息量。
+  const args: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(it ?? {})) {
+    if (k === "id" || k === "type") continue;
+    args[k] = typeof v === "string" && v.length > 500 ? v.slice(0, 500) + "…" : v;
+  }
+  return { name: type, args, resultText: String(it.command ?? it.text ?? it.status ?? "") };
+}
+
 interface Turn {
   proc: ChildProcess;
   stdoutBuf: string;
@@ -337,22 +382,31 @@ export class Drive {
             turn.agentText += (turn.agentText ? "\n\n" : "") + it.text;
             if (!turn.isE2E) this.emit(sid, "message.delta", { text: chunk });
           }
-        } else if (it.type && it.type !== "agent_message") {
-          // 工具類 item(file_change / command_execution / …):start/complete 成對
-          const id = String(it.id ?? `${it.type}-${turn.toolItems.size}`);
-          if (ev.type === "item.started") {
-            turn.toolItems.set(id, { name: String(it.type) });
+        } else if (it.type === "reasoning") {
+          // #153 思考完成項透出(token-delta 要 app-server v2 → #132;完成項現在就能給)。
+          const rtext = String(it.text ?? it.summary ?? "");
+          if (ev.type === "item.completed" && rtext && !turn.isE2E) {
             this.startMsg(sid, turn);
-            if (!turn.isE2E) this.emit(sid, "tool.start", { tool_id: id, name: String(it.type) });
+            this.emit(sid, "reasoning.delta", { text: rtext });
+          }
+        } else if (it.type && it.type !== "agent_message") {
+          // #153 工具類 item:按子類型取實料(args 不再恆 {};exit_code≠0/failed 標 error)。
+          const id = String(it.id ?? `${it.type}-${turn.toolItems.size}`);
+          const card = toolCardFor(it);
+          if (ev.type === "item.started") {
+            turn.toolItems.set(id, { name: card.name });
+            this.startMsg(sid, turn);
+            if (!turn.isE2E) this.emit(sid, "tool.start", { tool_id: id, name: card.name });
           } else {
             const t = turn.toolItems.get(id);
             if (t && !turn.isE2E) {
               this.emit(sid, "tool.complete", {
                 tool_id: id,
-                name: t.name,
-                args: {},
+                name: card.name,
+                args: card.args,
                 result: null,
-                result_text: String(it.command ?? it.text ?? it.status ?? "").slice(0, 20_000),
+                result_text: card.resultText.slice(0, 20_000),
+                ...(card.error ? { error: card.error } : {}),
               });
             }
           }
