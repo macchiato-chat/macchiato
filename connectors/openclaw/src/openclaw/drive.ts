@@ -215,6 +215,27 @@ export class Drive {
           await this.sendPrompt(key, sid, text, chatAtts);
           return;
         }
+        case "command.invoke": {
+          // #199 skill 調用:翻成 gateway 命令管線文本 `/skill <name> [args]`(無專用 invoke RPC;
+          // /skill 前綴無歧義——直呼 /<name> 雖也解析,但會與 /tools 等內建命令搶名字)。
+          // 走 sendPrompt 全路徑:回合進行中 steer 注入、斷線重投同 prompt。
+          const name = String(params.command ?? "")
+            .trim()
+            .replace(/^\//, "");
+          if (!name) return;
+          const args = String(params.args ?? "").trim();
+          const text = `/skill ${name}${args ? ` ${args}` : ""}`;
+          if (this.e2e?.isE2E(sid)) {
+            // 命令名明文是既定設計;文本記入 pendingUser 供回合末加密鏡像批
+            const arr = this.pendingUser.get(key) ?? [];
+            arr.push(text);
+            this.pendingUser.set(key, arr);
+          }
+          this.markDriven(key, sid);
+          console.log(`· #199 command.invoke ${text} → ${key}`);
+          await this.sendPrompt(key, sid, text);
+          return;
+        }
         case "session.interrupt":
           // #5:重投等待期(#4)收到中斷 → 標記取消重投。
           if (this.retryWaiting.has(key)) {

@@ -6,7 +6,6 @@ import { gcAttachments } from "./codex/attachments";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { LinkBClient } from "./linkb/client";
-import type { Drive } from "./codex/drive";
 import type { Mirror } from "./codex/mirror";
 import { sessionsRoot } from "./codex/transcripts";
 import { checkCompat } from "./codex/compat";
@@ -38,7 +37,7 @@ export class HealthLoop {
     private readonly linkb: LinkBClient,
     private readonly mirror: Mirror,
     private readonly version: string,
-    private readonly drive?: Drive, // #10:驅動錯誤計數來源
+    private readonly drive?: { counters: Record<string, number> }, // #10:驅動錯誤計數來源(v1/v2 drive 皆可)
   ) {}
 
   start(): void {

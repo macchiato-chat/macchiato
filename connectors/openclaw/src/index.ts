@@ -13,12 +13,13 @@ import { announceImportAvailable, runImport } from "./openclaw/history-import";
 import { Mirror } from "./openclaw/mirror";
 import { PushHandler } from "./push/handler";
 import { E2EKeyStore } from "./e2e/keys";
+import { CommandsReporter } from "./openclaw/commands";
 import { HealthLoop } from "./health";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 import { spawn } from "node:child_process";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.5.14";
+const CONNECTOR_VERSION = "1.5.15";
 
 /** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
 function runSelfUpdate(): void {
@@ -51,6 +52,7 @@ async function main(): Promise<void> {
   const mirror = new Mirror(gw, linkb, e2e);
   const drive = new Drive(gw, linkb, mirror, e2e);
   drive.wire(); // tui 幀（prompt.submit/interrupt）+ OpenClaw 事件 → 流式回傳
+  new CommandsReporter(gw, linkb).start(); // #199 skill 清單上報(/菜單數據源;失敗只缺菜單)
   linkb.onFrame((msg) => {
     if (msg.t === "mirror_nack" && typeof msg.batchId === "number") mirror.handleNack(msg.batchId);
     else if (msg.t === "import_start") void runImport(gw, linkb); // web「re-import」→ 回灌全量歷史

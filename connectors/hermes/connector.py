@@ -65,7 +65,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.14"
+CONNECTOR_VERSION = "1.5.15"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -488,6 +488,7 @@ class Connector:
         # 把它們的鏡像水位線推到當前 max（重啟後不重發舊消息；之後的 Discord 續聊仍會鏡像）。
         if driven:
             asyncio.create_task(self._advance_mirror_driven(driven, floors))
+        asyncio.create_task(self._report_commands())  # #199 catalog 可能隨升級變 → 重發清單
 
     async def _advance_mirror_driven(self, sids: list, floors: dict | None = None) -> None:
         """#203:快進上限 = min(當前 max, 該會話 srcId 回填 floor)。floor 之前的行必然「已 live 投遞
@@ -1359,6 +1360,66 @@ class Connector:
                 f"（水位線→{snap['cover']}）"
             )
 
+    async def _submit_final(self, server_sid: str, real: str, final_text: str, retry_refs: list) -> None:
+        """提交一回合文本給 gateway(prompt.submit 與 #199 command.invoke 共用尾段):
+        #13 記回合 floor → submit;GatewayDied → 後台重投(#4);4009 busy → steer 注入(#75 方案 D);
+        成功 → 補償早到中斷(#5)。"""
+        assert self.gw is not None
+        # #13:記回合 floor——此後 > floor 的 state.db 行即本回合所寫,
+        # 回合結束(message.complete)按它定位行 id 回填 live 消息身份。
+        if self._stored.get(server_sid) and not self._e2e.is_e2e(server_sid):
+            try:
+                self._turn_floor[server_sid] = await current_max_id()
+            except Exception:
+                pass  # 拿不到 floor → 本回合不回填,會話級跳過照舊兜底
+        try:
+            await self.gw.submit_prompt(real, final_text)
+        except GatewayDied:
+            # #4:gateway 死於 prompt 在途——請求確定沒完成(在途回合也隨進程死了)。
+            # 後台等 gateway 重啟就緒後重投一次(去重見 _retry_prompt),你那句話不再石沉。
+            # 不 await:重啟可能要幾十秒,別堵住 Link B 的分派循環。
+            self._retry_tasks[server_sid] = asyncio.create_task(
+                self._retry_prompt(server_sid, final_text, retry_refs)
+            )
+        except GatewayError as exc:
+            # 回合進行中（4009 session busy）→ steer 把跟進消息注入正在跑的回合（方案 D），
+            # 不丟、不打斷；模型在下一次工具迭代時看到。純圖無文字無法 steer → 照舊上拋記日誌。
+            if exc.code == 4009 and final_text:
+                res = await self.gw.steer(real, final_text)
+                print(f"· 回合進行中 → steer 注入跟進消息（status={(res or {}).get('status')}）")
+            else:
+                raise
+        else:
+            # 補償早到的中斷：prompt.submit 返回即「streaming」（回合在後台線程跑），
+            # 此刻 interrupt 立即取消；turn_context 對剛起步的回合會保留此 interrupt。
+            if server_sid in self._pending_interrupt:
+                self._pending_interrupt.discard(server_sid)
+                await self.gw.interrupt(real)
+                print(f"· 補償早到中斷 → interrupt {real}（回合起步即取消）")
+
+    async def _report_commands(self) -> None:
+        """#199 枚舉 agent 命令/技能 → 上報 {t:"commands"}(整份替換,composer / 菜單數據源)。
+        權威源 = tui_gateway RPC `commands.catalog`(已按平台過濾 disabled、已 dedup、描述已截 120)
+        ——勿 dir-walk(磁碟 SKILL.md 遠多於 live 生效數,會多報),勿讀 .skills_prompt_snapshot.json
+        (system-prompt 緩存會 stale)。失敗只缺菜單,靜默降級不影響其他功能。"""
+        if self.gw is None or not self.gw.ready():
+            return
+        try:
+            res = await self.gw.request("commands.catalog", {})
+            pairs = (res or {}).get("pairs") or []
+            n = int((res or {}).get("skill_count") or 0)
+            cmds = []
+            for item in pairs[-n:] if n > 0 else []:
+                slug = str(item[0] if len(item) > 0 else "").strip().lstrip("/")
+                desc = str(item[1] if len(item) > 1 else "").strip()
+                if not slug:
+                    continue
+                cmds.append({"name": slug, **({"description": desc[:200]} if desc else {})})
+            await self._send({"t": "commands", "agentLinkId": self.agent_link_id, "commands": cmds})
+            print(f"· #199 命令枚舉:{len(cmds)} 條上報")
+        except Exception as exc:
+            print(f"[#199 commands.catalog 失敗(/菜單缺席,其餘不受影響)] {exc!r}", file=sys.stderr)
+
     def _dispatch_session(self, server_sid: str, coro_factory) -> None:
         """#148:把慢工作掛到該會話的串行鏈上。讀循環立刻返回;同會話按序、跨會話並發。
         前任異常不斷鏈(已各自記日誌/計數);鏈尾完成且仍是尾 → 清條目防字典緩慢積長。"""
@@ -1403,6 +1464,7 @@ class Connector:
                 except Exception as exc:
                     print(f"[積壓補發失敗,剩 {len(self._out_pending)}] {exc!r}", file=sys.stderr)
             await self._advertise_import()
+            await self._report_commands()  # #199 每次 ready 重發(server 重啟丟內存緩存)
             return
         if t == "auth_error":
             reason = msg.get("reason")
@@ -1500,41 +1562,32 @@ class Connector:
                     # 純語音且轉錄為空（STT 不可用/沒聽清）→ 不打擾 agent（server 已落兜底提示）。
                     non_audio = any(r.get("kind") != "audio" for r in attachments)
                     if final_text or non_audio or not attachments:
-                        # #13:記回合 floor——此後 > floor 的 state.db 行即本回合所寫,
-                        # 回合結束(message.complete)按它定位行 id 回填 live 消息身份。
-                        if self._stored.get(server_sid) and not self._e2e.is_e2e(server_sid):
-                            try:
-                                self._turn_floor[server_sid] = await current_max_id()
-                            except Exception:
-                                pass  # 拿不到 floor → 本回合不回填,會話級跳過照舊兜底
-                        try:
-                            await self.gw.submit_prompt(real, final_text)
-                        except GatewayDied:
-                            # #4:gateway 死於 prompt 在途——請求確定沒完成(在途回合也隨進程死了)。
-                            # 後台等 gateway 重啟就緒後重投一次(去重見 _retry_prompt),你那句話不再石沉。
-                            # 不 await:重啟可能要幾十秒,別堵住 Link B 的分派循環。
-                            non_audio_refs = [r for r in attachments if r.get("kind") != "audio"]
-                            self._retry_tasks[server_sid] = asyncio.create_task(
-                                self._retry_prompt(server_sid, final_text, non_audio_refs)
-                            )
-                        except GatewayError as exc:
-                            # 回合進行中（4009 session busy）→ steer 把跟進消息注入正在跑的回合（方案 D），
-                            # 不丟、不打斷；模型在下一次工具迭代時看到。純圖無文字無法 steer → 照舊上拋記日誌。
-                            if exc.code == 4009 and final_text:
-                                res = await self.gw.steer(real, final_text)
-                                print(f"· 回合進行中 → steer 注入跟進消息（status={(res or {}).get('status')}）")
-                            else:
-                                raise
-                        else:
-                            # 補償早到的中斷：prompt.submit 返回即「streaming」（回合在後台線程跑），
-                            # 此刻 interrupt 立即取消；turn_context 對剛起步的回合會保留此 interrupt。
-                            if server_sid in self._pending_interrupt:
-                                self._pending_interrupt.discard(server_sid)
-                                await self.gw.interrupt(real)
-                                print(f"· 補償早到中斷 → interrupt {real}（回合起步即取消）")
+                        non_audio_refs = [r for r in attachments if r.get("kind") != "audio"]
+                        await self._submit_final(server_sid, real, final_text, non_audio_refs)
                     else:
                         print("· 語音轉錄為空，跳過提交 agent（server 已落兜底）")
                 self._dispatch_session(server_sid, _do_prompt)
+            elif method == "command.invoke":
+                # #199 命令/技能調用(composer / 菜單選中):**兩步**——prompt.submit 不展開 /slug
+                # (harness 原文直達 agent),必須先 command.dispatch 拿展開全文,再走常規提交尾段
+                # (steer/重投/floor 同 prompt 路徑)。慢路徑(dispatch RPC 往返)→ per-session 串行鏈。
+                async def _do_invoke(params=params, server_sid=server_sid):
+                    name = str(params.get("command") or "").strip().lstrip("/")
+                    if not name:
+                        return
+                    arg = str(params.get("args") or "").strip()
+                    real = await self._ensure_session(server_sid)
+                    res = await self.gw.request(
+                        "command.dispatch", {"name": "/" + name, "arg": arg, "session_id": real}
+                    )
+                    text = str((res or {}).get("message") or "").strip()
+                    if not text:
+                        # dispatch 沒展開(未知/被禁命令)→ 原文提交兜底,agent 至少看得見用戶意圖
+                        text = f"/{name} {arg}".strip()
+                        print(f"· #199 dispatch 未展開 /{name},原文提交兜底", file=sys.stderr)
+                    await self._submit_final(server_sid, real, text, [])
+                    print(f"· #199 command.invoke /{name} → {server_sid}(展開 {len(text)} 字)")
+                self._dispatch_session(server_sid, _do_invoke)
             elif method == "approval.respond":
                 real = await self._ensure_session(server_sid)
                 await self.gw.request(

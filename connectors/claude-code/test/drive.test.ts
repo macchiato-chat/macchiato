@@ -188,6 +188,42 @@ describe("Drive", () => {
     expect((d as any).interruptedSids.has(CC_SID)).toBe(true); // 隨後 result 定性 interrupted
   });
 
+  it("#199 command.invoke → 拼 /name args 開回合;回合進行中同樣走 steer", async () => {
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "command.invoke", { command: "deep-research", args: "量子計算現狀" }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(queryCalls).toBe(1); // 閒置 → 直接開回合
+    // 回合進行中 → 進隊 + 打斷(dispatchContent 與 prompt.submit 同路)
+    let interrupted = 0;
+    (d as any).channels.set(CC_SID, { sid: CC_SID, turn: { completed: false }, q: { interrupt: async () => void interrupted++ } });
+    fire(tuiFrame(CC_SID, "command.invoke", { command: "/verify" })); // 帶斜杠也歸一
+    await new Promise((r) => setTimeout(r, 10));
+    expect((d as any).queued.get(CC_SID)).toEqual(["/verify"]);
+    expect(interrupted).toBe(1);
+  });
+
+  it("#199 system/commands_changed → 整份替換轉給 CommandsReporter", async () => {
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "system", subtype: "commands_changed", session_id: CC_SID, commands: [{ name: "newskill", description: "d", argumentHint: "" }] },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const updates: unknown[][] = [];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb, undefined, undefined, { update: (c: unknown[]) => updates.push(c) } as any);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(updates).toHaveLength(1);
+    expect((updates[0]![0] as any).name).toBe("newskill");
+  });
+
   it("session.interrupt → 調 query.interrupt", async () => {
     const { linkb, fire } = fakeLinkb();
     const d = new Drive(linkb);

@@ -18,9 +18,10 @@
  * 沙箱:非交互驅動需不卡審批。默認 workspace-write(可 env 調);danger-full-access 需顯式開。
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
+import { loadDriveState, saveDriveState } from "./state";
 import { resolveCodexBin } from "./codex-bin";
 import { generateTitle } from "./titles";
 import { materializeAttachment } from "./attachments";
@@ -30,9 +31,6 @@ import type { Mirror } from "./mirror";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-function mapPath(): string {
-  return process.env.MACCHIATO_CODEX_SESSIONS || join(homedir(), ".macchiato/codex-sessions.json");
-}
 export function workDir(): string {
   return process.env.MACCHIATO_CODEX_WORKDIR || homedir();
 }
@@ -493,37 +491,10 @@ export class Drive {
     this.linkb.send({ t: "mirror_append", agentLinkId: this.linkb.agentLinkId, sessions: [{ hermesSessionId: sid, source: "codex", e2e: true, messages: msgs }] });
   }
 
-  private loadState(): {
-    map: Record<string, string>;
-    cwds: Record<string, string>;
-    models: Record<string, string>;
-    titled: Set<string>;
-    pending: string[];
-  } {
-    try {
-      const p = JSON.parse(readFileSync(mapPath(), "utf8"));
-      return {
-        map: p.map ?? {},
-        cwds: p.cwds ?? {},
-        models: p.models ?? {}, // #143
-        titled: new Set<string>(Array.isArray(p.titled) ? p.titled : []),
-        pending: Array.isArray(p.pending) ? (p.pending as string[]) : [], // #200
-      };
-    } catch {
-      return { map: {}, cwds: {}, models: {}, titled: new Set(), pending: [] };
-    }
+  private loadState(): ReturnType<typeof loadDriveState> {
+    return loadDriveState(); // #132 抽到 state.ts(v1/v2 drive 共用同一持久文件)
   }
   private saveMap(): void {
-    try {
-      mkdirSync(dirname(mapPath()), { recursive: true });
-      const tmp = `${mapPath()}.tmp`;
-      writeFileSync(
-        tmp,
-        JSON.stringify({ v: 1, map: this.map, cwds: this.cwds, models: this.models, titled: [...this.titled], pending: [...this.pending] }),
-      );
-      renameSync(tmp, mapPath());
-    } catch (e) {
-      console.error("[session map save failed]", (e as Error).message);
-    }
+    saveDriveState({ map: this.map, cwds: this.cwds, models: this.models, titled: this.titled, pending: this.pending });
   }
 }

@@ -9,13 +9,14 @@ import { LinkBClient } from "./linkb/client";
 import { runPairing } from "./linkb/pairing";
 import { E2EKeyStore } from "./e2e/keys";
 import { Mirror } from "./cc/mirror";
+import { CommandsReporter } from "./cc/commands";
 import { announceImportAvailable, runImport } from "./cc/history-import";
 import { Drive, workDir } from "./cc/drive";
 import { HealthLoop } from "./health";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.5.14";
+const CONNECTOR_VERSION = "1.5.15";
 
 function runSelfUpdate(): void {
   // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。
@@ -38,7 +39,8 @@ async function main(): Promise<void> {
   const linkb = new LinkBClient(creds);
   const e2e = new E2EKeyStore();
   const mirror = new Mirror(linkb, e2e);
-  const drive = new Drive(linkb, mirror, e2e);
+  const commands = new CommandsReporter(linkb); // #199 命令/技能清單上報(/菜單數據源)
+  const drive = new Drive(linkb, mirror, e2e, commands);
   drive.wire();
 
   linkb.onFrame((msg) => {
@@ -59,6 +61,7 @@ async function main(): Promise<void> {
   drive.flushAbandonedTurns(); // #200 對上個進程死時被殺的在途回合回「請重發」提示(消滅靜默無響應)
   announceImportAvailable(linkb); // app 的「導入」入口據此顯示
   mirror.start();
+  void commands.start(workDir()); // #199 枚舉+上報(短命 CLI;失敗只缺菜單,不阻啟動)
 
   const health = new HealthLoop(linkb, mirror, CONNECTOR_VERSION, drive); // #10:計數上報
   health.start();

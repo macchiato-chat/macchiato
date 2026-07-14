@@ -41,6 +41,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { imageBlockFor, materializeAttachment } from "./attachments";
 import { claudeBinIsAbsolute, resolveClaudeBin } from "./claude-bin";
+import type { CommandsReporter } from "./commands";
 import { generateTitle } from "./titles";
 import type { LinkBClient } from "../linkb/client";
 import type { E2EKeyStore } from "../e2e/keys";
@@ -238,6 +239,8 @@ export class Drive {
     private readonly linkb: LinkBClient,
     private readonly mirror?: Mirror,
     private readonly e2e?: E2EKeyStore,
+    /** #199 命令上報器:live 通道的 commands_changed 經 drive 轉給它(整份替換)。 */
+    private readonly commands?: CommandsReporter,
   ) {
     const state = this.loadState();
     this.map = state.map;
@@ -267,6 +270,33 @@ export class Drive {
         summary: "⚠️ 連接器剛重啟,上一條消息可能沒跑完——請重發一次。",
       });
     }
+  }
+
+  /**
+   * #75/#199 投遞一回合內容(prompt.submit 與 command.invoke 共用):
+   * 回合進行中 = steer(硬轉向,2026-07-11 用戶拍板默認行為)——打斷當前回合(定稿 interrupted,
+   * 已生成部分保留)+ 新內容進隊由 finishTurn 續投(同通道帶完整上下文)。SDK 無「邊生成邊融合」
+   * (探測結論 3),打斷+接管是唯一真 steer;與 OpenClaw 在 Macchiato 的 steer 行為對齊。
+   * 閒置 = 直接開新回合。
+   */
+  private async dispatchContent(sid: string, content: TurnContent): Promise<void> {
+    const busy = this.channels.get(sid);
+    if (busy?.turn) {
+      const q = this.queued.get(sid) ?? [];
+      q.push(content);
+      this.queued.set(sid, q);
+      if (!busy.turn.completed) {
+        this.interruptedSids.add(sid);
+        try {
+          await busy.q.interrupt();
+        } catch {
+          /* 回合恰好剛結束 → interrupt 空打,排隊消息由 finishTurn 正常續投 */
+        }
+        console.log(`· Steer:打斷當前回合,新消息接管 → ${sid}`);
+      }
+      return;
+    }
+    this.startTurn(sid, content);
   }
 
   /** #98 該會話當前 SDK 權限模式 + 編輯自動批策略。UI 檔優先,回退 env(逃生門)。permKey=通道重建判據。 */
@@ -463,27 +493,26 @@ export class Drive {
           const content: TurnContent = imageBlocks.length
             ? [...(text ? [{ type: "text", text }] : []), ...imageBlocks]
             : text;
-          const busy = this.channels.get(sid);
-          if (busy?.turn) {
-            // #75 steer(硬轉向,2026-07-11 用戶拍板默認行為):回合進行中發消息 = 打斷當前回合
-            // (定稿 interrupted,已生成部分保留)+ 新消息作為下一回合立即開跑(finishTurn 的排隊
-            // 續投機制,同通道帶完整上下文)。SDK 無「邊生成邊融合」(探測結論 3),打斷+接管是
-            // 唯一真 steer;與 OpenClaw 在 Macchiato 的 steer 行為對齊。
-            const q = this.queued.get(sid) ?? [];
-            q.push(content);
-            this.queued.set(sid, q);
-            if (!busy.turn.completed) {
-              this.interruptedSids.add(sid);
-              try {
-                await busy.q.interrupt();
-              } catch {
-                /* 回合恰好剛結束 → interrupt 空打,排隊消息由 finishTurn 正常續投 */
-              }
-              console.log(`· Steer:打斷當前回合,新消息接管 → ${sid}`);
-            }
-            return;
+          await this.dispatchContent(sid, content);
+          return;
+        }
+        case "command.invoke": {
+          // #199 命令/技能調用(composer / 菜單選中):拼 `/name args` 推進 input 流,CLI 原生
+          // 攔截展開(skill 展開成 prompt 走正常模型回合;內建本地命令回合成 result,定稿照舊)。
+          // E2E:invoke 幀本就明文(既定設計),命令文本記入 pendingUser 供回合末密文回灌。
+          const name = String(params.command ?? "")
+            .trim()
+            .replace(/^\//, "");
+          if (!name) return;
+          const args = String(params.args ?? "").trim();
+          const text = `/${name}${args ? ` ${args}` : ""}`;
+          if (this.e2e?.isE2E(sid)) {
+            const arr = this.pendingUser.get(sid) ?? [];
+            arr.push(text);
+            this.pendingUser.set(sid, arr);
           }
-          this.startTurn(sid, content);
+          console.log(`· command.invoke ${text} → ${sid}`);
+          await this.dispatchContent(sid, text);
           return;
         }
         case "session.interrupt": {
@@ -802,6 +831,12 @@ export class Drive {
     if (m.type === "system" && typeof m.subtype === "string" && m.subtype.startsWith("task")) {
       // E2E 只抑制展示，仍需內部追蹤 task 生命周期，否則 #212 的 idle 保護會失效。
       this.handleTaskEvent(sid, m, !isE2E);
+      return;
+    }
+    // #199 命令清單變更(agent 進子目錄動態發現新 skill 等):SDK 明示載荷是整份新清單,
+    // 直接替換上報(supportedCommands 重調只會拿到 init 舊快照)。
+    if (m.type === "system" && m.subtype === "commands_changed") {
+      if (Array.isArray(m.commands)) this.commands?.update(m.commands);
       return;
     }
     // #102 壓縮可見化:長會話自動/手動壓縮不再是無解釋停頓。

