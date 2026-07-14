@@ -308,6 +308,10 @@ interface State {
   missingAt?: Record<string, number>;
   /** #161 墓碑:app 刪過的會話 key,鏡像/打撈永不再撈(agent 側 .jsonl 不動)。 */
   tombstones?: string[];
+  /** #211 水位線的文件身份:key → 上次消費的 sessionId。gateway 升級/會話重置會給同一 key 換新
+   * .jsonl(2026-07-14 OpenClaw 2026.7.1 實測)——舊字節水位線壓在新文件上 offset>size → 永久靜默
+   * 跳過。fileId 變 → 從 0 重讀(srcId 內容指紋去重,重讀安全)。 */
+  fileIds?: Record<string, string>;
 }
 
 export class Mirror {
@@ -553,6 +557,16 @@ export class Mirror {
       const sessionId: string | undefined = s.sessionId;
       if (!key || !sessionId || isCronSession(key)) continue; // cron 不鏡像（已在目標聊天裡）
       if (this.state.tombstones?.includes(key)) continue; // #161 app 刪過 → 永不再撈(含打撈)
+      // #211 文件輪換偵測:同一 key 換了 sessionId(gateway 升級/會話重置)→ 舊字節水位線作廢,
+      // 從 0 重讀新文件(srcId 指紋去重防重複)。否則 offset>size 永久靜默卡死(2026-07-14 實測)。
+      const fids = (this.state.fileIds ??= {});
+      if (fids[key] !== sessionId) {
+        if (fids[key] !== undefined && this.state.offsets[key] !== undefined) {
+          console.log(`· #211 ${key} 文件輪換(${fids[key]?.slice(0, 8)}→${String(sessionId).slice(0, 8)}),水位線歸零重讀`);
+          this.state.offsets[key] = 0;
+        }
+        fids[key] = sessionId;
+      }
       if (key.startsWith(MACCHIATO_PREFIX) || this.drivenKeys.has(key)) {
         // #147 drive 的會話:文字由 live 投遞;鏡像打撈 tool/thinking(去正文)補進歷史,推進水位線。
         const f = join(dir, `${sessionId}.jsonl`);
@@ -574,6 +588,12 @@ export class Mirror {
       if (off === undefined) {
         this.state.offsets[key] = size; // baseline：新會話只鏡像啟動後的消息
         continue;
+      }
+      if (size < off) {
+        // #211 兜底:文件比水位線短(被重寫/截短)→ 歸零重讀,srcId 去重兜住;別靜默卡死。
+        console.log(`· #211 ${key} 文件縮短(size=${size} < off=${off}),水位線歸零重讀`);
+        this.state.offsets[key] = 0;
+        continue; // 下輪從 0 讀(本輪 off 已失效)
       }
       if (size <= off) continue;
       const { messages, newOffset } = readNewMessages(file, off, BATCH_MAX); // #152
@@ -655,7 +675,7 @@ export class Mirror {
   private load(): State {
     return loadStateFile(
       statePath(),
-      (raw) => ({ offsets: raw.offsets ?? {}, missingAt: raw.missingAt ?? {}, tombstones: raw.tombstones ?? [] }), // #161
+      (raw) => ({ offsets: raw.offsets ?? {}, missingAt: raw.missingAt ?? {}, tombstones: raw.tombstones ?? [], fileIds: raw.fileIds ?? {} }), // #161/#211
       () => ({ offsets: {}, missingAt: {} }),
     );
   }
