@@ -17,9 +17,12 @@ import { CommandsReporter } from "./openclaw/commands";
 import { HealthLoop } from "./health";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.5.15";
+const CONNECTOR_VERSION = "1.5.16";
 
 /** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
 function runSelfUpdate(): void {
@@ -49,6 +52,7 @@ async function main(): Promise<void> {
   // 3. Macchiato Link B
   const linkb = new LinkBClient(creds);
   const e2e = new E2EKeyStore();
+  const freshInstall = !existsSync(process.env.MACCHIATO_OPENCLAW_MIRROR || join(homedir(), ".macchiato/openclaw-mirror.json")); // #154
   const mirror = new Mirror(gw, linkb, e2e);
   const drive = new Drive(gw, linkb, mirror, e2e);
   drive.wire(); // tui 幀（prompt.submit/interrupt）+ OpenClaw 事件 → 流式回傳
@@ -77,6 +81,13 @@ async function main(): Promise<void> {
 
   // 4. 上報可導入歷史數（app 的「導入」入口據此顯示）
   await announceImportAvailable(gw, linkb).catch((e) => console.error("import_available failed:", e));
+  // #154 首裝自動全量導入(拍板:Hermes/OpenClaw 不請示):鏡像水位線文件從未存在 = 首次安裝
+  // → 自動回灌全部歷史(等價點「導入」;server dedup_key 去重)。既有安裝不觸發——自動 replace
+  // 會重置手動改過的標題。freshInstall 在 mirror.start() 建檔**前**採樣;進程內只跑一次。
+  if (freshInstall) {
+    console.log("· #154 首裝偵測 → 自動全量導入歷史(無需請示)");
+    void runImport(gw, linkb).catch((e) => console.error("[#154 自動導入失敗(手動導入入口仍在)]", (e as Error).message));
+  }
 
   // 5. 鏡像（OpenClaw → Macchiato, 增量）
   mirror.start();

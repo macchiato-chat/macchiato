@@ -85,6 +85,8 @@ interface State {
   missingAt?: Record<string, number>;
   /** #161 墓碑:app 刪過的會話(CLI uuid),鏡像永不再撈;不刪 transcript(app 是遙控器)。 */
   tombstones?: string[];
+  /** #154 首掃基線已建(true 之後新發現的會話才 from-zero)。舊安裝(offsets 非空)載入時視為已建。 */
+  seeded?: boolean;
 }
 
 export class Mirror {
@@ -242,9 +244,10 @@ export class Mirror {
       this.lastSizeAt.set(sid, size);
       const grew = prevSize !== undefined && size !== prevSize;
       if (grew) this.lastGrowthAt.set(sid, now);
-      // 未知會話 → 從 0 全量鏡像（完整歷史，這是相對官方 remote control 的核心——自動看到所有會話；
-      // 不再 baseline 到文件末依賴手動 import。srcId 去重保證重發安全、新會話為空插入順序正確）。
-      if (!(sid in this.state.offsets)) this.state.offsets[sid] = 0;
+      // #154 基線策略(拍板翻轉,對齊 codex):**首掃**把既有 transcript 基線到文件末——裝上連接器
+      // 不再把全部舊會話不請自來灌進側欄,歷史改走「導入」提示(全量/按 project/不導,app 端三選)。
+      // 首掃之後新發現的會話 = 連接器運行期間新建 → 照舊從 0 全量鏡像(終端新會話實時可見不變)。
+      if (!(sid in this.state.offsets)) this.state.offsets[sid] = this.state.seeded ? 0 : size;
 
       if (this.drivenSids.has(sid)) {
         this.state.offsets[sid] = size; // live 獨佔投遞：只快進
@@ -326,6 +329,7 @@ export class Mirror {
     if (activity.length) {
       this.linkb.send({ t: "mirror_activity", agentLinkId: this.linkb.agentLinkId, sessions: activity });
     }
+    this.state.seeded = true; // #154 首掃完成:此後新發現的會話才 from-zero
     this.save();
   }
 
@@ -428,7 +432,14 @@ export class Mirror {
       try {
         const s = JSON.parse(readFileSync(p, "utf8")) as State;
         if (isBak) console.error(`⚠️ ${statePath()} 損壞/丟失 → 已從 .bak 恢復`);
-        return { offsets: s.offsets ?? {}, titles: s.titles ?? {}, missingAt: s.missingAt ?? {}, tombstones: s.tombstones ?? [] }; // #161
+        return {
+          offsets: s.offsets ?? {},
+          titles: s.titles ?? {},
+          missingAt: s.missingAt ?? {},
+          tombstones: s.tombstones ?? [], // #161
+          // #154:舊安裝(有水位線,歷史已全量鏡過)視為已 seeded;白名單漏字段的教訓——顯式帶上。
+          seeded: s.seeded ?? Object.keys(s.offsets ?? {}).length > 0,
+        };
       } catch {
         /* 下一個候選 */
       }

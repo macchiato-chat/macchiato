@@ -62,13 +62,16 @@ describe("Mirror", () => {
     process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
     mkdirSync(join(cfg, "projects", "-home-x"), { recursive: true });
     file = join(cfg, "projects", "-home-x", `${SID}.jsonl`);
+    // #154 預置已 seeded 的狀態:本套件測的是「首掃之後」的常態語義(新會話 from-zero 全量);
+    // 首掃基線本身見「#154 首掃基線」測試。
+    writeFileSync(process.env.MACCHIATO_CC_MIRROR!, JSON.stringify({ offsets: {}, titles: {}, seeded: true }));
   }
 
   beforeEach(() => {
     n = 0;
   });
 
-  it("未知會話從 0 全量鏡像歷史(不再 baseline 跳過);之後增量(帶 srcId)", () => {
+  it("seeded 後新發現的會話從 0 全量鏡像;之後增量(帶 srcId)", () => {
     setupEnv();
     writeFileSync(file, userLine("old history") + userLine("second"));
     const { linkb, sent } = fakeLinkb();
@@ -300,6 +303,9 @@ describe("Mirror #56 mirror_activity", () => {
     process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
     mkdirSync(join(cfg, "projects", "-home-x"), { recursive: true });
     file = join(cfg, "projects", "-home-x", `${SID}.jsonl`);
+    // #154 預置 seeded:activity 測的是「已建會話」的工作態;首掃基線的會話 server 側不存在,
+    // 對其不發 busy 是新語義下的正確行為(守衛本就攔「未建會話」)。
+    writeFileSync(process.env.MACCHIATO_CC_MIRROR!, JSON.stringify({ offsets: {}, titles: {}, seeded: true }));
     writeFileSync(file, userLine("hi"));
     const { linkb, sent } = fakeLinkb();
     return { linkb, sent, m: new Mirror(linkb) };
@@ -361,5 +367,34 @@ describe("#6/#9 狀態文件兜底與裁剪", () => {
     expect(m2.state.titles.gone_old).toBeUndefined(); // titles 同步清
     m2.prune(new Set(["live", "gone_new"]), Date.now()); // 回歸即清 missingAt
     expect(m2.state.missingAt.gone_new).toBeUndefined();
+  });
+});
+
+describe("#154 首掃基線(fresh install)", () => {
+  it("無狀態文件的首掃:既有 transcript 基線到末、不自動灌;首掃後新增內容照常鏡像;新會話 from-zero", () => {
+    const cfg = mkdtempSync(join(tmpdir(), "cc-cfg-"));
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
+    mkdirSync(join(cfg, "projects", "-home-x"), { recursive: true });
+    const oldFile = join(cfg, "projects", "-home-x", `${SID}.jsonl`);
+    writeFileSync(oldFile, userLine("多年舊歷史") + assistantLine("舊回覆"));
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb);
+    (m as any).doPoll(); // 首掃
+    expect(appends(sent)).toHaveLength(0); // 不請自來的歷史灌入沒有了(改走導入提示)
+    // 首掃後該會話繼續長 → 增量照鏡(從基線起)
+    appendFileSync(oldFile, userLine("新消息"));
+    (m as any).doPoll();
+    const inc = appends(sent).flatMap((f: any) => f.sessions[0].messages);
+    expect(inc.map((x: any) => x.text)).toEqual(["新消息"]);
+    // 首掃後新建的會話 → from-zero 全量(終端新會話實時可見不變)
+    const sid2 = "7777afc5-2dca-477d-a987-848421d25124";
+    writeFileSync(join(cfg, "projects", "-home-x", `${sid2}.jsonl`), userLine("新會話首條").replace(new RegExp(SID, "g"), sid2));
+    (m as any).doPoll();
+    const all2 = appends(sent).flatMap((f: any) => f.sessions).filter((x: any) => x.hermesSessionId === sid2);
+    expect(all2[0]!.messages.map((x: any) => x.text)).toEqual(["新會話首條"]);
+    // 重啟(新 Mirror 載同一狀態)→ seeded 持久,不會把舊歷史又基線一遍後漏鏡
+    const m2 = new Mirror(linkb);
+    expect(((m2 as any).state as any).seeded).toBe(true);
   });
 });

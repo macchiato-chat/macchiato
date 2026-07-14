@@ -65,7 +65,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.15"
+CONNECTOR_VERSION = "1.5.16"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -358,6 +358,7 @@ class Connector:
         self._compat: dict = {}
         self._smoke_err: str | None = None  # #112 解析冒煙結果(健康循環定期刷新)
         self._mirror_st = None  # 鏡像水位線狀態（nack 回退也要訪問）
+        self._fresh_install = False  # #154 首裝標記(run() 起步採樣;首裝 → ready 後自動全量導入)
         self._mirror_batch_id = 0
         self._mirror_rewind = deque(maxlen=64)  # (batchId, {sid: 舊floor})，供 nack 回退
         self._out_pending: deque = deque(maxlen=500)  # 斷線期間出站幀緩衝(ready 後補發;有界丟最舊)
@@ -403,6 +404,9 @@ class Connector:
         self._compat = await asyncio.to_thread(_check_hermes_compat)
         self._log_compat()
 
+        # #154 首裝採樣:水位線文件(含 .bak)從未存在 = 這台機器第一次跑 → ready 後自動全量導入。
+        # 必須在鏡像循環建基線**之前**採樣,否則首輪保存後就分不出新舊安裝了。
+        self._fresh_install = not (os.path.exists(MIRROR_STATE) or os.path.exists(MIRROR_STATE + ".bak"))
         self._mirror_task = asyncio.create_task(self._mirror_loop())
         print(f"· 持續鏡像已啟（輪詢 {MIRROR_POLL_S}s）")
         self._health_task = asyncio.create_task(self._health_loop())
@@ -872,6 +876,22 @@ class Connector:
             return
         print(f"· 可導入歷史會話: {n}")
         await self._send({"t": "import_available", "count": n})
+
+    async def _maybe_auto_import(self) -> None:
+        """#154 首裝自動全量導入(拍板:Hermes/OpenClaw 不請示用戶):水位線文件從未存在
+        = 首次安裝 → 自動把全部歷史 import_batch 回灌(等價用戶點「導入」;server 按
+        dedup_key 去重,非 replace 模式跳過已有)。既有安裝**不**觸發——自動 replace 會
+        重置用戶手動改過的標題。auto_imported 記進鏡像狀態,at-most-once。"""
+        if not self._fresh_install:
+            return
+        st = self._mirror_st or self._load_mirror_state()
+        if st.get("auto_imported"):
+            return
+        st["auto_imported"] = True
+        self._mirror_st = st
+        self._save_mirror_state(st)
+        print("· #154 首裝偵測 → 自動全量導入歷史(無需請示)")
+        await self._run_import()
 
     async def _run_import(self) -> None:
         """收到 import_start：枚舉磁盤歷史，分批 import_batch 回傳給 server。"""
@@ -1465,6 +1485,7 @@ class Connector:
                     print(f"[積壓補發失敗,剩 {len(self._out_pending)}] {exc!r}", file=sys.stderr)
             await self._advertise_import()
             await self._report_commands()  # #199 每次 ready 重發(server 重啟丟內存緩存)
+            await self._maybe_auto_import()  # #154 首裝自動全量導入(不請示)
             return
         if t == "auth_error":
             reason = msg.get("reason")

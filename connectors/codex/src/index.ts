@@ -17,7 +17,7 @@ import { HealthLoop } from "./health";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.5.15";
+const CONNECTOR_VERSION = "1.5.16";
 
 function runSelfUpdate(): void {
   // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。
@@ -63,7 +63,7 @@ async function main(): Promise<void> {
 
   linkb.onFrame((msg) => {
     if (msg.t === "mirror_nack" && typeof msg.batchId === "number") mirror.handleNack(msg.batchId);
-    else if (msg.t === "import_start") runImport(linkb); // app「導入歷史」→ 全量回灌
+    else if (msg.t === "import_start") runImport(linkb, Array.isArray(msg.projects) ? (msg.projects as string[]) : undefined); // #154 可按 project 過濾
     else if (msg.t === "self_update") runSelfUpdate();
     else if (msg.t === "e2e_wrap_request" && typeof msg.hermesSessionId === "string") {
       const wrapped = e2e.wrapForDevices(msg.hermesSessionId, (msg.devices as any[]) ?? []);
