@@ -83,15 +83,17 @@ export function permissionMode(): PermMode | undefined {
   return undefined;
 }
 
-/** #98 UI 四檔(協議 PermissionMode)。 */
-const UI_MODES = ["ask", "acceptEdits", "plan", "bypass"] as const;
+/** #98/#205 UI 五檔(協議 PermissionMode)。 */
+const UI_MODES = ["ask", "acceptEdits", "auto", "plan", "bypass"] as const;
 type UiMode = (typeof UI_MODES)[number];
 /** 文件編輯類工具——acceptEdits 檔在 canUseTool 內自動批(#116:SDK acceptEdits 被 canUseTool 覆蓋,故自實現)。 */
 const EDIT_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit", "ApplyPatch"]);
 /**
- * #98 UI 四檔 → SDK permissionMode + canUseTool 策略(#116 探針背書)。
+ * #98/#205 UI 五檔 → SDK permissionMode + canUseTool 策略(#116/#205 探針背書)。
  * - ask       → default,每工具問
  * - acceptEdits → default,編輯類自動批、其餘問(不用 SDK acceptEdits:被 canUseTool 覆蓋)
+ * - auto      → auto,classifier 自動批安全操作(#205 探針:classifier 先行、批准的不進
+ *               canUseTool——與 acceptEdits 被覆蓋不同;拿不準的仍落 canUseTool 彈審批卡)
  * - plan      → plan,ExitPlanMode 經審批橋(#99)
  * - bypass    → bypassPermissions,不調 canUseTool
  */
@@ -101,6 +103,8 @@ function mapUiMode(ui: UiMode): { sdk: PermMode | undefined; editAuto: boolean }
       return { sdk: "default", editAuto: false };
     case "acceptEdits":
       return { sdk: "default", editAuto: true };
+    case "auto":
+      return { sdk: "auto", editAuto: false };
     case "plan":
       return { sdk: "plan", editAuto: false };
     case "bypass":
@@ -318,47 +322,83 @@ export class Drive {
   /** #104 進度改原地更新(不再刷屏),節流可比文本行時代(15s)更密。 */
   private static readonly PROGRESS_THROTTLE_MS = 5_000;
 
+  private hasRunningTasks(sid: string): boolean {
+    return (this.sessionTasks.get(sid)?.size ?? 0) > 0;
+  }
+
+  /** #212 任務在跑時通道不算閒置；最後一個任務結束後才重新開始完整 idle 窗。 */
+  private scheduleIdleClose(ch: Channel): void {
+    if (ch.idleTimer) {
+      clearTimeout(ch.idleTimer);
+      ch.idleTimer = undefined;
+    }
+    if (ch.closing || ch.turn || this.channels.get(ch.sid) !== ch || this.hasRunningTasks(ch.sid)) return;
+    ch.idleTimer = setTimeout(() => {
+      ch.idleTimer = undefined;
+      // task_started 可能和 timer callback 同一個 event-loop tick 到達；關前再查一次。
+      if (ch.closing || ch.turn || this.channels.get(ch.sid) !== ch || this.hasRunningTasks(ch.sid)) return;
+      this.closeChannel(ch);
+    }, idleMs());
+    ch.idleTimer.unref?.();
+  }
+
   /**
    * #97→#104 後台任務:task_started/progress/notification → 結構化 task.start/update/end
    * (server 落一等 task 塊、原地更新;舊 server 的 switch default 忽略,無害)。
    * subagent 與後台 bash 統一;task_id 全量上報(task.stop 不再靠短 id 還原)。
    * #118 註:task 事件可在回合 result 之後才到(後台任務跑完前通道仍活)——會話級處理,不依賴 turn。
    */
-  private handleTaskEvent(sid: string, m: Record<string, any>): void {
+  private handleTaskEvent(sid: string, m: Record<string, any>, visible: boolean): void {
     const taskId: string = String(m.task_id ?? "");
     if (!taskId || m.ambient === true) return; // ambient/housekeeping 任務隱藏
     if (m.subtype === "task_started") {
       const set = this.sessionTasks.get(sid) ?? new Set();
       set.add(taskId);
       this.sessionTasks.set(sid, set);
-      this.emit(sid, "task.start", {
-        task_id: taskId,
-        kind: m.subagent_type ? "subagent" : "background",
-        ...(m.subagent_type ? { subagent_type: String(m.subagent_type) } : {}),
-        desc: String(m.description ?? "task").slice(0, 200),
-        // #138:發起任務的 Task 工具調用 id——server 據此把工具塊原地升格為 task 塊。
-        ...(m.tool_use_id ? { tool_use_id: String(m.tool_use_id) } : {}),
-      });
+      // task_started 可晚於主回合 result；立即撤掉已掛的 idle timer，別等 callback 才發現。
+      const ch = this.channels.get(sid);
+      if (ch?.idleTimer) {
+        clearTimeout(ch.idleTimer);
+        ch.idleTimer = undefined;
+      }
+      if (visible) {
+        this.emit(sid, "task.start", {
+          task_id: taskId,
+          kind: m.subagent_type ? "subagent" : "background",
+          ...(m.subagent_type ? { subagent_type: String(m.subagent_type) } : {}),
+          desc: String(m.description ?? "task").slice(0, 200),
+          // #138:發起任務的 Task 工具調用 id——server 據此把工具塊原地升格為 task 塊。
+          ...(m.tool_use_id ? { tool_use_id: String(m.tool_use_id) } : {}),
+        });
+      }
     } else if (m.subtype === "task_progress") {
+      if (!visible) return;
       const now = Date.now();
       if (now - (this.taskProgressAt.get(taskId) ?? 0) < Drive.PROGRESS_THROTTLE_MS) return; // 節流
       this.taskProgressAt.set(taskId, now);
       if (!m.last_tool_name) return; // 無新信息就別發空更新
       this.emit(sid, "task.update", { task_id: taskId, last_activity: String(m.last_tool_name) });
     } else if (m.subtype === "task_notification") {
-      this.sessionTasks.get(sid)?.delete(taskId);
+      const set = this.sessionTasks.get(sid);
+      set?.delete(taskId);
+      if (set?.size === 0) this.sessionTasks.delete(sid);
       this.taskProgressAt.delete(taskId);
       const status = m.status === "completed" ? "completed" : m.status === "stopped" ? "stopped" : "error";
       // notification 的 desc 不回退 summary(否則兩者相同時 summary 被誤判重複而丟——
       // 後台 bash 常只帶 summary 不帶 description)。desc 供 server 錯過 start 時兜底建行。
       const desc = String(m.description ?? "").slice(0, 200);
       const summary = String(m.summary ?? "").slice(0, 500);
-      this.emit(sid, "task.end", {
-        task_id: taskId,
-        status,
-        ...(summary && summary !== desc ? { summary } : {}),
-        ...(desc ? { desc } : {}),
-      });
+      if (visible) {
+        this.emit(sid, "task.end", {
+          task_id: taskId,
+          status,
+          ...(summary && summary !== desc ? { summary } : {}),
+          ...(desc ? { desc } : {}),
+        });
+      }
+      // 多任務只在最後一個歸零後計時；若 SDK 隨即自發續寫，init 會再清掉這個 timer。
+      const ch = this.channels.get(sid);
+      if (ch && !ch.turn && !this.hasRunningTasks(sid)) this.scheduleIdleClose(ch);
     }
     // task_updated / task_summary:v1 不單獨展示(進度靠 task_progress,完成靠 notification)。
   }
@@ -760,7 +800,8 @@ export class Drive {
     // #97 後台任務(subagent + run_in_background bash 統一走 task_*):展示進度/完成。E2E 會話
     // 跳過(避免明文洩漏);ambient/housekeeping 任務隱藏。#118:可在回合間到達(不依賴 turn)。
     if (m.type === "system" && typeof m.subtype === "string" && m.subtype.startsWith("task")) {
-      if (!isE2E) this.handleTaskEvent(sid, m);
+      // E2E 只抑制展示，仍需內部追蹤 task 生命周期，否則 #212 的 idle 保護會失效。
+      this.handleTaskEvent(sid, m, !isE2E);
       return;
     }
     // #102 壓縮可見化:長會話自動/手動壓縮不再是無解釋停頓。
@@ -977,8 +1018,7 @@ export class Drive {
       this.closeChannel(ch); // #105 回合中 cwd 被改 → 回合末重建生效
       return;
     }
-    ch.idleTimer = setTimeout(() => this.closeChannel(ch), idleMs());
-    ch.idleTimer.unref?.();
+    this.scheduleIdleClose(ch);
   }
 
   /** #118 通道結束(close/crash 後的統一收尾):未完回合定性;送達重投;續投排隊。 */

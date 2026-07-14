@@ -364,7 +364,7 @@ describe("#97→#104 background task 結構化事件 + 停止", () => {
     expect(ends[0]).toMatchObject({ task_id: "bg12345678", status: "completed", summary: "抓了30篇" });
   });
 
-  it("ambient 任务隐藏,E2E 会话不发 task 展示", async () => {
+  it("ambient 任务隐藏", async () => {
     emitScript = [
       { type: "system", subtype: "init", session_id: CC_SID },
       { type: "system", subtype: "task_started", task_id: "amb1", description: "housekeeping", ambient: true },
@@ -377,6 +377,51 @@ describe("#97→#104 background task 結構化事件 + 停止", () => {
     await new Promise((r) => setTimeout(r, 30));
     const taskFrames = sent.filter((f: any) => String(f.frame?.params?.type ?? "").startsWith("task."));
     expect(taskFrames).toHaveLength(0); // ambient 隐藏
+  });
+
+  it("#212 E2E 会话不展示 task，但内部仍跟踪生命周期供 idle 保护", () => {
+    const { linkb, sent } = fakeLinkb();
+    const e2e = { isE2E: () => true } as any;
+    const d = new Drive(linkb, undefined, e2e);
+    const ch = { sid: CC_SID, closing: false } as any;
+    (d as any).handleMessage(ch, {
+      type: "system",
+      subtype: "task_started",
+      task_id: "private-task",
+      description: "secret",
+    });
+    expect((d as any).sessionTasks.get(CC_SID)).toEqual(new Set(["private-task"]));
+    expect(sent).toHaveLength(0);
+
+    (d as any).handleMessage(ch, {
+      type: "system",
+      subtype: "task_notification",
+      task_id: "private-task",
+      status: "completed",
+      summary: "secret result",
+    });
+    expect((d as any).sessionTasks.has(CC_SID)).toBe(false);
+    expect(sent).toHaveLength(0);
+  });
+
+  it("#212 多個任務只在最後一個結束後恢復 idle timer", () => {
+    const { linkb } = fakeLinkb();
+    const d = new Drive(linkb);
+    const close = vi.fn();
+    const ch = { sid: CC_SID, closing: false, input: { close } } as any;
+    (d as any).channels.set(CC_SID, ch);
+
+    (d as any).handleTaskEvent(CC_SID, { subtype: "task_started", task_id: "task-a" }, true);
+    (d as any).handleTaskEvent(CC_SID, { subtype: "task_started", task_id: "task-b" }, true);
+    (d as any).handleTaskEvent(CC_SID, { subtype: "task_notification", task_id: "task-a", status: "completed" }, true);
+    expect((d as any).sessionTasks.get(CC_SID)).toEqual(new Set(["task-b"]));
+    expect(ch.idleTimer).toBeUndefined();
+
+    (d as any).handleTaskEvent(CC_SID, { subtype: "task_notification", task_id: "task-b", status: "completed" }, true);
+    expect((d as any).sessionTasks.has(CC_SID)).toBe(false);
+    expect(ch.idleTimer).toBeDefined();
+    d.dispose();
+    expect(close).toHaveBeenCalledOnce();
   });
 
   it("task.stop → query.stopTask(taskId)", async () => {
@@ -581,6 +626,55 @@ describe("#118 streaming-input 長活通道", () => {
     d.dispose();
   });
 
+  it("#212 回合結束時已有後台任務 → 越過 idle 窗仍保留，任務完成後才回收", async () => {
+    process.env.MACCHIATO_CC_IDLE_S = "0.05";
+    turnScripts = [[
+      init,
+      { type: "system", subtype: "task_started", task_id: "bg-long", description: "長任務" },
+      { type: "result", subtype: "success", result: "已放到後台" },
+      { __wait: 150 },
+      { type: "system", subtype: "task_notification", task_id: "bg-long", status: "completed" },
+    ]];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "run in background" }));
+
+    await new Promise((r) => setTimeout(r, 100)); // 已越過 50ms idle 窗，task 尚在跑
+    expect((d as any).channels.size).toBe(1);
+    expect((d as any).sessionTasks.get(CC_SID)?.has("bg-long")).toBe(true);
+
+    await new Promise((r) => setTimeout(r, 120)); // task 150ms 完成，再過完整 50ms idle 窗
+    expect((d as any).sessionTasks.has(CC_SID)).toBe(false);
+    expect((d as any).channels.size).toBe(0);
+    d.dispose();
+  });
+
+  it("#212 result 後才收到 task_started → 撤銷既有 idle timer，不競態誤殺", async () => {
+    process.env.MACCHIATO_CC_IDLE_S = "0.05";
+    turnScripts = [[
+      init,
+      { type: "result", subtype: "success", result: "done" },
+      { __wait: 20 },
+      { type: "system", subtype: "task_started", task_id: "bg-late", description: "晚到任務" },
+      { __wait: 130 },
+      { type: "system", subtype: "task_notification", task_id: "bg-late", status: "completed" },
+    ]];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "late background event" }));
+
+    await new Promise((r) => setTimeout(r, 100)); // 原 idle timer 應在 50ms 關閉；task_started 已將它撤銷
+    expect((d as any).channels.size).toBe(1);
+    expect((d as any).sessionTasks.get(CC_SID)?.has("bg-late")).toBe(true);
+
+    await new Promise((r) => setTimeout(r, 120));
+    expect((d as any).sessionTasks.has(CC_SID)).toBe(false);
+    expect((d as any).channels.size).toBe(0);
+    d.dispose();
+  });
+
   it("送達確認:push 後未見任何事件即死 → 自動重投一次(新通道)", async () => {
     turnScripts = [
       [{ __throw: true }], // 通道 1:user 消息剛 push 就崩,零事件
@@ -740,7 +834,7 @@ describe("#94 session.retitle(AI 重新命名老会话)", () => {
 describe("#98 每會話權限模式", () => {
   const init = { type: "system", subtype: "init", session_id: CC_SID };
 
-  it("session.create 存 permissionMode;傳給 SDK 的 sdk 模式按四檔映射", async () => {
+  it("session.create 存 permissionMode;傳給 SDK 的 sdk 模式按五檔映射", async () => {
     delete process.env.MACCHIATO_CC_PERMISSION_MODE;
     turnScripts = [[init, { type: "result", subtype: "success", result: "ok" }]];
     const { linkb, fire } = fakeLinkb();
@@ -755,11 +849,12 @@ describe("#98 每會話權限模式", () => {
     d.dispose();
   });
 
-  it("四檔各自映射:acceptEdits→default、plan→plan、bypass→bypassPermissions", async () => {
+  it("五檔各自映射:acceptEdits→default、auto→auto、plan→plan、bypass→bypassPermissions", async () => {
     delete process.env.MACCHIATO_CC_PERMISSION_MODE;
     process.env.MACCHIATO_CC_TITLE_MODE = "off"; // ULID sid 首回合會觸發標題,關掉防偷跑 turnScript
     const cases: [string, string][] = [
       ["acceptEdits", "default"],
+      ["auto", "auto"], // #205:classifier 自動批,canUseTool 只兜底(探針背書)
       ["plan", "plan"],
       ["bypass", "bypassPermissions"],
     ];
