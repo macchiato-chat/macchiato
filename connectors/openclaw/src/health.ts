@@ -60,11 +60,13 @@ export function buildHealth(gw: OpenClawGateway, mirror: Mirror, version: string
     !gw.isConnected && (gw.reconnectFailures ?? 0) >= 3
       ? `gateway 連續 ${gw.reconnectFailures} 次重連失敗(OpenClaw 沒在跑?)`
       : null;
+  // #210 殭屍 gateway(自動更新後未重啟)——最高優先:比「連不上」更可操作。
+  const stale = gw.staleInstall ? "OpenClaw 已自動更新,gateway 需重啟(ERR_MODULE_NOT_FOUND)" : null;
   return {
     gatewayAlive: gw.isConnected,
     compatOk: compat.ok,
     mirrorLastPollAgeS: Math.round((Date.now() - mirror.lastPollAt) / 1000),
-    lastError: gwDown ?? (compat.ok ? mirror.lastError : (compat.reason ?? "兼容自檢失敗")),
+    lastError: stale ?? gwDown ?? (compat.ok ? mirror.lastError : (compat.reason ?? "兼容自檢失敗")),
     kind: "openclaw",
     connectorVersion: version,
     stt: false,

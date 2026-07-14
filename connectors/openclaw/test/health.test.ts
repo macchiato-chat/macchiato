@@ -54,6 +54,33 @@ describe("health（上報 + 看門狗）", () => {
   });
 });
 
+describe("#210 殭屍 gateway 提示", () => {
+  it("staleInstall → lastError 給可操作提示(壓過其他原因);清標記即恢復", () => {
+    const { gw, mirror } = fakes(1000);
+    gw.staleInstall = true;
+    mirror.lastError = "別的錯";
+    const h = buildHealth(gw, mirror, "0.1.0");
+    expect(h.lastError).toContain("OpenClaw 已自動更新");
+    expect(h.lastError).toContain("ERR_MODULE_NOT_FOUND");
+    gw.staleInstall = false; // 重連成功(gateway 已重啟)即清
+    expect(buildHealth(gw, mirror, "0.1.0").lastError).toBe("別的錯");
+  });
+
+  it("gateway RPC 回 ERR_MODULE_NOT_FOUND → 標記 staleInstall;連接成功清除", async () => {
+    const { OpenClawGateway } = await import("../src/openclaw/gateway");
+    const gw = Object.create(OpenClawGateway.prototype) as any;
+    gw.pending = new Map();
+    gw.handlers = new Set();
+    gw.connectedHandlers = new Set();
+    gw.staleInstall = false;
+    const rejected: Error[] = [];
+    gw.pending.set("r1", { resolve: () => {}, reject: (e: Error) => rejected.push(e), timer: setTimeout(() => {}, 0) });
+    (gw as any).onMessage(Buffer.from(JSON.stringify({ type: "res", id: "r1", ok: false, error: { message: "UNAVAILABLE: Error [ERR_MODULE_NOT_FOUND]: Cannot find module './channels-xyz.js'" } })));
+    expect(gw.staleInstall).toBe(true);
+    expect(rejected[0]!.message).toContain("ERR_MODULE_NOT_FOUND");
+  });
+});
+
 describe("#112 深度兼容自檢", () => {
   const FULL_METHODS = ["chat.send", "sessions.list", "sessions.preview", "sessions.abort", "sessions.send", "sessions.messages.subscribe"];
 

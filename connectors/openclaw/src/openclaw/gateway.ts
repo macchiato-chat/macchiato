@@ -35,6 +35,8 @@ export class OpenClawGateway {
   private connected = false;
   /** #3 連續重連失敗計數(握手成功歸零)——health 據此上浮「gateway 連不上 + 次數」。 */
   reconnectFailures = 0;
+  /** #210 殭屍 gateway 標記:RPC 曾回 ERR_MODULE_NOT_FOUND(自動更新後未重啟);重連成功即清。 */
+  staleInstall = false;
 
   get isConnected(): boolean {
     return this.connected;
@@ -90,6 +92,7 @@ export class OpenClawGateway {
     });
     this.connected = true;
     this.reconnectFailures = 0; // #3 連上歸零
+    this.staleInstall = false; // #210 重連成功 = gateway 已重啟(新進程),殭屍標記清除
     if (this.firstConnect) {
       this.firstConnect();
       this.firstConnect = null;
@@ -116,7 +119,16 @@ export class OpenClawGateway {
       this.pending.delete(f.id);
       clearTimeout(p.timer);
       if (f.ok) p.resolve(f.payload);
-      else p.reject(new Error(`gateway error: ${JSON.stringify(f.error)}`));
+      else {
+        const msg = JSON.stringify(f.error);
+        // #210 殭屍 gateway 特徵:OpenClaw 每日自動更新換掉 dist(哈希文件名),在跑進程
+        // lazy-load 新模塊即 ERR_MODULE_NOT_FOUND——標記上浮 health,app 端一眼看懂要重啟。
+        if (msg.includes("ERR_MODULE_NOT_FOUND")) {
+          this.staleInstall = true;
+          console.error("⚠️ #210 偵測到 gateway 殭屍特徵(ERR_MODULE_NOT_FOUND)——OpenClaw 已自動更新,gateway 需重啟");
+        }
+        p.reject(new Error(`gateway error: ${msg}`));
+      }
     } else if (f.type === "event" && f.event) {
       const evt: GatewayEvent = { event: f.event, payload: f.payload, seq: f.seq };
       for (const h of this.handlers) {
