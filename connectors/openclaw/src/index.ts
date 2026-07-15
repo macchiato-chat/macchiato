@@ -14,6 +14,7 @@ import { Mirror } from "./openclaw/mirror";
 import { PushHandler } from "./push/handler";
 import { E2EKeyStore } from "./e2e/keys";
 import { CommandsReporter } from "./openclaw/commands";
+import { Projects } from "./openclaw/projects";
 import { HealthLoop } from "./health";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 import { spawn } from "node:child_process";
@@ -22,7 +23,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.5.17";
+const CONNECTOR_VERSION = "1.5.18";
 
 /** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
 function runSelfUpdate(): void {
@@ -54,7 +55,9 @@ async function main(): Promise<void> {
   const e2e = new E2EKeyStore();
   const freshInstall = !existsSync(process.env.MACCHIATO_OPENCLAW_MIRROR || join(homedir(), ".macchiato/openclaw-mirror.json")); // #154
   const mirror = new Mirror(gw, linkb, e2e);
-  const drive = new Drive(gw, linkb, mirror, e2e);
+  const projects = new Projects(linkb); // #227 備案目錄:project_op + 回合末惰性版本化
+  projects.wire();
+  const drive = new Drive(gw, linkb, mirror, e2e, projects);
   drive.wire(); // tui 幀（prompt.submit/interrupt）+ OpenClaw 事件 → 流式回傳
   new CommandsReporter(gw, linkb).start(); // #199 skill 清單上報(/菜單數據源;失敗只缺菜單)
   linkb.onFrame((msg) => {

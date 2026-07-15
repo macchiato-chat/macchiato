@@ -1130,4 +1130,36 @@ describe("#161 手動改名回寫", () => {
     expect(renameCalls.length).toBe(n);
     d.dispose();
   });
+
+  // #141b SDK 運行時 usage 為權威(session 累計 − 基線,含 subagent);拿不到退回本地累加。
+  describe("#141b turn output tokens", () => {
+    it("turnOutput:SDK 聚合增量(含 subagent)疊加 outputLive;無基線退回本地累加;max 兜輪詢空窗", () => {
+      const { linkb } = fakeLinkb();
+      const d = new Drive(linkb) as any;
+      // 無基線(SDK 不可用)→ 純本地 outputBase+outputLive
+      expect(d.turnOutput({ usageBaseline: null, sdkOutput: null, outputBase: 300, outputLive: 40 })).toBe(340);
+      // 有基線:sdkΔ=5000−1000=4000(含 subagent)> outputBase 300 → 4000 + live 40
+      expect(d.turnOutput({ usageBaseline: 1000, sdkOutput: 5000, outputBase: 300, outputLive: 40 })).toBe(4040);
+      // SDK 輪詢暫落後(子消息剛完成、sdkΔ 200 < 本地 outputBase 500)→ max 取 outputBase 兜住
+      expect(d.turnOutput({ usageBaseline: 1000, sdkOutput: 1200, outputBase: 500, outputLive: 10 })).toBe(510);
+    });
+
+    it("sdkOutputTotal:求和 model_usage.outputTokens(主 + subagent model);接口缺失/報錯 → null", async () => {
+      const { linkb } = fakeLinkb();
+      const d = new Drive(linkb) as any;
+      expect(await d.sdkOutputTotal({ q: {} })).toBeNull(); // 缺方法 → 退回本地
+      const q = {
+        usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
+          session: { model_usage: { opus: { outputTokens: 1200 }, "haiku(subagent)": { outputTokens: 800 } } },
+        }),
+      };
+      expect(await d.sdkOutputTotal({ q })).toBe(2000);
+      const qErr = {
+        usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => {
+          throw new Error("experimental gone");
+        },
+      };
+      expect(await d.sdkOutputTotal({ q: qErr })).toBeNull(); // 報錯絕不拋 → null 兜底
+    });
+  });
 });

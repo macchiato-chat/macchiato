@@ -175,11 +175,19 @@ interface TurnCtx {
   lastError?: string; // #102 assistant.error(auth/billing/rate_limit…)→ 失敗行帶上
   isE2E: boolean;
   isFirstMacchiatoTurn: boolean;
-  /** #141 output tokens 累計:outputBase=已完成子消息之和,outputLive=當前子消息的 message_delta 累計;
-   *  總計=base+live。lastUsageEmitAt 節流 turn.usage 上報。 */
+  /** #141 output tokens 兜底本地累加:outputBase=已完成子消息之和,outputLive=當前子消息 message_delta 累計。
+   *  SDK 運行時 usage 可用時改以其 session 累計為權威(含 subagent),見下 usageBaseline/sdkOutput。
+   *  lastUsageEmitAt 節流 turn.usage 上報。 */
   outputBase: number;
   outputLive: number;
   lastUsageEmitAt: number;
+  /** #141b SDK 運行時 usage(experimental):usageBaseline=回合起始的 session 累計 output(算本回合增量用;
+   *  null=接口不可用/未取到 → 全程退回本地累加)。sdkOutput=最近一次輪詢到的 session 累計 output。
+   *  usageInFlight/lastSdkPollAt:防並發 + 節流輪詢。 */
+  usageBaseline: number | null;
+  sdkOutput: number | null;
+  usageInFlight: boolean;
+  lastSdkPollAt: number;
 }
 
 /** #118 一條長活通道(每活躍會話一條;閒置回收,resume 重建)。 */
@@ -241,6 +249,8 @@ export class Drive {
     private readonly e2e?: E2EKeyStore,
     /** #199 命令上報器:live 通道的 commands_changed 經 drive 轉給它(整份替換)。 */
     private readonly commands?: CommandsReporter,
+    /** #227 回合末惰性版本化鉤子(掃備案目錄的 AGENTS.md)。 */
+    private readonly projects?: { checkTurnEnd(): void },
   ) {
     const state = this.loadState();
     this.map = state.map;
@@ -719,7 +729,13 @@ export class Drive {
       outputBase: 0,
       outputLive: 0,
       lastUsageEmitAt: 0,
+      usageBaseline: null,
+      sdkOutput: null,
+      usageInFlight: false,
+      lastSdkPollAt: 0,
     };
+    // #141b 回合起始快照 SDK session 累計 output 作基線(此刻本回合尚未產出 → 乾淨)。E2E 跳過。
+    if (!isE2E) void this.snapshotUsageBaseline(ch, ch.turn);
     this.pending.add(sid); // #200 在途回合登記(進程死在此後 → 下次啟動提示重發)
     this.saveMap();
     ch.input.push({
@@ -795,15 +811,78 @@ export class Drive {
   }
 
   /**
-   * #141 節流上報累計 output tokens(base+live)。默認 ~700ms 一次防刷屏;`force=true`(子消息邊界)
-   * 立即發一次確保跨步進位不丟。E2E 跳過(web 鎖住,且保守不外露任何回合信號)。
+   * #141 節流上報累計 output tokens。默認 ~700ms 一次防刷屏;`force=true`(子消息邊界)立即發一次
+   * 確保跨步進位不丟。E2E 跳過(web 鎖住,且保守不外露任何回合信號)。
+   * #141b 值以 SDK 運行時 usage 為權威(session 累計 − 回合基線,**含 subagent**);拿不到則退回本地累加。
    */
-  private emitTurnUsage(sid: string, turn: TurnCtx, force = false): void {
+  private emitTurnUsage(ch: Channel, sid: string, turn: TurnCtx, force = false): void {
     if (turn.isE2E) return;
     const now = Date.now();
     if (!force && now - turn.lastUsageEmitAt < 700) return;
     turn.lastUsageEmitAt = now;
-    this.emit(sid, "turn.usage", { output_tokens: turn.outputBase + turn.outputLive });
+    this.emit(sid, "turn.usage", { output_tokens: this.turnOutput(turn) });
+    this.pollSdkUsage(ch, sid, turn); // 異步刷新 SDK 聚合(含 subagent),回來再補發一版更準的
+  }
+
+  /**
+   * #141b 本回合 output tokens：優先 SDK 聚合增量(sdkOutput − 基線,含 subagent),疊加當前在飛子消息
+   * outputLive 保持平滑。`max(sdkΔ, outputBase)` 兜住「主 agent 子消息剛完成、SDK 輪詢尚未回」的空窗;
+   * SDK 不可用(基線/輪詢為 null)時退回純本地累加 outputBase+outputLive(= 舊行為)。
+   */
+  private turnOutput(turn: TurnCtx): number {
+    const sdkDelta =
+      turn.usageBaseline !== null && turn.sdkOutput !== null ? Math.max(turn.sdkOutput - turn.usageBaseline, 0) : 0;
+    return Math.max(sdkDelta, turn.outputBase) + turn.outputLive;
+  }
+
+  /** #141b 回合起始快照 session 累計 output 作基線;接口不可用則保持 null(整回合退回本地累加)。 */
+  private async snapshotUsageBaseline(ch: Channel, turn: TurnCtx): Promise<void> {
+    const total = await this.sdkOutputTotal(ch);
+    if (total !== null && !turn.completed && turn.usageBaseline === null) turn.usageBaseline = total;
+  }
+
+  /** #141b 節流(1.2s)+ 防並發地輪詢 SDK 運行時 usage → 更新 sdkOutput 並補發一版 turn.usage。
+   *  無基線(接口不可用/未取到)則不輪詢——沒有基線算不出本回合增量,純走本地累加。 */
+  private pollSdkUsage(ch: Channel, sid: string, turn: TurnCtx): void {
+    if (turn.usageBaseline === null || turn.usageInFlight || turn.completed) return;
+    const now = Date.now();
+    if (now - turn.lastSdkPollAt < 1200) return; // 實驗接口 + 可能取 rate_limit,節流緩一點
+    turn.lastSdkPollAt = now;
+    turn.usageInFlight = true;
+    void (async () => {
+      const total = await this.sdkOutputTotal(ch);
+      turn.usageInFlight = false;
+      if (total === null || turn.completed || turn.isE2E) return;
+      turn.sdkOutput = total;
+      this.emit(sid, "turn.usage", { output_tokens: this.turnOutput(turn) });
+    })();
+  }
+
+  /**
+   * #141b SDK 運行時 usage(experimental)→ session 累計 output_tokens(所有 model 求和,**含 subagent**)。
+   * 接口實驗性(方法名帶 DO_NOT_RELY,可能改名/移除)→ 特性探測 + try/catch,任何失敗返回 null 走本地兜底。
+   */
+  private async sdkOutputTotal(ch: Channel): Promise<number | null> {
+    try {
+      const q = ch.q as unknown as {
+        usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET?: () => Promise<{
+          session?: { model_usage?: Record<string, { outputTokens?: number }> };
+        }>;
+      };
+      const fn = q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
+      if (typeof fn !== "function") return null;
+      const u = await fn.call(q);
+      const mu = u?.session?.model_usage;
+      if (!mu || typeof mu !== "object") return null;
+      let sum = 0;
+      for (const mUsage of Object.values(mu)) {
+        const o = mUsage?.outputTokens;
+        if (typeof o === "number" && isFinite(o)) sum += o;
+      }
+      return sum;
+    } catch {
+      return null; // 接口不可用/報錯 → 退回本地累加,絕不拖垮回合
+    }
   }
 
   private handleMessage(ch: Channel, m: any): void {
@@ -894,7 +973,7 @@ export class Drive {
         const ot = ev.usage?.output_tokens;
         if (typeof ot === "number") {
           turn.outputLive = ot;
-          this.emitTurnUsage(sid, turn);
+          this.emitTurnUsage(ch, sid, turn);
         }
       }
       return;
@@ -908,7 +987,7 @@ export class Drive {
       if (typeof ot === "number") {
         turn.outputBase += ot;
         turn.outputLive = 0;
-        this.emitTurnUsage(sid, turn, true);
+        this.emitTurnUsage(ch, sid, turn, true);
       }
       // 完整 assistant API 消息：補齊 tool_use 的 args（deltas 裡是分片 json）
       for (const b of m.message?.content ?? []) {
@@ -982,7 +1061,12 @@ export class Drive {
       outputBase: 0, // #141
       outputLive: 0,
       lastUsageEmitAt: 0,
+      usageBaseline: null,
+      sdkOutput: null,
+      usageInFlight: false,
+      lastSdkPollAt: 0,
     };
+    if (!ch.turn.isE2E) void this.snapshotUsageBaseline(ch, ch.turn); // #141b 基線快照
     this.pending.add(sid); // #200 在途回合登記
     this.saveMap();
     console.log(`· ${sid} SDK 自發續寫回合(子任務完成自動喚醒)→ 建合成 turn 投遞`);
@@ -992,6 +1076,7 @@ export class Drive {
   private finishTurn(ch: Channel, turn: TurnCtx, m: any): void {
     const sid = ch.sid;
     turn.completed = true;
+    this.projects?.checkTurnEnd(); // #227 agent 可能在本回合改了 AGENTS.md → 惰性落版本
     const interrupted = this.interruptedSids.delete(sid);
     const isErr = m.subtype !== "success" || m.is_error === true;
     // #102 status:協議 MessageCompletePayload 本就有(server 已消費 done/interrupted/error);

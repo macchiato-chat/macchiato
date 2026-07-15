@@ -143,6 +143,8 @@ export class AppServerDrive {
     private readonly linkb: LinkBClient,
     private readonly mirror?: Mirror,
     private readonly e2e?: E2EKeyStore,
+    /** #227 回合末惰性版本化鉤子。 */
+    private readonly projects?: { checkTurnEnd(): void },
   ) {
     const st = loadDriveState();
     this.map = st.map;
@@ -545,6 +547,7 @@ export class AppServerDrive {
     }
     this.mirror?.fastForward(turn.threadId);
     this.mirror?.unsetDriven(turn.threadId);
+    this.projects?.checkTurnEnd(); // #227
   }
 
   // ============================== 審批橋 ==============================

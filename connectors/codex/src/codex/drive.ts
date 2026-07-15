@@ -136,6 +136,8 @@ export class Drive {
     private readonly linkb: LinkBClient,
     private readonly mirror?: Mirror,
     private readonly e2e?: E2EKeyStore,
+    /** #227 回合末惰性版本化鉤子。 */
+    private readonly projects?: { checkTurnEnd(): void },
   ) {
     const st = this.loadState();
     this.map = st.map;
@@ -460,6 +462,7 @@ export class Drive {
     const tid = this.threadFor(sid);
     if (tid) {
       this.mirror?.fastForward(tid);
+      this.projects?.checkTurnEnd(); // #227
       this.mirror?.unsetDriven(tid);
     }
     if (turn.isFirstMacchiatoTurn && this.genTitle) this.genTitle = undefined;

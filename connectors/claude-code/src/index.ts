@@ -10,13 +10,14 @@ import { runPairing } from "./linkb/pairing";
 import { E2EKeyStore } from "./e2e/keys";
 import { Mirror } from "./cc/mirror";
 import { CommandsReporter } from "./cc/commands";
+import { Projects } from "./cc/projects";
 import { announceImportAvailable, runImport } from "./cc/history-import";
 import { Drive, workDir } from "./cc/drive";
 import { HealthLoop } from "./health";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.5.17";
+const CONNECTOR_VERSION = "1.5.18";
 
 function runSelfUpdate(): void {
   // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。
@@ -40,7 +41,9 @@ async function main(): Promise<void> {
   const e2e = new E2EKeyStore();
   const mirror = new Mirror(linkb, e2e);
   const commands = new CommandsReporter(linkb); // #199 命令/技能清單上報(/菜單數據源)
-  const drive = new Drive(linkb, mirror, e2e, commands);
+  const projects = new Projects(linkb); // #227 備案目錄:project_op + 回合末惰性版本化
+  projects.wire();
+  const drive = new Drive(linkb, mirror, e2e, commands, projects);
   drive.wire();
 
   linkb.onFrame((msg) => {

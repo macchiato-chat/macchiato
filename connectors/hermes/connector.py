@@ -65,7 +65,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.17"
+CONNECTOR_VERSION = "1.5.18"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -75,6 +75,18 @@ IMPORT_BATCH = 20
 # §15 全渠道持續鏡像（tail state.db）—— **核心功能，常開、不可關閉**。
 MIRROR_POLL_S = float(os.environ.get("MACCHIATO_MIRROR_POLL_S", "2"))  # 輪詢間隔（小=更即時、多步回合更增量）
 MIRROR_STATE = os.path.expanduser("~/.macchiato/mirror.json")  # 鏡像水位線持久化
+PROJ_MEM_MAX = 256 * 1024  # #227 AGENTS.md 上限
+PROJ_SHIM = "@AGENTS.md\n"  # #227 CLAUDE.md 墊片
+
+
+def _projects_reg_path() -> str:
+    return os.environ.get("MACCHIATO_HERMES_PROJECTS") or os.path.expanduser("~/.macchiato/hermes-projects.json")
+
+
+def _mem_hash(s: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 MIRROR_PRUNE_S = float(os.environ.get("MACCHIATO_MIRROR_PRUNE_S", str(30 * 24 * 3600)))  # #9 水位線閒置多久可裁
 # 自驅會話 id 映射持久化：server sid（ULID）→ state.db 會話 id（gateway session_key）。
 # Hermes 0.18+ 的 create_session 返回 stored_session_id = state.db 行 id ≠ 運行時句柄；
@@ -359,6 +371,9 @@ class Connector:
         self._smoke_err: str | None = None  # #112 解析冒煙結果(健康循環定期刷新)
         self._mirror_st = None  # 鏡像水位線狀態（nack 回退也要訪問）
         self._fresh_install = False  # #154 首裝標記(run() 起步採樣;首裝 → ready 後自動全量導入)
+        self._projects: dict = {}  # #227 serverPath → canonical(本地註冊表,mem 操作硬校驗)
+        self._proj_last_hash: dict = {}  # #227 canon → AGENTS.md hash(回合末比對)
+        self._projects_load()
         self._mirror_batch_id = 0
         self._mirror_rewind = deque(maxlen=64)  # (batchId, {sid: 舊floor})，供 nack 回退
         self._out_pending: deque = deque(maxlen=500)  # 斷線期間出站幀緩衝(ready 後補發;有界丟最舊)
@@ -392,6 +407,7 @@ class Connector:
                 # #13:回合結束 → 回填本回合消息的源身份(state.db 行 id → live dedup_key)
                 if server_sid in self._turn_floor:
                     loop.create_task(self._backfill_srcids(server_sid))
+                self._projects_check_turn_end()  # #227 agent 可能在本回合改了備案目錄的 AGENTS.md
 
         self.gw = GatewayClient(
             on_event=on_event,
@@ -1440,6 +1456,153 @@ class Connector:
         except Exception as exc:
             print(f"[#199 commands.catalog 失敗(/菜單缺席,其餘不受影響)] {exc!r}", file=sys.stderr)
 
+    # ── #227 Projects:備案目錄 project_op + 回合末惰性版本化 ─────────────────
+    # 安全紀律(docs/projects.md):mem 操作只服務本地註冊表裡的路徑(server 被攻破也指不動);
+    # 只碰 AGENTS.md 一個文件;原子寫;CLAUDE.md 墊片只在不存在時補(不踩用戶配置)。
+
+    @staticmethod
+    def _proj_canon(server_path: str) -> str:
+        return os.path.realpath(os.path.expanduser(server_path))
+
+    def _projects_load(self) -> None:
+        try:
+            with open(_projects_reg_path()) as f:
+                data = json.load(f)
+            for sp in data.get("paths", []):
+                try:
+                    self._projects[sp] = self._proj_canon(sp)
+                except Exception:
+                    pass
+        except (FileNotFoundError, ValueError):
+            pass
+
+    def _projects_save(self) -> None:
+        try:
+            path = _projects_reg_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"v": 1, "paths": list(self._projects.keys())}, f)
+            os.replace(tmp, path)
+        except Exception as exc:
+            print(f"[#227 projects registry save failed] {exc!r}", file=sys.stderr)
+
+    @staticmethod
+    def _proj_atomic_write(file: str, content: str) -> None:
+        tmp = file + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(content)
+        os.replace(tmp, file)
+
+    async def _project_op(self, msg: dict) -> None:
+        req_id = msg.get("reqId")
+        op = msg.get("op")
+
+        def reply(**body):
+            return self._send({"t": "project_op_result", "reqId": req_id, **body})
+
+        try:
+            if op == "register":
+                await reply(**self._proj_register(str(msg.get("path") or ""), msg.get("mkdir") is True,
+                                                  msg.get("agentsMd") if isinstance(msg.get("agentsMd"), str) else None))
+            elif op == "mem_read":
+                await reply(**self._proj_mem_read(str(msg.get("path") or "")))
+            elif op == "mem_write":
+                await reply(**self._proj_mem_write(str(msg.get("path") or ""),
+                                                   msg.get("content") if isinstance(msg.get("content"), str) else None))
+            elif op == "registry":
+                paths = msg.get("paths") if isinstance(msg.get("paths"), list) else []
+                self._projects = {}
+                for sp in paths:
+                    try:
+                        self._projects[sp] = self._proj_canon(sp)
+                    except Exception:
+                        pass
+                self._projects_save()
+                await reply(ok=True)
+            else:
+                await reply(ok=False, error=f"未知 op:{op}")
+        except Exception as exc:
+            await reply(ok=False, error=repr(exc)[:300])
+
+    def _proj_register(self, server_path: str, mkdir: bool, agents_md) -> dict:
+        if not server_path:
+            return {"ok": False, "error": "缺 path"}
+        canon = self._proj_canon(server_path)
+        existed = os.path.exists(canon)
+        if not existed:
+            if not mkdir:
+                return {"ok": False, "error": f"目錄不存在:{canon}(可勾選「自動創建」)"}
+            os.makedirs(canon, exist_ok=True)
+        if not os.path.isdir(canon):
+            return {"ok": False, "error": f"不是目錄:{canon}"}
+        if not os.access(canon, os.W_OK):
+            return {"ok": False, "error": f"目錄不可寫:{canon}"}
+        ap = os.path.join(canon, "AGENTS.md")
+        existing = None
+        if os.path.exists(ap):
+            with open(ap, encoding="utf-8", errors="replace") as f:
+                existing = f.read()[:PROJ_MEM_MAX]
+        elif agents_md is not None:
+            self._proj_atomic_write(ap, agents_md)
+        content = existing if existing is not None else (agents_md or "")
+        cp = os.path.join(canon, "CLAUDE.md")
+        wrote_shim = False
+        if not os.path.exists(cp):
+            self._proj_atomic_write(cp, PROJ_SHIM)
+            wrote_shim = True
+        self._projects[server_path] = canon
+        self._proj_last_hash[canon] = _mem_hash(content)
+        self._projects_save()
+        print(f"· #227 project 備案:{server_path}{'(+CLAUDE.md 墊片)' if wrote_shim else ''}")
+        return {"ok": True, "existed": existed, "agentsMd": existing, "hash": _mem_hash(content), "wroteShim": wrote_shim}
+
+    def _proj_require(self, server_path: str) -> str:
+        canon = self._projects.get(server_path)
+        if not canon:
+            raise ValueError("路徑未備案(本地註冊表硬校驗)")
+        return canon
+
+    def _proj_mem_read(self, server_path: str) -> dict:
+        canon = self._proj_require(server_path)
+        ap = os.path.join(canon, "AGENTS.md")
+        content = ""
+        if os.path.exists(ap):
+            with open(ap, encoding="utf-8", errors="replace") as f:
+                content = f.read()[:PROJ_MEM_MAX]
+        self._proj_last_hash[canon] = _mem_hash(content)
+        return {"ok": True, "agentsMd": content, "hash": _mem_hash(content)}
+
+    def _proj_mem_write(self, server_path: str, content) -> dict:
+        canon = self._proj_require(server_path)
+        if content is None or len(content) > PROJ_MEM_MAX:
+            return {"ok": False, "error": "內容缺失或超限"}
+        self._proj_atomic_write(os.path.join(canon, "AGENTS.md"), content)
+        self._proj_last_hash[canon] = _mem_hash(content)
+        return {"ok": True, "hash": _mem_hash(content)}
+
+    def _projects_check_turn_end(self) -> None:
+        """#227 回合末惰性版本化:掃備案目錄(極少)的 AGENTS.md,hash 變了 → 推 project_mem_changed。
+        未定基線(重啟後首回合)只定不推——重啟間隙的變化由面板打開時的穿透讀對賬兜住。"""
+        for server_path, canon in list(self._projects.items()):
+            try:
+                ap = os.path.join(canon, "AGENTS.md")
+                content = ""
+                if os.path.exists(ap):
+                    with open(ap, encoding="utf-8", errors="replace") as f:
+                        content = f.read()[:PROJ_MEM_MAX]
+                h = _mem_hash(content)
+                prev = self._proj_last_hash.get(canon)
+                self._proj_last_hash[canon] = h
+                if prev is not None and prev != h:
+                    asyncio.get_event_loop().create_task(self._send({
+                        "t": "project_mem_changed", "agentLinkId": self.agent_link_id,
+                        "path": server_path, "content": content, "hash": h,
+                    }))
+                    print(f"· #227 AGENTS.md 變更 → 落版本({server_path})")
+            except Exception:
+                pass  # 單目錄壞不擋其餘
+
     def _dispatch_session(self, server_sid: str, coro_factory) -> None:
         """#148:把慢工作掛到該會話的串行鏈上。讀循環立刻返回;同會話按序、跨會話並發。
         前任異常不斷鏈(已各自記日誌/計數);鏈尾完成且仍是尾 → 清條目防字典緩慢積長。"""
@@ -1530,6 +1693,9 @@ class Connector:
             sid = msg.get("hermesSessionId")
             if sid:
                 asyncio.create_task(self._e2e_backfill_history(sid, mode="disable"))
+            return
+        if t == "project_op":
+            await self._project_op(msg)
             return
         if t != "tui":
             return
