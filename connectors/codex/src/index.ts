@@ -18,7 +18,7 @@ import { HealthLoop } from "./health";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.5.18";
+const CONNECTOR_VERSION = "1.5.19";
 
 function runSelfUpdate(): void {
   // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。

@@ -121,3 +121,17 @@ describe("#227 回合末惰性版本化", () => {
     expect(sent.filter((m) => m.t === "project_mem_changed")).toHaveLength(1); // 去抖
   });
 });
+
+describe("#227 file 白名單(CLAUDE.md 修墊片)", () => {
+  it("mem_read/write 可指名 CLAUDE.md;白名單外一律拒", () => {
+    const { op } = setup();
+    op({ reqId: 1, op: "register", path: workdir });
+    const w = op({ reqId: 2, op: "mem_write", path: workdir, content: "@AGENTS.md\n# 用戶的", file: "CLAUDE.md" });
+    expect(w.ok).toBe(true);
+    expect(readFileSync(join(workdir, "CLAUDE.md"), "utf8")).toBe("@AGENTS.md\n# 用戶的");
+    const r = op({ reqId: 3, op: "mem_read", path: workdir, file: "CLAUDE.md" });
+    expect(r.agentsMd).toBe("@AGENTS.md\n# 用戶的");
+    expect(op({ reqId: 4, op: "mem_read", path: workdir, file: "secrets.json" }).ok).toBe(false);
+    expect(op({ reqId: 5, op: "mem_write", path: workdir, content: "x", file: "../etc/passwd" }).ok).toBe(false);
+  });
+});

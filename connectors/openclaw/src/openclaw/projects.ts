@@ -56,9 +56,9 @@ export class Projects {
         case "register":
           return this.reply(reqId, this.register(String(msg.path ?? ""), msg.mkdir === true, typeof msg.agentsMd === "string" ? msg.agentsMd : undefined));
         case "mem_read":
-          return this.reply(reqId, this.memRead(String(msg.path ?? "")));
+          return this.reply(reqId, this.memRead(String(msg.path ?? ""), msg.file));
         case "mem_write":
-          return this.reply(reqId, this.memWrite(String(msg.path ?? ""), typeof msg.content === "string" ? msg.content : null));
+          return this.reply(reqId, this.memWrite(String(msg.path ?? ""), typeof msg.content === "string" ? msg.content : null, msg.file));
         case "registry":
           return this.reply(reqId, this.syncRegistry(Array.isArray(msg.paths) ? (msg.paths as string[]) : []));
         default:
@@ -71,6 +71,13 @@ export class Projects {
 
   private agentsPath(canon: string): string {
     return join(canon, "AGENTS.md");
+  }
+
+  /** #227 具名文件白名單:AGENTS.md(默認,記憶)| CLAUDE.md(修墊片用)。其餘一律拒。 */
+  private static fileFor(file: unknown): "AGENTS.md" | "CLAUDE.md" {
+    if (file === undefined || file === "AGENTS.md") return "AGENTS.md";
+    if (file === "CLAUDE.md") return "CLAUDE.md";
+    throw new Error(`文件不在白名單:${String(file)}`);
   }
 
   private register(serverPath: string, mkdir: boolean, agentsMd?: string): Record<string, unknown> {
@@ -116,19 +123,21 @@ export class Projects {
     return canon;
   }
 
-  private memRead(serverPath: string): Record<string, unknown> {
+  private memRead(serverPath: string, file?: unknown): Record<string, unknown> {
     const canon = this.requireRegistered(serverPath);
-    const ap = this.agentsPath(canon);
+    const name = Projects.fileFor(file);
+    const ap = join(canon, name);
     const content = existsSync(ap) ? readFileSync(ap, "utf8").slice(0, MEM_MAX) : "";
-    this.lastHash.set(canon, memHash(content));
+    if (name === "AGENTS.md") this.lastHash.set(canon, memHash(content));
     return { ok: true, agentsMd: content, hash: memHash(content) };
   }
 
-  private memWrite(serverPath: string, content: string | null): Record<string, unknown> {
+  private memWrite(serverPath: string, content: string | null, file?: unknown): Record<string, unknown> {
     const canon = this.requireRegistered(serverPath);
+    const name = Projects.fileFor(file);
     if (content === null || content.length > MEM_MAX) return { ok: false, error: "內容缺失或超限" };
-    this.atomicWrite(this.agentsPath(canon), content);
-    this.lastHash.set(canon, memHash(content));
+    this.atomicWrite(join(canon, name), content);
+    if (name === "AGENTS.md") this.lastHash.set(canon, memHash(content));
     return { ok: true, hash: memHash(content) };
   }
 

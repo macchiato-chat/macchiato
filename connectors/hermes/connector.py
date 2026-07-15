@@ -65,7 +65,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.18"
+CONNECTOR_VERSION = "1.5.19"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -1506,10 +1506,11 @@ class Connector:
                 await reply(**self._proj_register(str(msg.get("path") or ""), msg.get("mkdir") is True,
                                                   msg.get("agentsMd") if isinstance(msg.get("agentsMd"), str) else None))
             elif op == "mem_read":
-                await reply(**self._proj_mem_read(str(msg.get("path") or "")))
+                await reply(**self._proj_mem_read(str(msg.get("path") or ""), msg.get("file")))
             elif op == "mem_write":
                 await reply(**self._proj_mem_write(str(msg.get("path") or ""),
-                                                   msg.get("content") if isinstance(msg.get("content"), str) else None))
+                                                   msg.get("content") if isinstance(msg.get("content"), str) else None,
+                                                   msg.get("file")))
             elif op == "registry":
                 paths = msg.get("paths") if isinstance(msg.get("paths"), list) else []
                 self._projects = {}
@@ -1563,22 +1564,35 @@ class Connector:
             raise ValueError("路徑未備案(本地註冊表硬校驗)")
         return canon
 
-    def _proj_mem_read(self, server_path: str) -> dict:
+    @staticmethod
+    def _proj_file_for(file) -> str:
+        """#227 具名文件白名單:AGENTS.md(默認,記憶)| CLAUDE.md(修墊片用)。其餘一律拒。"""
+        if file is None or file == "AGENTS.md":
+            return "AGENTS.md"
+        if file == "CLAUDE.md":
+            return "CLAUDE.md"
+        raise ValueError(f"文件不在白名單:{file}")
+
+    def _proj_mem_read(self, server_path: str, file=None) -> dict:
         canon = self._proj_require(server_path)
-        ap = os.path.join(canon, "AGENTS.md")
+        name = self._proj_file_for(file)
+        ap = os.path.join(canon, name)
         content = ""
         if os.path.exists(ap):
             with open(ap, encoding="utf-8", errors="replace") as f:
                 content = f.read()[:PROJ_MEM_MAX]
-        self._proj_last_hash[canon] = _mem_hash(content)
+        if name == "AGENTS.md":
+            self._proj_last_hash[canon] = _mem_hash(content)
         return {"ok": True, "agentsMd": content, "hash": _mem_hash(content)}
 
-    def _proj_mem_write(self, server_path: str, content) -> dict:
+    def _proj_mem_write(self, server_path: str, content, file=None) -> dict:
         canon = self._proj_require(server_path)
+        name = self._proj_file_for(file)
         if content is None or len(content) > PROJ_MEM_MAX:
             return {"ok": False, "error": "內容缺失或超限"}
-        self._proj_atomic_write(os.path.join(canon, "AGENTS.md"), content)
-        self._proj_last_hash[canon] = _mem_hash(content)
+        self._proj_atomic_write(os.path.join(canon, name), content)
+        if name == "AGENTS.md":
+            self._proj_last_hash[canon] = _mem_hash(content)
         return {"ok": True, "hash": _mem_hash(content)}
 
     def _projects_check_turn_end(self) -> None:
