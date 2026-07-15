@@ -94,27 +94,44 @@ export class Projects {
     } catch {
       return { ok: false, error: `目錄不可寫:${canon}` };
     }
-    // AGENTS.md:已有 → 回傳內容(沿用語義);沒有且帶初始內容 → 寫入。
+    // AGENTS.md/CLAUDE.md 三態:
+    //  (A) 已有 AGENTS.md → 回傳內容(沿用語義);缺 CLAUDE.md 補墊片。
+    //  (B) 只有 CLAUDE.md 無 AGENTS.md → **遷移**:CLAUDE.md 改名為 AGENTS.md(其內容即項目記憶),
+    //      再重建一行墊片 CLAUDE.md(用戶建議的常見做法——無損,且四家統一以 AGENTS.md 為記憶)。
+    //  (C) 都沒有 / CLAUDE.md 已是純墊片 → 帶初始內容則寫 AGENTS.md;缺墊片補墊片。
     const ap = this.agentsPath(canon);
+    const cp = join(canon, "CLAUDE.md");
+    const hasA = existsSync(ap);
+    const hasC = existsSync(cp);
+    const cContent = hasC ? readFileSync(cp, "utf8") : "";
     let existing: string | null = null;
-    if (existsSync(ap)) {
+    let wroteShim = false;
+    let migrated = false;
+    if (hasA) {
       existing = readFileSync(ap, "utf8").slice(0, MEM_MAX);
-    } else if (agentsMd !== undefined) {
-      this.atomicWrite(ap, agentsMd);
+      if (!hasC) {
+        this.atomicWrite(cp, SHIM);
+        wroteShim = true;
+      }
+    } else if (hasC && cContent.trim() !== "@AGENTS.md") {
+      renameSync(cp, ap); // (B) 遷移:先把內容落到 AGENTS.md(原子 rename,內容安全)
+      this.atomicWrite(cp, SHIM); // 再重建一行墊片
+      existing = readFileSync(ap, "utf8").slice(0, MEM_MAX);
+      wroteShim = true;
+      migrated = true;
+    } else {
+      if (agentsMd !== undefined) this.atomicWrite(ap, agentsMd);
+      if (!hasC) {
+        this.atomicWrite(cp, SHIM);
+        wroteShim = true;
+      }
     }
     const content = existing ?? agentsMd ?? "";
-    // CLAUDE.md 墊片:讓 CC 經 @import 讀 AGENTS.md;已有 CLAUDE.md 絕不動(別踩用戶配置)。
-    const cp = join(canon, "CLAUDE.md");
-    let wroteShim = false;
-    if (!existsSync(cp)) {
-      this.atomicWrite(cp, SHIM);
-      wroteShim = true;
-    }
     this.reg.set(serverPath, canon);
     this.lastHash.set(canon, memHash(content)); // 定基線:回合末只報備案後的變化
     this.save();
-    console.log(`· #227 project 備案:${serverPath}${wroteShim ? "(+CLAUDE.md 墊片)" : ""}`);
-    return { ok: true, existed, agentsMd: existing, hash: memHash(content), wroteShim };
+    console.log(`· #227 project 備案:${serverPath}${migrated ? "(CLAUDE.md→AGENTS.md 遷移)" : wroteShim ? "(+CLAUDE.md 墊片)" : ""}`);
+    return { ok: true, existed, agentsMd: existing, hash: memHash(content), wroteShim, migratedClaudeToAgents: migrated };
   }
 
   private requireRegistered(serverPath: string): string {

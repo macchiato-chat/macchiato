@@ -47,15 +47,36 @@ describe("#227 register", () => {
     expect(readFileSync(join(workdir, "CLAUDE.md"), "utf8")).toBe("@AGENTS.md\n");
   });
 
-  it("無 AGENTS.md + 帶初始內容 → 寫入;已有 CLAUDE.md 絕不動", () => {
-    writeFileSync(join(workdir, "CLAUDE.md"), "# 用戶自己的配置");
+  it("都無 AGENTS.md/CLAUDE.md + 帶初始內容 → 寫 AGENTS.md + 補墊片", () => {
     const { op } = setup();
     const r = op({ reqId: 1, op: "register", path: workdir, agentsMd: "# 初始記憶" });
     expect(r.ok).toBe(true);
-    expect(r.agentsMd).toBeNull();
+    expect(r.agentsMd).toBeNull(); // 無現存
     expect(readFileSync(join(workdir, "AGENTS.md"), "utf8")).toBe("# 初始記憶");
-    expect(r.wroteShim).toBe(false);
-    expect(readFileSync(join(workdir, "CLAUDE.md"), "utf8")).toBe("# 用戶自己的配置"); // 沒被踩
+    expect(r.wroteShim).toBe(true);
+    expect(readFileSync(join(workdir, "CLAUDE.md"), "utf8")).toBe("@AGENTS.md\n");
+  });
+
+  it("只有 CLAUDE.md 無 AGENTS.md → 遷移:改名為 AGENTS.md + 重建一行墊片(內容無損)", () => {
+    writeFileSync(join(workdir, "CLAUDE.md"), "# 這是項目指令(其實就是記憶)");
+    const { op } = setup();
+    const r = op({ reqId: 1, op: "register", path: workdir });
+    expect(r.ok).toBe(true);
+    expect(r.migratedClaudeToAgents).toBe(true);
+    expect(r.agentsMd).toBe("# 這是項目指令(其實就是記憶)"); // 遷移後作現存記憶回傳
+    expect(readFileSync(join(workdir, "AGENTS.md"), "utf8")).toBe("# 這是項目指令(其實就是記憶)");
+    expect(readFileSync(join(workdir, "CLAUDE.md"), "utf8")).toBe("@AGENTS.md\n"); // 重建的墊片
+    expect(r.wroteShim).toBe(true);
+  });
+
+  it("CLAUDE.md 已是純墊片(無 AGENTS.md)→ 不遷移;帶初始內容寫 AGENTS.md", () => {
+    writeFileSync(join(workdir, "CLAUDE.md"), "@AGENTS.md\n");
+    const { op } = setup();
+    const r = op({ reqId: 1, op: "register", path: workdir, agentsMd: "# 新記憶" });
+    expect(r.ok).toBe(true);
+    expect(r.migratedClaudeToAgents).toBe(false);
+    expect(readFileSync(join(workdir, "AGENTS.md"), "utf8")).toBe("# 新記憶");
+    expect(readFileSync(join(workdir, "CLAUDE.md"), "utf8")).toBe("@AGENTS.md\n"); // 純墊片原樣
   });
 
   it("目錄不存在:默認拒;mkdir=true → 創建", () => {

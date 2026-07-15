@@ -65,7 +65,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.19"
+CONNECTOR_VERSION = "1.5.20"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -1539,24 +1539,46 @@ class Connector:
             return {"ok": False, "error": f"不是目錄:{canon}"}
         if not os.access(canon, os.W_OK):
             return {"ok": False, "error": f"目錄不可寫:{canon}"}
+        # 三態(同 TS): (A) 有 AGENTS.md 沿用; (B) 只有 CLAUDE.md 無 AGENTS.md → 遷移(改名+重建墊片);
+        # (C) 都無/CLAUDE.md 已是純墊片 → 帶初始內容則寫 AGENTS.md,缺墊片補。
         ap = os.path.join(canon, "AGENTS.md")
+        cp = os.path.join(canon, "CLAUDE.md")
+        has_a = os.path.exists(ap)
+        has_c = os.path.exists(cp)
+        c_content = ""
+        if has_c:
+            with open(cp, encoding="utf-8", errors="replace") as f:
+                c_content = f.read()
         existing = None
-        if os.path.exists(ap):
+        wrote_shim = False
+        migrated = False
+        if has_a:
             with open(ap, encoding="utf-8", errors="replace") as f:
                 existing = f.read()[:PROJ_MEM_MAX]
-        elif agents_md is not None:
-            self._proj_atomic_write(ap, agents_md)
-        content = existing if existing is not None else (agents_md or "")
-        cp = os.path.join(canon, "CLAUDE.md")
-        wrote_shim = False
-        if not os.path.exists(cp):
-            self._proj_atomic_write(cp, PROJ_SHIM)
+            if not has_c:
+                self._proj_atomic_write(cp, PROJ_SHIM)
+                wrote_shim = True
+        elif has_c and c_content.strip() != "@AGENTS.md":
+            os.rename(cp, ap)  # (B) 遷移:內容落到 AGENTS.md
+            self._proj_atomic_write(cp, PROJ_SHIM)  # 重建一行墊片
+            with open(ap, encoding="utf-8", errors="replace") as f:
+                existing = f.read()[:PROJ_MEM_MAX]
             wrote_shim = True
+            migrated = True
+        else:
+            if agents_md is not None:
+                self._proj_atomic_write(ap, agents_md)
+            if not has_c:
+                self._proj_atomic_write(cp, PROJ_SHIM)
+                wrote_shim = True
+        content = existing if existing is not None else (agents_md or "")
         self._projects[server_path] = canon
         self._proj_last_hash[canon] = _mem_hash(content)
         self._projects_save()
-        print(f"· #227 project 備案:{server_path}{'(+CLAUDE.md 墊片)' if wrote_shim else ''}")
-        return {"ok": True, "existed": existed, "agentsMd": existing, "hash": _mem_hash(content), "wroteShim": wrote_shim}
+        tag = "(CLAUDE.md→AGENTS.md 遷移)" if migrated else ("(+CLAUDE.md 墊片)" if wrote_shim else "")
+        print(f"· #227 project 備案:{server_path}{tag}")
+        return {"ok": True, "existed": existed, "agentsMd": existing, "hash": _mem_hash(content),
+                "wroteShim": wrote_shim, "migratedClaudeToAgents": migrated}
 
     def _proj_require(self, server_path: str) -> str:
         canon = self._projects.get(server_path)
