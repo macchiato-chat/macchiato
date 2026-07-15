@@ -8,3 +8,12 @@ export interface CommandInfo {
   argumentHint?: string;
   source?: string;
 }
+
+/** #231 一個可選 model(連接器上報 {t:"models"};鏡像 packages/protocol ModelOption,字段只增不改)。 */
+export interface ModelOption {
+  id: string;
+  label: string;
+  description?: string;
+  effortLevels?: string[];
+  defaultEffort?: string;
+}

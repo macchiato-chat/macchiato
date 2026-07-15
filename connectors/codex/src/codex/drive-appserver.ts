@@ -125,6 +125,7 @@ export class AppServerDrive {
   private map: Record<string, string>;
   private cwds: Record<string, string>;
   private models: Record<string, string>;
+  private efforts: Record<string, string>; // #231
   private pending: Set<string>;
   private titled: Set<string>;
   private abandonedTurns: string[] = [];
@@ -150,6 +151,7 @@ export class AppServerDrive {
     this.map = st.map;
     this.cwds = st.cwds;
     this.models = st.models;
+    this.efforts = st.efforts;
     this.titled = st.titled;
     this.abandonedTurns = st.pending;
     this.pending = new Set();
@@ -201,6 +203,9 @@ export class AppServerDrive {
   }
   private modelFor(sid: string): string | undefined {
     return this.models[sid] || process.env.MACCHIATO_CODEX_MODEL || undefined;
+  }
+  private effortFor(sid: string): string | undefined {
+    return this.efforts[sid] || process.env.MACCHIATO_CODEX_EFFORT || undefined; // #231
   }
 
   // ============================== 下行(server → 連接器) ==============================
@@ -254,6 +259,12 @@ export class AppServerDrive {
           if (md ? this.models[sid] !== md : this.models[sid] !== undefined) {
             if (md) this.models[sid] = md;
             else delete this.models[sid];
+            this.saveMap();
+          }
+          const ef = typeof params.effort === "string" ? params.effort.trim() : ""; // #231
+          if (ef ? this.efforts[sid] !== ef : this.efforts[sid] !== undefined) {
+            if (ef) this.efforts[sid] = ef;
+            else delete this.efforts[sid];
             this.saveMap();
           }
           if (cwd && !this.e2e?.isE2E(sid) && !isDir(this.cwdFor(sid))) {
@@ -371,7 +382,8 @@ export class AppServerDrive {
       this.pending.add(sid); // #200
       this.saveMap();
       const model = this.modelFor(sid);
-      const res = await this.client.request("turn/start", { threadId, input, ...(model ? { model } : {}) });
+      const effort = this.effortFor(sid); // #231 per-turn reasoning effort
+      const res = await this.client.request("turn/start", { threadId, input, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
       // turn/start 立即返回(探針);turnId 也會隨 turn/started 通知到,這裡先記省一拍。
       if (res?.turn?.id) turn.turnId = String(res.turn.id);
     } catch (e) {
@@ -621,6 +633,6 @@ export class AppServerDrive {
   }
 
   private saveMap(): void {
-    saveDriveState({ map: this.map, cwds: this.cwds, models: this.models, titled: this.titled, pending: this.pending });
+    saveDriveState({ map: this.map, cwds: this.cwds, models: this.models, efforts: this.efforts, titled: this.titled, pending: this.pending });
   }
 }

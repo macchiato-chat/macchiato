@@ -1007,6 +1007,30 @@ describe("#98 每會話權限模式", () => {
     delete process.env.MACCHIATO_CC_TITLE_MODE;
   });
 
+  it("#231 effort 變更 → 閒置通道重建 + SDK options.effort;空清回默認", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "off";
+    delete process.env.MACCHIATO_CC_EFFORT;
+    turnScripts = [
+      [init, { type: "result", subtype: "success", result: "one" }],
+      [init, { type: "result", subtype: "success", result: "two" }],
+    ];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "session.create", { effort: "high" }));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "t1" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOptions.effort).toBe("high");
+    fire(tuiFrame(CC_SID, "session.create", { effort: "" })); // 清 effort → 閒置重建
+    await new Promise((r) => setTimeout(r, 10));
+    expect((d as any).channels.size).toBe(0);
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "t2" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOptions.effort).toBeUndefined(); // 清回默認 = 不傳
+    d.dispose();
+    delete process.env.MACCHIATO_CC_TITLE_MODE;
+  });
+
   it("#143 無 per-session model → 回退 env MACCHIATO_CC_MODEL;都無 → 不傳 model", async () => {
     process.env.MACCHIATO_CC_TITLE_MODE = "off";
     // (a) 有 env → 用 env

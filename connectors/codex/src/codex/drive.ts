@@ -116,6 +116,7 @@ export class Drive {
   private cwds: Record<string, string>;
   /** #143 serverSid → 會話 model(session.create.model 下發;持久,同文件存)。 */
   private models: Record<string, string>;
+  private efforts: Record<string, string>; // #231
   /** #200 在途回合 sid 集(持久):回合起加、止刪;進程死於回合中途 → 下次啟動提示重發。 */
   private pending: Set<string>;
   /** #200 上個進程死時遺留的在途回合(構造載入即清盤;flushAbandonedTurns 在 ready 後告知)。 */
@@ -143,6 +144,7 @@ export class Drive {
     this.map = st.map;
     this.cwds = st.cwds;
     this.models = st.models;
+    this.efforts = st.efforts;
     this.titled = st.titled;
     this.abandonedTurns = st.pending;
     this.pending = new Set();
@@ -165,6 +167,9 @@ export class Drive {
    */
   private modelFor(sid: string): string | undefined {
     return this.models[sid] || process.env.MACCHIATO_CODEX_MODEL || undefined;
+  }
+  private effortFor(sid: string): string | undefined {
+    return this.efforts[sid] || process.env.MACCHIATO_CODEX_EFFORT || undefined; // #231
   }
 
   wire(): void {
@@ -283,6 +288,12 @@ export class Drive {
             else delete this.models[sid];
             this.saveMap();
           }
+          const ef = typeof params.effort === "string" ? params.effort.trim() : ""; // #231
+          if (ef ? this.efforts[sid] !== ef : this.efforts[sid] !== undefined) {
+            if (ef) this.efforts[sid] = ef;
+            else delete this.efforts[sid];
+            this.saveMap();
+          }
           if (cwd && !this.e2e?.isE2E(sid) && !isDir(this.cwdFor(sid))) {
             this.emit(sid, "review.summary", { summary: `⚠️ 工作目錄不存在或不是目錄:${this.cwdFor(sid)}(連接器主機上)` });
           }
@@ -317,6 +328,8 @@ export class Drive {
     // #143 per-session model(空 = 不傳 -m,用 codex 自身配置默認;絕不 hardcode)。放 resume 之前。
     const model = this.modelFor(sid);
     if (model) args.push("-m", model);
+    const effort = this.effortFor(sid); // #231 exec 用 config override(app-server 用 turn/start.effort)
+    if (effort) args.push("-c", `model_reasoning_effort=${effort}`);
     if (resume) args.push("resume", resume);
     args.push(text);
     const proc = spawn(resolveCodexBin(), args, {
@@ -498,6 +511,6 @@ export class Drive {
     return loadDriveState(); // #132 抽到 state.ts(v1/v2 drive 共用同一持久文件)
   }
   private saveMap(): void {
-    saveDriveState({ map: this.map, cwds: this.cwds, models: this.models, titled: this.titled, pending: this.pending });
+    saveDriveState({ map: this.map, cwds: this.cwds, models: this.models, efforts: this.efforts, titled: this.titled, pending: this.pending });
   }
 }

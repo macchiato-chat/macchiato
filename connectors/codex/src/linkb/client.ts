@@ -21,6 +21,7 @@ export class LinkBClient {
   private readonly pending: string[] = [];
   private static readonly PENDING_MAX = 500;
   private readonly handlers = new Set<FrameHandler>();
+  private readonly readyHandlers = new Set<() => void>(); // #231
   private firstReady: (() => void) | null = null;
   private readonly readyOnce: Promise<void>;
 
@@ -39,6 +40,12 @@ export class LinkBClient {
   onFrame(h: FrameHandler): () => void {
     this.handlers.add(h);
     return () => this.handlers.delete(h);
+  }
+
+  /** #231 每次 ready(含重連)回調。 */
+  onReady(h: () => void): () => void {
+    this.readyHandlers.add(h);
+    return () => this.readyHandlers.delete(h);
   }
 
   /** 連接 + hello + 等首次 ready。 */
@@ -82,6 +89,13 @@ export class LinkBClient {
         if (this.firstReady) {
           this.firstReady();
           this.firstReady = null;
+        }
+        for (const h of this.readyHandlers) {
+          try {
+            h();
+          } catch {
+            /* 監聽器自負其責 */
+          }
         }
         console.log("✓ Link B ready — connected to Macchiato");
         return;

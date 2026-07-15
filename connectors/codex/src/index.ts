@@ -13,12 +13,13 @@ import { announceImportAvailable, runImport } from "./codex/history-import";
 import { Drive, workDir } from "./codex/drive";
 import { AppServerClient } from "./codex/appserver";
 import { Projects } from "./codex/projects";
+import { ModelsReporter } from "./codex/models";
 import { AppServerDrive } from "./codex/drive-appserver";
 import { HealthLoop } from "./health";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.5.21";
+const CONNECTOR_VERSION = "1.5.22";
 
 function runSelfUpdate(): void {
   // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。
@@ -47,6 +48,7 @@ async function main(): Promise<void> {
   const projects = new Projects(linkb); // #227 備案目錄:project_op + 回合末惰性版本化
   projects.wire();
   let drive: Drive | AppServerDrive;
+  let modelsClient: AppServerClient | undefined; // #231 app-server 才有 model/list
   if (process.env.MACCHIATO_CODEX_ENGINE === "exec") {
     drive = new Drive(linkb, mirror, e2e, projects);
     console.log("· 引擎:exec v1(MACCHIATO_CODEX_ENGINE=exec 強制)");
@@ -55,6 +57,7 @@ async function main(): Promise<void> {
     try {
       await appClient.start();
       drive = new AppServerDrive(appClient, linkb, mirror, e2e, projects);
+      modelsClient = appClient;
       console.log("· 引擎:app-server v2(#132,握手成功)");
     } catch (e) {
       appClient.close();
@@ -63,6 +66,7 @@ async function main(): Promise<void> {
     }
   }
   drive.wire();
+  void new ModelsReporter(linkb, modelsClient).start(); // #231 model/effort 清單上報(exec 無 client → 空)
 
   linkb.onFrame((msg) => {
     if (msg.t === "mirror_nack" && typeof msg.batchId === "number") mirror.handleNack(msg.batchId);

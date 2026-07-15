@@ -199,6 +199,7 @@ interface Channel {
   permKey: string;
   /** #143 通道創建時的 model(per-session 選擇或 env 兜底;變更 → 重建通道)。 */
   modelKey: string;
+  effortKey: string; // #231
   input: PushStream<unknown>;
   q: Query;
   turn?: TurnCtx;
@@ -218,6 +219,8 @@ export class Drive {
   private permModes: Record<string, string>;
   /** #143 serverSid → 會話 model（session.create.model 下發；持久，同文件存）。 */
   private models: Record<string, string>;
+  /** #231 serverSid → reasoning effort(session.create.effort;持久,同文件存)。 */
+  private efforts: Record<string, string>;
   /**
    * #200 一期(可見化):**在途回合**的 sid 集(持久)。回合起加、止刪;進程死在回合中途 →
    * 該 sid 留在盤上 → 下次啟動撈出、Link B ready 後回一條 system 提示「連接器重啟了,這條沒跑完,
@@ -257,6 +260,7 @@ export class Drive {
     this.cwds = state.cwds;
     this.permModes = state.permModes;
     this.models = state.models;
+    this.efforts = state.efforts;
     // 影子兜底:啟動時把既有 ULID→CLI 映射的 CLI uuid 全灌給鏡像(跨重啟持久),鏡像據此永不給
     // 這些「被驅動過」的 CLI 會話單獨建會話(防重啟後污染態丟失又復發)。
     for (const cc of Object.values(this.map)) this.mirror?.markDrivenUuid(cc);
@@ -330,6 +334,11 @@ export class Drive {
     if (ui) return ui;
     const env = process.env.MACCHIATO_CC_MODEL;
     return env || undefined;
+  }
+
+  /** #231 該會話 reasoning effort:per-session 優先,回退 env MACCHIATO_CC_EFFORT;都無 → undefined(模型默認)。 */
+  private resolveEffort(sid: string): string | undefined {
+    return this.efforts[sid] || process.env.MACCHIATO_CC_EFFORT || undefined;
   }
 
   wire(): void {
@@ -562,6 +571,14 @@ export class Drive {
             this.saveMap();
             console.log(`· session.create ${sid} model=${md || "(default)"}`);
           }
+          // #231 effort(upsert;隨時可改)。空 = 清回模型默認。自由字符串,連接器只透傳。
+          const ef = typeof params.effort === "string" ? params.effort.trim() : "";
+          if (ef ? this.efforts[sid] !== ef : this.efforts[sid] !== undefined) {
+            if (ef) this.efforts[sid] = ef;
+            else delete this.efforts[sid];
+            this.saveMap();
+            console.log(`· session.create ${sid} effort=${ef || "(default)"}`);
+          }
           // #98/#118/#143 cwd/權限/model 是通道創建參數:閒置通道立即重建生效;回合進行中的留給回合末。
           const ch = this.channels.get(sid);
           if (
@@ -569,7 +586,8 @@ export class Drive {
             !ch.turn &&
             (ch.cwd !== this.cwdFor(sid) ||
               ch.permKey !== this.resolvePerm(sid).permKey ||
-              ch.modelKey !== (this.resolveModel(sid) ?? "default"))
+              ch.modelKey !== (this.resolveModel(sid) ?? "default") ||
+              ch.effortKey !== (this.resolveEffort(sid) ?? "default"))
           ) {
             this.closeChannel(ch);
           }
@@ -699,7 +717,8 @@ export class Drive {
       (ch.closing ||
         ch.cwd !== cwd ||
         ch.permKey !== this.resolvePerm(sid).permKey ||
-        ch.modelKey !== (this.resolveModel(sid) ?? "default"))
+        ch.modelKey !== (this.resolveModel(sid) ?? "default") ||
+        ch.effortKey !== (this.resolveEffort(sid) ?? "default"))
     ) {
       this.closeChannel(ch);
       ch = undefined;
@@ -756,6 +775,7 @@ export class Drive {
     // canUseTool 內自實現)、plan=plan、bypass=bypassPermissions。回退 env 逃生門。
     const perm = this.resolvePerm(sid);
     const model = this.resolveModel(sid); // #143 per-session model(回退 env);undefined = CLI 默認
+    const effort = this.resolveEffort(sid); // #231 per-session effort;undefined = 模型默認
     const input = new PushStream<unknown>();
     const q = query({
       prompt: input as AsyncIterable<never>,
@@ -764,6 +784,7 @@ export class Drive {
         ...(resume ? { resume } : {}),
         ...(claudeBinIsAbsolute() ? { pathToClaudeCodeExecutable: resolveClaudeBin() } : {}),
         ...(model ? { model } : {}), // #143 per-session model(空 = 不傳,用 CLI 配置默認)
+        ...(effort ? { effort: effort as "low" | "medium" | "high" | "xhigh" | "max" } : {}), // #231
         ...(perm.sdk ? { permissionMode: perm.sdk } : {}),
         includePartialMessages: true,
         canUseTool: async (
@@ -783,7 +804,7 @@ export class Drive {
         },
       },
     });
-    const ch: Channel = { sid, cwd, permKey: perm.permKey, modelKey: model ?? "default", input, q, closing: false };
+    const ch: Channel = { sid, cwd, permKey: perm.permKey, modelKey: model ?? "default", effortKey: effort ?? "default", input, q, closing: false };
     this.channels.set(sid, ch);
     void this.consume(ch);
     return ch;
@@ -1400,6 +1421,7 @@ export class Drive {
     cwds: Record<string, string>;
     permModes: Record<string, string>;
     models: Record<string, string>;
+    efforts: Record<string, string>;
     pending: string[];
   } {
     try {
@@ -1410,12 +1432,13 @@ export class Drive {
           cwds: (parsed.cwds ?? {}) as Record<string, string>,
           permModes: (parsed.permModes ?? {}) as Record<string, string>, // #98
           models: (parsed.models ?? {}) as Record<string, string>, // #143
+          efforts: (parsed.efforts ?? {}) as Record<string, string>, // #231
           pending: Array.isArray(parsed.pending) ? (parsed.pending as string[]) : [], // #200
         };
       }
-      return { map: (parsed ?? {}) as Record<string, string>, cwds: {}, permModes: {}, models: {}, pending: [] };
+      return { map: (parsed ?? {}) as Record<string, string>, cwds: {}, permModes: {}, models: {}, efforts: {}, pending: [] };
     } catch {
-      return { map: {}, cwds: {}, permModes: {}, models: {}, pending: [] };
+      return { map: {}, cwds: {}, permModes: {}, models: {}, efforts: {}, pending: [] };
     }
   }
   private saveMap(): void {
@@ -1430,6 +1453,7 @@ export class Drive {
           cwds: this.cwds,
           permModes: this.permModes,
           models: this.models,
+          efforts: this.efforts, // #231
           pending: [...this.pending], // #200 在途回合
         }),
       );

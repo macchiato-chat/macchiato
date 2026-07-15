@@ -14,6 +14,7 @@ export interface DriveState {
   map: Record<string, string>;
   cwds: Record<string, string>;
   models: Record<string, string>;
+  efforts: Record<string, string>;
   titled: Set<string>;
   pending: string[];
 }
@@ -25,19 +26,20 @@ export function loadDriveState(): DriveState {
       map: p.map ?? {},
       cwds: p.cwds ?? {},
       models: p.models ?? {}, // #143
+      efforts: p.efforts ?? {}, // #231
       titled: new Set<string>(Array.isArray(p.titled) ? p.titled : []),
       pending: Array.isArray(p.pending) ? (p.pending as string[]) : [], // #200
     };
   } catch {
-    return { map: {}, cwds: {}, models: {}, titled: new Set(), pending: [] };
+    return { map: {}, cwds: {}, models: {}, efforts: {}, titled: new Set(), pending: [] };
   }
 }
 
-export function saveDriveState(st: { map: Record<string, string>; cwds: Record<string, string>; models: Record<string, string>; titled: Iterable<string>; pending: Iterable<string> }): void {
+export function saveDriveState(st: { map: Record<string, string>; cwds: Record<string, string>; models: Record<string, string>; efforts: Record<string, string>; titled: Iterable<string>; pending: Iterable<string> }): void {
   try {
     mkdirSync(dirname(mapPath()), { recursive: true });
     const tmp = `${mapPath()}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ v: 1, map: st.map, cwds: st.cwds, models: st.models, titled: [...st.titled], pending: [...st.pending] }));
+    writeFileSync(tmp, JSON.stringify({ v: 1, map: st.map, cwds: st.cwds, models: st.models, efforts: st.efforts, titled: [...st.titled], pending: [...st.pending] }));
     renameSync(tmp, mapPath());
   } catch (e) {
     console.error("[session map save failed]", (e as Error).message);
