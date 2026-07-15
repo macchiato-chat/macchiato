@@ -65,7 +65,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.20"
+CONNECTOR_VERSION = "1.5.21"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -344,6 +344,7 @@ class Connector:
         self.ws = None
         self.gw: GatewayClient | None = None
         self._fwd: dict[str, str] = {}  # server session id -> real hermes session id
+        self._cwds: dict[str, str] = {}  # #227 server sid -> 會話工作目錄(建會話時傳給 gateway)
         self._rev: dict[str, str] = {}  # real hermes session id -> server session id
         self._pending_interrupt: set[str] = set()  # 回合映射建立前到達的 session.interrupt：別丟，等回合起步即取消
         self._titled: set[str] = set()  # #94：已自動生成過標題的 server_sid（防會話內重複）
@@ -712,7 +713,8 @@ class Connector:
             except GatewayError:
                 continue
         if real is None:
-            res = await self.gw.create_session()
+            cwd = self._cwds.get(server_sid)
+            res = await self.gw.create_session(**({"cwd": cwd} if cwd else {}))  # #227 per-session cwd
             real = res.get("session_id")
             stored = (res or {}).get("stored_session_id")
             self._record_stored(server_sid, stored)
@@ -1832,7 +1834,23 @@ class Connector:
                     self._pending_interrupt.add(server_sid)
                     print(f"· interrupt 早到（{server_sid} 未映射）→ pending", file=sys.stderr)
             elif method == "session.create":
-                await self._ensure_session(server_sid)
+                # #227 cwd:草稿期傳來的工作目錄。未建會話 → 存起來,create 時帶上;已建 → session.cwd.set
+                # 中途改(gateway 支持;session busy=agent 回覆過返 4009,Macchiato 側本就鎖 cwd、不該發)。
+                cwd = str(params.get("cwd") or "").strip()
+                if cwd:
+                    self._cwds[server_sid] = cwd
+                else:
+                    self._cwds.pop(server_sid, None)
+                real = self._fwd.get(server_sid)
+                if real is None:
+                    await self._ensure_session(server_sid)
+                elif cwd:
+                    try:
+                        await self.gw.request("session.cwd.set", {"session_id": real, "cwd": cwd})
+                        print(f"· #227 session.cwd.set {real} → {cwd}")
+                    except GatewayError as exc:
+                        if exc.code != 4009:  # 4009=busy(已鎖),其餘上拋
+                            raise
             elif method == "session.archive":
                 await self._set_hermes_archived(server_sid, bool(params.get("archived", True)))
             elif method == "session.delete":
