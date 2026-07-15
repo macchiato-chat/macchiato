@@ -229,3 +229,38 @@ describe("#156 覆蓋缺口:排隊續投 + E2E send", () => {
     expect(mf.sessions[0].messages[1].enc).toContain("秘密回答");
   });
 });
+
+describe("#230 codex 權限 → sandbox", () => {
+  const sandboxOf = (args: string[]) => args[args.indexOf("-s") + 1];
+
+  it("session.create.permissionMode 三檔映射到 exec -s(plan→read-only)", async () => {
+    const { linkb } = makeDrive();
+    await linkb.deliver(tui("session.create", SID, { permissionMode: "plan" }));
+    await linkb.deliver(tui("prompt.submit", SID, { text: "hi" }));
+    expect(sandboxOf(spawnArgs[0]!)).toBe("read-only");
+  });
+
+  it("bypass → danger-full-access", async () => {
+    const { linkb } = makeDrive();
+    await linkb.deliver(tui("session.create", SID, { permissionMode: "bypass" }));
+    await linkb.deliver(tui("prompt.submit", SID, { text: "hi" }));
+    expect(sandboxOf(spawnArgs[0]!)).toBe("danger-full-access");
+  });
+
+  it("未設 permissionMode(或非三檔值)→ 回退進程級默認 workspace-write", async () => {
+    delete process.env.MACCHIATO_CODEX_SANDBOX; // 排除環境干擾
+    const { linkb } = makeDrive();
+    await linkb.deliver(tui("session.create", SID, { permissionMode: "ask" })); // 非 codex 三檔 → 回退
+    await linkb.deliver(tui("prompt.submit", SID, { text: "hi" }));
+    expect(sandboxOf(spawnArgs[0]!)).toBe("workspace-write");
+  });
+
+  it("清空 permissionMode(空串)→ 回退默認", async () => {
+    delete process.env.MACCHIATO_CODEX_SANDBOX;
+    const { linkb } = makeDrive();
+    await linkb.deliver(tui("session.create", SID, { permissionMode: "bypass" }));
+    await linkb.deliver(tui("session.create", SID, { permissionMode: "" })); // 清空
+    await linkb.deliver(tui("prompt.submit", SID, { text: "hi" }));
+    expect(sandboxOf(spawnArgs[0]!)).toBe("workspace-write");
+  });
+});

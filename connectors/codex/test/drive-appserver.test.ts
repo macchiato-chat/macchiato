@@ -307,3 +307,45 @@ describe("#132 toolCardForV2", () => {
     expect(String(unk.args.detail)).toHaveLength(501);
   });
 });
+
+describe("#224 codex 改名雙向", () => {
+  it("session.rename → thread/name/set(回寫);thread/name/updated → session.title(餵標題)", async () => {
+    const { d, client, linkb, sent } = make();
+    // 先起一個回合建立 thread 映射(byThread);清掉首回合的佔位標題,只看改名相關事件
+    await linkb.deliver(tui("prompt.submit", SID, { text: "hi" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    await tick();
+    sent.length = 0;
+    // 方向1:app 改名 → thread/name/set
+    await linkb.deliver(tui("session.rename", SID, { title: "支付重構" }));
+    const setCall = client.requests.find((r) => r.method === "thread/name/set");
+    expect(setCall?.params).toEqual({ threadId: TID, name: "支付重構" });
+    // 自寫回聲:同名的 thread/name/updated 不回投 session.title
+    client.fire("thread/name/updated", { threadId: TID, threadName: "支付重構" });
+    await tick();
+    expect(events(sent).filter((e) => e.type === "session.title")).toHaveLength(0);
+    // 方向2:codex 自己起的新名 → session.title
+    client.fire("thread/name/updated", { threadId: TID, threadName: "Codex 自己的標題" });
+    await tick();
+    const titles = events(sent).filter((e) => e.type === "session.title");
+    expect(titles).toHaveLength(1);
+    expect(titles[0].payload.title).toBe("Codex 自己的標題");
+  });
+
+  it("E2E 會話:thread/name/updated 不投 session.title(標題明文,#113 紀律)", async () => {
+    const sent: any[] = [];
+    const lb: any = { agentLinkId: "al", isReady: true, handlers: [], onFrame(h: any) { this.handlers.push(h); }, send: (m: any) => sent.push(m), async deliver(m: any) { for (const h of this.handlers) await h(m); } };
+    const c2 = new FakeClient();
+    c2.queueResponse("thread/start", { thread: { id: TID } });
+    process.env.MACCHIATO_CODEX_SESSIONS = join(mkdtempSync(join(tmpdir(), "cx-224e-")), "s.json");
+    const e2e: any = { isE2E: () => true, decryptText: (_s: string, t: string) => t, encryptContent: () => "enc" };
+    const d = new AppServerDrive(c2 as any, lb, undefined, e2e);
+    d.wire();
+    await lb.deliver(tui("prompt.submit", SID, { text: "秘密" }));
+    c2.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    c2.fire("thread/name/updated", { threadId: TID, threadName: "不該外洩的標題" });
+    await tick();
+    expect(sent.filter((f) => f.frame?.params?.type === "session.title")).toHaveLength(0);
+    void d;
+  });
+});

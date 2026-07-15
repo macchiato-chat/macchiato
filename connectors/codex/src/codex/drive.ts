@@ -21,7 +21,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { loadDriveState, saveDriveState } from "./state";
+import { loadDriveState, saveDriveState, codexPermsFor } from "./state";
 import { resolveCodexBin } from "./codex-bin";
 import { generateTitle } from "./titles";
 import { materializeAttachment } from "./attachments";
@@ -117,6 +117,8 @@ export class Drive {
   /** #143 serverSid → 會話 model(session.create.model 下發;持久,同文件存)。 */
   private models: Record<string, string>;
   private efforts: Record<string, string>; // #231
+  /** #230 serverSid → 會話 permissionMode(session.create.permissionMode;映射為 codex sandbox)。 */
+  private perms: Record<string, string>;
   /** #200 在途回合 sid 集(持久):回合起加、止刪;進程死於回合中途 → 下次啟動提示重發。 */
   private pending: Set<string>;
   /** #200 上個進程死時遺留的在途回合(構造載入即清盤;flushAbandonedTurns 在 ready 後告知)。 */
@@ -145,6 +147,7 @@ export class Drive {
     this.cwds = st.cwds;
     this.models = st.models;
     this.efforts = st.efforts;
+    this.perms = st.perms;
     this.titled = st.titled;
     this.abandonedTurns = st.pending;
     this.pending = new Set();
@@ -170,6 +173,14 @@ export class Drive {
   }
   private effortFor(sid: string): string | undefined {
     return this.efforts[sid] || process.env.MACCHIATO_CODEX_EFFORT || undefined; // #231
+  }
+
+  /**
+   * #230 該會話 sandbox:per-session permissionMode 映射優先(plan/auto/bypass 三檔),
+   * 否則回退進程級 env 默認 `sandboxMode()`。exec 非交互,approval 不適用,只取 sandbox。
+   */
+  private sandboxFor(sid: string): string {
+    return codexPermsFor(this.perms[sid])?.sandbox ?? sandboxMode();
   }
 
   wire(): void {
@@ -294,6 +305,13 @@ export class Drive {
             else delete this.efforts[sid];
             this.saveMap();
           }
+          // #230 permissionMode(upsert;隨時可改)。空 = 回退進程級 env 沙箱默認。
+          const pm = typeof params.permissionMode === "string" ? params.permissionMode.trim() : "";
+          if (pm ? this.perms[sid] !== pm : this.perms[sid] !== undefined) {
+            if (pm) this.perms[sid] = pm;
+            else delete this.perms[sid];
+            this.saveMap();
+          }
           if (cwd && !this.e2e?.isE2E(sid) && !isDir(this.cwdFor(sid))) {
             this.emit(sid, "review.summary", { summary: `⚠️ 工作目錄不存在或不是目錄:${this.cwdFor(sid)}(連接器主機上)` });
           }
@@ -324,7 +342,7 @@ export class Drive {
     // exec 級標誌(--json/-s/-C/--skip-git-repo-check/-m)是 `exec` 的選項,必須放在 `resume`
     // 子命令**之前**(codex exec resume 不接這些,實測 2026-07-12)。
     //   codex exec --json --skip-git-repo-check -s <sandbox> -C <cwd> [-m <model>] [resume <id>] <prompt>
-    const args = ["exec", "--json", "--skip-git-repo-check", "-s", sandboxMode(), "-C", cwd];
+    const args = ["exec", "--json", "--skip-git-repo-check", "-s", this.sandboxFor(sid), "-C", cwd];
     // #143 per-session model(空 = 不傳 -m,用 codex 自身配置默認;絕不 hardcode)。放 resume 之前。
     const model = this.modelFor(sid);
     if (model) args.push("-m", model);
@@ -511,6 +529,6 @@ export class Drive {
     return loadDriveState(); // #132 抽到 state.ts(v1/v2 drive 共用同一持久文件)
   }
   private saveMap(): void {
-    saveDriveState({ map: this.map, cwds: this.cwds, models: this.models, efforts: this.efforts, titled: this.titled, pending: this.pending });
+    saveDriveState({ map: this.map, cwds: this.cwds, models: this.models, efforts: this.efforts, perms: this.perms, titled: this.titled, pending: this.pending });
   }
 }

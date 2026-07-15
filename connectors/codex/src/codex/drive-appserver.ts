@@ -17,9 +17,9 @@ import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { AppServerClient, AppServerDied } from "./appserver";
-import { loadDriveState, saveDriveState } from "./state";
+import { loadDriveState, saveDriveState, codexPermsFor } from "./state";
 import { workDir } from "./drive";
-import { generateTitle } from "./titles";
+import { fallbackTitle, titleMode } from "./titles";
 import { materializeAttachment } from "./attachments";
 import type { LinkBClient } from "../linkb/client";
 import type { E2EKeyStore } from "../e2e/keys";
@@ -126,6 +126,8 @@ export class AppServerDrive {
   private cwds: Record<string, string>;
   private models: Record<string, string>;
   private efforts: Record<string, string>; // #231
+  /** #230 serverSid → 會話 permissionMode(映射為 codex sandbox + approvalPolicy)。 */
+  private perms: Record<string, string>;
   private pending: Set<string>;
   private titled: Set<string>;
   private abandonedTurns: string[] = [];
@@ -138,6 +140,8 @@ export class AppServerDrive {
   private readonly approvals = new Map<string, PendingApproval[]>();
   private readonly pendingUser = new Map<string, string[]>();
   private readonly interruptedSids = new Set<string>();
+  /** #224 自己 thread/name/set 寫過的 threadId→title(抑制回聲 thread/name/updated 重投 session.title)。 */
+  private readonly renamedTitles = new Map<string, string>();
 
   constructor(
     private readonly client: AppServerClient,
@@ -152,6 +156,7 @@ export class AppServerDrive {
     this.cwds = st.cwds;
     this.models = st.models;
     this.efforts = st.efforts;
+    this.perms = st.perms;
     this.titled = st.titled;
     this.abandonedTurns = st.pending;
     this.pending = new Set();
@@ -207,6 +212,14 @@ export class AppServerDrive {
   private effortFor(sid: string): string | undefined {
     return this.efforts[sid] || process.env.MACCHIATO_CODEX_EFFORT || undefined; // #231
   }
+  /** #230 per-session sandbox/approval:permissionMode 映射優先(三檔),否則回退進程級 env 默認。
+   *  注:app-server 的 sandbox/approval 在 thread start/resume 時定;會話啟動後再改要等線程重載才生效。 */
+  private sandboxFor(sid: string): string {
+    return codexPermsFor(this.perms[sid])?.sandbox ?? sandboxMode();
+  }
+  private approvalFor(sid: string): string {
+    return codexPermsFor(this.perms[sid])?.approval ?? approvalPolicy();
+  }
 
   // ============================== 下行(server → 連接器) ==============================
 
@@ -248,6 +261,22 @@ export class AppServerDrive {
           if (tid) this.mirror?.tombstone(tid); // #161 墓碑;不刪 rollout
           return;
         }
+        case "session.rename": {
+          // #224 改名回寫:app 改標題 → thread/name/set,codex 本地(TUI /resume 列表)看到同名。
+          // 僅 app-server 引擎有此能力(exec drive 無此 case,靜默跳過)。無 thread(尚未建會話)→ 跳過。
+          const tid = this.threadFor(sid);
+          const title = typeof params.title === "string" ? params.title.trim() : "";
+          if (tid && title) {
+            try {
+              await this.client.request("thread/name/set", { threadId: tid, name: title });
+              this.renamedTitles.set(tid, title); // 標記自寫,回聲的 thread/name/updated 不再回投
+              console.log(`· #224 thread/name/set ${tid} → ${title}`);
+            } catch (e) {
+              console.error(`[#224 thread/name/set failed ${tid}] ${(e as Error).message}`);
+            }
+          }
+          return;
+        }
         case "session.create": {
           const cwd = typeof params.cwd === "string" ? params.cwd.trim() : "";
           if (cwd ? this.cwds[sid] !== cwd : this.cwds[sid] !== undefined) {
@@ -265,6 +294,13 @@ export class AppServerDrive {
           if (ef ? this.efforts[sid] !== ef : this.efforts[sid] !== undefined) {
             if (ef) this.efforts[sid] = ef;
             else delete this.efforts[sid];
+            this.saveMap();
+          }
+          // #230 permissionMode(upsert)。空 = 回退進程級 env 默認。
+          const pm = typeof params.permissionMode === "string" ? params.permissionMode.trim() : "";
+          if (pm ? this.perms[sid] !== pm : this.perms[sid] !== undefined) {
+            if (pm) this.perms[sid] = pm;
+            else delete this.perms[sid];
             this.saveMap();
           }
           if (cwd && !this.e2e?.isE2E(sid) && !isDir(this.cwdFor(sid))) {
@@ -350,13 +386,13 @@ export class AppServerDrive {
     }
     let threadId = this.threadFor(sid);
     const isFirstMacchiatoTurn = !threadId && !UUID_RE.test(sid) && !isE2E;
-    if (isFirstMacchiatoTurn && !this.titled.has(sid) && firstText) void this.maybeTitle(sid, firstText);
+    if (isFirstMacchiatoTurn && !this.titled.has(sid) && firstText) this.maybeTitle(sid, firstText);
     try {
       if (threadId && !this.loadedThreads.has(threadId)) {
-        await this.client.request("thread/resume", { threadId, cwd, approvalPolicy: approvalPolicy(), sandbox: sandboxMode() });
+        await this.client.request("thread/resume", { threadId, cwd, approvalPolicy: this.approvalFor(sid), sandbox: this.sandboxFor(sid) });
         this.loadedThreads.add(threadId);
       } else if (!threadId) {
-        const ts = await this.client.request("thread/start", { cwd, approvalPolicy: approvalPolicy(), sandbox: sandboxMode() });
+        const ts = await this.client.request("thread/start", { cwd, approvalPolicy: this.approvalFor(sid), sandbox: this.sandboxFor(sid) });
         threadId = String(ts?.thread?.id ?? "");
         if (!threadId) throw new Error("thread/start 未返回 thread.id");
         this.loadedThreads.add(threadId);
@@ -407,6 +443,19 @@ export class AppServerDrive {
     switch (method) {
       case "turn/started": {
         if (turn && !turn.turnId) turn.turnId = String(p.turn?.id ?? "");
+        return;
+      }
+      case "thread/name/updated": {
+        // #224 codex 自己起的 thread 名 → session.title(替代首條消息截斷的土標題)。
+        // 自寫回聲(session.rename 觸發的)不回投;E2E 跳過(標題事件明文,#113 紀律)。
+        const name = typeof p.threadName === "string" ? p.threadName.trim() : "";
+        if (!name || this.e2e?.isE2E(sid)) return;
+        if (this.renamedTitles.get(threadId) === name) {
+          this.renamedTitles.delete(threadId);
+          return;
+        }
+        this.emit(sid, "session.title", { title: name });
+        console.log(`· #224 thread/name/updated → session.title(${sid})`);
         return;
       }
       case "item/agentMessage/delta": {
@@ -610,16 +659,21 @@ export class AppServerDrive {
     this.saveMap();
   }
 
-  private async maybeTitle(sid: string, firstUserText: string): Promise<void> {
+  /**
+   * #224 app-server 標題:codex 原生 thread/name/updated 提供好標題並覆蓋。這裡只即時落一個
+   * **便宜的截斷佔位**(不再起額外 codex exec 生成標題——那在 app-server 下純屬浪費),讓會話立刻
+   * 有名、codex 的原生名一到就蓋掉。E2E 不落(明文標題,#113 紀律)。
+   */
+  private maybeTitle(sid: string, firstUserText: string): void {
     try {
       this.titled.add(sid);
       this.saveMap();
-      const title = await generateTitle(firstUserText);
+      if (titleMode() === "off") return; // off:不落佔位(codex 原生名或無)
+      const title = fallbackTitle(firstUserText);
       if (!title) return;
       this.emit(sid, "session.title", { title });
-      console.log(`· 生成標題「${title}」→ ${sid}`);
     } catch (e) {
-      console.error(`[title gen failed for ${sid}] ${(e as Error).message}`);
+      console.error(`[title placeholder failed for ${sid}] ${(e as Error).message}`);
     }
   }
 
@@ -633,6 +687,6 @@ export class AppServerDrive {
   }
 
   private saveMap(): void {
-    saveDriveState({ map: this.map, cwds: this.cwds, models: this.models, efforts: this.efforts, titled: this.titled, pending: this.pending });
+    saveDriveState({ map: this.map, cwds: this.cwds, models: this.models, efforts: this.efforts, perms: this.perms, titled: this.titled, pending: this.pending });
   }
 }
