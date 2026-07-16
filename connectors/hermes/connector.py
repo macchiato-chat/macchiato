@@ -65,7 +65,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.23"
+CONNECTOR_VERSION = "1.5.24"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -393,7 +393,19 @@ class Connector:
             real_sid = params.get("session_id")
             server_sid = self._rev.get(real_sid, real_sid)
             if self._e2e.is_e2e(server_sid):
-                return  # §19 E2E（方案 A）：抑制 live 明文轉發；內容改由加密鏡像投遞（~2s 一條完整消息）
+                # §19 E2E:內容事件(message.*/tool.*)走加密鏡像抑制;但 #240 交互事件不能一起黑洞——
+                # approval.request 加密後放行(否則 agent 要審批用戶永遠看不到、回合卡死),媒體放行
+                # (照 e2e.md 既定邊界:附件不 E2E、存 server 可讀桶)。clarify/secret 的雙向加密走 follow-up。
+                etype = params.get("type")
+                fwd = self._e2e_live_frame(server_sid, etype, params.get("payload") or {})
+                if fwd is not None:
+                    loop.create_task(self._to_server(server_sid, fwd))
+                if etype == "message.complete":
+                    text = (params.get("payload") or {}).get("text") or ""
+                    if text:
+                        loop.create_task(self._emit_media_from_text(server_sid, text))  # 媒體放行
+                    self._projects_check_turn_end()  # #227 回合末惰性版本化
+                return
             frame = {
                 "jsonrpc": "2.0",
                 "method": "event",
@@ -645,6 +657,32 @@ class Connector:
             print(f"[auto_title gen failed] {exc!r}", file=sys.stderr)
             return ""
 
+    def _e2e_live_frame(self, server_sid: str, etype: str, payload: dict) -> dict | None:
+        """§19 E2E 會話的 live 事件過濾(#240)。返回要轉發的 event frame,或 None(抑制)。
+        - approval.request:命令/說明加密進 enc,明文只留占位 + pattern_key/request_id(元數據);
+          server 盲存密文、不落明文,iOS 用 K_S 解密渲染。choice 回程非敏感,照 approval.respond 舊路。
+        - 其餘(message.*/tool.* 走加密鏡像;clarify/secret 待雙向加密 follow-up):抑制。"""
+        if etype != "approval.request":
+            return None
+        enc = self._e2e.encrypt_content(
+            server_sid,
+            {"command": payload.get("command", ""), "description": payload.get("description", "")},
+        )
+        out = {
+            "command": "🔒 加密審批請求",
+            "pattern_key": payload.get("pattern_key", ""),
+            "pattern_keys": payload.get("pattern_keys", []),
+            "description": "",
+            "enc": enc,
+        }
+        if payload.get("request_id"):
+            out["request_id"] = payload["request_id"]
+        return {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {"type": "approval.request", "session_id": server_sid, "payload": out},
+        }
+
     async def _emit_media_from_text(self, server_sid: str, text: str) -> None:
         # 出站附件：agent 在正文用 MEDIA:/裸路徑標的文件 → 讀取 → media.attach 事件上送。
         try:
@@ -808,19 +846,22 @@ class Connector:
         except Exception as exc:
             print(f"[#13 srcid 回填失敗(忽略) {server_sid}] {exc!r}", file=sys.stderr)
 
-    async def _send(self, msg: dict) -> None:
+    async def _send(self, msg: dict) -> bool:
         """斷線期間**緩衝**、ready 後按序補發(此前直接丟——server 部署重啟撞上進行中回合,
-        回覆/標題被靜默丟掉,會話卡成「影子」,2026-07-12 實測)。鏡像/健康/pong 有自愈或時效性,照舊丟。"""
+        回覆/標題被靜默丟掉,會話卡成「影子」,2026-07-12 實測)。鏡像/健康/pong 有自愈或時效性,照舊丟。
+        返回「是否已實際發出」(緩衝/丟棄 → False)——鏡像靠它決定推不推水位線(#239):
+        失敗批若照推,server 沒收到就永不 nack,消息永久丟失且無自愈路徑。"""
         data = json.dumps(msg, ensure_ascii=False)
         if self.ws is not None:
             try:
                 await self.ws.send(data)
-                return
+                return True
             except Exception as exc:
                 print(f"[send failed → 緩衝] {exc!r}", file=sys.stderr)
         if msg.get("t") in ("mirror_append", "connector_health", "pong"):
-            return
+            return False
         self._out_pending.append(data)
+        return False
 
     async def _start_push_socket(self) -> None:
         """§17 主動投遞：本地 unix socket 接 Hermes macchiato 插件的投遞請求 → 經 Link B 發 connector_push。"""
@@ -1309,12 +1350,18 @@ class Connector:
             self._mirror_batch_id += 1
             bid = self._mirror_batch_id
             rewind = {sid: (wm[sid] if sid in wm else default_floor) for sid in touched}  # advance 前的舊 floor
-            await self._send({
+            ok = await self._send({
                 "t": "mirror_append",
                 "agentLinkId": self.agent_link_id,
                 "batchId": bid,
                 "sessions": batch,
             })
+            if not ok:
+                # #239:批根本沒到 server(斷線/半路失敗)→ 不推水位線、不記 rewind、不記標題,
+                # 下輪 poll 原地重撈重發。照推的話 server 永不 nack(沒收到),消息永久丟失。
+                self._count("mirrorSendFailed")
+                print(f"[mirror batch {bid} 未發出 → 水位線不推進,下輪重試]", file=sys.stderr)
+                return
             self._mirror_rewind.append((bid, rewind))
             # 修 B：只在水位線未被併發 nack 回退時推進（否則回退會被覆蓋 → 丟）。
             ta = st.setdefault("touched_at", {})

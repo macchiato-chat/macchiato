@@ -7,6 +7,7 @@ K_S 存 `~/.macchiato/e2e.json`（0600，在用戶自己的機器上）。**某 
 import base64
 import json
 import os
+import sys
 import threading
 
 import e2e_crypto as ec
@@ -22,12 +23,39 @@ class E2EKeyStore:
         self._load()
 
     def _load(self) -> None:
-        try:
-            with open(self._path) as f:
-                d = json.load(f)
-            self._keys = {sid: base64.b64decode(k) for sid, k in d.items()}
-        except (FileNotFoundError, ValueError, json.JSONDecodeError):
-            self._keys = {}
+        """#241 fail-closed:e2e.json 損壞絕不能靜默回空——is_e2e 全 False 會讓原 E2E
+        會話的 live 事件**明文直發 server**,違背 E2E 承諾。主檔壞/缺 → 試 .bak(恢復後
+        立即重建主檔);兩檔都壞 → 拒啟。確認放棄密鑰可手動刪 e2e.json(+.bak) 後重啟,
+        相關會話從此按明文處理。"""
+        for path in (self._path, self._path + ".bak"):
+            try:
+                with open(path) as f:
+                    d = json.load(f)
+                keys = {sid: base64.b64decode(k) for sid, k in d.items()}
+                for sid, k in keys.items():
+                    if len(k) != 32:
+                        raise ValueError(f"bad K_S length for {sid}: {len(k)}")
+                self._keys = keys
+                if path != self._path:
+                    print(f"[e2e] 主檔壞/缺,已從 .bak 恢復 {len(keys)} 把密鑰", file=sys.stderr)
+                    try:
+                        os.unlink(self._path)  # 移走損壞主檔——別讓 _save 的輪替把它蓋進 .bak(唯一好備份)
+                    except FileNotFoundError:
+                        pass
+                    self._save()  # 立即重建主檔(.bak 保持好內容)
+                return
+            except FileNotFoundError:
+                continue
+            except (ValueError, json.JSONDecodeError) as exc:
+                print(f"[e2e] {path} 損壞:{exc!r}", file=sys.stderr)
+                continue
+        if os.path.exists(self._path) or os.path.exists(self._path + ".bak"):
+            raise RuntimeError(
+                "e2e.json 及其 .bak 均損壞——拒絕啟動(fail-closed):繼續跑會把 E2E 會話明文發往 "
+                "server。如確認放棄這些密鑰,手動刪除 e2e.json 與 e2e.json.bak 後重啟"
+                "(相關會話將按明文處理,歷史密文不可再解)。"
+            )
+        self._keys = {}  # 全新安裝
 
     def _save(self) -> None:
         os.makedirs(os.path.dirname(self._path), exist_ok=True)
@@ -35,6 +63,8 @@ class E2EKeyStore:
         with open(tmp, "w") as f:
             json.dump({sid: base64.b64encode(k).decode("ascii") for sid, k in self._keys.items()}, f)
         os.chmod(tmp, 0o600)
+        if os.path.exists(self._path):
+            os.replace(self._path, self._path + ".bak")  # #241 輪替備份(load 側有 .bak 回退)
         os.replace(tmp, self._path)  # 原子替換
 
     # ── 狀態 ──────────────────────────────────────────────────────────────

@@ -171,7 +171,7 @@ describe("Drive", () => {
     const p2 = (d as any).requestApproval(CC_SID, "Read", {});
     fire(tuiFrame(CC_SID, "approval.respond", { choice: "deny" }));
     expect((await p2).behavior).toBe("deny");
-    expect((d as any).alwaysAllow.get(CC_SID)?.has("Bash")).toBe(true);
+    expect((d as any).alwaysRules.get(CC_SID)).toEqual(["Bash"]); // #238 無建議 → 工具級兜底規則
   });
 
   it("回合進行中再來 prompt → steer(#75):消息進隊 + 打斷當前回合", async () => {
@@ -616,8 +616,59 @@ describe("#102 審批 request_id + always 持久化", () => {
     expect(r2.updatedPermissions).toEqual([
       { type: "addRules", rules: [{ toolName: "Grep" }], behavior: "allow", destination: "session" },
     ]);
-    // 內存 Set 仍是真來源(雙保險)
-    expect((d as any).alwaysAllow.get(CC_SID)?.has("Grep")).toBe(true);
+    // #238:存檔窄規則串(suggestions 轉換;Grep 無建議 → 工具級兜底),供通道重建回灌
+    expect((d as any).alwaysRules.get(CC_SID)).toEqual(["Bash(ls *)", "Grep"]);
+  });
+
+  it("#238 alwaysRules 回灌 settings.permissions.allow,canUseTool 不再按工具名短路", async () => {
+    turnScripts = [[
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "ok" },
+    ]];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    (d as any).alwaysRules.set(CC_SID, ["Bash(git status:*)"]);
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+    // 通道創建帶上窄規則(SDK flag-settings 層,重建不丟)
+    expect(lastOptions.settings).toEqual({ permissions: { allow: ["Bash(git status:*)"] } });
+    // 舊實現:Set 有 Bash → 本會話所有 Bash 短路放行(rm -rf 也免審);新實現:未命中規則仍走審批卡
+    const p = lastOptions.canUseTool("Bash", { command: "rm -rf /tmp/x" }, { toolUseID: "tx" });
+    await new Promise((r) => setTimeout(r, 10));
+    const reqs = sent.filter((f: any) => f.frame?.params?.type === "approval.request");
+    expect(reqs.length).toBe(1);
+    fire(tuiFrame(CC_SID, "approval.respond", { choice: "deny", request_id: "tx" }));
+    expect((await p).behavior).toBe("deny");
+    d.dispose();
+  });
+
+  it("#240 E2E 審批卡:命令/說明加密進 enc,明文只留占位 + pattern_key", async () => {
+    const store = new Map<string, string>();
+    const e2e = {
+      isE2E: (id: string) => id === CC_SID,
+      encryptContent: (_sid: string, obj: unknown) => {
+        const b = `enc#${store.size}`;
+        store.set(b, JSON.stringify(obj));
+        return b;
+      },
+    } as any;
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb, undefined, e2e);
+    d.wire();
+    const p = (d as any).requestApproval(CC_SID, "Bash", { command: "rm -rf /secret" }, { toolUseID: "e1", description: "刪除機密目錄" });
+    const req = (sent.find((f: any) => f.frame?.params?.type === "approval.request") as any).frame.params.payload;
+    expect(req.command).toBe("🔒 加密審批請求"); // 明文占位
+    expect(req.description).toBe("");
+    expect(req.pattern_key).toBe("Bash"); // 元數據明文
+    expect(req.request_id).toBe("e1");
+    expect(typeof req.enc).toBe("string");
+    // enc 解出真實命令/說明(rm 全文不在明文任何字段)
+    expect(JSON.stringify(req).includes("rm -rf")).toBe(false);
+    expect(JSON.parse(store.get(req.enc)!)).toMatchObject({ command: expect.stringContaining("rm -rf /secret"), description: "刪除機密目錄" });
+    // choice 回程照舊
+    fire(tuiFrame(CC_SID, "approval.respond", { choice: "allow", request_id: "e1" }));
+    expect((await p).behavior).toBe("allow");
   });
 });
 
@@ -821,6 +872,63 @@ describe("#118 streaming-input 長活通道", () => {
     expect(typeof content).toBe("string"); // 回退:路徑注入純文本
     expect(content).toContain("讀這個文件");
     expect(content).toContain(pdf);
+    d.dispose();
+  });
+
+  it("#237 E2E×附件:先解密再拼註記,整條不再被靜默丟", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cc-e2eatt-"));
+    const pdf = join(dir, "doc.pdf");
+    writeFileSync(pdf, Buffer.alloc(8, 3));
+    mockMaterialize = async () => pdf;
+    turnScripts = [[{ type: "system", subtype: "init", session_id: CC_SID }, { type: "result", subtype: "success", result: "ok" }]];
+    const { linkb, fire } = fakeLinkb();
+    const e2e = {
+      isE2E: (id: string) => id === CC_SID,
+      // 模擬 GCM:只認純密文,任何拼接污染都拋(舊實現先拼註記 → 這裡拋 → 整條丟)
+      decryptText: (_sid: string, ct: string) => {
+        if (ct !== "CIPHER") throw new Error("gcm auth failed");
+        return "明文問題";
+      },
+      encryptContent: (_sid: string, c: { text: string }) => `enc:${c.text}`,
+    } as any;
+    const d = new Drive(linkb, undefined, e2e);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", {
+      text: "CIPHER",
+      attachments: [{ id: "e1", kind: "file", mime: "application/pdf", name: "doc.pdf", url: "https://files.example/e" }],
+    }));
+    await new Promise((r) => setTimeout(r, 50));
+    const content = pushedMessages[0]?.message?.content;
+    expect(typeof content).toBe("string");
+    expect(content).toContain("明文問題"); // 解密成功(未被註記污染)
+    expect(content).toContain(pdf); // 附件註記在解密後拼上
+    d.dispose();
+  });
+
+  it("#237 E2E 附件-only:註記即正文,不走解密不被丟", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cc-e2eatt2-"));
+    const pdf = join(dir, "r.pdf");
+    writeFileSync(pdf, Buffer.alloc(8, 5));
+    mockMaterialize = async () => pdf;
+    turnScripts = [[{ type: "system", subtype: "init", session_id: CC_SID }, { type: "result", subtype: "success", result: "ok" }]];
+    const { linkb, fire } = fakeLinkb();
+    const e2e = {
+      isE2E: (id: string) => id === CC_SID,
+      decryptText: () => {
+        throw new Error("不該被調:空正文無密文");
+      },
+      encryptContent: (_sid: string, c: { text: string }) => `enc:${c.text}`,
+    } as any;
+    const d = new Drive(linkb, undefined, e2e);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", {
+      text: "",
+      attachments: [{ id: "e2", kind: "file", mime: "application/pdf", name: "r.pdf", url: "https://files.example/r" }],
+    }));
+    await new Promise((r) => setTimeout(r, 50));
+    const content = pushedMessages[0]?.message?.content;
+    expect(typeof content).toBe("string");
+    expect(content).toContain(pdf); // 舊實現:註記被當密文解密失敗 → 整條丟
     d.dispose();
   });
 

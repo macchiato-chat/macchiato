@@ -37,6 +37,19 @@ describe("Link B 出站緩衝(影子會話修復:斷線期間幀不再靜默丟)
     c.close();
   });
 
+  it("#243 E2E 加密批例外:斷線入緩衝、ready 後送達(明文鏡像批照舊丟)", async () => {
+    srv = fakeServer();
+    const c = new LinkBClient({ serverUrl: `ws://127.0.0.1:${srv.port}`, connectorToken: "t", agentLinkId: "al" } as any);
+    // 未連接:E2E 批緩衝(唯一一份,對賬/打撈都跳過 E2E);明文批丟(有水位線自愈)
+    c.send({ t: "mirror_append", n: 1, sessions: [{ hermesSessionId: "s", e2e: true, messages: [] }] });
+    c.send({ t: "mirror_append", n: 2, sessions: [{ hermesSessionId: "p", messages: [] }] });
+    expect((c as any).pending.length).toBe(1);
+    await c.start();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(srv.got.map((m: any) => m.n)).toEqual([1]); // E2E 批送達,明文批沒重發
+    c.close();
+  });
+
   it("緩衝有界:超過上限丟最舊", () => {
     srv = fakeServer();
     const c = new LinkBClient({ serverUrl: `ws://127.0.0.1:${srv.port}`, connectorToken: "t", agentLinkId: "al" } as any);

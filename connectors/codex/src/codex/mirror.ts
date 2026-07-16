@@ -100,6 +100,8 @@ interface State {
   missingAt?: Record<string, number>;
   /** #161 墓碑:app 刪過的 thread,鏡像永不再撈(rollout 檔案不動)。 */
   tombstones?: string[];
+  /** #236 首掃已建基線(持久,對齊 CC #154):此後新發現的 rollout 才從頭鏡像。 */
+  seeded?: boolean;
 }
 
 export class Mirror {
@@ -113,8 +115,6 @@ export class Mirror {
   /** #10:累計計數(進程生命週期),健康上報帶出。 */
   readonly counters: Record<string, number> = { mirrorBatches: 0, mirrorMessages: 0, mirrorNacks: 0, mirrorErrors: 0 };
   private polling = false;
-  /** 首輪 poll 已建立基線——之後新出現的 rollout 從頭鏡像(而非跳過)。 */
-  private baselined = false;
 
   constructor(
     private readonly linkb: LinkBClient,
@@ -217,13 +217,15 @@ export class Mirror {
         continue;
       }
       if (off === undefined) {
-        if (!this.baselined) {
-          // 首輪:存量會話建基線(跳過歷史,避免每次啟動全量回灌——導入走 runImport)
+        // #236:`seeded` 持久化(對齊 CC #154)——首掃把存量會話基線到檔末(歷史走「導入」,
+        // 避免裝上/重啟即全量回灌);首掃**成功走完**之後新出現的 rollout(終端新開的會話,
+        // 含連接器停機期間新建的)→ 從頭鏡像,首拍不丟。舊版此處是進程級旗標且從未置 true,
+        // 導致新會話一律被誤基線、首次發現前的消息永丟。
+        if (!this.state.seeded) {
           this.state.offsets[threadId] = size;
           this.state.ords[threadId] = content.split("\n").length;
           continue;
         }
-        // 連接器啟動後**新出現**的 rollout(終端新開的會話)→ 從頭鏡像
       }
       const startOff = off ?? 0;
       if (size <= startOff) continue;
@@ -265,6 +267,7 @@ export class Mirror {
       this.counters.mirrorBatches += 1; // #10
       this.counters.mirrorMessages += batch.reduce((a: number, s: any) => a + (s.messages?.length ?? 0), 0);
     }
+    this.state.seeded = true; // #236 首掃完成:此後新發現的 rollout 才從頭鏡像
     this.save();
   }
 
@@ -306,7 +309,8 @@ export class Mirror {
   }
 
   /** #9:offsets/ords 無界增長治理——rollout 消失連續 PRUNE_MS 才裁(7 天後壓縮 .zst 即「消失」)。
-   * uuid 不復用,被裁 id 不會回歸;萬一回歸走「首見 baseline」既有語義,不重發不誤丟。 */
+   * uuid 不復用,被裁 id 不會回歸;萬一回歸,#236 後按「新 rollout」從頭鏡像,srcId 內容哈希
+   * 在 server 端唯一索引去重 → 不重複入庫、不誤丟(與 CC 行為一致)。 */
   private pruneState(liveIds: Set<string>): void {
     const ma = (this.state.missingAt ??= {});
     const now = Date.now();
@@ -334,7 +338,14 @@ export class Mirror {
       try {
         const s = JSON.parse(readFileSync(p, "utf8"));
         if (isBak) console.error(`⚠️ ${statePath()} 損壞/丟失 → 已從 .bak 恢復水位線`);
-        return { offsets: s.offsets ?? {}, ords: s.ords ?? {}, missingAt: s.missingAt ?? {}, tombstones: s.tombstones ?? [] }; // #161
+        return {
+          offsets: s.offsets ?? {},
+          ords: s.ords ?? {},
+          missingAt: s.missingAt ?? {},
+          tombstones: s.tombstones ?? [], // #161
+          // #236:舊安裝(有水位線,存量已基線過)視為已 seeded;白名單漏字段的教訓——顯式帶上。
+          seeded: s.seeded ?? Object.keys(s.offsets ?? {}).length > 0,
+        };
       } catch {
         /* 下一個候選 */
       }

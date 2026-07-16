@@ -112,10 +112,14 @@ interface ActiveTurn {
   isE2E: boolean;
   isFirstMacchiatoTurn: boolean;
   lastError?: string;
+  /** #245 interrupt 點在 turnId 未到位的窗口 → 掛起,turnId 到位即補發。 */
+  interruptPending?: boolean;
 }
 
 interface PendingApproval {
   sid: string;
+  /** #245 反向請求的 itemId(隨 approval.request 的 request_id 上行;respond 回帶則精準配對)。 */
+  requestId?: string;
   resolve: (decision: string) => void;
 }
 
@@ -236,11 +240,23 @@ export class AppServerDrive {
           return;
         }
         case "approval.respond": {
-          // 審批卡回話 → 解掛反向請求(FIFO,對齊 CC)。allow+all → acceptForSession(codex 原生
-          // 會話級審批緩存,同類後續免問);deny → decline(agent 收到拒絕並繼續)。
+          // 審批卡回話 → 解掛反向請求。#245:優先按 request_id(=itemId)精準配對——codex 並行
+          // 工具下同會話可同掛多個審批(command+fileChange 交錯),純 FIFO 會把回話錯配到先掛的
+          // 請求(批錯命令);缺省回退 FIFO(舊 server 兼容,CC #102 同款)。allow+all →
+          // acceptForSession(codex 原生會話級審批緩存);deny → decline(agent 收到拒絕並繼續)。
           const list = this.approvals.get(sid);
-          const p = list?.shift();
-          if (!list?.length) this.approvals.delete(sid);
+          if (!list?.length) {
+            this.approvals.delete(sid);
+            return;
+          }
+          const reqId = typeof params.request_id === "string" ? params.request_id : "";
+          let p: PendingApproval | undefined;
+          if (reqId) {
+            const i = list.findIndex((x) => x.requestId === reqId);
+            if (i >= 0) p = list.splice(i, 1)[0];
+          }
+          p ??= list.shift();
+          if (!list.length) this.approvals.delete(sid);
           if (!p) return;
           const allow = params.choice === "allow";
           const all = params.all === true;
@@ -249,10 +265,15 @@ export class AppServerDrive {
         }
         case "session.interrupt": {
           const t = this.active.get(sid);
-          if (t?.turnId) {
-            this.interruptedSids.add(sid);
+          if (!t) return;
+          this.interruptedSids.add(sid);
+          if (t.turnId) {
             await this.client.request("turn/interrupt", { threadId: t.threadId, turnId: t.turnId });
             console.log(`· turn/interrupt → ${sid}`);
+          } else {
+            // #245:turn/start 未返回的窗口點停止,舊實現靜默吞掉 → turnId 到位即補發
+            t.interruptPending = true;
+            console.log(`· interrupt 掛起(turnId 未到位,到位即補發)→ ${sid}`);
           }
           return;
         }
@@ -422,6 +443,7 @@ export class AppServerDrive {
       const res = await this.client.request("turn/start", { threadId, input, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
       // turn/start 立即返回(探針);turnId 也會隨 turn/started 通知到,這裡先記省一拍。
       if (res?.turn?.id) turn.turnId = String(res.turn.id);
+      if (turn.turnId && turn.interruptPending) void this.fireDeferredInterrupt(sid, turn); // #245
     } catch (e) {
       this.active.delete(sid);
       this.pending.delete(sid);
@@ -443,6 +465,7 @@ export class AppServerDrive {
     switch (method) {
       case "turn/started": {
         if (turn && !turn.turnId) turn.turnId = String(p.turn?.id ?? "");
+        if (turn?.turnId && turn.interruptPending) void this.fireDeferredInterrupt(sid, turn); // #245
         return;
       }
       case "thread/name/updated": {
@@ -613,6 +636,17 @@ export class AppServerDrive {
 
   // ============================== 審批橋 ==============================
 
+  /** #245:補發掛起的 interrupt(點停止時 turn/start 尚未返回)。 */
+  private async fireDeferredInterrupt(sid: string, turn: ActiveTurn): Promise<void> {
+    turn.interruptPending = false;
+    try {
+      await this.client.request("turn/interrupt", { threadId: turn.threadId, turnId: turn.turnId });
+      console.log(`· turn/interrupt(補發) → ${sid}`);
+    } catch (e) {
+      console.error(`[#245 補發 interrupt 失敗 ${sid}] ${(e as Error).message}`);
+    }
+  }
+
   /** 反向請求 → approval.request 卡(payload 對齊 CC 的形狀);掛起等 approval.respond。 */
   private onApprovalRequest(p: any, kind: "command" | "fileChange"): Promise<Record<string, unknown>> {
     const sid = this.byThread.get(String(p?.threadId ?? ""));
@@ -623,16 +657,22 @@ export class AppServerDrive {
         ? String(p.command ?? "")
         : `修改文件:${(Array.isArray(p.changes) ? p.changes : []).map((c: any) => String(c?.path ?? "")).filter(Boolean).join(", ").slice(0, 300) || "(見詳情)"}`;
     const reason = p.reason ? String(p.reason) : "";
+    const cmd = command.slice(0, 500);
+    const desc = reason || (kind === "command" ? `Codex 想在 ${String(p.cwd ?? "")} 執行命令` : "Codex 想寫入以上文件");
+    // #240 E2E:命令全文/文件路徑/cwd 都敏感 → 加密進 enc,明文只留占位 + 類別 + request_id。
+    const isE2E = this.e2e?.isE2E(sid) ?? false;
+    const enc = isE2E ? this.e2e!.encryptContent(sid, { command: cmd, description: desc }) : undefined;
     this.emit(sid, "approval.request", {
-      command: command.slice(0, 500),
+      command: isE2E ? "🔒 加密審批請求" : cmd,
       pattern_key: kind === "command" ? "shell" : "fileChange",
       pattern_keys: [kind === "command" ? "shell" : "fileChange"],
-      description: reason || (kind === "command" ? `Codex 想在 ${String(p.cwd ?? "")} 執行命令` : "Codex 想寫入以上文件"),
+      description: isE2E ? "" : desc,
+      ...(enc ? { enc } : {}),
       ...(p.itemId ? { request_id: String(p.itemId) } : {}),
     });
     return new Promise((resolve) => {
       const list = this.approvals.get(sid) ?? [];
-      list.push({ sid, resolve: (decision) => resolve({ decision }) });
+      list.push({ sid, requestId: p.itemId ? String(p.itemId) : undefined, resolve: (decision) => resolve({ decision }) });
       this.approvals.set(sid, list);
     });
   }

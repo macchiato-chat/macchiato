@@ -87,3 +87,83 @@ describe("#161 墓碑", () => {
     expect(sent2.filter((x) => x.t === "mirror_append")).toHaveLength(0);
   });
 });
+
+describe("#236 seeded 基線語義(pollOnce 核心路徑)", () => {
+  const mkWorld = async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, appendFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { Mirror } = await import("../src/codex/mirror");
+    const root = mkdtempSync(join(tmpdir(), "cx-seed-"));
+    process.env.MACCHIATO_CODEX_SESSIONS_DIR = join(root, "sessions");
+    process.env.MACCHIATO_CODEX_MIRROR = join(root, "mirror.json");
+    const dir = join(root, "sessions", "2026", "07", "16");
+    mkdirSync(dir, { recursive: true });
+    const line = (role: "user_message" | "agent_message", text: string) =>
+      JSON.stringify({ timestamp: "2026-07-16T00:00:01Z", type: "event_msg", payload: { type: role, message: text } }) + "\n";
+    const rollout = (tid: string, ...texts: string[]) => {
+      const f = join(dir, `rollout-2026-07-16T00-00-00-${tid}.jsonl`);
+      writeFileSync(f, texts.map((t) => line("user_message", t)).join(""));
+      return f;
+    };
+    return { Mirror, rollout, line, appendFileSync };
+  };
+  const T1 = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee2360";
+  const T2 = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee2361";
+  const T3 = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee2362";
+
+  it("首掃基線存量會話(不回灌)並置 seeded;此後新 rollout 從頭鏡像", async () => {
+    const { Mirror, rollout } = await mkWorld();
+    rollout(T1, "存量歷史,不該被回灌");
+    const sent: any[] = [];
+    const m: any = new Mirror({ agentLinkId: "al", isReady: true, send: (x: any) => sent.push(x), onFrame: () => () => {} } as any);
+    m.pollOnce();
+    expect(sent.filter((x) => x.t === "mirror_append")).toHaveLength(0); // 存量只基線
+    expect(m.state.seeded).toBe(true);
+    rollout(T2, "終端新開會話的首拍");
+    m.pollOnce();
+    const batches = sent.filter((x) => x.t === "mirror_append");
+    expect(batches).toHaveLength(1); // 新 rollout 從頭鏡像——原 bug 此處為 0(被誤基線)
+    expect(batches[0].sessions[0].hermesSessionId).toBe(T2);
+    expect(batches[0].sessions[0].messages[0].text).toBe("終端新開會話的首拍");
+  });
+
+  it("seeded 持久:重啟(新實例)後停機期間新建的 rollout 仍從頭鏡像", async () => {
+    const { Mirror, rollout } = await mkWorld();
+    rollout(T1, "存量");
+    const m1: any = new Mirror({ agentLinkId: "al", isReady: true, send: () => {}, onFrame: () => () => {} } as any);
+    m1.pollOnce(); // 首掃 + seeded 落盤
+    rollout(T3, "連接器停機期間寫入的消息"); // 模擬停機窗口
+    const sent: any[] = [];
+    const m2: any = new Mirror({ agentLinkId: "al", isReady: true, send: (x: any) => sent.push(x), onFrame: () => () => {} } as any);
+    expect(m2.state.seeded).toBe(true); // 持久載回
+    m2.pollOnce();
+    const batches = sent.filter((x) => x.t === "mirror_append");
+    expect(batches).toHaveLength(1); // 原 bug:每進程重新基線 → 這段永丟
+    expect(batches[0].sessions[0].messages[0].text).toBe("連接器停機期間寫入的消息");
+  });
+
+  it("舊安裝遷移:state 無 seeded 但有水位線 → 視為已 seeded", async () => {
+    const { Mirror, rollout } = await mkWorld();
+    rollout(T1, "x");
+    const m1: any = new Mirror({ agentLinkId: "al", isReady: true, send: () => {}, onFrame: () => () => {} } as any);
+    m1.state = { offsets: { [T1]: 5 }, ords: { [T1]: 1 } }; // 舊版落盤形狀(無 seeded)
+    m1.save();
+    const m2: any = new Mirror({ agentLinkId: "al", isReady: true, send: () => {}, onFrame: () => () => {} } as any);
+    expect(m2.state.seeded).toBe(true);
+  });
+
+  it("linkb 未就緒的首掃不置 seeded(不誤把存量當新會話)", async () => {
+    const { Mirror, rollout } = await mkWorld();
+    rollout(T1, "存量");
+    const sent: any[] = [];
+    const linkb: any = { agentLinkId: "al", isReady: false, send: (x: any) => sent.push(x), onFrame: () => () => {} };
+    const m: any = new Mirror(linkb);
+    m.pollOnce(); // isReady=false → 早退
+    expect(m.state.seeded).toBeUndefined();
+    linkb.isReady = true;
+    m.pollOnce(); // 真首掃:基線存量、置 seeded
+    expect(sent.filter((x) => x.t === "mirror_append")).toHaveLength(0);
+    expect(m.state.seeded).toBe(true);
+  });
+});

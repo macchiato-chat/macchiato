@@ -133,7 +133,13 @@ export class LinkBClient {
       ws.send(JSON.stringify(msg));
       return;
     }
-    if (msg.t === "mirror_append" || msg.t === "connector_health" || msg.t === "pong") return; // 有自愈/時效性,不緩衝
+    if (msg.t === "mirror_append" || msg.t === "connector_health" || msg.t === "pong") {
+      // #243 例外:E2E 加密批(sendE2ETurn)**不是**水位線驅動——鏡像走 transcript 對非 E2E
+      // 自愈,E2E 批就是內容唯一一份,丟=整回合永久丟失 → 照常入緩衝。明文鏡像批照舊丟。
+      const sessions = (msg as { sessions?: Array<{ e2e?: boolean }> }).sessions;
+      const hasE2E = msg.t === "mirror_append" && Array.isArray(sessions) && sessions.some((s) => s?.e2e === true);
+      if (!hasE2E) return;
+    }
     if (this.pending.length >= LinkBClient.PENDING_MAX) this.pending.shift(); // 有界:丟最舊
     this.pending.push(JSON.stringify(msg));
   }

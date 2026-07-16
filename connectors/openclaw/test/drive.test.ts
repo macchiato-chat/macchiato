@@ -14,12 +14,21 @@ function makeDrive(opts: { titleMode?: string } = {}) {
   const calls: { method: string; params: any }[] = [];
   const gw: any = {
     handlers: [] as any[],
+    connHandlers: [] as any[],
     onEvent(h: any) {
       this.handlers.push(h);
       return () => {
         const i = this.handlers.indexOf(h);
         if (i >= 0) this.handlers.splice(i, 1);
       };
+    },
+    // #242:重連鉤子(測試手動 triggerConnected 觸發)
+    onConnected(h: any) {
+      this.connHandlers.push(h);
+      return () => {};
+    },
+    triggerConnected() {
+      for (const h of [...this.connHandlers]) h();
     },
     async request(method: string, params: any) {
       calls.push({ method, params });
@@ -407,6 +416,30 @@ describe("#162 回合中帶附件的跟進", () => {
     expect(sends).toHaveLength(2);
     expect(sends[1]!.params.attachments).toHaveLength(1);
     expect(sends[1]!.params.message).toBe("看這張圖");
+  });
+});
+
+describe("#242 gateway 重連重置回合態", () => {
+  it("斷線丟 lifecycle end → 重連清 active(prompt 回 chat.send)+ 續投排隊跟進", async () => {
+    const { drive, gw, linkb, calls } = makeDrive();
+    const SID = "01OC242SID000000000000000A";
+    const KEY = `agent:main:macchiato:${SID}`.toLowerCase();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "第一條" }));
+    gw.fire({ event: "agent", payload: { sessionKey: KEY, stream: "lifecycle", runId: "r1", data: { phase: "start" } } });
+    // 回合中帶附件 → 排隊;gateway 斷線把 lifecycle end 吞了(永遠不 fire end)
+    await (drive as any).sendPrompt(KEY, SID, "看這張圖", [{ name: "a.png", mime: "image/png", content: "b64" }]);
+    expect(calls.filter((c) => c.method === "chat.send")).toHaveLength(1);
+    // gateway 重連 → active/回合態作廢 + 隊列續投(舊實現:兩者都永久卡死)
+    gw.triggerConnected();
+    await new Promise((r) => setTimeout(r, 20));
+    const sends = calls.filter((c) => c.method === "chat.send");
+    expect(sends).toHaveLength(2); // 排隊的帶附件跟進送達
+    expect(sends[1]!.params.attachments).toHaveLength(1);
+    expect(sends[1]!.params.message).toBe("看這張圖");
+    // 後續純文本 prompt 走 chat.send,不再 steer 打向已死回合
+    await linkb.deliver(tui("prompt.submit", SID, { text: "第三條" }));
+    expect(calls.filter((c) => c.method === "sessions.steer")).toHaveLength(0);
+    expect(calls.filter((c) => c.method === "chat.send")).toHaveLength(3);
   });
 });
 

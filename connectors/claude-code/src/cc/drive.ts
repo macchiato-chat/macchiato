@@ -141,6 +141,22 @@ interface PendingApproval {
   toolName: string;
   /** #102 SDK 給的 toolUseID(隨 approval.request 上行;server 支持後 respond 回帶精準配對)。 */
   requestId?: string;
+  /** #238 SDK 給的窄規則建議——「總是允許」時存檔(alwaysRules)供通道重建回灌。 */
+  suggestions?: PermissionUpdate[];
+}
+
+/** #238 PermissionUpdate(addRules/allow)→ settings.permissions.allow 規則串;無可用建議 → 工具級兜底。 */
+export function ruleStringsFor(suggestions: PermissionUpdate[] | undefined, toolName: string): string[] {
+  const out: string[] = [];
+  for (const s of suggestions ?? []) {
+    if (s.type !== "addRules" || s.behavior !== "allow") continue;
+    for (const r of s.rules ?? []) {
+      if (!r?.toolName) continue;
+      out.push(r.ruleContent ? `${r.toolName}(${r.ruleContent})` : r.toolName);
+    }
+  }
+  if (!out.length) out.push(toolName);
+  return out;
 }
 
 /** #109 AskUserQuestion 的單題掛起（clarify.respond 按 request_id 回填;empty answer = 跳過）。 */
@@ -241,8 +257,10 @@ export class Drive {
   private readonly interruptedSids = new Set<string>();
   /** #102 未處理 SDK 消息類型一次性日誌去重(`type/subtype`)——37 種 SDKMessage 只處理一小撮,靜默丟=升級漂移無感知。 */
   private readonly loggedUnknown = new Set<string>();
-  /** sid → 本會話「總是允許」的工具名（approval.respond all=true 記住）。 */
-  private readonly alwaysAllow = new Map<string, Set<string>>();
+  /** #238 sid → 「總是允許」累積的**窄規則**串(settings 格式,如 "Bash(git status:*)")。
+   * 只在通道重建時經 settings.permissions.allow 回灌;活通道內由 updatedPermissions 即時生效。
+   * 絕不按工具名短路——那會把 Bash(git status) 放大成本會話所有 Bash(舊實現的 p1 漏洞)。 */
+  private readonly alwaysRules = new Map<string, string[]>();
   /** §19 E2E：回合內暫存的（已解密）用戶消息，回合結束隨加密批投遞。 */
   private readonly pendingUser = new Map<string, string[]>();
 
@@ -491,18 +509,22 @@ export class Drive {
               }
             }
           }
-          if (filePaths.length) {
-            const note = `[The user attached ${filePaths.length} file(s), read them with the Read tool: ${filePaths.join(", ")}]`;
-            text = text ? `${text}\n\n${note}` : note;
-          }
-          if (!text && !imageBlocks.length) return;
-          if (this.e2e?.isE2E(sid)) {
+          // #237:E2E 先解密正文、再拼附件註記——順序反了會把明文註記餵進 GCM 驗證,
+          // 整條 prompt(含附件)被靜默丟棄。附件-only(text 空)不走解密,註記本身即正文。
+          if (this.e2e?.isE2E(sid) && text) {
             try {
               text = this.e2e.decryptText(sid, text).trim();
             } catch (e) {
               console.error(`[E2E prompt decrypt failed for ${sid}] ${(e as Error).message}`);
               return;
             }
+          }
+          if (filePaths.length) {
+            const note = `[The user attached ${filePaths.length} file(s), read them with the Read tool: ${filePaths.join(", ")}]`;
+            text = text ? `${text}\n\n${note}` : note;
+          }
+          if (!text && !imageBlocks.length) return;
+          if (this.e2e?.isE2E(sid)) {
             if (!text) return;
             const arr = this.pendingUser.get(sid) ?? [];
             arr.push(text);
@@ -670,9 +692,12 @@ export class Drive {
           const allow = choice === "allow" || choice === "always" || choice === "yes";
           const always = allow && (params.all === true || choice === "always");
           if (always) {
-            const s = this.alwaysAllow.get(sid) ?? new Set();
-            s.add(pending.toolName);
-            this.alwaysAllow.set(sid, s);
+            // #238:記的是窄規則(suggestions 優先;無則工具級兜底),供通道重建回灌——
+            // 不再維護工具名 Set(那會把單條命令的放行放大成整個工具)。
+            const rules = ruleStringsFor(pending.suggestions, pending.toolName);
+            const acc = this.alwaysRules.get(sid) ?? [];
+            for (const r of rules) if (!acc.includes(r)) acc.push(r);
+            this.alwaysRules.set(sid, acc);
           }
           pending.resolve(allow, always);
           return;
@@ -786,6 +811,11 @@ export class Drive {
         ...(model ? { model } : {}), // #143 per-session model(空 = 不傳,用 CLI 配置默認)
         ...(effort ? { effort: effort as "low" | "medium" | "high" | "xhigh" | "max" } : {}), // #231
         ...(perm.sdk ? { permissionMode: perm.sdk } : {}),
+        // #238:通道重建時回灌「總是允許」的窄規則(活通道由 updatedPermissions 即時生效,
+        // 但閒置回收後 SDK session 規則隨進程消亡——這裡是跨重建的持久層)。
+        ...(this.alwaysRules.get(sid)?.length
+          ? { settings: { permissions: { allow: [...this.alwaysRules.get(sid)!] } } }
+          : {}),
         includePartialMessages: true,
         canUseTool: async (
           toolName: string,
@@ -797,7 +827,8 @@ export class Drive {
           // #109 AskUserQuestion 不是審批是提問:走 clarify 卡收答案,經 updatedInput.answers 回帶
           // (探針驗證:AskUserQuestionInput 頂層有可選 answers,填上即出「questions answered」tool_result)。
           if (toolName === "AskUserQuestion") return await this.requestAnswers(sid, input, opts?.toolUseID);
-          if (this.alwaysAllow.get(sid)?.has(toolName)) return { behavior: "allow" as const, updatedInput: input };
+          // #238:「總是允許」不再在此按工具名短路——窄規則由 SDK 自行匹配(活通道經
+          // updatedPermissions、重建通道經 settings.permissions.allow),命中就不會進 canUseTool。
           // #98 acceptEdits 檔:文件編輯類自動批(SDK acceptEdits 被 canUseTool 覆蓋,故此處自實現)。
           if (perm.editAuto && EDIT_TOOLS.has(toolName)) return { behavior: "allow" as const, updatedInput: input };
           return await this.requestApproval(sid, toolName, input, opts);
@@ -1287,9 +1318,9 @@ export class Drive {
   /**
    * canUseTool → approval.request，掛起等 approval.respond。
    * #102:payload 帶 request_id(=SDK toolUseID);respond 回帶則精準配對,缺省 FIFO(舊 server 兼容)。
-   * 「總是允許」優先回 SDK 給的 suggestions(原生規則,SDK 文檔明示的用法);沒有則退化 addRules
-   * destination:"session"。#118 通道長活後會話級規則在通道生命期內天然持久;內存 alwaysAllow
-   * Set 仍保留為真來源(通道閒置回收後重建也不丟)。
+   * #238「總是允許」優先回 SDK 給的 suggestions(原生窄規則,SDK 文檔明示的用法);沒有則退化
+   * addRules destination:"session"(工具級)。跨通道重建的持久化走 alwaysRules →
+   * settings.permissions.allow 回灌;不再有按工具名短路的本地 Set。
    */
   private requestApproval(
     sid: string,
@@ -1301,12 +1332,21 @@ export class Drive {
     const isPlan = toolName === "ExitPlanMode";
     const planText = isPlan && typeof input?.plan === "string" ? (input.plan as string) : "";
     const argsPreview = JSON.stringify(input ?? {}).slice(0, 500);
+    const command = isPlan ? "批准計劃並開始執行" : opts?.title || `${toolName} ${argsPreview}`;
+    const description = isPlan ? planText.slice(0, 8000) : opts?.description || `Claude Code wants to use ${toolName}`;
+    // #240 E2E:命令/說明/計劃全文加密進 enc,明文只留占位 + pattern_key(工具名)+ request_id;
+    // server 盲存密文、不落明文,iOS 用 K_S 解密渲染。choice(yes/no/always)非敏感 → 回程照舊。
+    const e2e = this.e2e?.isE2E(sid) ?? false;
+    const encPayload = e2e
+      ? this.e2e!.encryptContent(sid, { command, description, ...(isPlan ? { plan: planText.slice(0, 20000) } : {}) })
+      : undefined;
     this.emit(sid, "approval.request", {
-      command: isPlan ? "批准計劃並開始執行" : opts?.title || `${toolName} ${argsPreview}`,
+      command: e2e ? "🔒 加密審批請求" : command,
       pattern_key: toolName,
       pattern_keys: [toolName],
-      description: isPlan ? planText.slice(0, 8000) : opts?.description || `Claude Code wants to use ${toolName}`,
-      ...(isPlan ? { plan: planText.slice(0, 20000) } : {}),
+      description: e2e ? "" : description,
+      ...(!e2e && isPlan ? { plan: planText.slice(0, 20000) } : {}),
+      ...(encPayload ? { enc: encPayload } : {}),
       ...(opts?.toolUseID ? { request_id: opts.toolUseID } : {}),
     });
     return new Promise((resolve) => {
@@ -1314,6 +1354,7 @@ export class Drive {
       list.push({
         toolName,
         requestId: opts?.toolUseID,
+        suggestions: opts?.suggestions,
         resolve: (allow, always) =>
           resolve(
             allow

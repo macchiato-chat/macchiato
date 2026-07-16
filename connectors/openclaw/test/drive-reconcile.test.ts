@@ -154,6 +154,56 @@ describe("#202 對賬", () => {
     expect(mf[0].sessions[0].messages).toEqual([{ role: "agent", text: "遲到的回答", srcId: "id-2" }]);
   });
 
+  it("#244 渠道側 user 行:回合末補投進 Macchiato;srcId 只回填我們發的行", async () => {
+    // 回合內:我們發「問題」,渠道(discord)用戶亂入「渠道插話」,agent 回覆
+    const hist = [row(1, "user", "問題"), row(2, "user", "渠道插話"), row(3, "assistant", "回答")];
+    const { gw, linkb, sent } = makeDrive(() => hist);
+    await linkb.deliver(tui("prompt.submit", SID, { text: "問題" }));
+    gw.fire({ event: "agent", payload: { sessionKey: KEY, stream: "lifecycle", runId: "r1", data: { phase: "start" } } });
+    gw.fire({ event: "agent", payload: { sessionKey: KEY, stream: "lifecycle", runId: "r1", data: { phase: "end" } } });
+    await sleep(20);
+    const sf = srcidFrames(sent);
+    expect(sf).toHaveLength(1);
+    // 舊實現:lastUser=渠道行 → id-2 誤掛到 Macchiato 消息;新實現:文本匹配 → id-1
+    expect(sf[0].items).toEqual([
+      { role: "user", srcId: "id-1" },
+      { role: "agent", srcId: "id-3" },
+    ]);
+    // 渠道 user 行補投(舊實現:水位線推過即永久丟)
+    const mf = mirrorFrames(sent);
+    expect(mf).toHaveLength(1);
+    expect(mf[0].sessions[0].messages).toEqual([{ role: "user", text: "渠道插話", srcId: "id-2" }]);
+  });
+
+  it("#244 全部未匹配(OpenClaw 改寫文本)→ 回退舊語義:最後 user 行回填、不補投", async () => {
+    const hist = [row(1, "user", "被改寫過的問題"), row(2, "assistant", "回答")];
+    const { gw, linkb, sent } = makeDrive(() => hist);
+    await linkb.deliver(tui("prompt.submit", SID, { text: "問題" }));
+    gw.fire({ event: "agent", payload: { sessionKey: KEY, stream: "lifecycle", runId: "r1", data: { phase: "start" } } });
+    gw.fire({ event: "agent", payload: { sessionKey: KEY, stream: "lifecycle", runId: "r1", data: { phase: "end" } } });
+    await sleep(20);
+    expect(srcidFrames(sent)[0].items).toEqual([
+      { role: "user", srcId: "id-1" }, // 寧按舊語義回填
+      { role: "agent", srcId: "id-2" },
+    ]);
+    expect(mirrorFrames(sent)).toHaveLength(0); // 寧漏勿雙投
+  });
+
+  it("#244 渠道接管(agent: key):水位線初值=檔末,重啟對賬不把接管前歷史再投一遍", async () => {
+    const CH_SID = "agent:main:discord:channel:99";
+    const CH_KEY = CH_SID.toLowerCase();
+    // 接管前頻道已有歷史(已由鏡像以內容指紋 srcId 入庫)
+    const hist = [row(1, "user", "老消息"), row(2, "assistant", "老回覆")];
+    const { drive, linkb, sent, calls } = makeDrive(() => hist);
+    await linkb.deliver(tui("prompt.submit", CH_SID, { text: "接管第一問" }));
+    await sleep(20);
+    // markDriven 已拉 chat.history 把 wm 推到 2 → 立刻對賬不會補投老歷史
+    const n = await (drive as any).reconcileKey(CH_KEY, CH_SID);
+    expect(n).toBe(0);
+    expect(mirrorFrames(sent)).toHaveLength(0);
+    expect(calls.some((c) => c.method === "chat.history")).toBe(true);
+  });
+
   it("Link B 未 ready → 對賬整體跳過、水位線不動(mirror_append 不入斷線緩衝,發了即丟)", async () => {
     let hist: any[] = [row(1, "user", "q"), row(2, "assistant", "a")];
     const { drive, gw, linkb, sent } = makeDrive(() => hist);

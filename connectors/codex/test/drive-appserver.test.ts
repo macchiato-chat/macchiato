@@ -211,6 +211,35 @@ describe("#132 v2 審批橋", () => {
     expect(await p3).toEqual({ decision: "accept" });
   });
 
+  it("#245 並行審批:respond 按 request_id 精準配對,不再 FIFO 錯配批錯命令", async () => {
+    const { client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "q" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    const h = client.reverse.get("item/commandExecution/requestApproval")!;
+    const fh = client.reverse.get("item/fileChange/requestApproval")!;
+    const pCmd = h({ threadId: TID, turnId: "t1", itemId: "e1", command: "rm -rf /", cwd: "/" });
+    const pFile = fh({ threadId: TID, turnId: "t1", itemId: "f1", changes: [{ path: "/a" }] });
+    await tick();
+    // 用戶先答後彈的 f1(允許)再答 e1(拒絕)——舊 FIFO 把「允許」錯配給隊首的 rm -rf
+    await linkb.deliver(tui("approval.respond", SID, { choice: "allow", request_id: "f1" }));
+    await linkb.deliver(tui("approval.respond", SID, { choice: "deny", request_id: "e1" }));
+    expect(await pFile).toEqual({ decision: "accept" });
+    expect(await pCmd).toEqual({ decision: "decline" });
+  });
+
+  it("#245 interrupt 掛起:turnId 未到位時點停止不再被吞,到位即補發", async () => {
+    const { client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "q" }));
+    // turn/start 已返回(fixture 不帶 turn.id)、turn/started 未到 → turnId 空窗口
+    await linkb.deliver(tui("session.interrupt", SID));
+    expect(client.requests.filter((r) => r.method === "turn/interrupt")).toHaveLength(0); // 掛起
+    client.fire("turn/started", { threadId: TID, turn: { id: "t9" } });
+    await tick();
+    const ti = client.requests.filter((r) => r.method === "turn/interrupt");
+    expect(ti).toHaveLength(1); // 補發而非吞掉
+    expect(ti[0]!.params).toEqual({ threadId: TID, turnId: "t9" });
+  });
+
   it("回合結束仍懸空的審批 → decline 收尾(反向請求不永久掛)", async () => {
     const { client, linkb } = make();
     await linkb.deliver(tui("prompt.submit", SID, { text: "q" }));
@@ -293,6 +322,34 @@ describe("#132 v2 附件/resume/重啟", () => {
     expect(mf.sessions[0].messages.map((m: any) => m.role)).toEqual(["user", "agent"]);
     void sent;
     void client;
+  });
+
+  it("#240 E2E 審批卡:命令加密進 enc,明文只留占位 + 類別", async () => {
+    const store: string[] = [];
+    const e2e: any = { isE2E: () => true, decryptText: (_s: string, t: string) => t, encryptContent: (_s: string, o: any) => { store.push(JSON.stringify(o)); return `enc#${store.length - 1}`; } };
+    const d2sent: any[] = [];
+    const lb: any = { agentLinkId: "al", isReady: true, handlers: [], onFrame(h: any) { this.handlers.push(h); }, send: (m: any) => d2sent.push(m), async deliver(m: any) { for (const h of this.handlers) await h(m); } };
+    const c2 = new FakeClient();
+    c2.queueResponse("thread/start", { thread: { id: TID } });
+    process.env.MACCHIATO_CODEX_SESSIONS = join(mkdtempSync(join(tmpdir(), "cx-v2ea-")), "s.json");
+    const d = new AppServerDrive(c2 as any, lb, undefined, e2e);
+    d.wire();
+    await lb.deliver(tui("prompt.submit", SID, { text: "秘密" }));
+    await tick(); // 等 thread/start 解析 → byThread 有 TID(否則反向請求找不到 sid)
+    c2.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    const h = c2.reverse.get("item/commandExecution/requestApproval")!;
+    const p = h({ threadId: TID, turnId: "t1", itemId: "e1", command: "rm -rf /secret", cwd: "/w" });
+    await tick();
+    const card = (d2sent.find((f) => f.t === "tui" && f.frame?.params?.type === "approval.request") as any).frame.params.payload;
+    expect(card.command).toBe("🔒 加密審批請求");
+    expect(card.pattern_key).toBe("shell");
+    expect(card.request_id).toBe("e1");
+    expect(typeof card.enc).toBe("string");
+    expect(JSON.stringify(card).includes("rm -rf")).toBe(false); // 命令全文不在明文
+    expect(store.some((s) => s.includes("rm -rf /secret"))).toBe(true);
+    // choice 回程照舊
+    await lb.deliver(tui("approval.respond", SID, { choice: "allow", request_id: "e1" }));
+    expect(await p).toEqual({ decision: "accept" });
   });
 });
 

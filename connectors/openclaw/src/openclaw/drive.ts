@@ -60,6 +60,10 @@ export class Drive {
 
   /** E2E 會話：runId 前暫存的（已解密）用戶消息, 回合結束隨加密批一起投遞。 */
   private readonly pendingUser = new Map<string, string[]>();
+  /** #244 本回合經 Macchiato 發出的 prompt 文本(chat.send/steer/重投都記):回合末對賬按
+   * 文本匹配區分「我們的 user 行(只回填 srcId)」vs「渠道側 user 行(live 從未投遞 → 補投)」。
+   * 舊實現不分,把渠道行 id 誤回填給 Macchiato 消息,渠道 user 消息則永不進 Macchiato。 */
+  private readonly sentTexts = new Map<string, string[]>();
   /** #162 回合中帶附件的跟進消息:整條排隊(steer 無附件通道),lifecycle end 自動 chat.send 送達。 */
   private readonly pendingFollowUps = new Map<string, Array<{ sid: string; text: string; attachments: ChatAttachment[] }>>();
 
@@ -116,8 +120,21 @@ export class Drive {
   wire(): void {
     this.linkb.onFrame((m) => void this.onServerFrame(m));
     this.gw.onEvent((e) => this.onGatewayEvent(e));
-    // #202 重連後對賬:斷連窗內漏收的廣播(live 唯一路)靠 chat.history 補齊。
-    this.gw.onConnected?.(() => void this.reconcileAll("reconnect"));
+    // #202 重連後對賬 + #242 回合態重置(斷連窗內 lifecycle end 可能已丟)。
+    this.gw.onConnected?.(() => void this.onGatewayConnected());
+  }
+
+  /** #242 gateway (重)連:斷線窗內 lifecycle end 可能已丟——active/回合態全部作廢,
+   * 免得後續 prompt 恆走 sessions.steer 打向已死回合、排隊的帶附件跟進永不送達
+   * (OpenClaw 每日自動更新 = gateway 重啟是常態,#210)。重置後先對賬補漏,再續投隊列。 */
+  private async onGatewayConnected(): Promise<void> {
+    const stale = new Set([...this.active.keys(), ...this.pendingFollowUps.keys()]);
+    this.active.clear();
+    this.started.clear(); // 斷線期的 runId 條目一併作廢(否則只在 lifecycle end 清 → 洩漏)
+    this.acc.clear();
+    this.completed.clear();
+    await this.reconcileAll("reconnect");
+    for (const key of stale) await this.flushFollowUps(key);
   }
 
   isDriven(key: string): boolean {
@@ -134,13 +151,36 @@ export class Drive {
     });
   }
 
-  private markDriven(key: string, sid: string): void {
+  private async markDriven(key: string, sid: string): Promise<void> {
     this.driven.add(key);
     this.sidByKey.set(key, sid);
     this.mirror?.setDriven(key, sid); // #147 帶真大小寫 sid(打撈的 mirror_append 用)
     if (this.drivenPersist[key] !== sid) {
       this.drivenPersist[key] = sid; // #202 持久:重啟後仍知道哪些 key 歸 live、對賬要覆蓋誰
       this.saveDriveState();
+    }
+    // #244 新 driven key 的水位線初值:渠道接管(sid 本身是 agent: 開頭的真實 key)= 當前
+    // 檔末——接管前的頻道歷史已由鏡像以**內容指紋** srcId 入庫,對賬若以 wm=0 用
+    // __openclaw.id 再投一遍,兩套 dedup 鍵不互通、唯一索引擋不住 → 重複。
+    // Macchiato 新建會話(包 macchiato 前綴)無前史,顯式置 0、不打 RPC。
+    if (!(key in this.wmByKey)) {
+      if (sid.startsWith("agent:")) await this.initWatermark(key);
+      else {
+        this.wmByKey[key] = 0;
+        this.saveDriveState();
+      }
+    }
+  }
+
+  /** #244 渠道接管時把水位線推到檔末(失敗 → 留空,回合末對賬會保守處理)。 */
+  private async initWatermark(key: string): Promise<void> {
+    try {
+      const rows = await this.historyRows(key);
+      if (key in this.wmByKey) return; // 並發路徑已寫過 → 別回退
+      this.wmByKey[key] = rows.length ? Math.max(...rows.map((r) => r.seq)) : 0;
+      this.saveDriveState();
+    } catch (e) {
+      console.error(`[#244 init watermark failed ${key}] ${(e as Error).message}`);
     }
   }
 
@@ -206,7 +246,7 @@ export class Drive {
             arr.push(text);
             this.pendingUser.set(key, arr);
           }
-          this.markDriven(key, sid);
+          await this.markDriven(key, sid);
           // #113 首個 prompt → 自動標題(越早越好,與 CC/Hermes 對齊)。僅 Macchiato 發起的會話
           // (鏡像來的 agent: key 有自己的頻道標題);E2E 跳過(標題事件是明文,防洩漏)。
           if (text && !sid.startsWith("agent:") && !this.e2e?.isE2E(sid) && !this.titled.has(sid)) {
@@ -233,7 +273,7 @@ export class Drive {
             arr.push(text);
             this.pendingUser.set(key, arr);
           }
-          this.markDriven(key, sid);
+          await this.markDriven(key, sid);
           console.log(`· #199 command.invoke ${text} → ${key}`);
           await this.sendPrompt(key, sid, text);
           return;
@@ -257,7 +297,7 @@ export class Drive {
           return;
         }
         case "session.create":
-          this.markDriven(key, sid); // 會話本體由首次 chat.send 自動建
+          await this.markDriven(key, sid); // 會話本體由首次 chat.send 自動建
           return;
         default:
           return; // 其它方法 v1 忽略
@@ -302,6 +342,7 @@ export class Drive {
         }
         if (!text) return; // 純附件 + 回合進行中:無可 steer
         const r = await this.gw.request("sessions.steer", { key, message: text });
+        this.recordSent(key, sid, text); // #244
         console.log(`· Turn in progress → steering follow-up into (${key}, status=${r?.status})`);
       } else {
         await this.gw.request("chat.send", {
@@ -310,6 +351,7 @@ export class Drive {
           idempotencyKey: idem,
           ...(attachments.length ? { attachments } : {}),
         });
+        this.recordSent(key, sid, text); // #244
       }
     } catch (e) {
       const m = (e as Error).message ?? "";
@@ -357,6 +399,7 @@ export class Drive {
         idempotencyKey: idem,
         ...(attachments.length ? { attachments } : {}),
       });
+      this.recordSent(key, sid, text); // #244
       this.counters.promptRetries += 1; // #10
       console.log(`· #4 prompt 重投成功 (${key},gateway 死於在途,已補投)`);
     } catch (e) {
@@ -508,24 +551,71 @@ export class Drive {
     return out;
   }
 
+  /** #244 記錄本回合經 Macchiato 發出的 prompt 文本(E2E 走加密批不參與明文對賬,不記)。 */
+  private recordSent(key: string, sid: string, text: string): void {
+    const t = text.trim();
+    if (!t || this.e2e?.isE2E(sid)) return;
+    const list = this.sentTexts.get(key) ?? [];
+    list.push(t);
+    if (list.length > 50) list.shift(); // 有界(未匹配的殘留別無限積)
+    this.sentTexts.set(key, list);
+  }
+
   /**
    * 回合末(lifecycle end):把本回合落庫的行 id 回填給 server 作 live 消息的 dedup_key
    * (#13 同款,Hermes 驗證過的模式),再推水位線。順序刻意:先回填、後推水位——若死在中間,
    * 重啟對賬會重投 >wm 的行,但 srcId 已回填 → 撞唯一索引被吃掉,不雙投。
+   * #244:user 行按 sentTexts 文本匹配——匹配的是我們發的(只回填 srcId);不匹配的是
+   * 渠道側(discord 等)user 行,live 從未投遞 → mirror_append 補投,別再讓水位線白白推過。
    */
   private async reconcileTurnEnd(key: string, sid: string): Promise<void> {
     if (this.e2e?.isE2E(sid)) return; // E2E 走加密批,不參與明文對賬
     try {
       const rows = await this.historyRows(key);
+      const hasWm = key in this.wmByKey; // #244 初值缺失(接管時 gateway 沒連上)→ 保守:不補投
       const fresh = rows.filter((r) => r.seq > (this.wmByKey[key] ?? 0));
       if (!fresh.length) return;
-      const lastUser = [...fresh].reverse().find((r) => r.role === "user");
+      const sent = this.sentTexts.get(key) ?? [];
+      const sentBefore = sent.length;
+      let lastOurs: { seq: number; id: string } | undefined;
+      let channelUsers: Array<{ id: string; text: string }> = [];
+      for (const r of fresh) {
+        if (r.role !== "user") continue;
+        const i = sent.indexOf(r.text.trim());
+        if (i >= 0) {
+          sent.splice(i, 1); // 消耗一條(同文本多發按次匹配)
+          lastOurs = { seq: r.seq, id: r.id };
+        } else if (r.text.trim()) {
+          channelUsers.push({ id: r.id, text: r.text });
+        }
+      }
+      if (!lastOurs && sentBefore > 0 && channelUsers.length) {
+        // #244 保守回退:本回合明明發過 prompt 卻一條都沒匹配上(OpenClaw 可能改寫落庫文本)
+        // → 按舊語義把最後一條 user 行當我們的,且不補投(寧漏勿雙投)。
+        lastOurs = { seq: 0, id: channelUsers[channelUsers.length - 1]!.id };
+        channelUsers = [];
+      }
       const lastAssistant = [...fresh].reverse().find((r) => r.role === "assistant");
       const items: Array<{ role: string; srcId: string }> = [];
-      if (lastUser) items.push({ role: "user", srcId: lastUser.id });
+      if (lastOurs) items.push({ role: "user", srcId: lastOurs.id }); // 只回填我們的行(#244)
       if (lastAssistant) items.push({ role: "agent", srcId: lastAssistant.id });
       if (items.length) {
         this.linkb.send({ t: "message_srcid", agentLinkId: this.linkb.agentLinkId, sessionId: sid, items });
+      }
+      if (hasWm && channelUsers.length && this.linkb.isReady) {
+        // #244 渠道側 user 行補投(帶 __openclaw.id 作 srcId,重試撞唯一索引不雙投)
+        this.linkb.send({
+          t: "mirror_append",
+          agentLinkId: this.linkb.agentLinkId,
+          sessions: [
+            {
+              hermesSessionId: sid,
+              source: "openclaw",
+              messages: channelUsers.map((r) => ({ role: "user", text: r.text, srcId: r.id })),
+            },
+          ],
+        });
+        console.log(`· #244 渠道側 user 行補投 ${channelUsers.length} 條(${key})`);
       }
       this.wmByKey[key] = Math.max(...fresh.map((r) => r.seq));
       this.saveDriveState();
