@@ -353,6 +353,10 @@ export class Mirror {
   }
 
   private async salvageToEnd(key: string): Promise<void> {
+    // #252 Link B 未 ready 時整體跳過:不拉 sessionsList、不推水位線、不發——否則 salvageDriven
+    // 已推 offset(:401)但 mirror_append 被 client 丟(非 E2E 不緩衝),tool/thinking 永久缺失。
+    // 下輪 pollOnce(ready 後)照樣對 driven key 打撈(:575),水位線沒動 → 補得回。同 pollOnce(:542)。
+    if (!this.linkb.isReady) return;
     try {
       const list = await this.gw.sessionsList();
       const s = (list?.sessions ?? []).find((x: any) => x.key === key);

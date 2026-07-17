@@ -6,7 +6,7 @@ const procs: FakeProc[] = [];
 class FakeProc extends EventEmitter {
   stdout = new EventEmitter();
   stderr = new EventEmitter();
-  stdin = { write: (s: string) => (this.written.push(JSON.parse(s)), true), destroyed: false };
+  stdin = { write: (s: string) => (this.written.push(JSON.parse(s)), true), destroyed: false, writable: true };
   written: any[] = [];
   killed = false;
   kill() {
@@ -115,6 +115,65 @@ describe("#132 AppServerClient", () => {
     c.onNotification((m, p) => got.push([m, p]));
     procs[0]!.reply({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { delta: "hi" } });
     expect(got).toEqual([["item/agentMessage/delta", { delta: "hi" }]]);
+    c.close();
+  });
+
+  it("#250 握手超時 → 殺舊進程 + 摘 stdout 監聽(孤兒不再喂緩衝)", async () => {
+    vi.useFakeTimers();
+    const c = new AppServerClient();
+    const startP = c.start().catch((e) => e);
+    await vi.advanceTimersByTimeAsync(1); // 讓 spawn/監聽掛上
+    procs[0]!.emit("error", new Error("ignored")); // 空 no-op 改為記錄,不崩
+    await vi.advanceTimersByTimeAsync(15_000); // 握手 15s 超時
+    const err = await startP;
+    expect(String(err)).toContain("handshake timeout");
+    expect(procs[0]!.killed).toBe(true); // 舊進程被殺
+    expect(procs[0]!.stdout.listenerCount("data")).toBe(0); // stdout 監聽已摘,孤兒不喂緩衝
+    vi.useRealTimers();
+    c.close();
+  });
+
+  it("#250 死亡窗口 respondError 不崩:stdin 不可寫時反向請求 catch 靜默跳過", async () => {
+    const c = new AppServerClient();
+    const startP = c.start();
+    await tick();
+    procs[0]!.autoInit();
+    await startP;
+    c.onReverseRequest("x/req", async () => {
+      throw new Error("handler boom");
+    });
+    procs[0]!.stdin.writable = false; // 模擬死亡窗口:流不可寫
+    // 反向請求 → handler 拋 → respondError(safeWrite 見不可寫 → 跳過,不拋 unhandled rejection)
+    expect(() => procs[0]!.reply({ jsonrpc: "2.0", id: 5, method: "x/req", params: {} })).not.toThrow();
+    await tick();
+    c.close();
+  });
+
+  it("#250 重啟連續失敗:STUCK 閾值清懸空回合(onRestart),FATAL 閾值上浮 onFatal", async () => {
+    // spawn 出的進程一創建就 emit close(握手期即退)→ 每輪重啟都失敗
+    const c = new AppServerClient();
+    const restarts: number[] = [];
+    const fatals: number[] = [];
+    c.onRestart = () => restarts.push(1);
+    c.onFatal = (n) => fatals.push(n);
+    const startP = c.start().catch(() => {}); // 首啟即失敗(index 據此回退,這裡只測 supervise)
+    // 首啟失敗後 supervise 不會跑(start 拋);直接測 supervise 需先握手成功再讓它死。改法:
+    // 先握手成功,再讓進程反覆死。
+    await tick();
+    procs[0]!.autoInit();
+    await startP;
+    // 之後每個新 spawn 的進程立即 close(重啟必失敗)
+    const origLen = procs.length;
+    procs[origLen - 1]!.emit("close", 1); // 觸發 supervise 重啟循環
+    // 讓後續 spawn 的進程都立即退出
+    for (let i = 0; i < 15; i++) {
+      await tick();
+      const p = procs[procs.length - 1];
+      if (p && !p.killed && p.listenerCount("close") >= 0) p.emit("close", 1);
+    }
+    await tick();
+    expect(restarts.length).toBeGreaterThanOrEqual(1); // STUCK:清了懸空回合
+    expect(fatals.length).toBeGreaterThanOrEqual(1); // FATAL:上浮退出
     c.close();
   });
 });

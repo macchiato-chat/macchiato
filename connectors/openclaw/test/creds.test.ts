@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { credPath, loadCreds, saveCreds, type Creds } from "../src/linkb/creds";
@@ -29,6 +29,15 @@ describe("Link B 憑證 load/save", () => {
     expect(loaded?.connectorToken).toBe("tok123");
     expect(loaded?.agentLinkId).toBe("al1");
     expect(loaded?.serverUrl).toBe("wss://x/connector");
+  });
+
+  it("#254 原子寫:重寫保持 0600、無 .tmp 殘留(不經 0644 窗口)", () => {
+    const c: Creds = { serverUrl: "wss://x/connector", connectorToken: "a", agentLinkId: "al" };
+    saveCreds(c);
+    saveCreds({ ...c, connectorToken: "b" }); // 覆蓋既有
+    expect(statSync(credPath()).mode & 0o777).toBe(0o600);
+    expect(existsSync(credPath() + ".tmp")).toBe(false);
+    expect(loadCreds()?.connectorToken).toBe("b");
   });
 
   it("env MACCHIATO_SERVER_URL 覆蓋文件的 serverUrl", () => {

@@ -68,7 +68,18 @@ export class OpenClawGateway {
   private connect(): void {
     const ws = new WebSocket(this.cfg.url);
     this.ws = ws;
-    ws.on("open", () => void this.handshake());
+    // #252 握手失敗(token 錯/拒絕/15s 超時)此前是 `void handshake()` 的 unhandled rejection——
+    // index.ts 無兜底,Node 默認可崩進程。收斂:catch → 關 socket 交給 onClose 走既有退避重連。
+    ws.on("open", () => {
+      this.handshake().catch((e) => {
+        console.error(`[gateway 握手失敗 → 退避重連] ${(e as Error).message}`);
+        try {
+          ws.close();
+        } catch {
+          /* 已斷 */
+        }
+      });
+    });
     ws.on("message", (d) => this.onMessage(d));
     ws.on("close", () => this.onClose());
     ws.on("error", () => {

@@ -50,11 +50,23 @@ export function saveDriveState(st: { map: Record<string, string>; cwds: Record<s
 }
 
 /**
+ * #255 bypass(danger-full-access + never)= server 一幀即在用戶機器**全開不問任意執行**的高危檔。
+ * 必須本地顯式開放:env `MACCHIATO_CODEX_ALLOW_BYPASS` 真值,或進程級 `MACCHIATO_CODEX_SANDBOX`
+ * 本就是 danger-full-access(操作者已 opt-in)。否則 server 下發的 bypass 降級 auto(workspace-write
+ * + on-request,越界才問)——對齊 CC #255 與 projects.ts「server 攻破也指不動」紀律。
+ */
+export function codexBypassAllowed(): boolean {
+  const v = process.env.MACCHIATO_CODEX_ALLOW_BYPASS;
+  if (v && /^(1|true|yes|on)$/i.test(v.trim())) return true;
+  return process.env.MACCHIATO_CODEX_SANDBOX === "danger-full-access";
+}
+
+/**
  * #230 UI 的 permissionMode → codex (sandbox, approvalPolicy)。只認 codex 有意義的三檔;
  * 其餘(ask/acceptEdits/未設)返回 undefined → 調用方回退進程級 env 默認。
  * - plan   → 只讀:read-only + on-request(讀隨意,寫/執行前必問)
  * - auto   → 工作區寫入:workspace-write + on-request(工作區內自動,越界才問)
- * - bypass → 完全訪問:danger-full-access + never(全開,不問)
+ * - bypass → 完全訪問:danger-full-access + never(全開,不問);#255 未本地開放 → 降級 auto
  */
 export function codexPermsFor(mode: string | undefined): { sandbox: string; approval: string } | undefined {
   switch (mode) {
@@ -63,7 +75,9 @@ export function codexPermsFor(mode: string | undefined): { sandbox: string; appr
     case "auto":
       return { sandbox: "workspace-write", approval: "on-request" };
     case "bypass":
-      return { sandbox: "danger-full-access", approval: "never" };
+      return codexBypassAllowed()
+        ? { sandbox: "danger-full-access", approval: "never" }
+        : { sandbox: "workspace-write", approval: "on-request" }; // #255 降級
     default:
       return undefined;
   }

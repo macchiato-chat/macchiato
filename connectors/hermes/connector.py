@@ -65,7 +65,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.24"
+CONNECTOR_VERSION = "1.5.25"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -378,6 +378,7 @@ class Connector:
         self._mirror_batch_id = 0
         self._mirror_rewind = deque(maxlen=64)  # (batchId, {sid: 舊floor})，供 nack 回退
         self._out_pending: deque = deque(maxlen=500)  # 斷線期間出站幀緩衝(ready 後補發;有界丟最舊)
+        self._linkb_ready = False  # #251 收到 t:"ready" 才置真:handshaking 窗口不直發未認證幀、走緩衝
         self._e2e = E2EKeyStore()  # §19 per-session E2E 密鑰管理（持 K_S、封裝給設備、加解密內容）
         self._mirror_lock = None  # 鏡像輪詢 ↔ E2E 歷史回灌互斥（防舊 floor 追加與整段替換競態）
         # 自驅會話持久映射（server sid ↔ state.db id）。跨進程/gateway 重啟保留——E2E 鏡像投遞、
@@ -458,14 +459,24 @@ class Connector:
                         self.server_url, ping_interval=20, ping_timeout=None, close_timeout=10
                     ) as ws:
                         self.ws = ws
+                        self._linkb_ready = False  # #251 新連接:ready 前不直發(見 _send)
                         self._linkb_state = "handshaking"
                         await ws.send(hello)
                         async for raw in ws:
                             backoff = 1  # 收到幀 = 健康，重置退避
-                            await self._on_server_msg(raw)
+                            # #251:單條幀分支異常(如 e2e_wrap_request payload 畸形)此前會炸穿主循環、
+                            # _out_pending 全丟。這裡吞掉非斷線異常,主循環照跑;斷線仍上拋外層重連。
+                            try:
+                                await self._on_server_msg(raw)
+                            except (websockets.exceptions.ConnectionClosed, OSError):
+                                raise
+                            except Exception as exc:
+                                self._count("serverMsgErrors")
+                                print(f"[_on_server_msg 分支異常吞掉,不崩主循環] {exc!r}", file=sys.stderr)
                 except (websockets.exceptions.ConnectionClosed, OSError) as exc:
                     print(f"· link B 斷開（{type(exc).__name__}），{backoff}s 後重連…", file=sys.stderr)
                 self.ws = None
+                self._linkb_ready = False
                 self._linkb_state = "disconnected"
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
@@ -852,7 +863,9 @@ class Connector:
         返回「是否已實際發出」(緩衝/丟棄 → False)——鏡像靠它決定推不推水位線(#239):
         失敗批若照推,server 沒收到就永不 nack,消息永久丟失且無自愈路徑。"""
         data = json.dumps(msg, ensure_ascii=False)
-        if self.ws is not None:
+        # #251:只在 ready(已收 t:"ready")後直發——handshaking 窗口(ws 已置但未認證)直發會發出
+        # 未認證幀;ready 補發期間新幀也走緩衝、由補發循環按序帶出,不繞過隊列亂序。
+        if self.ws is not None and self._linkb_ready:
             try:
                 await self.ws.send(data)
                 return True
@@ -1726,11 +1739,15 @@ class Connector:
             if self._out_pending and self.ws is not None:
                 n = len(self._out_pending)
                 try:
+                    # #251:先 peek 再 popleft——send 失敗時該幀不丟(此前 popleft 後 send 拋即丟一幀)。
                     while self._out_pending:
-                        await self.ws.send(self._out_pending.popleft())
+                        await self.ws.send(self._out_pending[0])
+                        self._out_pending.popleft()
                     print(f"· 重連 → 補發斷線期間積壓的 {n} 幀")
                 except Exception as exc:
                     print(f"[積壓補發失敗,剩 {len(self._out_pending)}] {exc!r}", file=sys.stderr)
+            # #251:補發完成後才置 ready——補發期間並發的 _send 走緩衝、由上面循環按序帶出,不亂序。
+            self._linkb_ready = True
             await self._advertise_import()
             await self._report_commands()  # #199 每次 ready 重發(server 重啟丟內存緩存)
             await self._maybe_auto_import()  # #154 首裝自動全量導入(不請示)

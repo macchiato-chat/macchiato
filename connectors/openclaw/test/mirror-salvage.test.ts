@@ -87,6 +87,24 @@ describe("#147 driven 會話 tool/thinking 打撈", () => {
     expect(appends(sent)).toHaveLength(1);
   });
 
+  it("#252 Link B 未 ready → salvageToEnd 整體跳過:不推水位線,ready 後 pollOnce 補得回", async () => {
+    const { mirror, file, sent } = setup();
+    const linkb = (mirror as any).linkb;
+    writeFileSync(file, "");
+    await (mirror as any).pollOnce(); // 基線 0
+    appendFileSync(file, toolMsg("斷線期回覆", 3000));
+    linkb.isReady = false; // Link B 斷
+    mirror.fastForward(KEY);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(appends(sent)).toHaveLength(0); // 沒 ready:不發、不推水位線
+    // ready 後照樣打撈得到(水位線沒被白推過)
+    linkb.isReady = true;
+    await (mirror as any).pollOnce();
+    const entries = appends(sent);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].messages[0].tools[0].name).toBe("exec");
+  });
+
   it("macchiato-native 新會話基線 0(首回合工具不丟);非 macchiato 頻道 driven key 首見基線到文件末", async () => {
     const { mirror, file, sent } = setup();
     // macchiato key:文件已有內容,首見從 0 打撈 → 首回合的 tools 撈得到

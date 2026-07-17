@@ -19,7 +19,7 @@ import { HealthLoop } from "./health";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.5.24";
+const CONNECTOR_VERSION = "1.5.25";
 
 function runSelfUpdate(): void {
   // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。
@@ -54,6 +54,12 @@ async function main(): Promise<void> {
     console.log("· 引擎:exec v1(MACCHIATO_CODEX_ENGINE=exec 強制)");
   } else {
     const appClient = new AppServerClient();
+    // #250 運行期 app-server 連續重啟失敗到 FATAL 閾值 → 優雅退出,交 systemd 重啟(重走上面的
+    // 啟動探活:app-server 仍壞則自動降級 exec v1)。此前運行期壞死無回退、活躍回合永久懸空。
+    appClient.onFatal = (failures) => {
+      console.error(`· codex app-server 無法恢復(${failures} 次重啟失敗)→ 退出交 systemd 重啟重走探活`);
+      process.exit(1);
+    };
     try {
       await appClient.start();
       drive = new AppServerDrive(appClient, linkb, mirror, e2e, projects);

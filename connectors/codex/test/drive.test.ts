@@ -240,11 +240,22 @@ describe("#230 codex 權限 → sandbox", () => {
     expect(sandboxOf(spawnArgs[0]!)).toBe("read-only");
   });
 
-  it("bypass → danger-full-access", async () => {
+  it("bypass → danger-full-access(本地開放後)", async () => {
+    process.env.MACCHIATO_CODEX_ALLOW_BYPASS = "1"; // #255 顯式開放
     const { linkb } = makeDrive();
     await linkb.deliver(tui("session.create", SID, { permissionMode: "bypass" }));
     await linkb.deliver(tui("prompt.submit", SID, { text: "hi" }));
     expect(sandboxOf(spawnArgs[0]!)).toBe("danger-full-access");
+    delete process.env.MACCHIATO_CODEX_ALLOW_BYPASS;
+  });
+
+  it("#255 bypass 未本地開放 → 降級 workspace-write(不盲執行)", async () => {
+    delete process.env.MACCHIATO_CODEX_ALLOW_BYPASS;
+    delete process.env.MACCHIATO_CODEX_SANDBOX;
+    const { linkb } = makeDrive();
+    await linkb.deliver(tui("session.create", SID, { permissionMode: "bypass" }));
+    await linkb.deliver(tui("prompt.submit", SID, { text: "hi" }));
+    expect(sandboxOf(spawnArgs[0]!)).toBe("workspace-write"); // 降級,非 danger-full-access
   });
 
   it("未設 permissionMode(或非三檔值)→ 回退進程級默認 workspace-write", async () => {

@@ -84,6 +84,28 @@ export function permissionMode(): PermMode | undefined {
   return undefined;
 }
 
+/**
+ * #255 bypass(bypassPermissions)= server 一幀即在用戶機器上**繞過全部審批任意執行**的高危檔。
+ * 必須本地顯式開放才認:env `MACCHIATO_CC_ALLOW_BYPASS` 真值,或進程級默認本就是 bypassPermissions
+ * (操作者已在自己機器 opt-in)。否則 server 下發的 bypass 降級為 ask(每工具審批)——對齊 projects.ts
+ * 「本地硬校驗、server 攻破也指不動」紀律。cwd 不做白名單:那是 #227 自由文件夾特性,且 bypass
+ * 門控後 ask/auto 檔的每個操作都經審批、cwd 可見,任意 cwd 不再構成盲執行。
+ */
+export function bypassAllowed(): boolean {
+  const v = process.env.MACCHIATO_CC_ALLOW_BYPASS;
+  if (v && /^(1|true|yes|on)$/i.test(v.trim())) return true;
+  return permissionMode() === "bypassPermissions";
+}
+
+/** #253 回合看門狗:回合內連續**無任何 SDK 事件**達此毫秒數 → 判定卡死、強制收尾。
+ * 活動式(每個事件續期)故不誤殺長回合;後台任務在跑時也豁免。默認 30min(對齊鏡像
+ * transcripts.ts STALE_TURN_MS);env MACCHIATO_CC_TURN_STALL_MS 可調(0=關)。 */
+function turnStallMs(): number {
+  const v = Number(process.env.MACCHIATO_CC_TURN_STALL_MS);
+  if (Number.isFinite(v) && v >= 0) return v;
+  return 30 * 60_000;
+}
+
 /** #98/#205 UI 五檔(協議 PermissionMode)。 */
 const UI_MODES = ["ask", "acceptEdits", "auto", "plan", "bypass"] as const;
 type UiMode = (typeof UI_MODES)[number];
@@ -204,6 +226,8 @@ interface TurnCtx {
   sdkOutput: number | null;
   usageInFlight: boolean;
   lastSdkPollAt: number;
+  /** #253 回合看門狗:最近一次 SDK 事件的時間戳(活動式判卡——續期靠它,而非硬 deadline)。 */
+  lastActivityAt: number;
 }
 
 /** #118 一條長活通道(每活躍會話一條;閒置回收,resume 重建)。 */
@@ -220,6 +244,8 @@ interface Channel {
   q: Query;
   turn?: TurnCtx;
   idleTimer?: ReturnType<typeof setTimeout>;
+  /** #253 在途回合的卡死看門狗(無事件靜默超時 → 強制收尾 + 回收通道)。 */
+  watchdog?: ReturnType<typeof setTimeout>;
   /** close() 已叫(閒置回收/cwd 變更/dispose)——迭代器自然結束不當 crash。 */
   closing: boolean;
 }
@@ -335,6 +361,10 @@ export class Drive {
   private resolvePerm(sid: string): { sdk: PermMode | undefined; editAuto: boolean; permKey: string } {
     const ui = this.permModes[sid];
     if (ui && (UI_MODES as readonly string[]).includes(ui)) {
+      // #255:未本地開放 bypass → 降級 ask,server 攻破也繞不過審批(permKey 帶標記以正確重建通道)。
+      if (ui === "bypass" && !bypassAllowed()) {
+        return { sdk: "default", editAuto: false, permKey: "ui:bypass!denied" };
+      }
       const m = mapUiMode(ui as UiMode);
       return { ...m, permKey: `ui:${ui}` };
     }
@@ -391,6 +421,58 @@ export class Drive {
 
   private hasRunningTasks(sid: string): boolean {
     return (this.sessionTasks.get(sid)?.size ?? 0) > 0;
+  }
+
+  /**
+   * #253 回合看門狗:回合在途但連續無任何 SDK 事件達 turnStallMs → 判定卡死。CLI 掛住(有事件無
+   * result)或 startContinuationTurn 合成回合無後續時,回合永久在途——通道不回收(CLI 進程滯留)、
+   * sid 卡 #200 pending(重啟誤發「請重發」)。鏡像側有 STALE_TURN_MS 兜底,drive 側此前沒有。
+   * 活動式(每事件續期,見 handleMessage)故不誤殺長回合;後台任務在跑時豁免(hasRunningTasks)。
+   */
+  private armTurnWatchdog(ch: Channel): void {
+    this.clearTurnWatchdog(ch);
+    const stall = turnStallMs();
+    if (!stall || !ch.turn) return; // 0=關
+    const due = ch.turn.lastActivityAt + stall - Date.now();
+    ch.watchdog = setTimeout(() => {
+      ch.watchdog = undefined;
+      const turn = ch.turn;
+      if (!turn || turn.completed || ch.closing) return;
+      // 後台任務在跑 / 期間有活動(lastActivityAt 被續期)→ 沒卡,重排
+      if (this.hasRunningTasks(ch.sid) || Date.now() - turn.lastActivityAt < stall) {
+        this.armTurnWatchdog(ch);
+        return;
+      }
+      this.forceFinalizeStuck(ch, stall);
+    }, Math.max(due, 25)); // 地板 25ms 只防邊界重排的 0/負值忙轉,不影響 stall 精度
+    ch.watchdog.unref?.();
+  }
+
+  private clearTurnWatchdog(ch: Channel): void {
+    if (ch.watchdog) {
+      clearTimeout(ch.watchdog);
+      ch.watchdog = undefined;
+    }
+  }
+
+  /** #253 卡死回合強制收尾:定稿 error + 提示重試、解掛審批、回收卡死的 CLI 通道(下個 prompt 建新 resume)。 */
+  private forceFinalizeStuck(ch: Channel, stall: number): void {
+    const sid = ch.sid;
+    const turn = ch.turn;
+    if (!turn) return;
+    console.error(`[turn watchdog] ${sid} 回合 ${Math.round(stall / 1000)}s 無任何事件 → 判定卡死,強制收尾 + 回收通道`);
+    turn.completed = true;
+    if (!turn.isE2E) {
+      this.startMsg(sid, turn);
+      this.emit(sid, "message.complete", { text: turn.acc || "", status: "error", usage: {} });
+      this.emit(sid, "review.summary", { summary: "⚠️ 回合長時間無響應,已判定卡死並收尾——請重試。" });
+    }
+    for (const p of this.approvals.get(sid) ?? []) p.resolve(false, false);
+    this.approvals.delete(sid);
+    ch.turn = undefined;
+    this.pending.delete(sid); // #200 出在途集(否則重啟誤發「請重發」)
+    this.saveMap();
+    this.closeChannel(ch); // 卡死的 CLI 通道回收;onChannelEnd 見 turn 已 undefined 不重複定稿
   }
 
   /** #212 任務在跑時通道不算閒置；最後一個任務結束後才重新開始完整 idle 窗。 */
@@ -578,6 +660,12 @@ export class Drive {
           // #98 權限檔(upsert;隨時可改,不像 cwd)。空/非法 = 清回 env 默認。
           const pm = typeof params.permissionMode === "string" ? params.permissionMode.trim() : "";
           const validPm = (UI_MODES as readonly string[]).includes(pm) ? pm : "";
+          if (validPm === "bypass" && !bypassAllowed()) {
+            // #255 高危檔本地未開放:記下用戶意圖(降級在 resolvePerm 生效),操作者可設 env 開放。
+            console.error(
+              `[drive] ${sid} 請求 bypass 但本地未開放 → 降級 ask;要允許請設 MACCHIATO_CC_ALLOW_BYPASS=1`,
+            );
+          }
           if (validPm ? this.permModes[sid] !== validPm : this.permModes[sid] !== undefined) {
             if (validPm) this.permModes[sid] = validPm;
             else delete this.permModes[sid];
@@ -777,9 +865,11 @@ export class Drive {
       sdkOutput: null,
       usageInFlight: false,
       lastSdkPollAt: 0,
+      lastActivityAt: Date.now(), // #253
     };
     // #141b 回合起始快照 SDK session 累計 output 作基線(此刻本回合尚未產出 → 乾淨)。E2E 跳過。
     if (!isE2E) void this.snapshotUsageBaseline(ch, ch.turn);
+    this.armTurnWatchdog(ch); // #253 起看門狗
     this.pending.add(sid); // #200 在途回合登記(進程死在此後 → 下次啟動提示重發)
     this.saveMap();
     ch.input.push({
@@ -940,7 +1030,10 @@ export class Drive {
   private handleMessage(ch: Channel, m: any): void {
     const sid = ch.sid;
     const turn = ch.turn;
-    if (turn && !turn.completed) turn.seen = true; // 送達確認(#116 b)
+    if (turn && !turn.completed) {
+      turn.seen = true; // 送達確認(#116 b)
+      turn.lastActivityAt = Date.now(); // #253 看門狗續期:有事件 = 沒卡
+    }
     const isE2E = turn?.isE2E ?? this.e2e?.isE2E(sid) ?? false;
 
     if (m.type === "system" && m.subtype === "init" && typeof m.session_id === "string") {
@@ -1117,8 +1210,10 @@ export class Drive {
       sdkOutput: null,
       usageInFlight: false,
       lastSdkPollAt: 0,
+      lastActivityAt: Date.now(), // #253
     };
     if (!ch.turn.isE2E) void this.snapshotUsageBaseline(ch, ch.turn); // #141b 基線快照
+    this.armTurnWatchdog(ch); // #253 合成回合也上看門狗(無後續內容 → 判卡收尾,不永久卡 pending)
     this.pending.add(sid); // #200 在途回合登記
     this.saveMap();
     console.log(`· ${sid} SDK 自發續寫回合(子任務完成自動喚醒)→ 建合成 turn 投遞`);
@@ -1128,6 +1223,7 @@ export class Drive {
   private finishTurn(ch: Channel, turn: TurnCtx, m: any): void {
     const sid = ch.sid;
     turn.completed = true;
+    this.clearTurnWatchdog(ch); // #253
     this.projects?.checkTurnEnd(); // #227 agent 可能在本回合改了 AGENTS.md → 惰性落版本
     const interrupted = this.interruptedSids.delete(sid);
     const isErr = m.subtype !== "success" || m.is_error === true;
@@ -1201,6 +1297,7 @@ export class Drive {
       clearTimeout(ch.idleTimer);
       ch.idleTimer = undefined;
     }
+    this.clearTurnWatchdog(ch); // #253
     const turn = ch.turn;
     ch.turn = undefined;
     this.pending.delete(sid); // #200 通道收尾 → 出在途集(下面若走送達重投,startTurn 會再加回)

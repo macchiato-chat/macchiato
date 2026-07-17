@@ -28,10 +28,24 @@ import websockets
 SERVER_URL = os.environ.get("MACCHIATO_SERVER_URL", "wss://api.macchiato.chat/connector")
 WEB_URL = os.environ.get("MACCHIATO_WEB_URL", "https://macchiato.chat")
 CRED_PATH = os.path.expanduser(os.environ.get("MACCHIATO_CRED", "~/.macchiato/connector.json"))
-CODE_FILE = os.environ.get("MACCHIATO_CODE_FILE", "/tmp/macchiato-pair-code.txt")
+# #254:配對碼此前寫 /tmp 世界可讀——共享機他人可讀碼、搶先 claim 把 agent 綁到攻擊者帳號。
+# 改寫 ~/.macchiato/ 0600(下方 _write_private)。可 env 覆蓋但默認私有。
+CODE_FILE = os.path.expanduser(os.environ.get("MACCHIATO_CODE_FILE", "~/.macchiato/pair-code.txt"))
 PROTO = 3  # 對齊 server 的 LINK_B_PROTO（packages/protocol）；不符會被拒 "proto mismatch"
 WAIT_S = 30 * 60  # overall pairing window (we refresh the code well within the server TTL)
 REFRESH_S = 6 * 60 + 30  # re-request a fresh code before the server's 8-min code TTL
+
+
+def _write_private(path: str, content: str) -> None:
+    """#254:0600 原子寫——O_CREAT 帶 mode(不經「先寫 0644 後 chmod」窗口)+ fchmod 抵 umask + rename。
+    含 connector_token / 配對碼的文件從落盤第一刻就只有本人可讀。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:  # fdopen 接管 fd,with 退出即關(異常也關)
+        os.fchmod(f.fileno(), 0o600)  # umask 可能削弱 O_CREAT 的 mode → 顯式收緊
+        f.write(content)
+    os.replace(tmp, path)
 
 
 def _save_cred(msg: dict, label: str) -> None:
@@ -41,16 +55,12 @@ def _save_cred(msg: dict, label: str) -> None:
         "agent_link_id": msg["agentLinkId"],
         "label": label,
     }
-    os.makedirs(os.path.dirname(CRED_PATH), exist_ok=True)
-    with open(CRED_PATH, "w") as f:
-        json.dump(cred, f, indent=2)
-    os.chmod(CRED_PATH, 0o600)
+    _write_private(CRED_PATH, json.dumps(cred, indent=2))
 
 
 def _show_code(code: str, fresh: bool) -> None:
     try:
-        with open(CODE_FILE, "w") as f:
-            f.write(code)
+        _write_private(CODE_FILE, code)  # #254 0600 私有(此前 /tmp 世界可讀 → 他人可搶 claim)
     except Exception:
         pass
     print("\n" + "=" * 54)

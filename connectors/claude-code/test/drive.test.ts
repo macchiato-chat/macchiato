@@ -377,6 +377,38 @@ describe("permissionMode (#bypass)", () => {
     expect(permissionMode()).toBeUndefined();
     delete process.env.MACCHIATO_CC_PERMISSION_MODE;
   });
+
+  it("#255 bypassAllowed:默認關;env 開放或進程默認 bypass 才開", async () => {
+    const { bypassAllowed } = await import("../src/cc/drive");
+    delete process.env.MACCHIATO_CC_ALLOW_BYPASS;
+    delete process.env.MACCHIATO_CC_PERMISSION_MODE;
+    expect(bypassAllowed()).toBe(false); // 默認關
+    process.env.MACCHIATO_CC_ALLOW_BYPASS = "1";
+    expect(bypassAllowed()).toBe(true);
+    process.env.MACCHIATO_CC_ALLOW_BYPASS = "false";
+    expect(bypassAllowed()).toBe(false);
+    delete process.env.MACCHIATO_CC_ALLOW_BYPASS;
+    process.env.MACCHIATO_CC_PERMISSION_MODE = "bypassPermissions"; // 進程級已 opt-in
+    expect(bypassAllowed()).toBe(true);
+    delete process.env.MACCHIATO_CC_PERMISSION_MODE;
+  });
+
+  it("#255 server 下發 bypass 未本地開放 → resolvePerm 降級 ask(不盲執行)", () => {
+    delete process.env.MACCHIATO_CC_ALLOW_BYPASS;
+    delete process.env.MACCHIATO_CC_PERMISSION_MODE;
+    const { linkb } = fakeLinkb();
+    const d = new Drive(linkb) as any;
+    d.permModes[CC_SID] = "bypass";
+    const denied = d.resolvePerm(CC_SID);
+    expect(denied.sdk).toBe("default"); // 降級:走 canUseTool 審批
+    expect(denied.permKey).toBe("ui:bypass!denied");
+    // 本地開放後才真 bypass
+    process.env.MACCHIATO_CC_ALLOW_BYPASS = "1";
+    const allowed = d.resolvePerm(CC_SID);
+    expect(allowed.sdk).toBe("bypassPermissions");
+    expect(allowed.permKey).toBe("ui:bypass");
+    delete process.env.MACCHIATO_CC_ALLOW_BYPASS;
+  });
 });
 
 describe("#97→#104 background task 結構化事件 + 停止", () => {
@@ -737,6 +769,48 @@ describe("#118 streaming-input 長活通道", () => {
     d.dispose();
   });
 
+  it("#253 回合卡死(有事件無 result)→ 看門狗強制收尾 error + 回收通道 + 清 pending", async () => {
+    process.env.MACCHIATO_CC_TURN_STALL_MS = "50"; // 50ms 無事件即判卡
+    turnScripts = [[init, { __wait: 400 }, { type: "result", subtype: "success", result: "永遠到不了" }]];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "會卡住的回合" }));
+    await new Promise((r) => setTimeout(r, 40));
+    expect((d as any).pending.has(CC_SID)).toBe(true); // 回合在途
+    await new Promise((r) => setTimeout(r, 120)); // 越過 50ms 靜默窗 → 看門狗開火
+    const done = sent.find(
+      (f: any) => f.frame?.params?.type === "message.complete" && f.frame.params.payload.status === "error",
+    );
+    expect(done).toBeTruthy(); // 強制定稿 error
+    expect(sent.some((f: any) => JSON.stringify(f).includes("卡死"))).toBe(true); // 提示重試
+    expect((d as any).pending.has(CC_SID)).toBe(false); // 清出在途集(不誤發「請重發」)
+    expect((d as any).channels.size).toBe(0); // 卡死通道回收
+    d.dispose();
+    delete process.env.MACCHIATO_CC_TURN_STALL_MS;
+  });
+
+  it("#253 後台任務在跑時看門狗豁免(不誤殺長任務回合)", async () => {
+    process.env.MACCHIATO_CC_TURN_STALL_MS = "50";
+    process.env.MACCHIATO_CC_IDLE_S = "10"; // 排除 idle 干擾
+    turnScripts = [[
+      init,
+      { type: "system", subtype: "task_started", task_id: "bg-x", description: "長任務" },
+      { type: "result", subtype: "success", result: "放後台" },
+      { __wait: 200 }, // result 後通道還活(等 task);此間無事件但有 running task → 不判卡
+    ]];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "run bg" }));
+    await new Promise((r) => setTimeout(r, 150)); // 遠超 50ms,但 task 在跑
+    // 回合已正常 result 收尾(watchdog 已清),不應有 error 定稿
+    expect(sent.some((f: any) => f.frame?.params?.type === "message.complete" && f.frame.params.payload.status === "error")).toBe(false);
+    d.dispose();
+    delete process.env.MACCHIATO_CC_TURN_STALL_MS;
+    delete process.env.MACCHIATO_CC_IDLE_S;
+  });
+
   it("#212 result 後才收到 task_started → 撤銷既有 idle timer，不競態誤殺", async () => {
     process.env.MACCHIATO_CC_IDLE_S = "0.05";
     turnScripts = [[
@@ -995,6 +1069,7 @@ describe("#98 每會話權限模式", () => {
 
   it("五檔各自映射:acceptEdits→default、auto→auto、plan→plan、bypass→bypassPermissions", async () => {
     delete process.env.MACCHIATO_CC_PERMISSION_MODE;
+    process.env.MACCHIATO_CC_ALLOW_BYPASS = "1"; // #255 本測驗映射本身,顯式開放 bypass
     process.env.MACCHIATO_CC_TITLE_MODE = "off"; // ULID sid 首回合會觸發標題,關掉防偷跑 turnScript
     const cases: [string, string][] = [
       ["acceptEdits", "default"],
@@ -1067,6 +1142,7 @@ describe("#98 每會話權限模式", () => {
 
   it("權限檔變更 → 閒置通道重建(permKey 變)", async () => {
     delete process.env.MACCHIATO_CC_PERMISSION_MODE;
+    process.env.MACCHIATO_CC_ALLOW_BYPASS = "1"; // #255 本測驗通道重建,顯式開放 bypass
     process.env.MACCHIATO_CC_TITLE_MODE = "off";
     turnScripts = [
       [init, { type: "result", subtype: "success", result: "one" }],
@@ -1088,6 +1164,7 @@ describe("#98 每會話權限模式", () => {
     expect(lastOptions.permissionMode).toBe("bypassPermissions");
     d.dispose();
     delete process.env.MACCHIATO_CC_TITLE_MODE;
+    delete process.env.MACCHIATO_CC_ALLOW_BYPASS;
   });
 
   it("#143 model 變更 → 閒置通道重建 + SDK options.model", async () => {

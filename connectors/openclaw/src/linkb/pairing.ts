@@ -6,6 +6,7 @@
 import { hostname } from "node:os";
 import WebSocket from "ws";
 import { LINK_B_PROTO } from "./proto";
+import { backoffMs } from "../backoff";
 import { type Creds, DEFAULT_SERVER_URL, DEFAULT_WEB_URL, saveCreds } from "./creds";
 
 const REFRESH_MS = (6 * 60 + 30) * 1000; // 趕在 server 8-min code TTL 前換新
@@ -82,14 +83,21 @@ export async function runPairing(opts: PairOptions = {}): Promise<Creds> {
   const label = opts.label || process.env.MACCHIATO_LABEL || hostname();
   const deadline = Date.now() + (opts.windowMs ?? WINDOW_MS);
   let fresh = false;
+  let failures = 0;
   while (Date.now() < deadline) {
     console.log(`· connecting to ${serverUrl} …`);
     try {
       return await attempt(serverUrl, webUrl, label, fresh);
     } catch (e) {
       if ((e as Error).message === "PAIR_REJECTED") throw new Error("Pairing rejected by server");
-      console.error("· 連接斷開, 重連並換新碼…");
       fresh = true;
+      // #252 此前 connection-refused 立即重試 = 熱循環(server 不可達時 30 分鐘窗口空轉燒 CPU)。
+      // 加指數退避(3s→60s+抖動,同 Link B 重連);窗口剩餘時間不足退避則直接結束。
+      failures += 1;
+      const wait = backoffMs(failures - 1);
+      if (Date.now() + wait >= deadline) break;
+      console.error(`· 連接斷開, ${Math.round(wait / 1000)}s 後重連並換新碼…`);
+      await new Promise((r) => setTimeout(r, wait));
     }
   }
   throw new Error("配對窗口超時未認領, 請重跑。");

@@ -86,8 +86,6 @@ export class Drive {
     private readonly linkb: LinkBClient,
     private readonly mirror?: Mirror,
     private readonly e2e?: E2EKeyStore,
-    /** #227 回合末惰性版本化鉤子。 */
-    private readonly projects?: { checkTurnEnd(): void },
   ) {
     // #202 載入持久對賬狀態;歷史 driven key 重新登記(鏡像跳過 + 事件路由 + 對賬覆蓋)。
     try {
@@ -458,7 +456,6 @@ export class Drive {
         this.mirror?.fastForward(key); // live 已投遞 → 鏡像水位線快進到文件末, 防雙投
         void this.reconcileTurnEnd(key, sid); // #202 回填 srcId + 推水位線(fire-and-forget)
         void this.flushFollowUps(key); // #162 排隊的帶附件跟進 → chat.send 續投
-        this.projects?.checkTurnEnd(); // #227 agent 可能在本回合改了備案目錄的 AGENTS.md
       }
       return;
     }

@@ -2,7 +2,7 @@
  * Link B 憑證：配對後拿到的 connector_token + agentLinkId, 存 ~/.macchiato/openclaw-connector.json。
  * 與 Hermes 連接器的 connector.json **分開**——OpenClaw 是另一個獨立配對的連接器。
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -39,10 +39,13 @@ export function loadCreds(): Creds | null {
   };
 }
 
-/** 寫憑證（0600）。 */
+/** 寫憑證（0600）。#254:tmp 先建 0600 再 chmod 再 rename——消除「先寫 0644 後 chmod」的窗口
+ * (含 connector_token 的文件在 chmod 前世界可讀),照 e2e/keys.ts 原子模式。 */
 export function saveCreds(c: Creds): void {
   const p = credPath();
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(c, null, 2));
-  chmodSync(p, 0o600);
+  const tmp = p + ".tmp";
+  writeFileSync(tmp, JSON.stringify(c, null, 2), { mode: 0o600 });
+  chmodSync(tmp, 0o600); // umask 可能削弱 create mode → 顯式收緊
+  renameSync(tmp, p);
 }

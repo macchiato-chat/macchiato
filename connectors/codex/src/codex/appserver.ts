@@ -24,6 +24,10 @@ type Pending = { resolve: (v: any) => void; reject: (e: Error) => void; timer: N
 export type ReverseHandler = (params: any) => Promise<Record<string, unknown>> | Record<string, unknown>;
 
 const REQUEST_TIMEOUT_MS = Number(process.env.MACCHIATO_CODEX_RPC_TIMEOUT_S ?? 120) * 1000;
+/** #250 重啟失敗閾值:到 STUCK 次先清懸空回合(免 app 永久轉圈)、到 FATAL 次上浮 onFatal
+ * (index.ts 優雅退出 → systemd 重啟重走啟動探活 → app-server 仍壞則降級 exec v1)。 */
+const RESTART_STUCK_AT = Number(process.env.MACCHIATO_CODEX_RESTART_STUCK ?? 3);
+const RESTART_FATAL_AT = Number(process.env.MACCHIATO_CODEX_RESTART_FATAL ?? 10);
 
 export class AppServerClient {
   private proc: ChildProcess | null = null;
@@ -36,8 +40,11 @@ export class AppServerClient {
   private readonly notificationHandlers = new Set<(method: string, params: any) => void>();
   /** 連續重啟失敗計數(成功歸零;上浮 health 告警)。 */
   restartFailures = 0;
-  /** 每次(重)啟動握手成功後回調——drive 據此清活躍回合/通知用戶。 */
+  /** (重)啟動握手成功後 **或** 重啟連續失敗到 STUCK 閾值時回調——drive 據此清活躍回合/通知用戶
+   * (免 app-server 永遠起不來時活躍回合永久懸空、app 轉圈到死)。 */
   onRestart: (() => void) | null = null;
+  /** #250 重啟連續失敗到 FATAL 閾值——index.ts 據此優雅退出讓 systemd 重啟(重走啟動探活/降級 exec)。 */
+  onFatal: ((failures: number) => void) | null = null;
 
   get isReady(): boolean {
     return this.ready;
@@ -67,28 +74,51 @@ export class AppServerClient {
     });
     this.proc = proc;
     this.stdoutBuf = "";
-    proc.stdout!.on("data", (c: Buffer) => this.onData(c));
+    // #250 只處理**當前** proc 的 stdout——握手超時等場景舊進程未被殺仍活著,若也喂同一 stdoutBuf
+    // 會與新進程行緩衝交錯、遲到響應錯配新請求 id。捕獲 proc 到閉包,非當前即忽略。
+    proc.stdout!.on("data", (c: Buffer) => {
+      if (this.proc === proc) this.onData(c);
+    });
     let stderrTail = "";
     proc.stderr!.on("data", (c: Buffer) => {
       stderrTail = (stderrTail + c.toString("utf8")).slice(-2000);
     });
-    proc.on("error", () => {
-      /* close 隨後觸發,統一在 supervise 處理 */
+    proc.on("error", (e) => {
+      // spawn/管道錯誤(EPIPE/ENOENT 等):記錄(此前空 no-op);close 隨後觸發,統一在 supervise 重啟。
+      console.error(`[appserver proc error] ${(e as Error).message}`);
     });
     this.ready = false;
+    let timer: NodeJS.Timeout | undefined;
     // 握手要快速失敗:老 codex 無 app-server 子命令會直接退出——race 進程退出/15s,
     // 別等 REQUEST_TIMEOUT(index.ts 靠這個拋錯回退 exec v1)。
     const closed = new Promise<never>((_, rej) =>
       proc.once("close", (code) => rej(new AppServerDied(`app-server exited during handshake (code ${code}) ${stderrTail.slice(-300)}`))),
     );
-    const handshakeTimeout = new Promise<never>((_, rej) => setTimeout(() => rej(new AppServerDied("initialize handshake timeout (15s)")), 15_000));
-    await Promise.race([
-      this.request("initialize", {
-        clientInfo: { name: "macchiato-codex-connector", version: process.env.npm_package_version ?? "0" },
-      }),
-      closed,
-      handshakeTimeout,
-    ]);
+    const handshakeTimeout = new Promise<never>((_, rej) => {
+      timer = setTimeout(() => rej(new AppServerDied("initialize handshake timeout (15s)")), 15_000);
+    });
+    try {
+      await Promise.race([
+        this.request("initialize", {
+          clientInfo: { name: "macchiato-codex-connector", version: process.env.npm_package_version ?? "0" },
+        }),
+        closed,
+        handshakeTimeout,
+      ]);
+    } catch (e) {
+      // #250 握手失敗(超時/退出)→ 殺掉這個進程並摘監聽,否則孤兒進程繼續喂 stdoutBuf、下輪
+      // spawn 的新進程與它交錯。SIGKILL 確保死透。
+      clearTimeout(timer);
+      proc.stdout?.removeAllListeners();
+      proc.stderr?.removeAllListeners();
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        /* 已死 */
+      }
+      throw e;
+    }
+    clearTimeout(timer);
     this.notify("initialized");
     this.ready = true;
   }
@@ -119,6 +149,22 @@ export class AppServerClient {
           this.restartFailures += 1;
           if (shouldAlert(this.restartFailures)) {
             console.error(`⚠️ codex app-server 連續 ${this.restartFailures} 次重啟失敗:${(e as Error).message.slice(0, 200)}`);
+          }
+          // #250 到 STUCK 閾值:清懸空回合(app-server 起不來時 onRestart 永不觸發 → 活躍回合永久
+          // 懸空、app 轉圈到死)。只在剛跨過閾值那次調一次,免刷屏。
+          if (this.restartFailures === RESTART_STUCK_AT) {
+            console.error(`⚠️ codex app-server 重啟受阻(${this.restartFailures} 次)→ 清活躍回合,通知用戶`);
+            try {
+              this.onRestart?.();
+            } catch {
+              /* 回調自負其責 */
+            }
+          }
+          // #250 到 FATAL 閾值:上浮 index.ts 優雅退出,交 systemd 重啟(重走啟動探活 → 降級 exec v1)。
+          if (this.restartFailures >= RESTART_FATAL_AT) {
+            console.error(`⚠️ codex app-server 連續 ${this.restartFailures} 次重啟失敗 → 退出交 systemd 重啟(將重走啟動探活/降級 exec)`);
+            this.onFatal?.(this.restartFailures);
+            return;
           }
           await new Promise((r) => setTimeout(r, backoffMs(this.restartFailures - 1)));
         }
@@ -188,10 +234,10 @@ export class AppServerClient {
   }
 
   request(method: string, params: Record<string, unknown> = {}): Promise<any> {
-    const proc = this.proc;
-    if (!proc || proc.stdin?.destroyed) return Promise.reject(new AppServerDied("not running"));
     const id = this.nextId++;
-    proc.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    if (!this.safeWrite({ jsonrpc: "2.0", id, method, params })) {
+      return Promise.reject(new AppServerDied("not running"));
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (this.pending.delete(id)) reject(new Error(`app-server request timeout: ${method}`));
@@ -200,15 +246,29 @@ export class AppServerClient {
     });
   }
 
+  /** #250 安全寫:stdin 已毀/不可寫時直接跳過並 try/catch——死亡窗口往死流 write 會拋,
+   * 反向請求 catch 裡的 respondError 若同步拋更會冒成 unhandled rejection(void async)。 */
+  private safeWrite(obj: Record<string, unknown>): boolean {
+    const stdin = this.proc?.stdin;
+    if (!stdin || stdin.destroyed || !stdin.writable) return false;
+    try {
+      stdin.write(JSON.stringify(obj) + "\n");
+      return true;
+    } catch (e) {
+      console.error(`[appserver write failed] ${(e as Error).message}`);
+      return false;
+    }
+  }
+
   notify(method: string, params: Record<string, unknown> = {}): void {
-    this.proc?.stdin?.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
+    this.safeWrite({ jsonrpc: "2.0", method, params });
   }
 
   private respond(id: unknown, result: Record<string, unknown>): void {
-    this.proc?.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
+    this.safeWrite({ jsonrpc: "2.0", id, result });
   }
   private respondError(id: unknown, message: string): void {
-    this.proc?.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message } }) + "\n");
+    this.safeWrite({ jsonrpc: "2.0", id, error: { code: -32000, message } });
   }
 
   close(): void {
