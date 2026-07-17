@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -109,5 +109,15 @@ describe("titled 持久集", () => {
     expect(loadTitled()).toEqual(s);
     process.env.MACCHIATO_OPENCLAW_TITLED = "/nonexistent/titled.json";
     expect(loadTitled()).toEqual(new Set());
+  });
+
+  it("#248 主檔損壞 → 從 .bak 恢復(手改標題不因崩在寫一半而蒸發)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "oc-titled-bak-"));
+    const p = join(dir, "titled.json");
+    process.env.MACCHIATO_OPENCLAW_TITLED = p;
+    saveTitled(new Set(["01A"])); // 首存
+    saveTitled(new Set(["01A", "01B"])); // 第二存 → 把好的第一版輪替進 .bak
+    writeFileSync(p, "{壞了"); // 主檔損壞
+    expect(loadTitled()).toEqual(new Set(["01A"])); // 從 .bak 恢復,不回空集
   });
 });

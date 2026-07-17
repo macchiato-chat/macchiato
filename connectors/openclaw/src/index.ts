@@ -22,7 +22,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.5.25";
+const CONNECTOR_VERSION = "1.5.26";
 
 /** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
 function runSelfUpdate(): void {
@@ -52,7 +52,10 @@ async function main(): Promise<void> {
   // 3. Macchiato Link B
   const linkb = new LinkBClient(creds);
   const e2e = new E2EKeyStore();
-  const freshInstall = !existsSync(process.env.MACCHIATO_OPENCLAW_MIRROR || join(homedir(), ".macchiato/openclaw-mirror.json")); // #154
+  // #154/#248 首裝採樣:主檔**或 .bak**任一存在都不算首裝——此前只看主檔,兩段 rename 間崩潰
+  // (主檔缺、.bak 在)會誤判首裝 → 觸發自動全量導入、重置用戶手改的標題。
+  const mirrorMain = process.env.MACCHIATO_OPENCLAW_MIRROR || join(homedir(), ".macchiato/openclaw-mirror.json");
+  const freshInstall = !existsSync(mirrorMain) && !existsSync(mirrorMain + ".bak");
   const mirror = new Mirror(gw, linkb, e2e);
   // #256:OpenClaw **不是 project-capable**(gateway 無 per-session cwd 通道;web PROJECT_CAPABLE_KINDS
   // 已排除)。不接線 project_op handler——否則 server 被攻破可驅動這個本不該存在的路徑,往任意目錄

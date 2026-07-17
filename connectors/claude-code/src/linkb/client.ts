@@ -26,6 +26,14 @@ export class LinkBClient {
   private firstReady: (() => void) | null = null;
   private readonly readyOnce: Promise<void>;
 
+  /** #246 auth_error(憑證吊銷/proto 不符,非瞬時)= 終端態:退出非零讓 supervisor(systemd)
+   * 接手——重試/最終 stop,消滅「進程活著但不連、不重連、與離線不可區分」的殭屍。測試可覆蓋。 */
+  onFatal: () => void = () => process.exit(1);
+
+  /** #247 半開連接偵測:server 每 30s WS-ping,連續 LIVENESS_MS 無任何入站(含 ping)= 對端已亡
+   * (readyState 恒 OPEN、發幀進黑洞)→ terminate 觸發 onClose 重連。收每幀/每 ping 續期。 */
+  private livenessTimer?: ReturnType<typeof setTimeout>;
+
   constructor(private readonly creds: Creds) {
     this.readyOnce = new Promise((r) => (this.firstReady = r));
   }
@@ -58,7 +66,9 @@ export class LinkBClient {
   private connect(): void {
     const ws = new WebSocket(this.creds.serverUrl, { handshakeTimeout: 20000 });
     this.ws = ws;
+    ws.on("ping", () => this.bumpLiveness()); // #247 server WS-ping 續期 liveness
     ws.on("open", () => {
+      this.bumpLiveness();
       ws.send(
         JSON.stringify({
           t: "hello",
@@ -76,6 +86,7 @@ export class LinkBClient {
   }
 
   private handleFrame(raw: WebSocket.RawData): void {
+    this.bumpLiveness(); // #247 任何入站幀續期
     let msg: Record<string, unknown>;
     try {
       msg = JSON.parse(raw.toString());
@@ -101,8 +112,9 @@ export class LinkBClient {
         console.log("✓ Link B ready — connected to Macchiato");
         return;
       case "auth_error":
-        console.error(`Link B auth_error: ${msg.reason} (credentials revoked? re-pair needed)`);
+        console.error(`Link B auth_error: ${msg.reason} — 憑證吊銷或 proto 不符,需重新配對/升級`);
         this.close();
+        this.onFatal(); // #246 退出交 supervisor,不再靜默殭屍空轉
         return;
       case "ping":
         this.send({ t: "pong" });
@@ -153,8 +165,20 @@ export class LinkBClient {
     for (const f of this.pending.splice(0)) ws.send(f);
   }
 
+  /** #247 續期半開偵測計時器;LIVENESS_MS 內無入站 → terminate 交 onClose 重連。 */
+  private bumpLiveness(): void {
+    if (this.livenessTimer) clearTimeout(this.livenessTimer);
+    const ms = Number(process.env.MACCHIATO_LINKB_LIVENESS_MS) || 90_000;
+    this.livenessTimer = setTimeout(() => {
+      console.error(`⚠️ Link B ${ms / 1000}s 無任何入站(含 server WS-ping)→ 判半開,terminate 重連`);
+      this.ws?.terminate();
+    }, ms);
+    this.livenessTimer.unref?.();
+  }
+
   private onClose(): void {
     this.ready = false;
+    if (this.livenessTimer) { clearTimeout(this.livenessTimer); this.livenessTimer = undefined; } // #247
     if (this.closed) return;
     // #3 指數退避(3s→60s+抖動),連續失敗每 5 次吼一聲——此前固定 3s 死磕,斷網一晚=上萬次重連。
     this.failures += 1;

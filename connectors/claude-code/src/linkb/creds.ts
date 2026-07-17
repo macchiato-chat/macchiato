@@ -2,7 +2,7 @@
  * Link B 憑證：配對後拿到的 connector_token + agentLinkId, 存 ~/.macchiato/claude-code-connector.json。
  * 與 Hermes 連接器的 connector.json **分開**——OpenClaw 是另一個獨立配對的連接器。
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -29,7 +29,15 @@ function serverUrl(fromFile?: string): string {
 export function loadCreds(): Creds | null {
   const p = credPath();
   if (!existsSync(p)) return null;
-  const c = JSON.parse(readFileSync(p, "utf8")) as Partial<Creds>;
+  // #248 此前裸 JSON.parse:壞 JSON 拋到 main → process.exit(1) → systemd 無限崩潰循環。
+  // 改為 fail-safe:壞檔視為「未配對」返回 null(引導重新配對),不崩服務。
+  let c: Partial<Creds>;
+  try {
+    c = JSON.parse(readFileSync(p, "utf8")) as Partial<Creds>;
+  } catch (e) {
+    console.error(`[creds] ${p} 損壞(${(e as Error).message})→ 視為未配對,請重新配對`);
+    return null;
+  }
   if (!c.connectorToken || !c.agentLinkId) return null;
   return {
     serverUrl: serverUrl(c.serverUrl),
@@ -39,10 +47,12 @@ export function loadCreds(): Creds | null {
   };
 }
 
-/** 寫憑證（0600）。 */
+/** 寫憑證（0600）。#248/#254:tmp(0600)+chmod+rename 原子寫,不經「先寫 0644 後 chmod」窗口。 */
 export function saveCreds(c: Creds): void {
   const p = credPath();
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(c, null, 2));
-  chmodSync(p, 0o600);
+  const tmp = p + ".tmp";
+  writeFileSync(tmp, JSON.stringify(c, null, 2), { mode: 0o600 });
+  chmodSync(tmp, 0o600);
+  renameSync(tmp, p);
 }

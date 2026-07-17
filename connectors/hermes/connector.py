@@ -33,13 +33,14 @@ import json
 import mimetypes
 import os
 import re
+import http.client
 import ipaddress
 import socket
+import ssl
 import subprocess
 import sys
 import time
 import traceback
-import urllib.request
 from collections import deque
 from urllib.parse import urlparse
 
@@ -65,7 +66,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.25"
+CONNECTOR_VERSION = "1.5.26"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -132,9 +133,56 @@ def _validate_download_url(url: str) -> None:
             raise ValueError(f"目標 IP {ip} 在私網/環回/保留範圍（防 SSRF）")
 
 
+def _open_validated_download(url: str, timeout: float = 30.0):
+    """#249 pin-IP 下載:解析→校驗→**連校驗過的那個 IP**(SNI/cert 仍用 hostname)→GET。此前
+    _validate_download_url 用 getaddrinfo 校驗、urlopen 卻獨立再解析一次(TOCTOU:兩次解析間
+    DNS-rebinding 換內網 IP 可繞過),且 urlopen 默認**跟隨 302**、可重定向到內網。改為單次解析、
+    直接連校驗過的 IP、不跟隨重定向(3xx 也拒)。返回 http.client.HTTPResponse(caller 讀+關)。"""
+    p = urlparse(url)
+    host = (p.hostname or "").lower()
+    path = p.path or "/"
+    if p.query:
+        path += "?" + p.query
+    headers = {"User-Agent": "macchiato-connector"}
+    if p.scheme == "http" and host in _LOCAL_HOSTS:
+        conn = http.client.HTTPConnection(host, p.port or 80, timeout=timeout)
+        conn.request("GET", path, headers=headers)
+        resp = conn.getresponse()
+    else:
+        if p.scheme != "https":
+            raise ValueError(f"不允許的 scheme：{p.scheme!r}（只允許 https）")
+        if not host:
+            raise ValueError("url 缺主機名")
+        port = p.port or 443
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        ip = None
+        for info in infos:
+            cand = ipaddress.ip_address(info[4][0])
+            if cand.is_private or cand.is_loopback or cand.is_link_local or cand.is_reserved or cand.is_multicast:
+                raise ValueError(f"目標 IP {cand} 在私網/環回/保留範圍（防 SSRF DNS-rebinding）")
+            if ip is None:
+                ip = info[4][0]
+        if ip is None:
+            raise ValueError("解析無可用地址")
+        raw = socket.create_connection((ip, port), timeout=timeout)  # 連校驗過的 IP（pin）
+        try:
+            sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host)  # SNI/cert 用 hostname
+        except Exception:
+            raw.close()
+            raise
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+        conn.sock = sock  # 注入已連好的 socket → request 不再 connect()、不再重解析
+        conn.request("GET", path, headers=headers)
+        resp = conn.getresponse()
+    if resp.status >= 300:  # 不跟隨重定向:3xx 也拒(此前 urlopen 會跟 302 跳內網)
+        resp.close()
+        raise ValueError(f"下載失敗/拒重定向 HTTP {resp.status}")
+    return resp
+
+
 def _materialize_attachment(ref: dict) -> str:
     """下載 presigned GET url 到本地文件（連接器與 gateway 同機，落盤即可讓 gateway 讀）。"""
-    _validate_download_url(str(ref.get("url") or ""))  # 審計 #12：下載前校驗，防 file:// / SSRF
+    _validate_download_url(str(ref.get("url") or ""))  # 審計 #12：下載前早拒（file:// / 字面私網）
     name = _sanitize_filename(ref.get("name") or "")
     if "." not in name:
         ext = mimetypes.guess_extension((ref.get("mime") or "").split(";")[0].strip()) or ""
@@ -142,9 +190,8 @@ def _materialize_attachment(ref: dict) -> str:
     d = os.path.join(ATTACH_DIR, re.sub(r"[^\w\-]+", "_", str(ref.get("id") or "att")))
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, name)
-    req = urllib.request.Request(ref["url"], headers={"User-Agent": "macchiato-connector"})
     written = 0
-    with urllib.request.urlopen(req, timeout=30) as r, open(path, "wb") as f:
+    with _open_validated_download(str(ref["url"])) as r, open(path, "wb") as f:  # #249 pin-IP + 拒重定向
         while True:
             chunk = r.read(1 << 16)
             if not chunk:
@@ -379,6 +426,7 @@ class Connector:
         self._mirror_rewind = deque(maxlen=64)  # (batchId, {sid: 舊floor})，供 nack 回退
         self._out_pending: deque = deque(maxlen=500)  # 斷線期間出站幀緩衝(ready 後補發;有界丟最舊)
         self._linkb_ready = False  # #251 收到 t:"ready" 才置真:handshaking 窗口不直發未認證幀、走緩衝
+        self._on_fatal = lambda: sys.exit(1)  # #246 auth_error 終端態 → 退出交 supervisor(測試可覆蓋)
         self._e2e = E2EKeyStore()  # §19 per-session E2E 密鑰管理（持 K_S、封裝給設備、加解密內容）
         self._mirror_lock = None  # 鏡像輪詢 ↔ E2E 歷史回灌互斥（防舊 floor 追加與整段替換競態）
         # 自驅會話持久映射（server sid ↔ state.db id）。跨進程/gateway 重啟保留——E2E 鏡像投遞、
@@ -456,7 +504,14 @@ class Connector:
             while True:
                 try:
                     async with websockets.connect(
-                        self.server_url, ping_interval=20, ping_timeout=None, close_timeout=10
+                        # #247 ping_timeout 此前為 None——websockets 的 liveness 被關掉,server
+                        # 半開(進程亡但 TCP 未 FIN)時永遠檢測不到、幀發進黑洞。改有限值:每 20s WS-ping,
+                        # 無 pong 超時即斷 → 外層重連。取 45s(寬容家用上行推大 import 批時 pong 遲到,
+                        # 又能在一分鐘內揪出死連接);env 可調。
+                        self.server_url,
+                        ping_interval=20,
+                        ping_timeout=float(os.environ.get("MACCHIATO_LINKB_PING_TIMEOUT", "45")),
+                        close_timeout=10,
                     ) as ws:
                         self.ws = ws
                         self._linkb_ready = False  # #251 新連接:ready 前不直發(見 _send)
@@ -718,15 +773,20 @@ class Connector:
             print(f"· media.attach {payload['name']}（{payload['size']}B）→ {server_sid}")
 
     def _load_stored(self) -> dict:
-        try:
-            with open(SESSIONS_MAP) as f:
-                d = json.load(f)
-            return d if isinstance(d, dict) else {}
-        except (FileNotFoundError, ValueError):
-            return {}
+        # #248 主檔壞/缺 → 試 .bak(此前無備份:sessions.json 損壞即自驅會話 server↔state.db
+        # 映射蒸發,E2E 投遞/重啟 resume/歸檔回寫全丟)。兩檔都壞才回空。
+        for path in (SESSIONS_MAP, SESSIONS_MAP + ".bak"):
+            try:
+                with open(path) as f:
+                    d = json.load(f)
+                if isinstance(d, dict):
+                    return d
+            except (FileNotFoundError, ValueError):
+                continue
+        return {}
 
     def _record_stored(self, server_sid: str, stored) -> None:
-        """記住自驅會話的 state.db id（create 返回的 stored_session_id）。冪等、原子持久化。"""
+        """記住自驅會話的 state.db id（create 返回的 stored_session_id）。冪等、原子持久化 + .bak 輪替。"""
         if not stored or stored == server_sid or self._stored.get(server_sid) == stored:
             return
         self._stored[server_sid] = stored
@@ -736,6 +796,8 @@ class Connector:
             tmp = SESSIONS_MAP + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(self._stored, f)
+            if os.path.exists(SESSIONS_MAP):
+                os.replace(SESSIONS_MAP, SESSIONS_MAP + ".bak")  # #248 輪替備份(load 側有 .bak 回退)
             os.replace(tmp, SESSIONS_MAP)
         except Exception as exc:
             print(f"[sessions map save failed] {exc!r}", file=sys.stderr)
@@ -1757,9 +1819,12 @@ class Connector:
             self._linkb_state = f"auth_error: {reason}"
             self._last_error = f"auth_error: {reason}"
             print(
-                f"✗ auth_error: {reason}（服務將無法工作——可能 Hermes 升級致 proto 不符）",
+                f"✗ auth_error: {reason}（憑證吊銷或 Hermes 升級致 proto 不符——需重新配對/升級）",
                 file=sys.stderr,
             )
+            # #246 auth_error 是終端態(非瞬時):此前只記狀態,外層 ≤1s 全速重連狂打 server
+            # (收帧重置退避)。改為退出交 supervisor(systemd)——重試/最終 stop,不再殭屍空轉。
+            self._on_fatal()
             return
         if t == "ping":
             if self.ws:

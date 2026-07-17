@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { IMAGE_BLOCK_MAX, imageBlockFor, isPrivateIp, materializeAttachment, validateDownloadUrl } from "../src/cc/attachments";
+import { IMAGE_BLOCK_MAX, imageBlockFor, isPrivateIp, materializeAttachment, pinnedLookup, validateDownloadUrl } from "../src/cc/attachments";
 
 describe("imageBlockFor (#118 原生圖片入站)", () => {
   it("支持類型且 ≤3.5MB → image block;非圖/超限/讀失敗 → null(回退路徑注入)", () => {
@@ -60,5 +60,22 @@ describe("materializeAttachment", () => {
   });
   it("拒絕 file:// url(不落盤)", async () => {
     await expect(materializeAttachment({ id: "b", name: "n", url: "file:///etc/passwd" })).rejects.toThrow();
+  });
+});
+
+describe("#249 pinnedLookup(連接時校驗實際 IP,防 rebinding TOCTOU)", () => {
+  it("解析到私網 IP → 拒(rebinding 換的正是這次連接的 IP)", async () => {
+    // localhost 必解析到環回(127.0.0.1/::1)= 私網 → pinnedLookup 應報錯
+    await expect(
+      new Promise<string>((resolve, reject) =>
+        pinnedLookup("localhost", {}, (err, addr) => (err ? reject(err) : resolve(addr))),
+      ),
+    ).rejects.toThrow(/私網|SSRF/);
+  });
+  it("解析到公網 IP → 放行(以字面公網 IP 為例,lookup 原樣返回)", async () => {
+    const addr = await new Promise<string>((resolve, reject) =>
+      pinnedLookup("1.1.1.1", {}, (err, a) => (err ? reject(err) : resolve(a))),
+    );
+    expect(addr).toBe("1.1.1.1");
   });
 });

@@ -8,12 +8,15 @@
  * (或 http+localhost 的 dev 服務);https 目標解析後不得落私網/環回/link-local/保留段;下載 100MB 封頂。
  */
 import { lookup } from "node:dns/promises";
+import { lookup as dnsLookupCb } from "node:dns";
+import * as http from "node:http";
+import * as https from "node:https";
 import { createWriteStream, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import type { IncomingMessage } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { Readable } from "node:stream";
 
 export const DOWNLOAD_MAX = 100 * 1024 * 1024;
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
@@ -90,16 +93,54 @@ export interface AttachmentRefLike {
   url?: unknown;
 }
 
+/**
+ * #249 pin-IP 解析:socket 連接時用它做 DNS——校驗**實際要連的那個 IP**。DNS-rebinding 換的正是
+ * 這次連接解析到的 IP,當場被拒;validateDownloadUrl 的預解析只是早拒,真正把關在這裡(單次解析、
+ * 直接用於 socket,無「校驗解析 ≠ 連接解析」的 TOCTOU 窗口)。
+ */
+export function pinnedLookup(
+  hostname: string,
+  options: unknown,
+  cb: (err: NodeJS.ErrnoException | null, address: string, family: number) => void,
+): void {
+  dnsLookupCb(hostname, { ...(options as object), all: false }, (err, address, family) => {
+    if (err) return cb(err, address as unknown as string, family as unknown as number);
+    if (isPrivateIp(address)) {
+      return cb(new Error(`目標 IP ${address} 在私網/保留範圍(防 SSRF DNS-rebinding)`), address, family);
+    }
+    cb(null, address, family);
+  });
+}
+
 /** 下載附件到本地,返回落盤路徑。 */
 export async function materializeAttachment(ref: AttachmentRefLike): Promise<string> {
   const url = String(ref.url ?? "");
-  await validateDownloadUrl(url);
+  await validateDownloadUrl(url); // 早拒:scheme / 字面私網
+  const u = new URL(url);
+  const isLocalHttp = u.protocol === "http:";
+  const mod = u.protocol === "https:" ? https : http;
   const dir = join(attachDir(), String(ref.id ?? "att").replace(/[^\w\-]+/g, "_"));
   mkdirSync(dir, { recursive: true });
   const path = join(dir, sanitizeName(String(ref.name ?? "file")));
-  const res = await fetch(url, { headers: { "user-agent": "macchiato-codex-connector" }, redirect: "error" });
-  if (!res.ok || !res.body) throw new Error(`下載失敗 HTTP ${res.status}`);
+  // #249 node http/https 默認不跟隨重定向 → 順帶堵死 redirect-based SSRF;https 掛 pinnedLookup 校驗實際 IP。
+  const res: IncomingMessage = await new Promise((resolve, reject) => {
+    const req = mod.get(
+      url,
+      { headers: { "user-agent": "macchiato-codex-connector" }, ...(isLocalHttp ? {} : { lookup: pinnedLookup }) },
+      (r) => {
+        const code = r.statusCode ?? 0;
+        if (code >= 300) {
+          r.resume();
+          return reject(new Error(`下載失敗/拒重定向 HTTP ${code}`));
+        }
+        resolve(r);
+      },
+    );
+    req.on("error", reject);
+    req.setTimeout(60_000, () => req.destroy(new Error("下載超時")));
+  });
   let written = 0;
+  const out = createWriteStream(path);
   const counter = new Writable({
     write(chunk: Buffer, _enc, cb) {
       written += chunk.length;
@@ -110,8 +151,7 @@ export async function materializeAttachment(ref: AttachmentRefLike): Promise<str
       out.end(cb);
     },
   });
-  const out = createWriteStream(path);
-  await pipeline(Readable.fromWeb(res.body as import("stream/web").ReadableStream), counter);
+  await pipeline(res, counter);
   return path;
 }
 

@@ -11,7 +11,7 @@
  *
  * env `MACCHIATO_OPENCLAW_TITLE_MODE`:summary(默認,經用戶 agent 生成)/ firstmsg(截斷,零 LLM)/ off。
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { OpenClawGateway } from "./gateway";
@@ -111,18 +111,26 @@ function titledPath(): string {
 }
 
 export function loadTitled(): Set<string> {
-  try {
-    const arr = JSON.parse(readFileSync(titledPath(), "utf8"));
-    return new Set(Array.isArray(arr) ? arr.map(String) : []);
-  } catch {
-    return new Set();
+  // #248 主檔壞/缺 → 試 .bak(此前非原子直寫,損壞回空集 → 手改標題被重新生成覆蓋)。
+  for (const path of [titledPath(), titledPath() + ".bak"]) {
+    try {
+      const arr = JSON.parse(readFileSync(path, "utf8"));
+      return new Set(Array.isArray(arr) ? arr.map(String) : []);
+    } catch {
+      /* 試下一個 */
+    }
   }
+  return new Set();
 }
 
 export function saveTitled(titled: Set<string>): void {
   try {
     mkdirSync(dirname(titledPath()), { recursive: true });
-    writeFileSync(titledPath(), JSON.stringify([...titled]));
+    // #248 tmp+rename 原子寫 + .bak 輪替(此前直寫,崩在寫一半即損壞回空集、手改標題被覆蓋)。
+    const tmp = titledPath() + ".tmp";
+    writeFileSync(tmp, JSON.stringify([...titled]));
+    if (existsSync(titledPath())) renameSync(titledPath(), titledPath() + ".bak");
+    renameSync(tmp, titledPath());
   } catch (e) {
     console.error("[titled save failed]", (e as Error).message);
   }
