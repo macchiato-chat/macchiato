@@ -21,7 +21,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.5.29";
+const CONNECTOR_VERSION = "1.5.30";
 
 /** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
 function runSelfUpdate(): void {
@@ -62,6 +62,8 @@ async function main(): Promise<void> {
   // 只在 ready 對 openclaw 發空 registry、fire-and-forget,無回應期待)。Projects 走 cc/codex/hermes。
   const drive = new Drive(gw, linkb, mirror, e2e);
   drive.wire(); // tui 幀（prompt.submit/interrupt）+ OpenClaw 事件 → 流式回傳
+  // #261 首連顯式訂閱 session 事件流(onGatewayConnected 只在重連 fire;wire 已註冊 onEvent → 不漏事件)。
+  void drive.subscribeSessionEvents();
   new CommandsReporter(gw, linkb).start(); // #199 skill 清單上報(/菜單數據源;失敗只缺菜單)
   linkb.onFrame((msg) => {
     if (msg.t === "mirror_nack" && typeof msg.batchId === "number") mirror.handleNack(msg.batchId);

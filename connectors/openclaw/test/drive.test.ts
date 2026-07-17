@@ -463,3 +463,99 @@ describe("#158 出站附件", () => {
     expect(Buffer.from(media.frame.params.payload.data_b64, "base64").toString()).toBe("IMGDATA");
   });
 });
+
+describe("#261 live 工具事件(session.tool → tool.start/complete)", () => {
+  // 真實 payload 形狀來自 live 捕獲:start 帶 args 無 result,result 反之,同 toolCallId 配對。
+  const start = (KEY: string) => ({
+    event: "session.tool",
+    payload: { sessionKey: KEY, runId: "r1", data: {
+      phase: "start", name: "bash", itemId: "call_X", toolCallId: "call_X",
+      meta: "print text (agent)", args: { command: "/bin/bash -lc 'echo hi'", cwd: "/w" },
+    } },
+  });
+  const result = (KEY: string, over: Record<string, unknown> = {}) => ({
+    event: "session.tool",
+    payload: { sessionKey: KEY, runId: "r1", data: {
+      phase: "result", name: "bash", itemId: "call_X", toolCallId: "call_X", meta: "print text (agent)",
+      status: "completed", isError: false, result: { status: "completed", exitCode: 0, durationMs: 1500 }, ...over,
+    } },
+  });
+
+  it("phase=start → tool.start(tool_id/name/context/args_text)", async () => {
+    const { gw, linkb, sent } = makeDrive();
+    const KEY = `${MACCHIATO_PREFIX}01sid`;
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "跑個命令" })); // 登記 driven
+    sent.length = 0;
+    gw.fire(start(KEY));
+    expect(sent).toHaveLength(1);
+    const f = sent[0].frame.params;
+    expect(f.type).toBe("tool.start");
+    expect(f.session_id).toBe("01SID"); // 回傳用 server 的原始 sid
+    expect(f.payload).toMatchObject({ tool_id: "call_X", name: "bash", context: "print text (agent)" });
+    expect(f.payload.args_text).toBe(JSON.stringify({ command: "/bin/bash -lc 'echo hi'", cwd: "/w" }));
+  });
+
+  it("phase=result → tool.complete(args/result/duration_s/result_text)", async () => {
+    const { gw, linkb, sent } = makeDrive();
+    const KEY = `${MACCHIATO_PREFIX}01sid`;
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "x" }));
+    sent.length = 0;
+    gw.fire(result(KEY));
+    expect(sent).toHaveLength(1);
+    const f = sent[0].frame.params;
+    expect(f.type).toBe("tool.complete");
+    expect(f.payload).toMatchObject({ tool_id: "call_X", name: "bash", duration_s: 1.5, result_text: "exit 0" });
+    expect(f.payload.result).toMatchObject({ exitCode: 0, status: "completed" });
+    expect(f.payload.args).toEqual({}); // result 事件無 args → 空對象
+  });
+
+  it("isError → result_text 帶 (error) + 失敗狀態", async () => {
+    const { gw, linkb, sent } = makeDrive();
+    const KEY = `${MACCHIATO_PREFIX}01sid`;
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "x" }));
+    sent.length = 0;
+    gw.fire(result(KEY, { isError: true, status: "failed", result: { status: "failed", exitCode: 1, durationMs: 0 } }));
+    const f = sent[0].frame.params;
+    expect(f.payload.result_text).toBe("exit 1 failed (error)");
+  });
+
+  it("非 driven 會話的 session.tool 忽略", async () => {
+    const { gw, sent } = makeDrive();
+    gw.fire(start("agent:main:discord:channel:7"));
+    expect(sent).toEqual([]);
+  });
+
+  it("E2E 會話不發明文工具卡", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    process.env.MACCHIATO_OPENCLAW_TITLE_MODE = "off";
+    const { E2EKeyStore } = await import("../src/e2e/keys");
+    const store = new E2EKeyStore(join(mkdtempSync(join(tmpdir(), "occ-tool-e2e-")), "e2e.json"));
+    const calls: any[] = [];
+    const gw: any = { handlers: [] as any[], onEvent(h: any) { this.handlers.push(h); },
+      async request(m: string, p: any) { calls.push({ method: m, params: p }); return { status: "started" }; },
+      fire(evt: any) { for (const h of this.handlers) h(evt); } };
+    const sent: any[] = [];
+    const linkb: any = { agentLinkId: "al1", handlers: [] as any[], onFrame(h: any) { this.handlers.push(h); },
+      send(m: any) { sent.push(m); }, async deliver(m: any) { for (const h of this.handlers) await h(m); } };
+    const { Drive } = await import("../src/openclaw/drive");
+    const d = new Drive(gw, linkb, { setDriven() {}, fastForward() {} } as any, store);
+    d.wire();
+    const SID = "01TOOLE2E";
+    store.getOrCreateKey(SID); // 開 E2E
+    await linkb.deliver({ t: "tui", sessionId: SID, frame: { method: "prompt.submit", params: { session_id: SID, text: store.encryptText(SID, "祕密") } } });
+    const KEY = `${MACCHIATO_PREFIX}${SID.toLowerCase()}`;
+    sent.length = 0;
+    gw.fire(start(KEY));
+    gw.fire(result(KEY));
+    expect(sent.filter((m) => m.t === "tui")).toEqual([]); // 無明文工具卡
+  });
+
+  it("(重)連時 sessions.subscribe(否則收不到 session.tool)", async () => {
+    const { gw, calls } = makeDrive();
+    gw.triggerConnected();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(calls.some((c) => c.method === "sessions.subscribe")).toBe(true);
+  });
+});

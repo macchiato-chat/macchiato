@@ -35,6 +35,32 @@ function driveStatePath(): string {
   return process.env.MACCHIATO_OPENCLAW_DRIVE || join(homedir(), ".macchiato/openclaw-drive.json");
 }
 
+/** #261 工具卡 args_text:JSON 化(截斷,防超大 args 撐爆幀)。 */
+function previewJson(v: unknown): string {
+  try {
+    const s = typeof v === "string" ? v : JSON.stringify(v);
+    return s.length > 2000 ? s.slice(0, 2000) + "…" : s;
+  } catch {
+    return "";
+  }
+}
+
+/** #261 工具卡 result_text:從 session.tool result 提一行人類可讀摘要(exec 給 exit/status;
+ * session.tool 的 bash result 只帶 {status,exitCode,durationMs},不含 stdout——回覆正文另有)。 */
+function toolResultText(d: Record<string, unknown>): string {
+  const r = d.result;
+  if (r && typeof r === "object") {
+    const ro = r as Record<string, unknown>;
+    const parts: string[] = [];
+    if (typeof ro.exitCode === "number") parts.push(`exit ${ro.exitCode}`);
+    if (typeof ro.status === "string" && ro.status !== "completed") parts.push(String(ro.status));
+    if (d.isError) parts.push("(error)");
+    return parts.join(" ").trim();
+  }
+  if (typeof r === "string") return r.slice(0, 2000);
+  return d.isError ? "(error)" : "";
+}
+
 export class Drive {
   /** key → runId（回合進行中）。 */
   private readonly active = new Map<string, string>();
@@ -125,7 +151,21 @@ export class Drive {
   /** #242 gateway (重)連:斷線窗內 lifecycle end 可能已丟——active/回合態全部作廢,
    * 免得後續 prompt 恆走 sessions.steer 打向已死回合、排隊的帶附件跟進永不送達
    * (OpenClaw 每日自動更新 = gateway 重啟是常態,#210)。重置後先對賬補漏,再續投隊列。 */
+  /** #261 訂閱 session 事件流(session.tool/message/operation)——連接器默認只收 agent/chat 廣播,
+   * 不訂閱就永遠收不到 session.tool、回合進行中的工具塊無從實時映射。訂閱是 per-connection、斷連即
+   * 失效:首連由 index.ts 顯式調(onGatewayConnected 只在**重連** fire、不覆蓋首連),重連走本方法。
+   * 失敗只記日誌不擋後續。 */
+  async subscribeSessionEvents(): Promise<void> {
+    try {
+      await this.gw.request("sessions.subscribe", {});
+      console.log("· #261 sessions.subscribe ok(live 工具事件 session.tool 已訂閱)");
+    } catch (e) {
+      console.error("[sessions.subscribe failed]", (e as Error).message);
+    }
+  }
+
   private async onGatewayConnected(): Promise<void> {
+    await this.subscribeSessionEvents(); // #261 重連要重訂(per-connection、斷連即失效)
     const stale = new Set([...this.active.keys(), ...this.pendingFollowUps.keys()]);
     this.active.clear();
     this.started.clear(); // 斷線期的 runId 條目一併作廢(否則只在 lifecycle end 清 → 洩漏)
@@ -457,6 +497,40 @@ export class Drive {
         void this.reconcileTurnEnd(key, sid); // #202 回填 srcId + 推水位線(fire-and-forget)
         void this.flushFollowUps(key); // #162 排隊的帶附件跟進 → chat.send 續投
       }
+      return;
+    }
+
+    // #261 live 工具事件:gateway 廣播 session.tool(需 sessions.subscribe,見 onGatewayConnected)。
+    // 把回合進行中的工具塊實時映射成 Macchiato tool.start/tool.complete(對齊 CC/codex 的工具卡);
+    // 此前工具塊只在回合末靠鏡像打撈補進歷史 → 回合進行中 app 端一片空白。同 toolCallId 配對:
+    // start 帶 args 無 result、result 反之。E2E 跳過(不發明文卡,內容只走加密鏡像批)。
+    if (evt.event === "session.tool") {
+      if (isE2E) return;
+      const d = (p.data ?? {}) as Record<string, any>;
+      const toolId = String(d.toolCallId ?? d.itemId ?? "");
+      if (!toolId) return;
+      const name = String(d.name ?? "tool");
+      const meta = typeof d.meta === "string" && d.meta ? d.meta : undefined;
+      if (d.phase === "start") {
+        this.emit(sid, "tool.start", {
+          tool_id: toolId,
+          name,
+          ...(meta ? { context: meta } : {}),
+          ...(d.args !== undefined ? { args_text: previewJson(d.args) } : {}),
+        });
+      } else if (d.phase === "result") {
+        const args = d.args && typeof d.args === "object" ? (d.args as Record<string, unknown>) : {};
+        const durMs = Number((d.result as Record<string, unknown>)?.durationMs);
+        this.emit(sid, "tool.complete", {
+          tool_id: toolId,
+          name,
+          args,
+          result: d.result ?? { status: d.status ?? "completed", isError: !!d.isError },
+          ...(Number.isFinite(durMs) && durMs > 0 ? { duration_s: durMs / 1000 } : {}),
+          ...(toolResultText(d) ? { result_text: toolResultText(d) } : {}),
+        });
+      }
+      // phase==="update"(增量進度)→ v1 不映射(回合末鏡像打撈仍兜底保真)。
       return;
     }
 
