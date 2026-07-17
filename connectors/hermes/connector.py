@@ -66,7 +66,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.28"
+CONNECTOR_VERSION = "1.5.29"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -85,8 +85,6 @@ def _projects_reg_path() -> str:
 
 
 def _mem_hash(s: str) -> str:
-    import hashlib
-
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 MIRROR_PRUNE_S = float(os.environ.get("MACCHIATO_MIRROR_PRUNE_S", str(30 * 24 * 3600)))  # #9 水位線閒置多久可裁
 # 自驅會話 id 映射持久化：server sid（ULID）→ state.db 會話 id（gateway session_key）。
@@ -1765,7 +1763,7 @@ class Connector:
                 prev = self._proj_last_hash.get(canon)
                 self._proj_last_hash[canon] = h
                 if prev is not None and prev != h:
-                    asyncio.get_event_loop().create_task(self._send({
+                    asyncio.get_running_loop().create_task(self._send({
                         "t": "project_mem_changed", "agentLinkId": self.agent_link_id,
                         "path": server_path, "content": content, "hash": h,
                     }))

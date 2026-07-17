@@ -166,4 +166,34 @@ describe("#236 seeded 基線語義(pollOnce 核心路徑)", () => {
     expect(sent.filter((x) => x.t === "mirror_append")).toHaveLength(0);
     expect(m.state.seeded).toBe(true);
   });
+
+  it("#268 driven 會話只快進不投遞(live 獨佔)", async () => {
+    const { Mirror, rollout, appendFileSync, line } = await mkWorld();
+    rollout(T1, "存量");
+    const sent: any[] = [];
+    const m: any = new Mirror({ agentLinkId: "al", isReady: true, send: (x: any) => sent.push(x), onFrame: () => () => {} } as any);
+    m.pollOnce(); // seeded
+    m.setDriven(T2); // T2 標為 driven(live 路徑獨佔)
+    const f = rollout(T2, "driven 首拍");
+    appendFileSync(f, line("agent_message", "driven 回覆"));
+    m.pollOnce();
+    expect(sent.filter((x) => x.t === "mirror_append")).toHaveLength(0); // driven → 不鏡像投遞
+    expect(m.state.offsets[T2]).toBeGreaterThan(0); // 只快進水位線
+  });
+
+  it("#268 mirror_nack 回退水位線 → 重發同批", async () => {
+    const { Mirror, rollout } = await mkWorld();
+    rollout(T1, "存量");
+    const sent: any[] = [];
+    const m: any = new Mirror({ agentLinkId: "al", isReady: true, send: (x: any) => sent.push(x), onFrame: () => () => {} } as any);
+    m.pollOnce(); // seeded
+    rollout(T2, "要被 nack 的消息");
+    m.pollOnce();
+    const batch = sent.filter((x) => x.t === "mirror_append").at(-1);
+    expect(batch.sessions[0].messages[0].text).toBe("要被 nack 的消息");
+    m.handleNack(batch.batchId); // 回退
+    m.pollOnce();
+    const re = sent.filter((x) => x.t === "mirror_append").at(-1);
+    expect(re.sessions[0].messages[0].text).toBe("要被 nack 的消息"); // 重發
+  });
 });

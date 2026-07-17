@@ -11,6 +11,7 @@ import { E2EKeyStore } from "./e2e/keys";
 import { Mirror } from "./codex/mirror";
 import { announceImportAvailable, runImport } from "./codex/history-import";
 import { Drive, workDir } from "./codex/drive";
+import { gcTitlegenResidue } from "./codex/titles";
 import { AppServerClient } from "./codex/appserver";
 import { Projects } from "./codex/projects";
 import { ModelsReporter } from "./codex/models";
@@ -19,7 +20,7 @@ import { HealthLoop } from "./health";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.5.28";
+const CONNECTOR_VERSION = "1.5.29";
 
 function runSelfUpdate(): void {
   // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。
@@ -67,7 +68,9 @@ async function main(): Promise<void> {
       console.log("· 引擎:app-server v2(#132,握手成功)");
     } catch (e) {
       appClient.close();
-      console.error(`· app-server 探活失敗(${(e as Error).message.slice(0, 150)})→ 回退 exec v1`);
+      // #268 日誌帶「引擎:exec v1」統一格式,回歸腳本據此斷言引擎(此前「回退 exec v1」regex 抓不到、
+      // v2 靜默降級只能靠超時發現)。
+      console.error(`· 引擎:exec v1(app-server 探活失敗回退:${(e as Error).message.slice(0, 150)})`);
       drive = new Drive(linkb, mirror, e2e, projects);
     }
   }
@@ -91,6 +94,7 @@ async function main(): Promise<void> {
 
   drive.flushAbandonedTurns(); // #200 上個進程死於回合中途 → 提示重發(消滅靜默無響應)
 
+  gcTitlegenResidue(); // #267 清掃殘留的 codex-titlegen-* 臨時目錄(SIGKILL 時 auth.json 副本殘留)
   announceImportAvailable(linkb); // app 的「導入」入口據此顯示
   mirror.start();
 

@@ -16,13 +16,12 @@ import { E2EKeyStore } from "./e2e/keys";
 import { CommandsReporter } from "./openclaw/commands";
 import { HealthLoop } from "./health";
 import { runVerifiedSelfUpdate } from "./selfupdate";
-import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 // §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION（發版三處同步 bump）。
-const CONNECTOR_VERSION = "1.5.28";
+const CONNECTOR_VERSION = "1.5.29";
 
 /** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
 function runSelfUpdate(): void {

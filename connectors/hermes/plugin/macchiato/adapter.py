@@ -44,6 +44,25 @@ def _is_connected(config: PlatformConfig) -> bool:
     return os.path.exists(PUSH_SOCK)
 
 
+def _chunk_message(content: str, max_len: int) -> list:
+    """#263 超長消息分片:優先在換行/段落邊界切,實在沒有才硬切。至少返回一片(空串照發)。"""
+    if len(content) <= max_len:
+        return [content]
+    chunks: list = []
+    rest = content
+    while len(rest) > max_len:
+        window = rest[:max_len]
+        # 在窗口內找最後一個換行作切點(避免切斷單詞/行);找不到就硬切。
+        cut = window.rfind("\n")
+        if cut < max_len // 2:  # 換行太靠前(整段無換行)→ 硬切
+            cut = max_len
+        chunks.append(rest[:cut].rstrip("\n"))
+        rest = rest[cut:].lstrip("\n")
+    if rest:
+        chunks.append(rest)
+    return chunks or [content]
+
+
 async def _push_to_connector(
     chat_id: str,
     content: str,
@@ -102,26 +121,24 @@ class MacchiatoAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        if len(content) > self.MAX_MESSAGE_LENGTH:
-            content = content[: self.MAX_MESSAGE_LENGTH - 1] + "…"
-        try:
-            ack = await _push_to_connector(chat_id, content, reply_to, metadata)
-        except (FileNotFoundError, ConnectionRefusedError) as exc:
-            # 連接器沒在跑 / socket 不在 → 瞬時錯，可重試。
-            return SendResult(success=False, error=f"connector unreachable: {exc}", retryable=True)
-        except asyncio.TimeoutError:
-            return SendResult(success=False, error="connector timeout", retryable=True)
-        except Exception as exc:
-            logger.error("[macchiato] send failed: %r", exc)
-            return SendResult(success=False, error=str(exc))
-
-        if ack.get("ok"):
-            return SendResult(success=True, message_id=ack.get("messageId"))
-        return SendResult(
-            success=False,
-            error=ack.get("error") or "push rejected",
-            retryable=bool(ack.get("retryable")),
-        )
+        # #263 超長消息**分片**而非硬截斷("…"丟尾)——按 MAX 切段依序投遞,不丟內容。
+        chunks = _chunk_message(content, self.MAX_MESSAGE_LENGTH)
+        last_id = None
+        for i, chunk in enumerate(chunks):
+            try:
+                # 只有首片帶 reply_to(回覆錨定首片);metadata 每片都帶(源身份等)。
+                ack = await _push_to_connector(chat_id, chunk, reply_to if i == 0 else None, metadata)
+            except (FileNotFoundError, ConnectionRefusedError) as exc:
+                return SendResult(success=False, error=f"connector unreachable: {exc}", retryable=True)
+            except asyncio.TimeoutError:
+                return SendResult(success=False, error="connector timeout", retryable=True)
+            except Exception as exc:
+                logger.error("[macchiato] send failed: %r", exc)
+                return SendResult(success=False, error=str(exc))
+            if not ack.get("ok"):
+                return SendResult(success=False, error=ack.get("error") or "push rejected", retryable=bool(ack.get("retryable")))
+            last_id = ack.get("messageId")
+        return SendResult(success=True, message_id=last_id)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id or "Macchiato", "type": "channel"}
@@ -144,15 +161,24 @@ async def _standalone_send(
 
     被 ``tools/send_message_tool`` 在 gateway runner 不在本進程時調用（cron 常見）。
     """
-    try:
-        ack = await _push_to_connector(
-            chat_id, message, metadata={"thread_id": thread_id} if thread_id else None
+    # #263 帶圖的主動投遞:proactive media 需連接器+server 配合(materialize→media.attach 到投遞
+    # 會話),見 follow-up。此前**靜默丟**——改為顯式日誌,不再無感知丟圖。
+    if media_files:
+        logger.warning(
+            "[macchiato] 主動投遞的 %d 個附件暫不支持(proactive media 待做),僅發文字。files=%r",
+            len(media_files), [str(f)[:80] for f in media_files],
         )
+    meta = {"thread_id": thread_id} if thread_id else None
+    last_id = None
+    try:
+        for i, chunk in enumerate(_chunk_message(message, MacchiatoAdapter.MAX_MESSAGE_LENGTH)):  # #263 分片
+            ack = await _push_to_connector(chat_id, chunk, metadata=meta)
+            if not ack.get("ok"):
+                return {"error": ack.get("error") or "push rejected"}
+            last_id = ack.get("messageId")
     except Exception as exc:
         return {"error": str(exc)}
-    if ack.get("ok"):
-        return {"success": True, "message_id": ack.get("messageId")}
-    return {"error": ack.get("error") or "push rejected"}
+    return {"success": True, "message_id": last_id}
 
 
 def register(ctx) -> None:

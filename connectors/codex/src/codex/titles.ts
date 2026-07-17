@@ -5,10 +5,28 @@
  * env MACCHIATO_CODEX_TITLE_MODE:summary(默認)/ firstmsg(截斷,零調用)/ off。
  */
 import { spawn } from "node:child_process";
-import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveCodexBin } from "./codex-bin";
+
+/** #267 啟動清掃殘留的 codex-titlegen-* 臨時目錄(v1 標題把 auth.json 拷進 /tmp;SIGKILL 時
+ * finally 不跑會殘留憑證副本)。啟動時掃一次,best-effort。 */
+export function gcTitlegenResidue(): void {
+  try {
+    for (const name of readdirSync(tmpdir())) {
+      if (name.startsWith("codex-titlegen-")) {
+        try {
+          rmSync(join(tmpdir(), name), { recursive: true, force: true });
+        } catch {
+          /* 單個失敗不擋其餘 */
+        }
+      }
+    }
+  } catch {
+    /* tmpdir 讀失敗無妨 */
+  }
+}
 
 export type TitleMode = "summary" | "firstmsg" | "off";
 
