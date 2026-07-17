@@ -66,7 +66,7 @@ from backfill import (
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
 # §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
 # 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.26"
+CONNECTOR_VERSION = "1.5.27"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
@@ -821,6 +821,11 @@ class Connector:
                 real = (res or {}).get("session_id") or target
                 print(f"· resumed hermes session {real}（帶上下文續聊，target={target}）")
                 break
+            except GatewayDied:
+                # #251(#1):gateway 重啟中 ≠ 會話不存在——GatewayDied 是「請求沒送達」,不是「無此會話」。
+                # 此前被 except GatewayError 一起吞、誤走 create 建了個空會話,原會話上下文丟失(agent「失憶」)。
+                # 上拋,讓調用方等 gateway 就緒後重投(帶持久映射 resume,上下文不丟)。
+                raise
             except GatewayError:
                 continue
         if real is None:
@@ -1878,13 +1883,13 @@ class Connector:
                 # #148:慢路徑(resume 往返/附件下載/STT)出讀循環——經 per-session 串行鏈派發,
                 # 某會話的大附件/慢 STT 不再 head-of-line 阻塞其他會話。同會話仍按序。
                 async def _do_prompt(params=params, server_sid=server_sid):
-                    real = await self._ensure_session(server_sid)
+                    # #251(#1):文本裝配(標題/解密/STT)提前到 _ensure_session **之前**——這樣 gateway
+                    # 死於建會話時,能拿已裝配好的 final_text 走重投(而非 _ensure_session 誤建空會話)。
                     attachments = params.get("attachments") or []
                     parts = []
                     base = (params.get("text") or "").strip()
-                    # #94：Macchiato 發起的會話(全走 prompt.submit;渠道會話是鏡像來的、不走這)首次發話 →
-                    # **立即**用首條 user 文本自動生成標題(越早越好),復用 Hermes 自身 title_generator。
-                    # E2E 跳過(明文);已標題過(state.db 有標題)跳過。_titled 防會話內重複。
+                    # #94：Macchiato 發起的會話首次發話 → 立即用首條 user 文本自動生成標題(越早越好)。
+                    # E2E 跳過(明文);已標題過跳過;_titled 防會話內重複。
                     if base and server_sid not in self._titled and not self._e2e.is_e2e(server_sid):
                         self._titled.add(server_sid)
                         asyncio.create_task(self._auto_title(server_sid, base))
@@ -1897,29 +1902,36 @@ class Connector:
                             base = ""  # 解不開 → 不把亂碼提交給 agent
                     if base:
                         parts.append(base)
+                    non_audio_refs = [r for r in attachments if r.get("kind") != "audio"]
                     for ref in attachments:
                         if ref.get("kind") == "audio":
                             # 語音輸入：本地 STT 轉錄 → 回填 server（顯示在 user 氣泡）+ 拼進發給 agent 的文字。
                             res = await asyncio.to_thread(_transcribe_attachment, ref)
                             transcript = (res.get("text") or "").strip()
-                            await self._send_voice_transcript(
-                                server_sid, ref.get("id"), transcript, res.get("error")
-                            )
+                            await self._send_voice_transcript(server_sid, ref.get("id"), transcript, res.get("error"))
                             if transcript:
                                 parts.append(transcript)
-                            continue
+                    final_text = "\n\n".join(parts)
+                    # 純語音且轉錄為空（STT 不可用/沒聽清）→ 不打擾 agent（server 已落兜底提示）。
+                    non_audio = any(r.get("kind") != "audio" for r in attachments)
+                    if not (final_text or non_audio or not attachments):
+                        print("· 語音轉錄為空，跳過提交 agent（server 已落兜底）")
+                        return
+                    # 建/續會話。#251(#1):gateway 死於此 → 後台重投(帶已裝配 final_text + 非語音附件),
+                    # 而非誤建空會話丟上下文。_ensure_session 已對 GatewayDied 上拋(不誤走 create)。
+                    try:
+                        real = await self._ensure_session(server_sid)
+                    except GatewayDied:
+                        self._retry_tasks[server_sid] = asyncio.create_task(
+                            self._retry_prompt(server_sid, final_text, non_audio_refs)
+                        )
+                        return
+                    for ref in non_audio_refs:
                         try:
                             await self._attach_to_session(real, ref)
                         except Exception as exc:
                             print(f"[attach failed {ref.get('name')!r}] {exc!r}", file=sys.stderr)
-                    final_text = "\n\n".join(parts)
-                    # 純語音且轉錄為空（STT 不可用/沒聽清）→ 不打擾 agent（server 已落兜底提示）。
-                    non_audio = any(r.get("kind") != "audio" for r in attachments)
-                    if final_text or non_audio or not attachments:
-                        non_audio_refs = [r for r in attachments if r.get("kind") != "audio"]
-                        await self._submit_final(server_sid, real, final_text, non_audio_refs)
-                    else:
-                        print("· 語音轉錄為空，跳過提交 agent（server 已落兜底）")
+                    await self._submit_final(server_sid, real, final_text, non_audio_refs)
                 self._dispatch_session(server_sid, _do_prompt)
             elif method == "command.invoke":
                 # #199 命令/技能調用(composer / 菜單選中):**兩步**——prompt.submit 不展開 /slug
@@ -1943,11 +1955,16 @@ class Connector:
                     print(f"· #199 command.invoke /{name} → {server_sid}(展開 {len(text)} 字)")
                 self._dispatch_session(server_sid, _do_invoke)
             elif method == "approval.respond":
-                real = await self._ensure_session(server_sid)
-                await self.gw.request(
-                    "approval.respond",
-                    {"session_id": real, "choice": params.get("choice", "deny"), "all": params.get("all", False)},
-                )
+                # #251(#4):此前在讀循環內聯調 _ensure_session,與同會話 _do_prompt 的
+                # _ensure_session 併發 → 雙 create、_fwd 覆寫、洩漏 gateway 會話。掛進 per-session
+                # 串行鏈,和 prompt/invoke 排同一隊(審批發生在回合中、鏈通常已空,不增延遲)。
+                async def _do_approval(params=params, server_sid=server_sid):
+                    real = await self._ensure_session(server_sid)
+                    await self.gw.request(
+                        "approval.respond",
+                        {"session_id": real, "choice": params.get("choice", "deny"), "all": params.get("all", False)},
+                    )
+                self._dispatch_session(server_sid, _do_approval)
             elif method == "session.interrupt":
                 # #5:重投等待期(#4)收到中斷 → 取消重投——用戶已叫停的 prompt 不許復活雙發。
                 rt = self._retry_tasks.pop(server_sid, None)
@@ -1966,20 +1983,26 @@ class Connector:
                 # #227 cwd:草稿期傳來的工作目錄。未建會話 → 存起來,create 時帶上;已建 → session.cwd.set
                 # 中途改(gateway 支持;session busy=agent 回覆過返 4009,Macchiato 側本就鎖 cwd、不該發)。
                 cwd = str(params.get("cwd") or "").strip()
+                # cwd 存儲同步(_do_prompt 的 _ensure_session 讀 self._cwds)——先於下面的建會話派發。
                 if cwd:
                     self._cwds[server_sid] = cwd
                 else:
                     self._cwds.pop(server_sid, None)
-                real = self._fwd.get(server_sid)
-                if real is None:
-                    await self._ensure_session(server_sid)
-                elif cwd:
-                    try:
-                        await self.gw.request("session.cwd.set", {"session_id": real, "cwd": cwd})
-                        print(f"· #227 session.cwd.set {real} → {cwd}")
-                    except GatewayError as exc:
-                        if exc.code != 4009:  # 4009=busy(已鎖),其餘上拋
-                            raise
+
+                # #251(#4):建會話/改 cwd 的 gateway 調用掛進 per-session 串行鏈,不再在讀循環內聯
+                # 與 _do_prompt 的 _ensure_session 併發雙 create。
+                async def _do_create(server_sid=server_sid, cwd=cwd):
+                    real = self._fwd.get(server_sid)
+                    if real is None:
+                        await self._ensure_session(server_sid)
+                    elif cwd:
+                        try:
+                            await self.gw.request("session.cwd.set", {"session_id": real, "cwd": cwd})
+                            print(f"· #227 session.cwd.set {real} → {cwd}")
+                        except GatewayError as exc:
+                            if exc.code != 4009:  # 4009=busy(已鎖),其餘上拋
+                                raise
+                self._dispatch_session(server_sid, _do_create)
             elif method == "session.archive":
                 await self._set_hermes_archived(server_sid, bool(params.get("archived", True)))
             elif method == "session.delete":
