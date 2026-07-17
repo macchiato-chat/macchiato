@@ -389,8 +389,29 @@ export class Drive {
     return this.efforts[sid] || process.env.MACCHIATO_CC_EFFORT || undefined;
   }
 
+  /** #266 sid → 內容型幀(prompt.submit/command.invoke)的串行鏈。附件下載(await materialize)慢時,
+   * 後到的純文本此前會超車 startTurn、附件幀反被 steer 打斷 → 順序反轉。串行保序。 */
+  private readonly frameChain = new Map<string, Promise<void>>();
+
   wire(): void {
-    this.linkb.onFrame((m) => void this.onServerFrame(m));
+    this.linkb.onFrame((m) => this.routeFrame(m));
+  }
+
+  /** #266 內容型幀 per-sid 串行(保序);其餘(interrupt/approval/session.* 等)即時,不被慢下載堵住。 */
+  private routeFrame(msg: Record<string, unknown>): void {
+    const frame = (msg.frame ?? {}) as { method?: string; params?: Record<string, unknown> };
+    const method = frame.method;
+    const sid = (msg.sessionId ?? frame.params?.session_id) as string | undefined;
+    if (sid && (method === "prompt.submit" || method === "command.invoke")) {
+      const prev = this.frameChain.get(sid) ?? Promise.resolve();
+      const next = prev.then(() => this.onServerFrame(msg)).catch((e) => console.error(`[frame ${method} ${sid}] ${(e as Error).message}`));
+      this.frameChain.set(sid, next);
+      void next.finally(() => {
+        if (this.frameChain.get(sid) === next) this.frameChain.delete(sid);
+      });
+    } else {
+      void this.onServerFrame(msg);
+    }
   }
 
   /** #118 關停:回收全部通道(CLI 進程),供 index.ts shutdown 調用。 */
@@ -1041,6 +1062,12 @@ export class Drive {
       if (!this.map[sid] && !CC_UUID_RE.test(sid)) {
         this.map[sid] = m.session_id;
         this.saveMap();
+      } else if (this.map[sid] && this.map[sid] !== m.session_id && !CC_UUID_RE.test(sid)) {
+        // #266:CLI 給的 session_id 與既有映射不一致(如 CLI resume 時 fork 出新 uuid)——此前無感知,
+        // 後續仍 resume 舊 uuid → 上下文丟失,且 fork 的新 transcript 被鏡像撈成影子。至少打斷言日誌 +
+        // 計數(對齊 mirrorGhostBlocked 絆線哲學);markDrivenUuid 已把新 uuid 登記為被驅動、防影子。
+        this.counters.initMapMismatch = (this.counters.initMapMismatch ?? 0) + 1;
+        console.error(`[#266 init session_id 不一致 sid=${sid} 映射=${this.map[sid]} 新=${m.session_id}(CLI fork/resume?)——仍用舊映射,新 uuid 已登記防影子]`);
       }
       this.mirror?.setDriven(m.session_id); // 本回合 live 獨佔(per-turn)
       this.mirror?.markDrivenUuid(m.session_id); // 影子兜底:永久登記此 CLI uuid 為「被驅動過」
@@ -1268,9 +1295,10 @@ export class Drive {
     }
     // #94：標題已在回合開頭立即生成(見 startTurn),此處不重複。回合末補寫回 transcript
     // (終端也見同一標題;ccSid 此時已建立)——只寫回,不重新生成(genTitle 由早期生成緩存)。
-    if (turn.isFirstMacchiatoTurn && cc && this.genTitle) {
-      void renameSession(cc, this.genTitle).catch(() => {});
-      this.genTitle = undefined;
+    const gt = this.genTitle.get(sid); // #266 per-sid,不再被並發首回合互相覆蓋
+    if (turn.isFirstMacchiatoTurn && cc && gt) {
+      void renameSession(cc, gt).catch(() => {});
+      this.genTitle.delete(sid);
     }
     ch.turn = undefined;
     this.pending.delete(sid); // #200 回合正常收尾 → 出在途集(有續投則 startTurn 再加回)
@@ -1312,7 +1340,11 @@ export class Drive {
       }
       console.error(`[turn failed for ${sid}] ${err?.message ?? "channel closed mid-turn"}`);
       const interrupted = this.interruptedSids.delete(sid);
-      if (!turn.isE2E) {
+      if (turn.isE2E) {
+        // #266 E2E 通道崩潰也要定稿:走加密批(user 消息 + 已累積回覆/錯誤註記),並清 pendingUser——
+        // 此前只走非 E2E 分支、pendingUser 不清,用戶消息滯留、隨下個成功回合的加密批串出去。
+        this.sendE2ETurn(sid, turn.acc || `(error: ${err?.message ?? "channel closed"})`);
+      } else {
         this.startMsg(sid, turn);
         this.emit(sid, "message.complete", {
           text: turn.acc || `(error: ${err?.message ?? "channel closed"})`,
@@ -1358,14 +1390,16 @@ export class Drive {
   }
 
   /** 回合開頭生成的標題(緩存供回合末寫回 transcript;避免二次生成)。 */
-  private genTitle: string | undefined;
+  /** #266 sid → 早期生成的標題(回合末寫回 transcript 用)。此前是實例級單欄位,多會話並發
+   * 首回合互相覆蓋 → 錯標題被 renameSession 寫回另一會話。改 per-sid Map。 */
+  private readonly genTitle = new Map<string, string>();
 
   /** #94：立即用首條 user 文本生成標題 → emit session.title(server 更新)。ccSid 有則順帶寫回 transcript。 */
   private async maybeTitle(sid: string, ccSid: string | undefined, firstUserText: string): Promise<void> {
     try {
       const title = await generateTitle(firstUserText);
       if (!title) return;
-      this.genTitle = title; // 供回合末寫回 transcript(首回合時 ccSid 尚未建立)
+      this.genTitle.set(sid, title); // 供回合末寫回 transcript(首回合時 ccSid 尚未建立)
       this.emit(sid, "session.title", { title });
       if (ccSid) {
         try {

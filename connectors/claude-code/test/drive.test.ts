@@ -871,6 +871,27 @@ describe("#118 streaming-input 長活通道", () => {
     d.dispose();
   });
 
+  it("#266 E2E 通道崩潰 → 加密批定稿 + 清 pendingUser(不滯留串到下回合)", async () => {
+    turnScripts = [[init, { __throw: true }]]; // init 已見(seen)→ 不重投,走定稿
+    const { linkb, sent, fire } = fakeLinkb();
+    const e2e = {
+      isE2E: (id: string) => id === CC_SID,
+      decryptText: (_s: string, ct: string) => (ct === "CIPHER" ? "明文問題" : ct),
+      encryptContent: (_s: string, o: { text: string }) => `enc:${o.text}`,
+    } as any;
+    const d = new Drive(linkb, undefined, e2e);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "CIPHER" }));
+    await new Promise((r) => setTimeout(r, 50));
+    // 不發明文 message.complete;走加密批(mirror_append e2e)定稿
+    expect(sent.some((f: any) => f.frame?.params?.type === "message.complete")).toBe(false);
+    const mf = sent.find((f: any) => f.t === "mirror_append") as any;
+    expect(mf?.sessions[0].e2e).toBe(true);
+    expect(mf.sessions[0].messages.some((m: any) => m.role === "user")).toBe(true); // 用戶消息定稿進批
+    expect((d as any).pendingUser.has(CC_SID)).toBe(false); // 清空,不滯留
+    d.dispose();
+  });
+
   it("#75 steer 全流程:中途消息 → 當前回合定稿 interrupted(保留部分文本)→ 新消息同通道接管", async () => {
     turnScripts = [
       // 回合 1:delta 後留 80ms 時間窗(此間 steer 消息到)→ 復刻真 CLI interrupt 後的 error result

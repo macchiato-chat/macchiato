@@ -18,11 +18,12 @@
  * 沙箱:非交互驅動需不卡審批。默認 workspace-write(可 env 調);danger-full-access 需顯式開。
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadDriveState, saveDriveState, codexPermsFor } from "./state";
 import { resolveCodexBin } from "./codex-bin";
+import { deriveMeta, discoverRollouts } from "./mirror";
 import { generateTitle } from "./titles";
 import { materializeAttachment } from "./attachments";
 import type { LinkBClient } from "../linkb/client";
@@ -285,6 +286,23 @@ export class Drive {
           if (tid) this.mirror?.tombstone(tid);
           return;
         }
+        case "session.retitle": {
+          // #257 app「重新生成標題」:從 rollout 首條 user 消息重算(codex 截斷哲學)。E2E 跳過。
+          if (this.e2e?.isE2E(sid)) return;
+          const tid = this.threadFor(sid);
+          if (!tid) return;
+          try {
+            const rf = discoverRollouts().rollouts.find((r) => r.threadId === tid);
+            if (!rf || !existsSync(rf.file)) return;
+            const { title } = deriveMeta(readFileSync(rf.file, "utf8"));
+            if (title && title !== "Codex") this.emit(sid, "session.title", { title });
+          } catch (e) {
+            console.error(`[#257 retitle failed ${sid}] ${(e as Error).message}`);
+          }
+          return;
+        }
+        case "session.archive":
+          return; // #257 codex 無歸檔概念 → 明確 no-op
         case "session.create": {
           const cwd = typeof params.cwd === "string" ? params.cwd.trim() : "";
           if (cwd ? this.cwds[sid] !== cwd : this.cwds[sid] !== undefined) {

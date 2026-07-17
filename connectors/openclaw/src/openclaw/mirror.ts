@@ -683,9 +683,14 @@ export class Mirror {
       () => ({ offsets: {}, missingAt: {} }),
     );
   }
+  private lastSaved = "";
   private save(): void {
     try {
+      // #262 dirty 判斷:與上次落盤相同 → 跳過(每輪 poll 無條件雙寫傷 SD 卡)。
+      const json = JSON.stringify(this.state);
+      if (json === this.lastSaved) return;
       saveStateFile(statePath(), this.state);
+      this.lastSaved = json;
     } catch {
       /* 持久化失敗不致命 */
     }

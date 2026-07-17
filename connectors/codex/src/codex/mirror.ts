@@ -203,6 +203,16 @@ export class Mirror {
     const prevOrd: Record<string, number> = {};
     for (const { file, threadId } of rollouts) {
       if (this.state.tombstones?.includes(threadId)) continue; // #161 app 刪過 → 永不再撈
+      // #262 stat-first:非 driven 且水位線已到檔末 → 跳過,不 readFileSync。每 5s 對每個未變
+      // rollout 全量重讀是 Pi 上的主要開銷(CC 鏡像早已 stat-first);driven/首基線仍讀。
+      const off0 = this.state.offsets[threadId];
+      if (!this.drivenIds.has(threadId) && off0 !== undefined) {
+        try {
+          if (statSync(file).size <= off0) continue;
+        } catch {
+          continue;
+        }
+      }
       let content: string;
       try {
         content = readFileSync(file, "utf8");
@@ -352,13 +362,18 @@ export class Mirror {
     }
     return { offsets: {}, ords: {} };
   }
+  private lastSaved = "";
   private save(): void {
     try {
+      // #262 dirty 判斷:與上次落盤相同 → 跳過(每 5s 無條件雙寫傷 SD 卡;Pi OOM/SD 前科)。
+      const json = JSON.stringify(this.state);
+      if (json === this.lastSaved) return;
       mkdirSync(dirname(statePath()), { recursive: true });
       const tmp = `${statePath()}.tmp`;
-      writeFileSync(tmp, JSON.stringify(this.state));
+      writeFileSync(tmp, json);
       if (existsSync(statePath())) renameSync(statePath(), `${statePath()}.bak`); // #6:上一版留 .bak
       renameSync(tmp, statePath()); // 原子寫
+      this.lastSaved = json;
     } catch {
       /* 持久化失敗不致命 */
     }

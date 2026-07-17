@@ -50,7 +50,10 @@ export async function generateTitle(firstUserText: string): Promise<string> {
   try {
     mkdirSync(join(tmpCfg, "projects"), { recursive: true });
     try {
-      copyFileSync(join(homedir(), ".claude/.credentials.json"), join(tmpCfg, ".credentials.json"));
+      // #266:憑證源要尊重 CLAUDE_CONFIG_DIR(自定義 config dir + OAuth 用戶,寫死 ~/.claude 會拷空、
+      // 標題生成必失敗回退截斷)。與 transcripts.ts 同款解析。
+      const srcCfg = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+      copyFileSync(join(srcCfg, ".credentials.json"), join(tmpCfg, ".credentials.json"));
     } catch {
       /* 無憑證文件(用 ANTHROPIC_API_KEY 的環境)→ 不拷貝,靠 env key 認證 */
     }

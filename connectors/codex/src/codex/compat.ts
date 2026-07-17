@@ -7,6 +7,9 @@ import { discoverRollouts } from "./mirror";
 import { readNewMessages } from "./transcripts";
 
 export const MIN_CLI_VERSION = "0.140.0";
+/** #258 已實測驗證的 CLI 上限(schema 0.144.1 探針背書)。超出 → 冒煙仍跑,但 health 上浮「超出實測區間」
+ * 告警(不判降級——rollout 冒煙通過就放行,只提醒留意升版漂移)。隨每輪驗版更新。 */
+export const MAX_VERIFIED_VERSION = "0.144.1";
 
 export function parseVersion(s: string): [number, number, number] | null {
   const m = /(\d+)\.(\d+)\.(\d+)/.exec(s || "");
@@ -25,6 +28,8 @@ export function versionGte(a: string, b: string): boolean {
 export interface CompatResult {
   ok: boolean;
   reason?: string;
+  /** #258 非致命提醒(如 CLI 超出實測驗證上限)——ok 仍為 true,只上浮 health 供留意。 */
+  advisory?: string;
 }
 
 export function checkVersion(cliVersion: string | undefined): CompatResult {
@@ -64,5 +69,11 @@ export function smokeParseLatest(): CompatResult {
 export function checkCompat(cliVersion: string | undefined): CompatResult {
   const v = checkVersion(cliVersion);
   if (!v.ok) return v;
-  return smokeParseLatest();
+  const smoke = smokeParseLatest();
+  if (!smoke.ok) return smoke;
+  // #258 冒煙通過但 CLI 超出實測驗證上限 → 放行 + 上浮告警(升版漂移早提醒,不判降級)。
+  if (cliVersion && versionGte(cliVersion, MAX_VERIFIED_VERSION) && cliVersion !== MAX_VERIFIED_VERSION) {
+    return { ok: true, advisory: `CLI ${cliVersion} 超出實測驗證上限 ${MAX_VERIFIED_VERSION}(冒煙通過,留意升版漂移)` };
+  }
+  return { ok: true };
 }

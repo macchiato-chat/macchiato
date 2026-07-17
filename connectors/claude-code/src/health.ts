@@ -14,6 +14,8 @@ import { resolveClaudeBin } from "./cc/claude-bin";
 
 const HEALTH_INTERVAL_MS = Number(process.env.MACCHIATO_HEALTH_INTERVAL_MS) || 60_000;
 const MIRROR_STUCK_MS = Number(process.env.MACCHIATO_MIRROR_STUCK_MS) || 120_000;
+/** #259 CLI 版本重探節流:CLI 自動升級後不能永遠用啟動時的舊值(env 可調)。 */
+const CLI_REPROBE_MS = Number(process.env.MACCHIATO_CLI_REPROBE_MS) || 3_600_000;
 
 export interface HealthSnapshot {
   gatewayAlive: boolean;
@@ -33,6 +35,7 @@ export class HealthLoop {
   private timer: ReturnType<typeof setInterval> | null = null;
   private cliVersion: string | undefined;
   private cliFound = false;
+  private lastProbeAt = 0;
 
   constructor(
     private readonly linkb: LinkBClient,
@@ -51,6 +54,7 @@ export class HealthLoop {
   }
 
   private probeCli(): void {
+    this.lastProbeAt = Date.now();
     // 用解析出的絕對路徑,不靠進程 PATH(systemd 服務常缺 ~/.local/bin → 誤報降級)。
     execFile(resolveClaudeBin(), ["--version"], { timeout: 15_000 }, (err, stdout) => {
       if (!err) {
@@ -64,6 +68,7 @@ export class HealthLoop {
 
   tick(): void {
     gcAttachments(); // #151 入站附件 TTL GC(節流在函數內)
+    if (Date.now() - this.lastProbeAt >= CLI_REPROBE_MS) this.probeCli(); // #259 CLI 升級後重探版本
     const ageS = Math.round((Date.now() - this.mirror.lastPollAt) / 1000);
     // #76 兼容自檢:版本門檻 + 最新 transcript 解析冒煙。不兼容 → compatOk=false(app 顯示降級),
     // 並把原因併入 lastError,別讓 CLI 升級悄悄破壞解析後靜默丟消息。

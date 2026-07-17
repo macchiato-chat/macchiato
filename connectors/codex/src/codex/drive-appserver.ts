@@ -13,12 +13,13 @@
  * notLoaded 空數組——最終文本必須從 item/completed(agentMessage)累積;app-server 回合照寫
  * ~/.codex/sessions rollout(鏡像/導入零改動);thread/resume 接受 exec 建的既有 rollout id。
  */
-import { statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { AppServerClient, AppServerDied } from "./appserver";
 import { loadDriveState, saveDriveState, codexPermsFor } from "./state";
 import { workDir } from "./drive";
+import { deriveMeta, discoverRollouts } from "./mirror";
 import { fallbackTitle, titleMode } from "./titles";
 import { materializeAttachment } from "./attachments";
 import type { LinkBClient } from "../linkb/client";
@@ -125,7 +126,9 @@ interface PendingApproval {
 
 export class AppServerDrive {
   /** #10:累計計數(與 v1 同鍵位,健康上報帶出)。engineAppServer=1 是引擎標記(v1 無此鍵)。 */
-  readonly counters: Record<string, number> = { driveErrors: 0, approvalsRequested: 0, steers: 0, engineAppServer: 1 };
+  readonly counters: Record<string, number> = { driveErrors: 0, approvalsRequested: 0, steers: 0, engineAppServer: 1, unknownNotifications: 0 };
+  /** #258 已告警過的未知通知 method(去重,不刷屏)。 */
+  private readonly loggedUnknownNotif = new Set<string>();
   private map: Record<string, string>;
   private cwds: Record<string, string>;
   private models: Record<string, string>;
@@ -298,6 +301,28 @@ export class AppServerDrive {
           }
           return;
         }
+        case "session.retitle": {
+          // #257 app「重新生成標題」:codex 無 LLM 標題(截斷哲學)→ 從 rollout 首條 user 消息
+          // 重算 fallbackTitle 並回投。此前無此 case、對 codex 是靜默 no-op。E2E 跳過(標題明文)。
+          if (this.e2e?.isE2E(sid)) return;
+          const tid = this.threadFor(sid);
+          if (!tid) return;
+          try {
+            const rf = discoverRollouts().rollouts.find((r) => r.threadId === tid);
+            if (!rf || !existsSync(rf.file)) return;
+            const { title } = deriveMeta(readFileSync(rf.file, "utf8"));
+            if (title && title !== "Codex") {
+              this.emit(sid, "session.title", { title });
+              console.log(`· #257 session.retitle ${sid} → ${title}`);
+            }
+          } catch (e) {
+            console.error(`[#257 retitle failed ${sid}] ${(e as Error).message}`);
+          }
+          return;
+        }
+        case "session.archive":
+          // #257 codex 無歸檔概念(不像 Hermes 有 state.db archived 列)——明確 no-op,不落 default。
+          return;
         case "session.create": {
           const cwd = typeof params.cwd === "string" ? params.cwd.trim() : "";
           if (cwd ? this.cwds[sid] !== cwd : this.cwds[sid] !== undefined) {
@@ -543,6 +568,13 @@ export class AppServerDrive {
         return;
       }
       default:
+        // #258 已知線程的未處理通知 method = codex 可能升版改了通知面(delta/審批等可能靜默消失)。
+        // 此前 default 一行 log 都不打 → 無感知。去重告警 + 計數(health 帶出 unknownNotifications)。
+        if (!this.loggedUnknownNotif.has(method)) {
+          this.loggedUnknownNotif.add(method);
+          console.error(`[#258 未知 app-server 通知 method=${method}——codex 可能升版改了通知面,請查是否需處理(delta 恐靜默消失)]`);
+        }
+        this.counters.unknownNotifications += 1;
         return;
     }
   }

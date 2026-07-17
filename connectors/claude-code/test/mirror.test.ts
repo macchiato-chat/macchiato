@@ -122,6 +122,21 @@ describe("Mirror", () => {
     expect(last.messages[0].text).toBe("msg1"); // 重發
   });
 
+  it("#266 mirror_nack 也回退 titles:重發時「無真人消息不建會話」守衛照常生效", () => {
+    setupEnv();
+    writeFileSync(file, "");
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb);
+    (m as any).doPoll();
+    appendFileSync(file, userLine("問題")); // 首批含 user + 派生標題 → titles[sid] 被 set
+    (m as any).doPoll();
+    const sid = (appends(sent).at(-1) as any).sessions[0].hermesSessionId;
+    expect((m as any).state.titles[sid]).toBeTruthy(); // 發批後有標題
+    const batchId = (appends(sent).at(-1) as any).batchId;
+    m.handleNack(batchId);
+    expect((m as any).state.titles[sid]).toBeUndefined(); // #266 nack 一起回退 title(此前殘留)
+  });
+
   it("driven 會話只快進不投遞", () => {
     setupEnv();
     writeFileSync(file, "");

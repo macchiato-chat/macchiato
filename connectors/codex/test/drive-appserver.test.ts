@@ -91,6 +91,45 @@ beforeEach(() => {
   delete process.env.MACCHIATO_CODEX_MODEL;
 });
 
+describe("#257 session.retitle", () => {
+  it("從 rollout 首條 user 消息重算標題 → session.title(此前 codex 靜默 no-op)", async () => {
+    const { mkdtempSync, writeFileSync, mkdirSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const root = mkdtempSync(join(tmpdir(), "cx-retitle-"));
+    process.env.MACCHIATO_CODEX_SESSIONS_DIR = root; // sessionsRoot()
+    const sdir = join(root, "2026", "07", "17");
+    mkdirSync(sdir, { recursive: true });
+    // rollout 文件名含 thread id(discoverRollouts 從檔名解析 UUID)
+    const tid = "0199abcd-1111-2222-3333-444455556666";
+    writeFileSync(
+      join(sdir, `rollout-2026-07-17T00-00-00-${tid}.jsonl`),
+      JSON.stringify({ type: "session_meta", payload: { cwd: "/w" } }) + "\n" +
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "幫我重構支付模塊的錯誤處理" } }) + "\n",
+    );
+    const { d, linkb, sent } = make();
+    (d as any).map[SID] = tid; // 綁 sid → thread
+    (d as any).byThread.set(tid, SID);
+    await linkb.deliver(tui("session.retitle", SID, {}));
+    await tick();
+    const title = (sent.find((f: any) => f.frame?.params?.type === "session.title") as any)?.frame.params.payload.title;
+    expect(title).toBe("幫我重構支付模塊的錯誤處理");
+    delete process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+  });
+});
+
+describe("#258 未知通知告警", () => {
+  it("已知線程收到未處理 method → unknownNotifications 計數(升版漂移可見)", async () => {
+    const { d, client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "hi" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } }); // 映射 TID→SID
+    expect(d.counters.unknownNotifications).toBe(0);
+    client.fire("thread/somethingNew/v3", { threadId: TID, foo: 1 }); // codex 假想升版新通知
+    client.fire("thread/somethingNew/v3", { threadId: TID, foo: 2 }); // 同 method 去重不刷屏但計數累加
+    expect(d.counters.unknownNotifications).toBe(2);
+  });
+});
+
 describe("#132 v2 回合生命週期", () => {
   it("prompt → thread/start+turn/start;delta 流→message.delta;completed 不重發已流部分;usage 隨 complete", async () => {
     const { client, linkb, sent } = make();

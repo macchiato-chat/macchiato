@@ -93,7 +93,9 @@ export class Mirror {
   private state: State;
   private timer: ReturnType<typeof setInterval> | null = null;
   private batchId = 0;
-  private readonly rewind: Array<{ id: number; prev: Record<string, number> }> = [];
+  // #266 rewind 除 offset 也記發批前的 title——nack 回退時一起還原,否則「無真人消息不建會話」
+  // 守衛(!titles[sid])在重發時失效(offset 回退了但 titles[sid] 已被 set,守衛判假)。
+  private readonly rewind: Array<{ id: number; prev: Record<string, number>; prevTitle: Record<string, string | undefined> }> = [];
   private readonly drivenSids = new Set<string>();
   /**
    * 影子 session 兜底(第二道防護,2026-07-13):**曾被 Macchiato 驅動過**的 CLI 會話 uuid(持久,
@@ -204,6 +206,11 @@ export class Mirror {
     if (!e) return;
     this.counters.mirrorNacks += 1; // #10
     for (const [k, off] of Object.entries(e.prev)) this.state.offsets[k] = off;
+    // #266 title 也回退:發批前無標題的會話,nack 後恢復「無標題」→ 守衛在重發時照常生效。
+    for (const [k, t] of Object.entries(e.prevTitle)) {
+      if (t === undefined) delete this.state.titles[k];
+      else this.state.titles[k] = t;
+    }
     this.save();
     console.warn(`· mirror_nack batch ${batchId} → rewinding watermark for resend`);
   }
@@ -336,7 +343,8 @@ export class Mirror {
   /** 發一條會話的一批（單帧單會話）；記 rewind 供 nack 回退。 */
   private sendOne(sid: string, entry: Record<string, unknown>, prevOff: number): void {
     this.batchId += 1;
-    this.rewind.push({ id: this.batchId, prev: { [sid]: prevOff } });
+    // #266 記發批前的 title(此刻尚未 set 新標題,見調用點 302→303 順序)供 nack 一起回退。
+    this.rewind.push({ id: this.batchId, prev: { [sid]: prevOff }, prevTitle: { [sid]: this.state.titles[sid] } });
     if (this.rewind.length > REWIND_KEEP) this.rewind.shift();
     this.linkb.send({
       t: "mirror_append",
@@ -446,13 +454,19 @@ export class Mirror {
     }
     return { offsets: {}, titles: {}, missingAt: {} };
   }
+  private lastSaved = "";
   private save(): void {
     try {
+      // #262 dirty 判斷:序列化與上次落盤相同 → 跳過(每 5s 無條件寫盤兩份=主+.bak,≈3.4 萬次/天
+      // 傷 SD 卡)。JSON.stringify 遠比兩次 write+rename 便宜。
+      const json = JSON.stringify(this.state);
+      if (json === this.lastSaved) return;
       mkdirSync(dirname(statePath()), { recursive: true });
       const tmp = `${statePath()}.tmp`;
-      writeFileSync(tmp, JSON.stringify(this.state));
+      writeFileSync(tmp, json);
       if (existsSync(statePath())) renameSync(statePath(), `${statePath()}.bak`); // #6:上一版留作 .bak
       renameSync(tmp, statePath()); // 原子寫（審計 #6 的教訓：別半截損壞）
+      this.lastSaved = json;
     } catch {
       /* 持久化失敗不致命 */
     }
