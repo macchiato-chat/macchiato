@@ -21,6 +21,7 @@ export interface PairOptions {
 function showCode(code: string, webUrl: string, fresh: boolean): void {
   const line = "=".repeat(54);
   console.log(`\n${line}`);
+  // ⚠️ 回歸契約:scripts/regression/run-codex-regression.mjs 斷言「>>> <碼> <<<」,改動需同步
   console.log(`  Pairing code${fresh ? " (refreshed)" : ""}:`);
   console.log(`        >>>  ${code}  <<<`);
   console.log(`  Sign in at ${webUrl} → \"Pair connector\" → enter this code.`);

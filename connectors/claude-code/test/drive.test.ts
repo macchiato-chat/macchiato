@@ -70,15 +70,22 @@ import { Drive } from "../src/cc/drive";
 function fakeLinkb() {
   const sent: Record<string, unknown>[] = [];
   const handlers: Array<(m: Record<string, unknown>) => void> = [];
+  const readyHandlers: Array<() => void> = [];
   return {
     sent,
     fire: (m: Record<string, unknown>) => handlers.forEach((h) => h(m)),
+    /** 模擬 Link B ready(含重連)——觸發 onReady 註冊的上報(task.sync 等)。 */
+    ready: () => readyHandlers.forEach((h) => h()),
     linkb: {
       agentLinkId: "AL1",
       isReady: true,
       send: (m: Record<string, unknown>) => sent.push(m),
       onFrame: (h: (m: Record<string, unknown>) => void) => {
         handlers.push(h);
+        return () => {};
+      },
+      onReady: (h: () => void) => {
+        readyHandlers.push(h);
         return () => {};
       },
     } as any,
@@ -430,6 +437,33 @@ describe("#97→#104 background task 結構化事件 + 停止", () => {
     expect(starts[0]).toMatchObject({ task_id: "bg12345678", kind: "background", desc: "抓论文" });
     expect(ends).toHaveLength(1);
     expect(ends[0]).toMatchObject({ task_id: "bg12345678", status: "completed", summary: "抓了30篇" });
+  });
+
+  it("task.sync:每次 ready 全量上報存活任務;任務結束後清單縮空", async () => {
+    // 任務 started 但 notification 尚未到——存活任務應出現在 ready 上報裡
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "system", subtype: "task_started", task_id: "bg-alive", tool_use_id: "tu1", description: "長活", subagent_type: "" },
+      { type: "result", subtype: "success", result: "回合先結束,任務還在跑" },
+    ];
+    const { linkb, sent, fire, ready } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "go" }));
+    await new Promise((r) => setTimeout(r, 30));
+
+    ready(); // 模擬重連 ready → 存活清單含 bg-alive
+    let syncs = sent.filter((f: any) => f.frame?.params?.type === "task.sync").map((f: any) => f.frame.params.payload);
+    expect(syncs).toHaveLength(1);
+    expect(syncs[0].tasks).toEqual([{ session_id: CC_SID, task_id: "bg-alive" }]);
+
+    // 新進程視角(sessionTasks 空)→ ready 上報空清單,server 據此收殮遺孤
+    const fresh = fakeLinkb();
+    new Drive(fresh.linkb);
+    fresh.ready();
+    syncs = fresh.sent.filter((f: any) => f.frame?.params?.type === "task.sync").map((f: any) => f.frame.params.payload);
+    expect(syncs).toHaveLength(1);
+    expect(syncs[0].tasks).toEqual([]);
   });
 
   it("ambient 任务隐藏", async () => {

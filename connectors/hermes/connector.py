@@ -64,9 +64,11 @@ from backfill import (
 )
 
 LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
-# §update 連接器發布版本：對齊 packages/protocol CONNECTOR_VERSION。發版修復時 bump（三處：
-# 這裡、openclaw 連接器、protocol）。server 拿它判 updateAvailable → app 提示更新。
-CONNECTOR_VERSION = "1.5.30"
+# §update 連接器發布版本:對齊 packages/protocol CONNECTOR_VERSION。⚠️ 發版必須**五處同步 bump**:
+# 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
+# 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
+# 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
+CONNECTOR_VERSION = "1.5.31"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",

@@ -109,6 +109,7 @@ export class LinkBClient {
             /* 監聽器自負其責 */
           }
         }
+        // ⚠️ 回歸契約:scripts/regression/run-regression.mjs 從 connector.log 斷言「Link B ready」,改動需同步
         console.log("✓ Link B ready — connected to Macchiato");
         return;
       case "auth_error":

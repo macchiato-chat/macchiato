@@ -272,6 +272,7 @@ export class AppServerDrive {
           this.interruptedSids.add(sid);
           if (t.turnId) {
             await this.client.request("turn/interrupt", { threadId: t.threadId, turnId: t.turnId });
+            // ⚠️ 回歸契約:scripts/regression/run-codex-regression.mjs 斷言「turn/interrupt → 」,改動需同步
             console.log(`· turn/interrupt → ${sid}`);
           } else {
             // #245:turn/start 未返回的窗口點停止,舊實現靜默吞掉 → turnId 到位即補發
@@ -412,6 +413,7 @@ export class AppServerDrive {
       try {
         await this.client.request("turn/steer", { threadId: running.threadId, expectedTurnId: running.turnId, input });
         this.counters.steers += 1;
+        // ⚠️ 回歸契約:scripts/regression/run-codex-regression.mjs 斷言「turn/steer 注入跟進消息」,改動需同步
         console.log(`· turn/steer 注入跟進消息 → ${sid}`);
         return;
       } catch (e) {

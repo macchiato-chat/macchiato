@@ -313,6 +313,18 @@ export class Drive {
     this.abandonedTurns = state.pending;
     this.pending = new Set();
     if (state.pending.length) this.saveMap();
+    // task.sync:每次 Link B ready(含重連)全量上報仍活着的後台任務清單。連接器進程重啟後清單
+    // 為空 → server 秒級收殮該 link 遺留的 running task 塊(進程死=任務死),不必等超齡殭屍清掃。
+    // 舊 server 對未知事件 default 忽略,無害。時序:client 先 flushPending(斷線期間緩衝的
+    // late task.end 先落地)再觸發 readyHandlers,sync 不會搶在 end 之前誤殮。
+    this.linkb.onReady(() => this.pushTaskSync());
+  }
+
+  /** 全量上報「仍活着的後台任務」(鏈路級,session_id 佔位;見構造器註釋)。 */
+  private pushTaskSync(): void {
+    const tasks: Array<{ session_id: string; task_id: string }> = [];
+    for (const [sid, set] of this.sessionTasks) for (const task_id of set) tasks.push({ session_id: sid, task_id });
+    this.emit("-", "task.sync", { tasks });
   }
 
   /**
@@ -350,6 +362,7 @@ export class Drive {
         } catch {
           /* 回合恰好剛結束 → interrupt 空打,排隊消息由 finishTurn 正常續投 */
         }
+        // ⚠️ 回歸契約:scripts/regression/run-cc-regression.mjs 斷言「Steer:打斷當前回合」,改動需同步
         console.log(`· Steer:打斷當前回合,新消息接管 → ${sid}`);
       }
       return;
@@ -664,6 +677,7 @@ export class Drive {
           if (ch?.turn && !ch.turn.completed) {
             this.interruptedSids.add(sid); // #102 隨後的 result(error) 定性為 interrupted
             await ch.q.interrupt(); // #116 g:interrupt 不殺通道,下一回合同通道照常
+            // ⚠️ 回歸契約:scripts/regression/run-cc-regression.mjs 斷言「Interrupted turn for」,改動需同步
             console.log(`· Interrupted turn for ${sid}`);
           }
           return;

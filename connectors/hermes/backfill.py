@@ -45,6 +45,18 @@ def _strip_sender_tag(text: str) -> str:
     return _SENDER_TAG_RE.sub("", text or "", count=1)
 
 
+# Hermes Discord 適配層(2026-07 實庫取樣)在 user 消息前注入觸發消息 id 前導塊,供 agent 的
+# discord 工具 reply/react/pin 定位:
+#   [Triggering message id: `152…830` — use as `message_id` for reply/react/pin via the discord tools.]\n\n[briansun] 原話
+# 機器殼,展示必剝;且它擋在行首會讓 [sender] tag 剝不掉(正則錨定 ^)——順序必須先於 sender tag。
+_TRIGGER_PREAMBLE_RE = re.compile(r"^\[Triggering message id:[^\]]*\]\s*")
+
+
+def _clean_user_text(text: str) -> str:
+    """user 消息展示清洗(順序敏感):觸發前導塊 → 語音 wrapper → 說話人 tag。"""
+    return _strip_sender_tag(_unwrap_voice(_TRIGGER_PREAMBLE_RE.sub("", text or "", count=1)))
+
+
 # #12:Hermes 語音消息在 state.db 裡是 wrapper 形態(2026-07-12 實庫取樣):
 #   [The user sent a voice message~ Here's what they said: "原話"]\n\n[handle] (The user sent a message with no text content)
 # 展示只留「原話」;隨語音附帶的真實文字(若有)保留。
@@ -92,7 +104,7 @@ def _derive_title(con: sqlite3.Connection, sid: str) -> str:
         (sid,),
     ).fetchone()
     if row and row[0]:
-        t = " ".join(_strip_sender_tag(_unwrap_voice(str(row[0]))).split())
+        t = " ".join(_clean_user_text(str(row[0])).split())
         return (t[:48] + "…") if len(t) > 48 else t
     return "(導入會話)"
 
@@ -154,7 +166,7 @@ def _read_messages(con: sqlite3.Connection, sid: str) -> list:
     ):
         content = content or ""
         if role == "user":
-            content = _strip_sender_tag(_unwrap_voice(content))
+            content = _clean_user_text(content)
             if content.strip():
                 out.append({"role": "user", "text": content, "createdAt": ts})
         else:  # assistant
@@ -348,7 +360,7 @@ def _tail_session_sync(sid: str, since_id: int) -> tuple:
         for rid, role, content, reasoning, tc, tcid, ts, fr in rows:
             content = content or ""
             if role == "user":
-                c = _strip_sender_tag(_unwrap_voice(content))
+                c = _clean_user_text(content)
                 if c.strip():
                     # §9 srcId=state.db 消息 id（穩定）→ server 據此去重連接器崩潰重發
                     folded.append(({"role": "user", "text": c, "createdAt": ts, "srcId": str(rid)}, rid))
