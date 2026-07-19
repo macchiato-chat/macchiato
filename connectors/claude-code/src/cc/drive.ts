@@ -552,6 +552,8 @@ export class Drive {
           desc: String(m.description ?? "task").slice(0, 200),
           // #138:發起任務的 Task 工具調用 id——server 據此把工具塊原地升格為 task 塊。
           ...(m.tool_use_id ? { tool_use_id: String(m.tool_use_id) } : {}),
+          // #222:子代理指令全文——Details 對齊鏡像側(描述+prompt+報告)。
+          ...(m.prompt ? { prompt: String(m.prompt).slice(0, 8000) } : {}),
         });
       }
     } else if (m.subtype === "task_progress") {
@@ -559,8 +561,15 @@ export class Drive {
       const now = Date.now();
       if (now - (this.taskProgressAt.get(taskId) ?? 0) < Drive.PROGRESS_THROTTLE_MS) return; // 節流
       this.taskProgressAt.set(taskId, now);
-      if (!m.last_tool_name) return; // 無新信息就別發空更新
-      this.emit(sid, "task.update", { task_id: taskId, last_activity: String(m.last_tool_name) });
+      // #222:步數/token 也是進度——沒有新工具名照樣上報(節流已擋頻率)。
+      const usage = (m.usage ?? {}) as Record<string, unknown>;
+      const update = {
+        ...(m.last_tool_name ? { last_activity: String(m.last_tool_name) } : {}),
+        ...(typeof usage.tool_uses === "number" ? { tool_uses: usage.tool_uses } : {}),
+        ...(typeof usage.total_tokens === "number" ? { total_tokens: usage.total_tokens } : {}),
+      };
+      if (Object.keys(update).length === 0) return; // 真沒新信息才不發
+      this.emit(sid, "task.update", { task_id: taskId, ...update });
     } else if (m.subtype === "task_notification") {
       const set = this.sessionTasks.get(sid);
       set?.delete(taskId);
@@ -571,12 +580,16 @@ export class Drive {
       // 後台 bash 常只帶 summary 不帶 description)。desc 供 server 錯過 start 時兜底建行。
       const desc = String(m.description ?? "").slice(0, 200);
       const summary = String(m.summary ?? "").slice(0, 500);
+      // #222:終態統計(task_notification.usage)。
+      const usage = (m.usage ?? {}) as Record<string, unknown>;
       if (visible) {
         this.emit(sid, "task.end", {
           task_id: taskId,
           status,
           ...(summary && summary !== desc ? { summary } : {}),
           ...(desc ? { desc } : {}),
+          ...(typeof usage.tool_uses === "number" ? { tool_uses: usage.tool_uses } : {}),
+          ...(typeof usage.total_tokens === "number" ? { total_tokens: usage.total_tokens } : {}),
         });
       }
       // 多任務只在最後一個歸零後計時；若 SDK 隨即自發續寫，init 會再清掉這個 timer。
