@@ -42,6 +42,8 @@ curl -sSL …/install.sh | bash -s -- --yes
 
 With no `--agents` and no terminal to prompt, it installs **every** detected connector. Run with `--help` to see all flags.
 
+**Don't want mirroring?** By default the connector mirrors terminal-side agent sessions into the app. If you'd rather keep the app to *only* the sessions you start from it, answer `n` at the installer's mirror prompt, or pass `--no-mirror` (env: `MACCHIATO_MIRROR=off`). Sessions you drive from the app work the same either way; you lose the terminal "busy" indicator and automatic history import. Re-run the installer with `--mirror` / `--no-mirror` anytime to flip the choice.
+
 **Requirements:** a working [Hermes](https://github.com/NousResearch), [OpenClaw](https://openclaw.ai) or [Claude Code](https://claude.com/claude-code) or [Codex](https://developers.openai.com/codex) install and a Macchiato account.
 
 **Updating:** re-run the same one-line installer. It re-downloads the latest connector, keeps your existing pairing, and restarts the service so the new version takes effect immediately — no re-pairing needed.

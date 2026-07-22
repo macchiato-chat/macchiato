@@ -15,11 +15,16 @@
 # CLI flags (after `bash -s --`):
 #   --agents=LIST   comma-separated: hermes, openclaw, claude-code, codex, or "all"
 #                   (aliases: cc/claude → claude-code, oc → openclaw)
+#   --no-mirror     don't mirror terminal-side agent sessions into the app —
+#                   only sessions you start from the app will appear
+#                   (also disables the "terminal busy" indicator)
+#   --mirror        force mirroring on (default; overrides MACCHIATO_MIRROR env)
 #   -y, --yes       install every detected connector, no prompt
 #   -h, --help      show usage and exit
 #
 # Env overrides:
 #   MACCHIATO_SERVER_URL   (default wss://api.macchiato.chat/connector)
+#   MACCHIATO_MIRROR       ("off" = same as --no-mirror; flags take precedence)
 #   HERMES_PYTHON          (path to the python inside your Hermes venv, if auto-detect fails)
 #   MACCHIATO_CLAUDE_BIN   (absolute path to the claude CLI, if auto-detect fails)
 #   MACCHIATO_CODEX_BIN    (absolute path to the codex CLI, if auto-detect fails)
@@ -185,6 +190,7 @@ normalize_agent() {
 
 REQUESTED=""    # space-separated canonical keys parsed from --agents / MACCHIATO_ONLY, or "all"
 ASSUME_YES=0
+MIRROR_MODE=""  # "" = undecided (env default → interactive prompt → on); "on" | "off"
 add_requested() { # $1 = comma/space-separated token list
   local tok norm
   local IFS=', '
@@ -208,11 +214,18 @@ Options:
   --agents=LIST   comma-separated connectors to install:
                   hermes, openclaw, claude-code, codex, or "all"
                   (aliases: cc/claude → claude-code, oc → openclaw)
+  --no-mirror     don't mirror terminal-side agent sessions into the app —
+                  only sessions you start from the app will appear
+                  (also disables the "terminal busy" indicator)
+  --mirror        force mirroring on (default)
   -y, --yes       install every detected connector without prompting
   -h, --help      show this help
 
 With no --agents and a terminal attached, an interactive picker appears when
 more than one agent is detected. Without a terminal it installs all detected.
+Mirroring defaults to ON; with a terminal attached a one-key [Y/n] prompt asks.
+Re-running the installer rewrites the service, so re-run with --no-mirror /
+--mirror anytime to flip the choice.
 EOF
 }
 
@@ -222,6 +235,8 @@ while [ $# -gt 0 ]; do
     --agents=*)    add_requested "${1#*=}" ;;
     --agents|-A)   shift; [ $# -gt 0 ] || fail "--agents needs a value (e.g. --agents=claude-code,codex)"; add_requested "$1" ;;
     --all)         REQUESTED="all" ;;
+    --no-mirror)   MIRROR_MODE="off" ;;
+    --mirror)      MIRROR_MODE="on" ;;
     -y|--yes|--non-interactive) ASSUME_YES=1 ;;
     -h|--help)     usage; exit 0 ;;
     *)             fail "Unknown option: $1 (try --help)" ;;
@@ -230,6 +245,13 @@ while [ $# -gt 0 ]; do
 done
 # Legacy MACCHIATO_ONLY (single-select) — honored only when --agents was not given.
 [ -z "$REQUESTED" ] && [ -n "${MACCHIATO_ONLY:-}" ] && add_requested "$MACCHIATO_ONLY"
+# MACCHIATO_MIRROR env (automation without flags) — flags above take precedence.
+if [ -z "$MIRROR_MODE" ]; then
+  case "$(printf '%s' "${MACCHIATO_MIRROR:-}" | tr '[:upper:]' '[:lower:]')" in
+    off|0|false|no) MIRROR_MODE="off" ;;
+    on|1|true|yes)  MIRROR_MODE="on" ;;
+  esac
+fi
 
 # ── shared: download repo once ──────────────────────────────────────────────
 TMP="$(mktemp -d)"
@@ -281,7 +303,7 @@ install_hermes() {
   else
     say "Hermes credentials found, skipping pairing"
   fi
-  install_unit "macchiato-connector" "$PY $APP/connector.py"
+  MACCHIATO_UNIT_EXTRA_ENV="${MIRROR_ENV:-}" install_unit "macchiato-connector" "$PY $APP/connector.py"
   # Platform plugin: lets Hermes proactively deliver to Macchiato (best effort)
   if [ -d "$TMP/connectors/hermes/plugin/macchiato" ]; then
     mkdir -p "$HOME/.hermes/plugins"
@@ -307,7 +329,7 @@ install_openclaw() {
   else
     say "OpenClaw credentials found, skipping pairing"
   fi
-  install_unit "macchiato-openclaw-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
+  MACCHIATO_UNIT_EXTRA_ENV="${MIRROR_ENV:-}" install_unit "macchiato-openclaw-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
   # Channel plugin: lets OpenClaw proactively deliver to Macchiato (best effort)
   if command -v openclaw >/dev/null 2>&1; then
     if openclaw plugins install --force "$APP/plugin" >/dev/null 2>&1 && openclaw plugins enable macchiato >/dev/null 2>&1; then
@@ -349,7 +371,8 @@ install_claude_code() {
   fi
   # PATH: user systemd units often miss ~/.local/bin → the connector could not find the claude CLI.
   MACCHIATO_UNIT_EXTRA_ENV="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
-MACCHIATO_CLAUDE_BIN=$CLAUDE"     install_unit "macchiato-claude-code-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
+MACCHIATO_CLAUDE_BIN=$CLAUDE
+${MIRROR_ENV:-}"     install_unit "macchiato-claude-code-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
 }
 
 # ═════════════════════════════ Codex ════════════════════════════════════════
@@ -382,7 +405,8 @@ install_codex() {
     say "Codex credentials found, skipping pairing"
   fi
   MACCHIATO_UNIT_EXTRA_ENV="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
-MACCHIATO_CODEX_BIN=$CODEX"     install_unit "macchiato-codex-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
+MACCHIATO_CODEX_BIN=$CODEX
+${MIRROR_ENV:-}"     install_unit "macchiato-codex-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
 }
 
 # ── detect installed agents ─────────────────────────────────────────────────
@@ -501,10 +525,33 @@ for a in ${DETECTED[@]+"${DETECTED[@]}"}; do    # DETECTED may be empty (explici
   case " ${SELECTED[*]} " in *" $a "*) ;; *) SKIPPED+=("$a") ;; esac
 done
 
-# Test-only (#307 smoke): print the resolved plan and stop before touching npm/pairing.
+# ── mirror choice (#308): flag/env decided above; else one-key [Y/n] on a terminal ──
+if [ -z "$MIRROR_MODE" ] && [ "$ASSUME_YES" != 1 ] && has_tty && stty -g </dev/tty >/dev/null 2>&1; then
+  {
+    printf '\n  \033[1;35m✻\033[0m \033[1mMirror terminal sessions into Macchiato?\033[0m\n'
+    printf '    \033[2mMirror shows agent sessions you run in your terminal inside the app\n'
+    printf '    (and lights the "busy" indicator). Sessions you start from the app\n'
+    printf '    always work either way. Re-run with --no-mirror / --mirror to change.\033[0m\n'
+    printf '    \033[36m[Y]\033[0m mirror on (default) · \033[36m[n]\033[0m app-driven only  '
+  } >/dev/tty
+  MKEY=""
+  IFS= read -rsn1 MKEY </dev/tty 2>/dev/null || MKEY=""
+  case "$MKEY" in
+    n|N) MIRROR_MODE="off"; printf '→ \033[1mmirror off\033[0m\n' >/dev/tty ;;
+    *)   MIRROR_MODE="on";  printf '→ \033[1mmirror on\033[0m\n'  >/dev/tty ;;
+  esac
+fi
+[ -z "$MIRROR_MODE" ] && MIRROR_MODE="on"   # no terminal / -y → default on
+# Connectors read MACCHIATO_MIRROR=off from their service env: polling stops (terminal
+# sessions stay out of the app) while app-driven sessions keep working untouched.
+MIRROR_ENV=""
+[ "$MIRROR_MODE" = "off" ] && MIRROR_ENV="MACCHIATO_MIRROR=off"
+
+# Test-only (#307/#308 smoke): print the resolved plan and stop before touching npm/pairing.
 if [ "${MACCHIATO_SELFTEST:-0}" = 1 ]; then
   printf 'SELECTED:%s\n' "$(csv ${SELECTED[@]+"${SELECTED[@]}"})"
   printf 'SKIPPED:%s\n' "$(csv ${SKIPPED[@]+"${SKIPPED[@]}"})"
+  printf 'MIRROR:%s\n' "$MIRROR_MODE"
   exit 0
 fi
 
