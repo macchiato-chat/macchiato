@@ -12,6 +12,12 @@
 #     interactive picker lets you tick the ones you want (↑/↓ + space + enter).
 #   • No terminal (CI/containers) and no --agents → installs every agent found.
 #
+# Hermes profiles (multiple independent Hermes agents on one machine):
+#   Named profiles under ~/.hermes/profiles/<name> are detected automatically and
+#   listed in the picker as "Hermes: <name>" — each installs its own connector
+#   instance (own pairing → shows as a separate agent in the app). Explicitly:
+#   … | bash -s -- --agents=hermes:coder   (default ~/.hermes stays plain "hermes")
+#
 # CLI flags (after `bash -s --`):
 #   --agents=LIST   comma-separated: hermes, openclaw, claude-code, codex, or "all"
 #                   (aliases: cc/claude → claude-code, oc → openclaw)
@@ -165,6 +171,7 @@ install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
 agent_label() {
   case "$1" in
     hermes)      echo "Hermes" ;;
+    hermes:*)    echo "Hermes: ${1#hermes:}" ;;   # #309 per-profile instance
     openclaw)    echo "OpenClaw" ;;
     claude-code) echo "Claude Code" ;;
     codex)       echo "Codex" ;;
@@ -181,6 +188,11 @@ csv() { local IFS=,; echo "$*"; }
 normalize_agent() {
   case "$1" in
     hermes|Hermes|HERMES)                                     echo "hermes" ;;
+    hermes:*|Hermes:*|HERMES:*)                               # #309 hermes profile — validate the name (same charset Hermes allows)
+      case "${1#*:}" in
+        ""|*[!a-z0-9_-]*) echo "" ;;
+        *)                echo "hermes:${1#*:}" ;;
+      esac ;;
     openclaw|OpenClaw|OPENCLAW|oc)                            echo "openclaw" ;;
     claude-code|claude|Claude|cc|claudecode|claude_code|CC)   echo "claude-code" ;;
     codex|Codex|CODEX)                                        echo "codex" ;;
@@ -198,7 +210,7 @@ add_requested() { # $1 = comma/space-separated token list
     [ -n "$tok" ] || continue
     if [ "$tok" = "all" ]; then REQUESTED="all"; return; fi
     norm="$(normalize_agent "$tok")"
-    [ -n "$norm" ] || fail "Unknown agent '$tok' (valid: hermes, openclaw, claude-code, codex, all)"
+    [ -n "$norm" ] || fail "Unknown agent '$tok' (valid: hermes, hermes:<profile>, openclaw, claude-code, codex, all)"
     case " $REQUESTED " in *" $norm "*) ;; *) REQUESTED="${REQUESTED:+$REQUESTED }$norm" ;; esac
   done
 }
@@ -214,6 +226,10 @@ Options:
   --agents=LIST   comma-separated connectors to install:
                   hermes, openclaw, claude-code, codex, or "all"
                   (aliases: cc/claude → claude-code, oc → openclaw)
+                  Hermes profiles: hermes:<name> installs a connector for the
+                  named profile (~/.hermes/profiles/<name>) — its own pairing,
+                  shown as a separate agent in the app. Detected profiles also
+                  appear in the interactive picker as "Hermes: <name>".
   --no-mirror     don't mirror terminal-side agent sessions into the app —
                   only sessions you start from the app will appear
                   (also disables the "terminal busy" indicator)
@@ -252,6 +268,17 @@ if [ -z "$MIRROR_MODE" ]; then
     on|1|true|yes)  MIRROR_MODE="on" ;;
   esac
 fi
+# #309 self-update from a profile instance: the connector re-runs this installer with its
+# own env (MACCHIATO_ONLY=hermes + MACCHIATO_HERMES_PROFILE=<name> from the service unit)
+# — retarget the plain "hermes" request at that profile so the right instance is updated.
+if [ -n "${MACCHIATO_HERMES_PROFILE:-}" ] && [ "$REQUESTED" != "all" ] && [ -n "$REQUESTED" ]; then
+  _nr=""
+  for a in $REQUESTED; do
+    [ "$a" = "hermes" ] && a="hermes:$MACCHIATO_HERMES_PROFILE"
+    _nr="${_nr:+$_nr }$a"
+  done
+  REQUESTED="$_nr"
+fi
 
 # ── shared: download repo once ──────────────────────────────────────────────
 TMP="$(mktemp -d)"
@@ -288,28 +315,58 @@ find_hermes_python() {
   echo ""
 }
 
-install_hermes() {
-  local PY APP="$HOME/.macchiato/app" CRED="$HOME/.macchiato/connector.json"
+install_hermes() { # $1 = Hermes profile name ("" / absent = the default ~/.hermes) — #309
+  local PROFILE="${1:-}" HH="$HOME/.hermes" STATE="$HOME/.macchiato" UNIT="macchiato-connector" WHAT="Hermes"
+  if [ -n "$PROFILE" ]; then
+    HH="$HOME/.hermes/profiles/$PROFILE"
+    [ -d "$HH" ] || fail "Hermes profile '$PROFILE' not found ($HH). Create it first: hermes profile create $PROFILE"
+    STATE="$HOME/.macchiato/hermes-$PROFILE"   # per-instance files — never collide with other instances
+    UNIT="macchiato-connector-$PROFILE"
+    WHAT="Hermes profile '$PROFILE'"
+  fi
+  local PY APP="$STATE/app" CRED="$STATE/connector.json"
   PY="$(find_hermes_python)"
   [ -n "$PY" ] || fail "Hermes not found. Install it first (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash), or set HERMES_PYTHON and re-run."
   "$PY" -c "import websockets" 2>/dev/null || fail "Hermes venv is missing websockets (required). Run: $PY -m pip install websockets"
-  say "Hermes connector → $APP  (python: $PY)"
+  say "$WHAT connector → $APP  (python: $PY)"
   verify_tree "$TMP/connectors/hermes" "connectors/hermes"
   mkdir -p "$APP"
   cp "$TMP"/connectors/hermes/*.py "$APP/"
-  if [ ! -f "$CRED" ]; then
-    say "Pairing Hermes connector (enter the code below at macchiato.chat)"
-    "$PY" "$APP/pair.py" || fail "Pairing not completed. Re-run this script to continue."
-  else
-    say "Hermes credentials found, skipping pairing"
+  # Per-instance env, threaded through pairing AND the service unit:
+  #   HERMES_HOME → which hermes profile the connector (and its gateway subprocess) talks to
+  #   MACCHIATO_STATE_DIR → where this instance keeps cred/mirror/health/…
+  #   MACCHIATO_HERMES_PROFILE → self-update re-runs this installer for the right instance
+  local PROFILE_ENV=""
+  if [ -n "$PROFILE" ]; then
+    PROFILE_ENV="HERMES_HOME=$HH
+MACCHIATO_STATE_DIR=$STATE
+MACCHIATO_HERMES_PROFILE=$PROFILE"
   fi
-  MACCHIATO_UNIT_EXTRA_ENV="${MIRROR_ENV:-}" install_unit "macchiato-connector" "$PY $APP/connector.py"
-  # Platform plugin: lets Hermes proactively deliver to Macchiato (best effort)
+  if [ ! -f "$CRED" ]; then
+    say "Pairing $WHAT connector (enter the code below at macchiato.chat)"
+    if [ -n "$PROFILE" ]; then
+      # Label carries the profile so the app can tell multiple Hermes agents apart.
+      env "HERMES_HOME=$HH" "MACCHIATO_STATE_DIR=$STATE" "MACCHIATO_LABEL=$(hostname 2>/dev/null || uname -n) ($PROFILE)" \
+        "$PY" "$APP/pair.py" || fail "Pairing not completed. Re-run this script to continue."
+    else
+      "$PY" "$APP/pair.py" || fail "Pairing not completed. Re-run this script to continue."
+    fi
+  else
+    say "$WHAT credentials found, skipping pairing"
+  fi
+  MACCHIATO_UNIT_EXTRA_ENV="$PROFILE_ENV
+${MIRROR_ENV:-}" install_unit "$UNIT" "$PY $APP/connector.py"
+  # Platform plugin: lets Hermes proactively deliver to Macchiato (best effort).
+  # Installed into THIS profile's home — its gateway loads it, and the plugin derives the
+  # per-profile push socket from its own HERMES_HOME (same rule as the connector).
   if [ -d "$TMP/connectors/hermes/plugin/macchiato" ]; then
-    mkdir -p "$HOME/.hermes/plugins"
-    cp -r "$TMP/connectors/hermes/plugin/macchiato" "$HOME/.hermes/plugins/"
-    command -v hermes >/dev/null 2>&1 && hermes plugins enable macchiato >/dev/null 2>&1 || true
-    say "Hermes 'macchiato' platform plugin installed — restart your Hermes gateway to load it"
+    mkdir -p "$HH/plugins"
+    cp -r "$TMP/connectors/hermes/plugin/macchiato" "$HH/plugins/"
+    if command -v hermes >/dev/null 2>&1; then
+      if [ -n "$PROFILE" ]; then hermes -p "$PROFILE" plugins enable macchiato >/dev/null 2>&1 || true
+      else hermes plugins enable macchiato >/dev/null 2>&1 || true; fi
+    fi
+    say "Hermes 'macchiato' platform plugin installed — restart your $WHAT gateway to load it"
   fi
 }
 
@@ -411,22 +468,47 @@ ${MIRROR_ENV:-}"     install_unit "macchiato-codex-connector" "$APP/node_modules
 
 # ── detect installed agents ─────────────────────────────────────────────────
 HAS_HERMES=0; HAS_OPENCLAW=0; HAS_CLAUDE=0; HAS_CODEX=0
+HERMES_PROFILES=""   # #309: space-separated named-profile list ("" = only the default)
 [ -n "$(find_hermes_python)" ] && HAS_HERMES=1
 { command -v openclaw >/dev/null 2>&1 || [ -f "$HOME/.openclaw/openclaw.json" ]; } && HAS_OPENCLAW=1
 [ -n "$(find_claude_bin)" ] && HAS_CLAUDE=1
 [ -n "$(find_codex_bin)" ] && HAS_CODEX=1
+# #309: named Hermes profiles live at ~/.hermes/profiles/<name> (each a full HERMES_HOME;
+# same enumeration Hermes' own `hermes profile list` uses — dirs matching its id charset).
+find_hermes_profiles() {
+  local d b
+  for d in "$HOME/.hermes/profiles"/*/; do
+    [ -d "$d" ] || continue
+    b="${d%/}"; b="${b##*/}"
+    case "$b" in
+      default) ;;                                  # ~/.hermes itself is the default profile
+      *[!a-z0-9_-]*|[!a-z0-9]*) ;;                 # invalid id charset / bad first char
+      *) printf '%s ' "$b" ;;
+    esac
+  done
+}
 # Test-only (#307 smoke): under MACCHIATO_SELFTEST the detection is taken ENTIRELY from
 # MACCHIATO_FAKE_DETECT (space-separated keys; empty = no agents) so the resolve/picker
 # logic is executable without real agents — and "no agent" is expressible. Never active
 # unless MACCHIATO_SELFTEST=1, and selftest exits before any real install.
+# #309: `hermes:<name>` tokens fake named profiles (and imply Hermes itself exists).
 if [ "${MACCHIATO_SELFTEST:-0}" = 1 ]; then
   HAS_HERMES=0; HAS_OPENCLAW=0; HAS_CLAUDE=0; HAS_CODEX=0
   for a in ${MACCHIATO_FAKE_DETECT:-}; do
-    case "$a" in hermes) HAS_HERMES=1 ;; openclaw) HAS_OPENCLAW=1 ;; claude-code) HAS_CLAUDE=1 ;; codex) HAS_CODEX=1 ;; esac
+    case "$a" in
+      hermes) HAS_HERMES=1 ;;
+      hermes:*) HAS_HERMES=1; HERMES_PROFILES="${HERMES_PROFILES}${a#hermes:} " ;;
+      openclaw) HAS_OPENCLAW=1 ;;
+      claude-code) HAS_CLAUDE=1 ;;
+      codex) HAS_CODEX=1 ;;
+    esac
   done
+elif [ "$HAS_HERMES" = 1 ]; then
+  HERMES_PROFILES="$(find_hermes_profiles)"
 fi
 DETECTED=()
 [ "$HAS_HERMES" = 1 ]   && DETECTED+=("hermes")
+for p in $HERMES_PROFILES; do DETECTED+=("hermes:$p"); done
 [ "$HAS_OPENCLAW" = 1 ] && DETECTED+=("openclaw")
 [ "$HAS_CLAUDE" = 1 ]   && DETECTED+=("claude-code")
 [ "$HAS_CODEX" = 1 ]    && DETECTED+=("codex")
@@ -559,6 +641,7 @@ fi
 for a in "${SELECTED[@]}"; do
   case "$a" in
     hermes)      install_hermes ;;
+    hermes:*)    install_hermes "${a#hermes:}" ;;   # #309 per-profile instance
     openclaw)    install_openclaw ;;
     claude-code) install_claude_code ;;
     codex)       install_codex ;;

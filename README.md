@@ -42,6 +42,8 @@ curl -sSL …/install.sh | bash -s -- --yes
 
 With no `--agents` and no terminal to prompt, it installs **every** detected connector. Run with `--help` to see all flags.
 
+**Multiple Hermes agents (profiles)?** If you run [Hermes profiles](https://hermes-agent.nousresearch.com/docs/user-guide/profiles/) (`hermes profile create coder`), the installer detects them and lists each as its own row — `Hermes: coder` — in the picker. Each profile gets its own connector instance with its own pairing, so it shows up as a **separate agent** in the app (proactive delivery included — the platform plugin is installed per profile). Non-interactively: `--agents=hermes:coder`. Updating any instance updates just that instance.
+
 **Don't want mirroring?** By default the connector mirrors terminal-side agent sessions into the app. If you'd rather keep the app to *only* the sessions you start from it, answer `n` at the installer's mirror prompt, or pass `--no-mirror` (env: `MACCHIATO_MIRROR=off`). Sessions you drive from the app work the same either way; you lose the terminal "busy" indicator and automatic history import. Re-run the installer with `--mirror` / `--no-mirror` anytime to flip the choice.
 
 **Requirements:** a working [Hermes](https://github.com/NousResearch), [OpenClaw](https://openclaw.ai) or [Claude Code](https://claude.com/claude-code) or [Codex](https://developers.openai.com/codex) install and a Macchiato account.
