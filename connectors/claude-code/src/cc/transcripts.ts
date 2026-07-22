@@ -37,6 +37,9 @@ export interface CCMessage {
   tools?: CCTool[];
   createdAt?: number; // epoch ms
   srcId: string; // 組內首行 uuid（§9 去重）
+  /** #318 assistant 組的 API message.id(= SDK 事件的 message.id;live×mirror 去重共同身份)。
+   * user/system 消息無此 id。 */
+  msgId?: string;
 }
 
 /** 一次增量讀出的「行 + 它的起始字節偏移」。 */
@@ -155,6 +158,7 @@ export function foldEntries(
     group = null;
     if (!g.text.trim() && !g.reasoning.trim() && g.tools.length === 0) return;
     const m: CCMessage = { role: "agent", text: g.text, srcId: g.srcId };
+    if (g.id) m.msgId = g.id; // #318 API message.id(live×mirror 去重)
     if (g.reasoning.trim()) m.reasoning = g.reasoning;
     if (g.tools.length) m.tools = g.tools;
     if (g.ts) m.createdAt = g.ts;

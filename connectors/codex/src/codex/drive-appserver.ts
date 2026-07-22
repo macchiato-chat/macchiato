@@ -17,7 +17,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { AppServerClient, AppServerDied } from "./appserver";
-import { loadDriveState, saveDriveState, codexPermsFor } from "./state";
+import { loadDriveState, saveDriveState, codexPermsFor, CODEX_AUTH_ERR_RE } from "./state";
 import { workDir } from "./drive";
 import { deriveMeta, discoverRollouts } from "./mirror";
 import { fallbackTitle, titleMode } from "./titles";
@@ -27,6 +27,10 @@ import type { E2EKeyStore } from "../e2e/keys";
 import type { Mirror } from "./mirror";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** #279 E2E prompt 解密失敗的用戶可見回執(僅提示語,零內容洩漏;四連接器同文案)。 */
+const E2E_DECRYPT_FAIL_WARNING = "無法解密這條消息(設備與連接器的加密密鑰可能失步)——請重試,或重新關閉再開啟本會話的端到端加密。";
+
 
 function isDir(p: string): boolean {
   try {
@@ -127,6 +131,8 @@ interface PendingApproval {
 export class AppServerDrive {
   /** #10:累計計數(與 v1 同鍵位,健康上報帶出)。engineAppServer=1 是引擎標記(v1 無此鍵)。 */
   readonly counters: Record<string, number> = { driveErrors: 0, approvalsRequested: 0, steers: 0, engineAppServer: 1, unknownNotifications: 0 };
+  /** #310 認證失效持續態:auth 類回合失敗置 true(health 上報 authOk=false),成功回合恢復。 */
+  authFailed = false;
   /** #258 已告警過的未知通知 method(去重,不刷屏)。 */
   private readonly loggedUnknownNotif = new Set<string>();
   private map: Record<string, string>;
@@ -396,6 +402,9 @@ export class AppServerDrive {
         text = this.e2e.decryptText(sid, text).trim();
       } catch (e) {
         console.error(`[E2E prompt decrypt failed for ${sid}] ${(e as Error).message}`);
+        // #279:靜默丟=用戶氣泡「已發送」卻永無回應。回 error 終態回合(僅提示語,零內容洩漏)。
+        this.emit(sid, "message.start", {});
+        this.emit(sid, "message.complete", { text: "", status: "error", warning: E2E_DECRYPT_FAIL_WARNING });
         return;
       }
       if (!text && !images.length) return;
@@ -654,11 +663,20 @@ export class AppServerDrive {
     const st = String(turnObj.status ?? "completed"); // TurnStatus: completed/interrupted/failed/inProgress
     const status = st === "failed" ? "error" : st === "interrupted" || interrupted ? "interrupted" : "complete";
     const errMsg = turnObj.error?.message ?? turn.lastError;
+    // #310 認證失效偵測:auth 類失敗置持續態(health authOk=false → app 顯降級);成功回合恢復。
+    const authErr = status === "error" && CODEX_AUTH_ERR_RE.test(String(errMsg ?? ""));
+    if (authErr) this.authFailed = true;
+    else if (status === "complete") this.authFailed = false;
     if (turn.isE2E) {
       this.sendE2ETurn(sid, turn.agentText);
     } else {
       if (status === "error" && !turn.agentText) {
-        this.emit(sid, "review.summary", { summary: `❌ 回合失敗:${String(errMsg ?? "unknown").slice(0, 200)}` });
+        // #310 auth 失敗給可行動文案(而非裸錯誤串,用戶不知道要去終端 login)
+        this.emit(sid, "review.summary", {
+          summary: authErr
+            ? "❌ Codex 登錄已失效——請在連接器主機終端跑 `codex login` 重新登錄後重試"
+            : `❌ 回合失敗:${String(errMsg ?? "unknown").slice(0, 200)}`,
+        });
       }
       this.startMsg(sid, turn);
       this.emit(sid, "message.complete", { text: turn.agentText, status, usage: turn.usage });

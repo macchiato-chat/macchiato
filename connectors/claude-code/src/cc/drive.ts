@@ -111,6 +111,9 @@ const UI_MODES = ["ask", "acceptEdits", "auto", "plan", "bypass"] as const;
 type UiMode = (typeof UI_MODES)[number];
 /** 文件編輯類工具——acceptEdits 檔在 canUseTool 內自動批(#116:SDK acceptEdits 被 canUseTool 覆蓋,故自實現)。 */
 const EDIT_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit", "ApplyPatch"]);
+
+/** #279 E2E prompt 解密失敗的用戶可見回執(僅提示語,零內容洩漏;四連接器同文案)。 */
+const E2E_DECRYPT_FAIL_WARNING = "無法解密這條消息(設備與連接器的加密密鑰可能失步)——請重試,或重新關閉再開啟本會話的端到端加密。";
 /**
  * #98/#205 UI 五檔 → SDK permissionMode + canUseTool 策略(#116/#205 探針背書)。
  * - ask       → default,每工具問
@@ -211,6 +214,9 @@ interface TurnCtx {
   retried: boolean;
   acc: string;
   lastError?: string; // #102 assistant.error(auth/billing/rate_limit…)→ 失敗行帶上
+  /** #318 本回合 live 投遞覆蓋的 API message.id 集(mirror 據此吞回合末晚落盤的 transcript 殘片,
+   * 防 live×mirror 雙投)。message.id 是 SDK 事件與 transcript 行的共同穩定身份。 */
+  seenMsgIds: Set<string>;
   isE2E: boolean;
   isFirstMacchiatoTurn: boolean;
   /** #141 output tokens 兜底本地累加:outputBase=已完成子消息之和,outputLive=當前子消息 message_delta 累計。
@@ -253,6 +259,8 @@ interface Channel {
 export class Drive {
   /** #10:累計計數(進程生命週期),健康上報帶出。 */
   readonly counters: Record<string, number> = { driveErrors: 0, turnErrors: 0 };
+  /** #310 認證失效持續態:auth 類回合失敗置 true(health 上報 authOk=false),成功回合恢復。 */
+  authFailed = false;
   /** serverSid → CC session uuid（跨重啟持久）。 */
   private map: Record<string, string>;
   /** #105 serverSid → 會話工作目錄（session.create.cwd 下發；跨重啟持久，與 map 同文件 v2 存）。 */
@@ -645,6 +653,10 @@ export class Drive {
               text = this.e2e.decryptText(sid, text).trim();
             } catch (e) {
               console.error(`[E2E prompt decrypt failed for ${sid}] ${(e as Error).message}`);
+              // #279:靜默丟=用戶氣泡「已發送」卻永無回應。回 error 終態回合(僅提示語,
+              // 零內容洩漏),用戶可見可重試;不把亂碼交給 agent 的語義不變。
+              this.emit(sid, "message.start", {});
+              this.emit(sid, "message.complete", { text: "", status: "error", warning: E2E_DECRYPT_FAIL_WARNING });
               return;
             }
           }
@@ -904,6 +916,7 @@ export class Drive {
       seen: false,
       retried: !!opts?.retriedDelivery,
       acc: "",
+      seenMsgIds: new Set(),
       isE2E,
       isFirstMacchiatoTurn,
       outputBase: 0,
@@ -1179,6 +1192,8 @@ export class Drive {
     }
     if (m.type === "assistant") {
       if (!turn || turn.completed) return;
+      // #318 記本回合 live 覆蓋的 API message.id(mirror 據此吞晚落盤殘片,防雙投)。
+      if (typeof m.message?.id === "string") turn.seenMsgIds.add(m.message.id);
       // #102 API 級錯誤分類(authentication_failed/billing_error/rate_limit/overloaded…)留給失敗行
       if (typeof m.error === "string") turn.lastError = m.error;
       // #141 子消息完成:把其最終 output_tokens 折進 base、清 live(下個子消息 message_delta 重新累)。
@@ -1255,6 +1270,7 @@ export class Drive {
       seen: true,
       retried: false,
       acc: "",
+      seenMsgIds: new Set(),
       isE2E: this.e2e?.isE2E(sid) ?? false,
       isFirstMacchiatoTurn: false,
       outputBase: 0, // #141
@@ -1281,6 +1297,10 @@ export class Drive {
     this.projects?.checkTurnEnd(); // #227 agent 可能在本回合改了 AGENTS.md → 惰性落版本
     const interrupted = this.interruptedSids.delete(sid);
     const isErr = m.subtype !== "success" || m.is_error === true;
+    // #310 認證失效偵測:auth 類失敗置持續態(health 上報 authOk=false → app 顯降級);成功回合恢復。
+    const authErr = isErr && /authenticat/i.test([turn.lastError ?? "", ...(Array.isArray(m.errors) ? m.errors.map(String) : [])].join(" "));
+    if (authErr) this.authFailed = true;
+    else if (!isErr) this.authFailed = false;
     // #102 status:協議 MessageCompletePayload 本就有(server 已消費 done/interrupted/error);
     // 此前不發 → 失敗回合對用戶靜默成「正常結束」。
     const status = isErr ? (interrupted ? "interrupted" : "error") : "complete";
@@ -1305,8 +1325,11 @@ export class Drive {
         ]
           .filter(Boolean)
           .join(" · ");
+        // #310 auth 失敗給可行動文案(而非裸分類串,用戶不知道要去終端 /login)
         this.emit(sid, "review.summary", {
-          summary: `❌ 回合失敗${detail ? `(${detail.slice(0, 200)})` : ""}`,
+          summary: authErr
+            ? "❌ Claude Code 登錄已失效——請在連接器主機終端跑 `claude /login` 重新登錄後重試"
+            : `❌ 回合失敗${detail ? `(${detail.slice(0, 200)})` : ""}`,
         });
       }
       this.startMsg(sid, turn);
@@ -1317,6 +1340,10 @@ export class Drive {
     this.approvals.delete(sid);
     const cc = this.ccSidFor(sid);
     if (cc) {
+      // #318 把本回合 live 覆蓋的 message.id 交給 mirror:fastForward 吞不掉的晚落盤殘片(SDK result
+      // 早於 CLI 寫完 transcript 尾巴)由此精確攔截,不再作為「終端新活動」補投成重複。順序在 fastForward
+      // 前登記,確保解除 driven 後恢復鏡像時集合已就位。
+      if (turn.seenMsgIds.size) this.mirror?.markLivePosted(cc, turn.seenMsgIds);
       this.mirror?.fastForward(cc); // live 已投遞 → 鏡像水位線快進越過本回合
       this.mirror?.unsetDriven(cc); // 僅回合級跳過：解除後終端側活動恢復鏡像（CC 無 gateway,鏡像是唯一路）
     }

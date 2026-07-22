@@ -68,15 +68,20 @@ LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.32"
+CONNECTOR_VERSION = "1.5.36"
+# #279 E2E prompt 解密失敗的用戶可見回執(僅提示語,零內容洩漏;四連接器同文案)。
+E2E_DECRYPT_FAIL_WARNING = "無法解密這條消息(設備與連接器的加密密鑰可能失步)——請重試,或重新關閉再開啟本會話的端到端加密。"
 # 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
 INSTALL_URL = os.environ.get(
     "MACCHIATO_INSTALL_URL",
     "https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh",
 )
 IMPORT_BATCH = 20
-# §15 全渠道持續鏡像（tail state.db）—— **核心功能，常開、不可關閉**。
+# §15 全渠道持續鏡像（tail state.db）——默認常開;#308 MACCHIATO_MIRROR=off 可停(見 MIRROR_OFF)。
 MIRROR_POLL_S = float(os.environ.get("MACCHIATO_MIRROR_POLL_S", "2"))  # 輪詢間隔（小=更即時、多步回合更增量）
+# #308 MACCHIATO_MIRROR=off:停鏡像輪詢+首裝自動導入(終端側活動不進 app)。⚠️ 只停這兩樣——
+# driven 會話路徑/dedup 衛生照常;_mirror_last_run 恆 None → 看門狗與 server staleness 天然跳過。
+MIRROR_OFF = os.environ.get("MACCHIATO_MIRROR", "").lower() in ("off", "0", "false", "no")
 MIRROR_STATE = os.path.expanduser("~/.macchiato/mirror.json")  # 鏡像水位線持久化
 PROJ_MEM_MAX = 256 * 1024  # #227 AGENTS.md 上限
 PROJ_SHIM = "@AGENTS.md\n"  # #227 CLAUDE.md 墊片
@@ -395,6 +400,9 @@ class Connector:
         self._rev: dict[str, str] = {}  # real hermes session id -> server session id
         self._pending_interrupt: set[str] = set()  # 回合映射建立前到達的 session.interrupt：別丟，等回合起步即取消
         self._titled: set[str] = set()  # #94：已自動生成過標題的 server_sid（防會話內重複）
+        # #302:live 在途回合(message.start 已轉發、complete 未到)的 server_sid。gateway 死亡時
+        # 這些回合永收不到終態 → server 卡 streaming、用戶氣泡永轉圈;重啟鉤子據此定稿 error。
+        self._live_inflight: set[str] = set()
         self._prompt_retried: set = set()  # #4：已重投過的 (sid, text 哈希)——每條 prompt 最多重投一次，防雙發
         self._retry_tasks: dict = {}  # #4/#5：sid → 在途重投任務。用戶中斷時取消之——已停的 prompt 不許復活
         # #148:per-session 串行任務鏈(sid → 鏈尾 task)。prompt.submit 的慢工作(resume 往返/
@@ -461,6 +469,11 @@ class Connector:
                 "params": {**params, "session_id": server_sid},
             }
             loop.create_task(self._to_server(server_sid, frame))
+            # #302:追蹤 live 在途回合(start→complete),gateway 死亡時據此定稿 error。
+            if params.get("type") == "message.start":
+                self._live_inflight.add(server_sid)
+            elif params.get("type") == "message.complete":
+                self._live_inflight.discard(server_sid)
             # 出站附件：message.complete 正文裡 MEDIA:/裸路徑標的文件 → media.attach。
             if params.get("type") == "message.complete":
                 text = (params.get("payload") or {}).get("text") or ""
@@ -485,8 +498,12 @@ class Connector:
         # #154 首裝採樣:水位線文件(含 .bak)從未存在 = 這台機器第一次跑 → ready 後自動全量導入。
         # 必須在鏡像循環建基線**之前**採樣,否則首輪保存後就分不出新舊安裝了。
         self._fresh_install = not (os.path.exists(MIRROR_STATE) or os.path.exists(MIRROR_STATE + ".bak"))
-        self._mirror_task = asyncio.create_task(self._mirror_loop())
-        print(f"· 持續鏡像已啟（輪詢 {MIRROR_POLL_S}s）")
+        if MIRROR_OFF:
+            # ⚠️ 回歸契約:scripts/localchain/scenarios-mirror-off.mjs 斷言此串,改文案需同步
+            print("· Mirror disabled (MACCHIATO_MIRROR=off) — terminal sessions stay out of the app; app-driven sessions unaffected")
+        else:
+            self._mirror_task = asyncio.create_task(self._mirror_loop())
+            print(f"· 持續鏡像已啟（輪詢 {MIRROR_POLL_S}s）")
         self._health_task = asyncio.create_task(self._health_loop())
         await self._start_push_socket()
 
@@ -554,6 +571,27 @@ class Connector:
         )
 
     def _on_gateway_restart(self) -> None:
+        # #302 gateway 死亡:在途 live 回合永收不到 message.complete → server 卡 streaming、
+        # 用戶氣泡永轉圈。對齊 CC 語義:立即定稿 error(可見可重試);內容若已落 state.db,
+        # 鏡像/對賬路徑會補進歷史。E2E 會話 live 被抑制、不進 _live_inflight,天然不涉及。
+        if self._live_inflight:
+            try:
+                loop = asyncio.get_running_loop()
+                for sid in list(self._live_inflight):
+                    frame = {
+                        "jsonrpc": "2.0",
+                        "method": "event",
+                        "params": {
+                            "type": "message.complete",
+                            "session_id": sid,
+                            "payload": {"text": "", "status": "error", "warning": "Hermes gateway 重啟,本回合中止——請重試"},
+                        },
+                    }
+                    loop.create_task(self._to_server(sid, frame))
+                    print(f"[#302] gateway 死亡 → 在途回合定稿 error({sid})", file=sys.stderr)
+            except RuntimeError:
+                pass  # 無運行中事件循環(理論不達:本鉤子由 supervise 協程調用)
+            self._live_inflight.clear()
         # gateway 重啟後，舊 session 映射失效（新 gateway 無這些活躍會話）→ 清空，
         # 下次 prompt 重新 resume（帶上下文）/ create。
         # 自驅會話的 live 消息已投遞過 → 重啟後推進其鏡像水位線、免得重發。需含 _fwd 鍵
@@ -1022,6 +1060,10 @@ class Connector:
         dedup_key 去重,非 replace 模式跳過已有)。既有安裝**不**觸發——自動 replace 會
         重置用戶手動改過的標題。auto_imported 記進鏡像狀態,at-most-once。"""
         if not self._fresh_install:
+            return
+        if MIRROR_OFF:
+            # #308:自動吸入終端歷史同屬「終端側活動進 app」語義,跟隨鏡像開關;
+            # app 裡的「導入」按鈕(import_start)是用戶顯式動作,保留不動。
             return
         st = self._mirror_st or self._load_mirror_state()
         if st.get("auto_imported"):
@@ -1904,7 +1946,17 @@ class Connector:
                             base = self._e2e.decrypt_text(server_sid, base).strip()
                         except Exception as exc:
                             print(f"[E2E 解密 prompt 失敗 {server_sid}] {exc!r}", file=sys.stderr)
-                            base = ""  # 解不開 → 不把亂碼提交給 agent
+                            # #279:靜默丟=用戶氣泡「已發送」卻永無回應。回 error 終態回合
+                            # (僅提示語,零內容洩漏),可見可重試;不把亂碼交給 agent 的語義不變。
+                            for etype, payload in (
+                                ("message.start", {}),
+                                ("message.complete", {"text": "", "status": "error", "warning": E2E_DECRYPT_FAIL_WARNING}),
+                            ):
+                                await self._to_server(
+                                    server_sid,
+                                    {"jsonrpc": "2.0", "method": "event", "params": {"type": etype, "session_id": server_sid, "payload": payload}},
+                                )
+                            return
                     if base:
                         parts.append(base)
                     non_audio_refs = [r for r in attachments if r.get("kind") != "audio"]

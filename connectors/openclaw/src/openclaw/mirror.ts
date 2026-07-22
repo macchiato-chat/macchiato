@@ -418,6 +418,11 @@ export class Mirror {
   }
 
 
+  /** #308 MACCHIATO_MIRROR=off:停鏡像輪詢(終端側活動不進 app)。⚠️ 只停這一樣——
+   * fastForward/墓碑/E2E backfill 是 driven 會話衛生,必須照常跑,多關 = 雙投回歸(#161)。
+   * index.ts 的 #154 首裝自動導入也按此開關跳過(自動吸入終端歷史同屬鏡像語義)。 */
+  readonly disabled = /^(off|0|false|no)$/i.test(process.env.MACCHIATO_MIRROR ?? "");
+
   constructor(
     private readonly gw: OpenClawGateway,
     private readonly linkb: LinkBClient,
@@ -427,6 +432,11 @@ export class Mirror {
   }
 
   start(): void {
+    if (this.disabled) {
+      // ⚠️ 回歸契約:scripts/localchain/scenarios-mirror-off.mjs 斷言此串,改文案需同步
+      console.log("· Mirror disabled (MACCHIATO_MIRROR=off) — terminal sessions stay out of the app; app-driven sessions unaffected");
+      return;
+    }
     void this.poll();
     this.timer = setInterval(() => void this.poll(), POLL_MS);
     console.log(`· Mirror started (poll ${POLL_MS / 1000}s, tailing ${sessionsDir()})`);

@@ -32,6 +32,19 @@ function assistantLine(text: string): string {
   );
 }
 
+/** #318 顯式指定 message.id 的 assistant 行(復現「同一條晚落盤殘片」用)。 */
+function assistantLineWithId(text: string, msgId: string): string {
+  return (
+    JSON.stringify({
+      type: "assistant",
+      uuid: uuid(),
+      sessionId: SID,
+      timestamp: "2026-07-05T10:00:02.000Z",
+      message: { id: msgId, role: "assistant", content: [{ type: "text", text }] },
+    }) + "\n"
+  );
+}
+
 interface Sent {
   frames: Record<string, unknown>[];
 }
@@ -87,6 +100,44 @@ describe("Mirror", () => {
     (m as any).doPoll();
     const last = (appends(sent).at(-1) as any).sessions[0];
     expect(last.messages.map((x: any) => x.text)).toEqual(["new message"]);
+  });
+
+  it("#318 markLivePosted 吞回合末晚落盤殘片:同 message.id 不重複投", () => {
+    setupEnv();
+    // 已存在會話(有真人消息+標題)——復現 bug:live 已投遞的最後一塊 text 晚落盤逃過 fastForward。
+    writeFileSync(file, userLine("問題") + assistantLine("完整回答正文"));
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb);
+    (m as any).doPoll(); // 首次全量鏡像
+    const firstMsgId = `a-${n}`; // assistantLine 用的 message.id(此刻 n 指向那條 assistant)
+    // 回合末:Drive 登記 live 已投遞這條 message.id
+    m.markLivePosted(SID, [firstMsgId]);
+    // 殘片:同一條 assistant(同 message.id)在 fastForward 後才落盤——用同 id 追加
+    appendFileSync(file, assistantLineWithId("完整回答正文", firstMsgId));
+    const before = appends(sent).length;
+    (m as any).doPoll();
+    // 應被吞掉:無新 mirror_append(或不含這條 text)
+    const afterFrames = appends(sent).slice(before).flatMap((f: any) => f.sessions[0].messages);
+    expect(afterFrames.map((x: any) => x.text)).not.toContain("完整回答正文");
+    // 一次性:同 id 二次殘片已不在集合,但也不該再有內容(水位線已推過)
+    (m as any).doPoll();
+    expect(appends(sent).slice(before).flatMap((f: any) => f.sessions[0]?.messages ?? [])).toHaveLength(0);
+  });
+
+  it("#318 markLivePosted 不誤傷:不同 message.id 的終端側新消息照常鏡像", () => {
+    setupEnv();
+    writeFileSync(file, userLine("問題") + assistantLine("回答"));
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb);
+    (m as any).doPoll();
+    m.markLivePosted(SID, ["a-999"]); // 登記一個不相干的 id
+    // 終端側真新消息(不同 id)→ 應照常鏡像
+    appendFileSync(file, userLine("終端追問") + assistantLine("終端回答"));
+    const before = appends(sent).length;
+    (m as any).doPoll();
+    const texts = appends(sent).slice(before).flatMap((f: any) => f.sessions[0].messages.map((x: any) => x.text));
+    expect(texts).toContain("終端追問");
+    expect(texts).toContain("終端回答");
   });
 
   it("大會話分批發:每帧單會話 ≤ BATCH_MAX 條", () => {
@@ -411,5 +462,53 @@ describe("#154 首掃基線(fresh install)", () => {
     // 重啟(新 Mirror 載同一狀態)→ seeded 持久,不會把舊歷史又基線一遍後漏鏡
     const m2 = new Mirror(linkb);
     expect(((m2 as any).state as any).seeded).toBe(true);
+  });
+});
+
+describe("#308 MACCHIATO_MIRROR=off(鏡像開關)", () => {
+  it("off:start 不輪詢(終端側不進 app);fastForward/tombstone 等 driven 衛生照常", () => {
+    const cfg = mkdtempSync(join(tmpdir(), "cc-cfg-"));
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
+    mkdirSync(join(cfg, "projects", "-home-x"), { recursive: true });
+    const f = join(cfg, "projects", "-home-x", `${SID}.jsonl`);
+    writeFileSync(f, userLine("終端側活動"));
+    writeFileSync(process.env.MACCHIATO_CC_MIRROR!, JSON.stringify({ offsets: {}, titles: {}, seeded: true }));
+    process.env.MACCHIATO_MIRROR = "off";
+    try {
+      const { linkb, sent } = fakeLinkb();
+      const m = new Mirror(linkb);
+      expect(m.disabled).toBe(true);
+      vi.useFakeTimers();
+      m.start(); // 不該裝 interval、不該 poll
+      vi.advanceTimersByTime(60_000);
+      vi.useRealTimers();
+      expect(appends(sent)).toHaveLength(0); // 終端側 transcript 一幀未發
+      // driven 衛生照常:fastForward 仍推水位線並落盤(關掉它 = 雙投回歸 #161/#318)
+      m.fastForward(SID);
+      expect(((m as any).state as any).offsets[SID]).toBeGreaterThan(0);
+      m.tombstone(SID);
+      expect(((m as any).state as any).tombstones).toContain(SID);
+    } finally {
+      delete process.env.MACCHIATO_MIRROR;
+    }
+  });
+
+  it("默認(env 未設)不停用;off/0/false/no 均停用", () => {
+    const cfg = mkdtempSync(join(tmpdir(), "cc-cfg-"));
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
+    try {
+      delete process.env.MACCHIATO_MIRROR;
+      expect(new Mirror(fakeLinkb().linkb).disabled).toBe(false);
+      for (const v of ["off", "OFF", "0", "false", "no"]) {
+        process.env.MACCHIATO_MIRROR = v;
+        expect(new Mirror(fakeLinkb().linkb).disabled).toBe(true);
+      }
+      process.env.MACCHIATO_MIRROR = "on";
+      expect(new Mirror(fakeLinkb().linkb).disabled).toBe(false);
+    } finally {
+      delete process.env.MACCHIATO_MIRROR;
+    }
   });
 });

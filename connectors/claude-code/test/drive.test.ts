@@ -590,6 +590,30 @@ describe("#102 消息面補齊", () => {
     expect(line.frame.params.payload.summary).toContain("hit max turns");
   });
 
+  it("#310 auth 類失敗 → 可行動文案(/login)+ authFailed 持續態;成功回合恢復", async () => {
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "assistant", error: "authentication_failed", message: { id: "m1", content: [] } },
+      { type: "result", subtype: "error_during_execution", is_error: true },
+    ];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "go" }));
+    await new Promise((r) => setTimeout(r, 20));
+    const line = sent.find((f: any) => f.frame?.params?.type === "review.summary") as any;
+    expect(line.frame.params.payload.summary).toContain("claude /login"); // 可行動,非裸分類串
+    expect(d.authFailed).toBe(true); // health 據此上報 authOk=false
+    // 成功回合 → 恢復
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "again" }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(d.authFailed).toBe(false);
+  });
+
   it("session.interrupt 後的錯誤 result → status=interrupted,不發 ❌ 行", async () => {
     emitScript = [
       { type: "system", subtype: "init", session_id: CC_SID },

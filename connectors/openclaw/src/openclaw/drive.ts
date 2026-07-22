@@ -146,6 +146,31 @@ export class Drive {
     this.gw.onEvent((e) => this.onGatewayEvent(e));
     // #202 重連後對賬 + #242 回合態重置(斷連窗內 lifecycle end 可能已丟)。
     this.gw.onConnected?.(() => void this.onGatewayConnected());
+    // #302 gateway 死亡:在途回合立即定稿 error(否則 server 永卡 streaming,用戶氣泡轉圈無終態)。
+    this.gw.onDisconnected?.(() => this.onGatewayDisconnected());
+  }
+
+  /** #302 gateway 斷開:對齊 CC 語義(onChannelEnd 定稿 error)——所有在途 live 回合就地終態。
+   * 重連後 onGatewayConnected 的對賬會把 gateway 側真正落盤的內容補進歷史(srcId 去重),不丟不重。
+   * E2E 會話跳過:live 被抑制、無 streaming 態可收。localchain adv-crash 場景為此路徑的防回歸。 */
+  private onGatewayDisconnected(): void {
+    for (const [key, runId] of this.active) {
+      const sid = this.sidByKey.get(key) ?? sidForKey(key);
+      if (!(this.e2e?.isE2E(sid) ?? false) && runId && this.started.has(runId) && !this.completed.has(runId)) {
+        this.emit(sid, "message.complete", {
+          text: this.acc.get(runId) ?? "",
+          status: "error",
+          warning: "OpenClaw gateway 斷開,本回合中止——內容若已生成,重連對賬後會補進歷史",
+        });
+        console.error(`[#302] gateway 斷開 → 在途回合定稿 error(${sid})`);
+      }
+      if (runId) {
+        this.started.delete(runId);
+        this.acc.delete(runId);
+        this.completed.delete(runId);
+      }
+    }
+    this.active.clear();
   }
 
   /** #242 gateway (重)連:斷線窗內 lifecycle end 可能已丟——active/回合態全部作廢,

@@ -105,6 +105,14 @@ export class Mirror {
    */
   private readonly drivenUuids = new Set<string>();
   /**
+   * #318 live 已投遞的 API message.id(按 sid)。回合末 Drive 登記本回合 live 覆蓋的 message.id;
+   * mirror fold 出的 assistant 消息若命中即跳過(一次性移除)——精確吞掉「SDK result 早於 CLI 寫完
+   * transcript 尾巴」逃過 fastForward 的晚落盤殘片,防 live×mirror 雙投(bug:回合末重複最後一塊)。
+   * 有界:每 sid ≤64 個 id、總 ≤64 個 sid(FIFO 淘汰)——殘片落盤窗口很短,淘汰不會誤刪在用的。
+   * 常態下多數 id 被 fastForward 先吃、永不匹配,故必須靠淘汰防洩漏。
+   */
+  private readonly livePosted = new Map<string, Set<string>>();
+  /**
    * 內部 fork 檔（subagent / 後台任務）：CC 會把它們寫成獨立 <uuid>.jsonl（繼承父會話標題
    * 元數據、**無任何真人消息**）。首次鏡像（水位線 0）折不出 user 消息 → 判內部檔，跳過且
    * 不推水位線；記 size，檔沒長就不重讀。若將來用戶真在該會話說話（size 變 + 出現 user），
@@ -133,6 +141,11 @@ export class Mirror {
   };
   private polling = false;
 
+  /** #308 MACCHIATO_MIRROR=off:停鏡像輪詢(終端側活動不進 app)。⚠️ 只停這一樣——
+   * fastForward/墓碑/markLivePosted/E2E backfill 是 driven 會話衛生,必須照常跑,
+   * 多關任何一個 = 影子會話/雙投全家回歸(#161/#318)。副作用:終端側忙碌指示(#56)一併失去。 */
+  readonly disabled = /^(off|0|false|no)$/i.test(process.env.MACCHIATO_MIRROR ?? "");
+
   constructor(
     private readonly linkb: LinkBClient,
     private readonly e2e?: E2EKeyStore,
@@ -141,6 +154,11 @@ export class Mirror {
   }
 
   start(): void {
+    if (this.disabled) {
+      // ⚠️ 回歸契約:scripts/localchain/scenarios-mirror-off.mjs 斷言此串,改文案需同步
+      console.log("· Mirror disabled (MACCHIATO_MIRROR=off) — terminal sessions stay out of the app; app-driven sessions unaffected");
+      return;
+    }
     void this.poll();
     this.timer = setInterval(() => void this.poll(), POLL_MS);
     console.log(`· Mirror started (poll ${POLL_MS / 1000}s, tailing ${projectsDir()})`);
@@ -172,6 +190,35 @@ export class Mirror {
    * ULID→CLI 映射時、及啟動時從既有映射批量灌入。鏡像據此永不給這些 uuid 單獨建會話。 */
   markDrivenUuid(cliUuid: string): void {
     if (cliUuid) this.drivenUuids.add(cliUuid);
+  }
+
+  /** #318 回合末登記本回合 live 覆蓋的 API message.id(Drive 調)。有界 FIFO 防洩漏。 */
+  markLivePosted(sid: string, msgIds: Iterable<string>): void {
+    let set = this.livePosted.get(sid);
+    if (!set) {
+      set = new Set();
+      this.livePosted.set(sid, set);
+      while (this.livePosted.size > 64) this.livePosted.delete(this.livePosted.keys().next().value!); // 總 sid 上限
+    }
+    for (const id of msgIds) {
+      if (id) set.add(id);
+      while (set.size > 64) set.delete(set.keys().next().value!); // 每 sid id 上限
+    }
+  }
+
+  /** #318 fold 出的消息過濾:命中 live 已投的 message.id → 跳過(一次性移除)。防雙投。 */
+  private dropLivePosted(sid: string, messages: CCMessage[]): CCMessage[] {
+    const set = this.livePosted.get(sid);
+    if (!set?.size) return messages;
+    const kept = messages.filter((m) => {
+      if (m.msgId && set.has(m.msgId)) {
+        set.delete(m.msgId); // 一次性:吞掉這條殘片後即釋放
+        return false;
+      }
+      return true;
+    });
+    if (!set.size) this.livePosted.delete(sid);
+    return kept;
   }
 
   /**
@@ -274,7 +321,11 @@ export class Mirror {
         if (size <= off) break;
         const { entries, endOffset } = readEntries(file, off);
         if (!entries.length) break;
-        const { messages, consumedUpTo, title } = foldEntries(entries, endOffset, Date.now(), batchMax());
+        const folded = foldEntries(entries, endOffset, Date.now(), batchMax());
+        const { consumedUpTo, title } = folded;
+        // #318 先濾掉 live 已投的殘片(回合末晚落盤、逃過 fastForward)——防重複最後一塊。濾空的批次
+        // 照常推進水位線(下方 consumedUpTo),只是不 emit;不影響「無 user 不建會話」等既有守衛。
+        const messages = this.dropLivePosted(sid, folded.messages);
         // 「無真人消息就別建會話」判定：鏡像從未建過此會話（`!titles[sid]`）時,只有含 user 的批次
         // 才允許**創建**它;沒有一條 user 的批次一律跳過。涵蓋三類 driven/fork 殘片,都會冒影子會話:
         //   (1) 內部 fork 檔（subagent/後台任務，繼承標題無真人行）;

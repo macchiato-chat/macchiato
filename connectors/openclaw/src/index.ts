@@ -24,7 +24,7 @@ import { join } from "node:path";
 // 四連接器常量(cc/codex/openclaw 各自 src/index.ts + hermes connector.py)+ protocol link.ts 全局。
 // 全局是 server 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」
 // (本機與公開用戶一起亮,重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-const CONNECTOR_VERSION = "1.5.32";
+const CONNECTOR_VERSION = "1.5.36";
 
 /** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
 function runSelfUpdate(): void {
@@ -95,7 +95,9 @@ async function main(): Promise<void> {
   // #154 首裝自動全量導入(拍板:Hermes/OpenClaw 不請示):鏡像水位線文件從未存在 = 首次安裝
   // → 自動回灌全部歷史(等價點「導入」;server dedup_key 去重)。既有安裝不觸發——自動 replace
   // 會重置手動改過的標題。freshInstall 在 mirror.start() 建檔**前**採樣;進程內只跑一次。
-  if (freshInstall) {
+  // #308 mirror off 時跳過自動導入——自動吸入終端歷史同屬「終端側活動進 app」語義;
+  // app 裡的「導入」按鈕(import_start)是用戶顯式動作,保留不動。
+  if (freshInstall && !mirror.disabled) {
     console.log("· #154 首裝偵測 → 自動全量導入歷史(無需請示)");
     void runImport(gw, linkb).catch((e) => console.error("[#154 自動導入失敗(手動導入入口仍在)]", (e as Error).message));
   }

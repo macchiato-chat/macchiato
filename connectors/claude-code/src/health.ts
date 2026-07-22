@@ -27,6 +27,8 @@ export interface HealthSnapshot {
   /** #89：無本地 STT——server 據此把語音輸入直接路由到雲端 BYOK STT（不再下達音頻）。 */
   stt: false;
   cliVersion?: string;
+  /** #310 登錄態:false=最近驅動回合認證失敗(app 顯「需重新登錄」);成功回合恢復 true。 */
+  authOk?: boolean;
   /** #10:累計計數(進程生命週期)——鏡像條數/nack/驅動錯誤,一次性的丟/重複才看得見。 */
   counters?: Record<string, number>;
 }
@@ -69,7 +71,8 @@ export class HealthLoop {
   tick(): void {
     gcAttachments(); // #151 入站附件 TTL GC(節流在函數內)
     if (Date.now() - this.lastProbeAt >= CLI_REPROBE_MS) this.probeCli(); // #259 CLI 升級後重探版本
-    const ageS = Math.round((Date.now() - this.mirror.lastPollAt) / 1000);
+    // #308 mirror off:輪詢本來就不跑,ageS 恆報 0——否則 server 60s 後誤判 degraded、下面看門狗無限「自愈」。
+    const ageS = this.mirror.disabled ? 0 : Math.round((Date.now() - this.mirror.lastPollAt) / 1000);
     // #76 兼容自檢:版本門檻 + 最新 transcript 解析冒煙。不兼容 → compatOk=false(app 顯示降級),
     // 並把原因併入 lastError,別讓 CLI 升級悄悄破壞解析後靜默丟消息。
     const compat = checkCompat(this.cliVersion);
@@ -82,6 +85,7 @@ export class HealthLoop {
       connectorVersion: this.version,
       stt: false,
       ...(this.cliVersion ? { cliVersion: this.cliVersion } : {}),
+      authOk: !this.drive?.authFailed, // #310:auth 失效上浮降級,成功回合自動恢復
       counters: { ...this.mirror.counters, ...(this.drive?.counters ?? {}) }, // #10
     };
     if (ageS * 1000 > MIRROR_STUCK_MS) {

@@ -65,7 +65,8 @@ export function buildHealth(gw: OpenClawGateway, mirror: Mirror, version: string
   return {
     gatewayAlive: gw.isConnected,
     compatOk: compat.ok,
-    mirrorLastPollAgeS: Math.round((Date.now() - mirror.lastPollAt) / 1000),
+    // #308 mirror off:輪詢本來就不跑,恆報 0——否則 server 60s 後誤判 degraded、tick 看門狗無限「自愈」。
+    mirrorLastPollAgeS: mirror.disabled ? 0 : Math.round((Date.now() - mirror.lastPollAt) / 1000),
     lastError: stale ?? gwDown ?? (compat.ok ? mirror.lastError : (compat.reason ?? "兼容自檢失敗")),
     kind: "openclaw",
     connectorVersion: version,

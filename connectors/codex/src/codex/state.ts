@@ -88,3 +88,7 @@ export function codexPermsFor(mode: string | undefined): { sandbox: string; appr
       return undefined;
   }
 }
+
+/** #310 codex 認證失敗特徵(auth.json 過期/未登錄/401)。窄匹配防誤傷("author"、403 權限類不算)。
+ * v1(drive)對 stderr、v2(drive-appserver)對 turn error message 同判。 */
+export const CODEX_AUTH_ERR_RE = /\b401\b|unauthoriz|authenticat|not.?logged.?in|token.{0,12}expired|invalid.?api.?key|login.?required/i;

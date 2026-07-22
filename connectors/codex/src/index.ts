@@ -16,6 +16,7 @@ import { AppServerClient } from "./codex/appserver";
 import { Projects } from "./codex/projects";
 import { ModelsReporter } from "./codex/models";
 import { AppServerDrive } from "./codex/drive-appserver";
+import { LoginFlow } from "./codex/login";
 import { HealthLoop } from "./health";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 
@@ -23,7 +24,7 @@ import { runVerifiedSelfUpdate } from "./selfupdate";
 // 四連接器常量(cc/codex/openclaw 各自 src/index.ts + hermes connector.py)+ protocol link.ts 全局。
 // 全局是 server 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」
 // (本機與公開用戶一起亮,重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-const CONNECTOR_VERSION = "1.5.32";
+const CONNECTOR_VERSION = "1.5.36";
 
 function runSelfUpdate(): void {
   // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。
@@ -83,10 +84,22 @@ async function main(): Promise<void> {
   drive.wire();
   void new ModelsReporter(linkb, modelsClient).start(); // #231 model/effort 清單上報(exec 無 client → 空)
 
+  // #313 遠程重登錄:app 觸發 → `codex login --device-auth` → URL+一次性碼上送,CLI 自輪詢完成。
+  const login = new LoginFlow();
+  const loginEvents = {
+    onUrl: (url: string, userCode?: string) =>
+      linkb.send({ t: "auth_login_update", agentLinkId: linkb.agentLinkId, phase: "url", url, ...(userCode ? { userCode } : {}), needsCode: false }),
+    onResult: (ok: boolean, error?: string) => {
+      if (ok) drive.authFailed = false; // 登錄成功 → health 立即恢復 authOk
+      linkb.send({ t: "auth_login_result", agentLinkId: linkb.agentLinkId, ok, ...(error ? { error } : {}) });
+      console.log(ok ? "✓ #313 遠程重登錄完成" : `✗ #313 遠程重登錄失敗:${error}`);
+    },
+  };
   linkb.onFrame((msg) => {
     if (msg.t === "mirror_nack" && typeof msg.batchId === "number") mirror.handleNack(msg.batchId);
     else if (msg.t === "import_start") runImport(linkb, Array.isArray(msg.projects) ? (msg.projects as string[]) : undefined); // #154 可按 project 過濾
     else if (msg.t === "self_update") runSelfUpdate();
+    else if (msg.t === "auth_login_start") login.start(loginEvents);
     else if (msg.t === "e2e_wrap_request" && typeof msg.hermesSessionId === "string") {
       const wrapped = e2e.wrapForDevices(msg.hermesSessionId, (msg.devices as any[]) ?? []);
       linkb.send({ t: "e2e_key", agentLinkId: linkb.agentLinkId, hermesSessionId: msg.hermesSessionId, wrapped });

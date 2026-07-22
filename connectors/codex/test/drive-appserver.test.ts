@@ -201,6 +201,30 @@ describe("#132 v2 回合生命週期", () => {
     evs = events(sent);
     expect(evs.at(-1)!.payload.status).toBe("interrupted");
   });
+
+  it("#310 auth 類失敗(401/token expired)→ 可行動文案(codex login)+ authFailed;成功回合恢復", async () => {
+    const { d, client, linkb, sent } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "q" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    client.fire("turn/completed", { threadId: TID, turn: { status: "failed", error: { message: "401 Unauthorized: token has expired" } } });
+    await tick();
+    const line = events(sent).find((e) => e.type === "review.summary");
+    expect(line?.payload.summary).toContain("codex login"); // 可行動,非裸錯誤串
+    expect(d.authFailed).toBe(true); // health 據此上報 authOk=false
+    // 成功回合 → 恢復
+    await linkb.deliver(tui("prompt.submit", SID, { text: "q2" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t2" } });
+    client.fire("item/completed", { threadId: TID, item: { type: "agentMessage", id: "m1", text: "ok" } });
+    client.fire("turn/completed", { threadId: TID, turn: { status: "completed" } });
+    await tick();
+    expect(d.authFailed).toBe(false);
+    // 非 auth 失敗(boom)不誤標
+    await linkb.deliver(tui("prompt.submit", SID, { text: "q3" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t3" } });
+    client.fire("turn/completed", { threadId: TID, turn: { status: "failed", error: { message: "boom" } } });
+    await tick();
+    expect(d.authFailed).toBe(false);
+  });
 });
 
 describe("#132 v2 steer", () => {

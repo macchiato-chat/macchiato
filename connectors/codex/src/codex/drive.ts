@@ -21,7 +21,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { loadDriveState, saveDriveState, codexPermsFor } from "./state";
+import { loadDriveState, saveDriveState, codexPermsFor, CODEX_AUTH_ERR_RE } from "./state";
 import { resolveCodexBin } from "./codex-bin";
 import { deriveMeta, discoverRollouts } from "./mirror";
 import { generateTitle } from "./titles";
@@ -31,6 +31,9 @@ import type { E2EKeyStore } from "../e2e/keys";
 import type { Mirror } from "./mirror";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** #279 E2E prompt 解密失敗的用戶可見回執(僅提示語,零內容洩漏;四連接器同文案)。 */
+const E2E_DECRYPT_FAIL_WARNING = "無法解密這條消息(設備與連接器的加密密鑰可能失步)——請重試,或重新關閉再開啟本會話的端到端加密。";
 
 export function workDir(): string {
   return process.env.MACCHIATO_CODEX_WORKDIR || homedir();
@@ -111,6 +114,8 @@ interface Turn {
 export class Drive {
   /** #10:累計計數(進程生命週期),健康上報帶出。 */
   readonly counters: Record<string, number> = { driveErrors: 0 };
+  /** #310 認證失效持續態:auth 類回合失敗置 true(health 上報 authOk=false),成功回合恢復。 */
+  authFailed = false;
   /** serverSid → codex thread uuid(跨重啟持久)。 */
   private map: Record<string, string>;
   /** serverSid → 會話工作目錄。 */
@@ -251,6 +256,9 @@ export class Drive {
               text = this.e2e.decryptText(sid, text).trim();
             } catch (e) {
               console.error(`[E2E prompt decrypt failed for ${sid}] ${(e as Error).message}`);
+              // #279:靜默丟=用戶氣泡「已發送」卻永無回應。回 error 終態回合(僅提示語,零內容洩漏)。
+              this.emit(sid, "message.start", {});
+              this.emit(sid, "message.complete", { text: "", status: "error", warning: E2E_DECRYPT_FAIL_WARNING });
               return;
             }
             if (!text) return;
@@ -499,11 +507,19 @@ export class Drive {
     const err = code !== 0 && code !== null;
     const status = err ? "error" : interrupted || code === null ? "interrupted" : "complete";
     const finalText = turn.agentText;
+    // #310 認證失效偵測(同 v2):auth 類失敗置持續態,成功回合恢復。
+    const authErr = err && CODEX_AUTH_ERR_RE.test(stderr);
+    if (authErr) this.authFailed = true;
+    else if (status === "complete") this.authFailed = false;
     if (turn.isE2E) {
       this.sendE2ETurn(sid, finalText);
     } else {
       if (err && !finalText) {
-        this.emit(sid, "review.summary", { summary: `❌ 回合失敗(codex exit ${code}${stderr ? ": " + stderr.slice(0, 200) : ""})` });
+        this.emit(sid, "review.summary", {
+          summary: authErr
+            ? "❌ Codex 登錄已失效——請在連接器主機終端跑 `codex login` 重新登錄後重試"
+            : `❌ 回合失敗(codex exit ${code}${stderr ? ": " + stderr.slice(0, 200) : ""})`,
+        });
       }
       this.startMsg(sid, turn);
       this.emit(sid, "message.complete", { text: finalText, status, usage: turn.usage });

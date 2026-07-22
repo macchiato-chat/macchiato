@@ -30,6 +30,15 @@ function makeDrive(opts: { titleMode?: string } = {}) {
     triggerConnected() {
       for (const h of [...this.connHandlers]) h();
     },
+    // #302:斷開鉤子(測試手動 triggerDisconnected 觸發)
+    discHandlers: [] as any[],
+    onDisconnected(h: any) {
+      this.discHandlers.push(h);
+      return () => {};
+    },
+    triggerDisconnected() {
+      for (const h of [...this.discHandlers]) h();
+    },
     async request(method: string, params: any) {
       calls.push({ method, params });
       // #113:titlegen 的 agent RPC → 異步回 chat final 事件(復刻真 gateway 行為)
@@ -131,6 +140,23 @@ describe("drive 上行翻譯（chat/lifecycle → tui EVENT）", () => {
     expect(sent.length).toBe(2); // start + complete
     expect(sent[1].sessionId).toBe("01KWNFM8ZB"); // 原始大寫 sid 還原 ✓
     expect(sent[1].frame.params.session_id).toBe("01KWNFM8ZB");
+  });
+
+  it("#302 gateway 斷開 → 在途回合定稿 message.complete(error);再斷冪等不重發", async () => {
+    const { gw, linkb, sent } = makeDrive();
+    const KEY = `${MACCHIATO_PREFIX}01sid`;
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "hi" }));
+    gw.fire({ event: "agent", payload: { stream: "lifecycle", data: { phase: "start" }, runId: "r1", sessionKey: KEY } });
+    gw.fire({ event: "chat", payload: { runId: "r1", sessionKey: KEY, state: "delta", deltaText: "半截" } });
+    gw.triggerDisconnected();
+    const last = sent[sent.length - 1];
+    expect(last.frame.params.type).toBe("message.complete");
+    expect(last.frame.params.payload.status).toBe("error");
+    expect(last.frame.params.payload.text).toBe("半截"); // 已流出的部分帶回,不憑空清零
+    expect(last.sessionId).toBe("01SID");
+    const n = sent.length;
+    gw.triggerDisconnected(); // active 已清 → 冪等
+    expect(sent.length).toBe(n);
   });
 
   it("非 driven 會話的事件忽略（別把 Discord live 會話誤翻譯）", async () => {

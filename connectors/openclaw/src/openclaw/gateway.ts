@@ -59,6 +59,14 @@ export class OpenClawGateway {
     return () => this.connectedHandlers.delete(h);
   }
 
+  /** #302 連接斷開回調(只在「已連上→斷開」的沿觸發;退避重連的反覆失敗不重複 fire)。
+   * 訂閱方(drive)據此把在途回合立即定稿 error——否則 server 側永卡 streaming、用戶氣泡轉圈無終態。 */
+  private readonly disconnectedHandlers = new Set<() => void>();
+  onDisconnected(h: () => void): () => void {
+    this.disconnectedHandlers.add(h);
+    return () => this.disconnectedHandlers.delete(h);
+  }
+
   /** 連接並完成首次握手。 */
   async start(): Promise<void> {
     this.connect();
@@ -170,12 +178,22 @@ export class OpenClawGateway {
   }
 
   private onClose(): void {
+    const wasConnected = this.connected;
     this.connected = false;
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
       p.reject(new Error("gateway connection lost"));
     }
     this.pending.clear();
+    if (wasConnected) {
+      for (const h of this.disconnectedHandlers) {
+        try {
+          h();
+        } catch {
+          /* 監聽器自負其責 */
+        }
+      }
+    }
     if (this.closed) return;
     // #3 指數退避(3s→60s+抖動);連續失敗每 5 次吼一聲,並經 reconnectFailures 上浮 health。
     this.reconnectFailures += 1;
