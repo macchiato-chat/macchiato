@@ -25,11 +25,22 @@ curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/instal
 
 The installer will:
 
-1. auto-detect your agent(s) — Hermes, OpenClaw, Claude Code and/or Codex,
+1. detect your agent(s) — Hermes, OpenClaw, Claude Code and/or Codex,
 2. download the connector to `~/.macchiato/app/`,
 3. show a **pairing code** — enter it at [macchiato.chat](https://macchiato.chat) to claim this connector,
 4. install a background service so it runs 24/7 (Linux: `systemd` user service; macOS: launchd LaunchAgent),
 5. install the agent-side plugin (Hermes platform plugin / OpenClaw channel plugin) so your agent can message you proactively — restart your agent's gateway to load it.
+
+**Choosing connectors** (when you run more than one agent): with a terminal attached, the installer shows an interactive picker (↑/↓ to move, space to tick, enter to confirm). To pick non-interactively — or in CI/containers — pass a list:
+
+```bash
+# only these two, no prompt (aliases: cc → claude-code, oc → openclaw)
+curl -sSL …/install.sh | bash -s -- --agents=claude-code,codex
+# everything detected, no prompt
+curl -sSL …/install.sh | bash -s -- --yes
+```
+
+With no `--agents` and no terminal to prompt, it installs **every** detected connector. Run with `--help` to see all flags.
 
 **Requirements:** a working [Hermes](https://github.com/NousResearch), [OpenClaw](https://openclaw.ai) or [Claude Code](https://claude.com/claude-code) or [Codex](https://developers.openai.com/codex) install and a Macchiato account.
 

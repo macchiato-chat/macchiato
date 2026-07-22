@@ -2,16 +2,29 @@
 # Macchiato Connector — one-line installer
 #   curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh | bash
 #
-# Auto-detects which agent(s) you run — Hermes, OpenClaw, Claude Code and/or Codex — and installs
+# Detects which agent(s) you run — Hermes, OpenClaw, Claude Code and/or Codex — and installs
 # the matching connector(s): download → pair (one-time code) → background service
 # (Linux: systemd user service; macOS: launchd LaunchAgent).
+#
+# Choosing what to install (when you run more than one agent):
+#   • Pass a list:   … | bash -s -- --agents=claude-code,codex
+#   • Or just run it: with a terminal attached and several agents found, an
+#     interactive picker lets you tick the ones you want (↑/↓ + space + enter).
+#   • No terminal (CI/containers) and no --agents → installs every agent found.
+#
+# CLI flags (after `bash -s --`):
+#   --agents=LIST   comma-separated: hermes, openclaw, claude-code, codex, or "all"
+#                   (aliases: cc/claude → claude-code, oc → openclaw)
+#   -y, --yes       install every detected connector, no prompt
+#   -h, --help      show usage and exit
 #
 # Env overrides:
 #   MACCHIATO_SERVER_URL   (default wss://api.macchiato.chat/connector)
 #   HERMES_PYTHON          (path to the python inside your Hermes venv, if auto-detect fails)
 #   MACCHIATO_CLAUDE_BIN   (absolute path to the claude CLI, if auto-detect fails)
 #   MACCHIATO_CODEX_BIN    (absolute path to the codex CLI, if auto-detect fails)
-#   MACCHIATO_ONLY         ("hermes" | "openclaw" | "claude-code" | "codex" — skip auto-detect, install just one)
+#   MACCHIATO_ONLY         ("hermes" | "openclaw" | "claude-code" | "codex" — legacy single-select;
+#                           --agents supersedes it and takes a list)
 #   MACCHIATO_MANIFEST     (path to a pre-verified release.json — self_update passes it;
 #                           every installed file is sha256-checked against it before use)
 
@@ -141,12 +154,92 @@ install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
   say "Service $1 running ✓   Update anytime by re-running this installer. Logs: journalctl --user -u $1 -f"
 }
 
+# ═════════════════════════════ agent selection (#307) ═══════════════════════
+# Parsed here (before the download) so --help and bad flags cost nothing.
+# Pretty display name for a canonical agent key.
+agent_label() {
+  case "$1" in
+    hermes)      echo "Hermes" ;;
+    openclaw)    echo "OpenClaw" ;;
+    claude-code) echo "Claude Code" ;;
+    codex)       echo "Codex" ;;
+    *)           echo "$1" ;;
+  esac
+}
+# Comma-join a list of agent labels for human-readable messages.
+labels_of() { local out="" a; for a in "$@"; do out="${out:+$out, }$(agent_label "$a")"; done; printf '%s' "$out"; }
+# Comma-join raw keys (safe with zero args → empty). Callers pass ${arr[@]+"${arr[@]}"}
+# so empty arrays don't trip `set -u` on bash 3.2 (macOS /bin/bash).
+csv() { local IFS=,; echo "$*"; }
+
+# Normalize a user-typed agent token (with aliases) → canonical key, or "" if unknown.
+normalize_agent() {
+  case "$1" in
+    hermes|Hermes|HERMES)                                     echo "hermes" ;;
+    openclaw|OpenClaw|OPENCLAW|oc)                            echo "openclaw" ;;
+    claude-code|claude|Claude|cc|claudecode|claude_code|CC)   echo "claude-code" ;;
+    codex|Codex|CODEX)                                        echo "codex" ;;
+    *)                                                        echo "" ;;
+  esac
+}
+
+REQUESTED=""    # space-separated canonical keys parsed from --agents / MACCHIATO_ONLY, or "all"
+ASSUME_YES=0
+add_requested() { # $1 = comma/space-separated token list
+  local tok norm
+  local IFS=', '
+  for tok in $1; do
+    [ -n "$tok" ] || continue
+    if [ "$tok" = "all" ]; then REQUESTED="all"; return; fi
+    norm="$(normalize_agent "$tok")"
+    [ -n "$norm" ] || fail "Unknown agent '$tok' (valid: hermes, openclaw, claude-code, codex, all)"
+    case " $REQUESTED " in *" $norm "*) ;; *) REQUESTED="${REQUESTED:+$REQUESTED }$norm" ;; esac
+  done
+}
+
+usage() {
+  cat <<'EOF'
+Macchiato connector installer
+
+  curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh | bash
+  … | bash -s -- [options]
+
+Options:
+  --agents=LIST   comma-separated connectors to install:
+                  hermes, openclaw, claude-code, codex, or "all"
+                  (aliases: cc/claude → claude-code, oc → openclaw)
+  -y, --yes       install every detected connector without prompting
+  -h, --help      show this help
+
+With no --agents and a terminal attached, an interactive picker appears when
+more than one agent is detected. Without a terminal it installs all detected.
+EOF
+}
+
+# ── parse CLI args (curl|bash passes them via `bash -s -- …`) ────────────────
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --agents=*)    add_requested "${1#*=}" ;;
+    --agents|-A)   shift; [ $# -gt 0 ] || fail "--agents needs a value (e.g. --agents=claude-code,codex)"; add_requested "$1" ;;
+    --all)         REQUESTED="all" ;;
+    -y|--yes|--non-interactive) ASSUME_YES=1 ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             fail "Unknown option: $1 (try --help)" ;;
+  esac
+  shift
+done
+# Legacy MACCHIATO_ONLY (single-select) — honored only when --agents was not given.
+[ -z "$REQUESTED" ] && [ -n "${MACCHIATO_ONLY:-}" ] && add_requested "$MACCHIATO_ONLY"
+
 # ── shared: download repo once ──────────────────────────────────────────────
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-say "Downloading Macchiato connectors…"
-curl -sSL --fail --proto '=https' "$REPO_TARBALL" | tar -xz -C "$TMP" --strip-components=1
-[ -d "$TMP/connectors" ] || fail "Downloaded repo has no connectors/ (repo layout changed?)"
+# Test-only (#307): selftest resolves the plan and exits before install — skip the download.
+if [ "${MACCHIATO_SELFTEST:-0}" != 1 ]; then
+  say "Downloading Macchiato connectors…"
+  curl -sSL --fail --proto '=https' "$REPO_TARBALL" | tar -xz -C "$TMP" --strip-components=1
+  [ -d "$TMP/connectors" ] || fail "Downloaded repo has no connectors/ (repo layout changed?)"
+fi
 
 # ═════════════════════════════ Hermes ═══════════════════════════════════════
 find_hermes_python() {
@@ -292,27 +385,141 @@ install_codex() {
 MACCHIATO_CODEX_BIN=$CODEX"     install_unit "macchiato-codex-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
 }
 
-# ── detect + run ─────────────────────────────────────────────────────────────
-ONLY="${MACCHIATO_ONLY:-}"
+# ── detect installed agents ─────────────────────────────────────────────────
 HAS_HERMES=0; HAS_OPENCLAW=0; HAS_CLAUDE=0; HAS_CODEX=0
 [ -n "$(find_hermes_python)" ] && HAS_HERMES=1
 { command -v openclaw >/dev/null 2>&1 || [ -f "$HOME/.openclaw/openclaw.json" ]; } && HAS_OPENCLAW=1
 [ -n "$(find_claude_bin)" ] && HAS_CLAUDE=1
 [ -n "$(find_codex_bin)" ] && HAS_CODEX=1
+# Test-only (#307 smoke): under MACCHIATO_SELFTEST the detection is taken ENTIRELY from
+# MACCHIATO_FAKE_DETECT (space-separated keys; empty = no agents) so the resolve/picker
+# logic is executable without real agents — and "no agent" is expressible. Never active
+# unless MACCHIATO_SELFTEST=1, and selftest exits before any real install.
+if [ "${MACCHIATO_SELFTEST:-0}" = 1 ]; then
+  HAS_HERMES=0; HAS_OPENCLAW=0; HAS_CLAUDE=0; HAS_CODEX=0
+  for a in ${MACCHIATO_FAKE_DETECT:-}; do
+    case "$a" in hermes) HAS_HERMES=1 ;; openclaw) HAS_OPENCLAW=1 ;; claude-code) HAS_CLAUDE=1 ;; codex) HAS_CODEX=1 ;; esac
+  done
+fi
+DETECTED=()
+[ "$HAS_HERMES" = 1 ]   && DETECTED+=("hermes")
+[ "$HAS_OPENCLAW" = 1 ] && DETECTED+=("openclaw")
+[ "$HAS_CLAUDE" = 1 ]   && DETECTED+=("claude-code")
+[ "$HAS_CODEX" = 1 ]    && DETECTED+=("codex")
 
-case "$ONLY" in
-  hermes)      install_hermes ;;
-  openclaw)    install_openclaw ;;
-  claude-code) install_claude_code ;;
-  codex)       install_codex ;;
-  "")
-    [ "$HAS_HERMES" = 1 ] || [ "$HAS_OPENCLAW" = 1 ] || [ "$HAS_CLAUDE" = 1 ] || [ "$HAS_CODEX" = 1 ] || fail "No supported agent found (Hermes, OpenClaw, Claude Code or Codex). Install one first — see README."
-    [ "$HAS_HERMES" = 1 ]   && install_hermes
-    [ "$HAS_OPENCLAW" = 1 ] && install_openclaw
-    [ "$HAS_CLAUDE" = 1 ]   && install_claude_code
-    [ "$HAS_CODEX" = 1 ]    && install_codex
-    ;;
-  *) fail "MACCHIATO_ONLY must be 'hermes', 'openclaw', 'claude-code' or 'codex'" ;;
-esac
+# ── interactive multi-select picker (arrow keys + space), drawn on /dev/tty ──
+# Requires a real terminal; caller checks. Sets the global SELECTED array.
+has_tty() { { true </dev/tty; } 2>/dev/null; }
+SELECTED=()
+pick_agents() {
+  local -a keys=("$@")
+  local n=${#keys[@]} i cur=0
+  local -a on
+  for ((i = 0; i < n; i++)); do on[i]=1; done   # default: everything ticked
+  local saved; saved="$(stty -g </dev/tty)"
+  # Ctrl-C during the picker: restore the terminal, then abort the whole install.
+  trap 'stty "$saved" </dev/tty 2>/dev/null; printf "\033[?25h\n" >/dev/tty; exit 130' INT
+  stty -echo -icanon min 1 time 0 </dev/tty 2>/dev/null || true
+  printf '\033[?25l' >/dev/tty   # hide cursor while navigating
 
+  local lines=$((n + 4)) drawn=0 key rest mark
+  while :; do
+    [ "$drawn" = 1 ] && printf '\033[%dA' "$lines" >/dev/tty
+    drawn=1
+    {
+      printf '\r\033[2K  \033[1;35m✻\033[0m \033[1mMacchiato\033[0m \033[2m·\033[0m choose connectors to install\n'
+      printf '\r\033[2K\n'
+      for ((i = 0; i < n; i++)); do
+        if [ "${on[i]}" = 1 ]; then mark=$'\033[32m◉\033[0m'; else mark=$'\033[2m○\033[0m'; fi
+        if [ "$i" = "$cur" ]; then
+          printf '\r\033[2K   \033[36m❯\033[0m %s \033[1;36m%s\033[0m\n' "$mark" "$(agent_label "${keys[i]}")"
+        else
+          printf '\r\033[2K     %s %s\n' "$mark" "$(agent_label "${keys[i]}")"
+        fi
+      done
+      printf '\r\033[2K\n'
+      printf '\r\033[2K   \033[2m↑/↓ move · space toggle · a all/none · enter confirm · q quit\033[0m\n'
+    } >/dev/tty
+
+    if ! IFS= read -rsn1 key </dev/tty 2>/dev/null; then key="__quit__"; fi
+    case "$key" in
+      $'\033')  # escape sequence — arrow keys send ESC [ A/B (or ESC O A/B)
+        rest=""; IFS= read -rsn2 -t 0.05 rest </dev/tty 2>/dev/null || true
+        case "$rest" in
+          '[A' | 'OA') cur=$(((cur - 1 + n) % n)) ;;
+          '[B' | 'OB') cur=$(((cur + 1) % n)) ;;
+          *) : ;;  # bare ESC / unknown — ignore (only `q` quits, to dodge the ESC-vs-arrow race)
+        esac ;;
+      k) cur=$(((cur - 1 + n) % n)) ;;
+      j) cur=$(((cur + 1) % n)) ;;
+      ' ') on[cur]=$((1 - on[cur])) ;;
+      a | A)
+        local allon=1
+        for ((i = 0; i < n; i++)); do [ "${on[i]}" = 1 ] || allon=0; done
+        for ((i = 0; i < n; i++)); do on[i]=$((allon == 1 ? 0 : 1)); done ;;
+      q | Q) key="__quit__"; break ;;
+      '' | $'\n' | $'\r') break ;;   # enter → confirm
+      __quit__) break ;;
+    esac
+  done
+
+  trap - INT
+  stty "$saved" </dev/tty 2>/dev/null || true
+  printf '\033[?25h' >/dev/tty   # show cursor again
+  if [ "$key" = "__quit__" ]; then
+    printf '\n' >/dev/tty
+    fail "Cancelled — nothing installed. Re-run anytime, or pass --agents=<list>."
+  fi
+  SELECTED=()
+  for ((i = 0; i < n; i++)); do [ "${on[i]}" = 1 ] && SELECTED+=("${keys[i]}"); done
+  [ "${#SELECTED[@]}" -gt 0 ] || fail "No connectors selected — re-run and tick at least one, or pass --agents=<list>."
+}
+
+# ── resolve what to install ─────────────────────────────────────────────────
+if [ "$REQUESTED" = "all" ]; then
+  SELECTED=(${DETECTED[@]+"${DETECTED[@]}"})    # may be empty on bash 3.2 → guard the expansion
+  [ "${#SELECTED[@]}" -gt 0 ] || fail "No supported agent found (Hermes, OpenClaw, Claude Code or Codex). Install one first — see README."
+elif [ -n "$REQUESTED" ]; then
+  read -ra SELECTED <<< "$REQUESTED"          # explicit list — trust the user, install_* validates presence
+elif [ "${#DETECTED[@]}" -eq 0 ]; then
+  fail "No supported agent found (Hermes, OpenClaw, Claude Code or Codex). Install one first — see README."
+elif [ "${#DETECTED[@]}" -eq 1 ]; then
+  SELECTED=("${DETECTED[@]}")                  # only one candidate — nothing to choose
+elif [ "$ASSUME_YES" = 1 ]; then
+  SELECTED=("${DETECTED[@]}")
+elif has_tty && stty -g </dev/tty >/dev/null 2>&1; then
+  say "Detected ${#DETECTED[@]} agents: $(labels_of "${DETECTED[@]}")."
+  pick_agents "${DETECTED[@]}"                 # interactive — sets SELECTED
+else
+  SELECTED=("${DETECTED[@]}")                  # no terminal to prompt → install all detected
+  warn "Multiple agents detected ($(labels_of "${DETECTED[@]}")) and no terminal to prompt — installing all. Pass --agents=<list> to choose."
+fi
+
+# What was detected but left out (for the closing summary + re-run hint).
+SKIPPED=()
+for a in ${DETECTED[@]+"${DETECTED[@]}"}; do    # DETECTED may be empty (explicit --agents, nothing detected)
+  case " ${SELECTED[*]} " in *" $a "*) ;; *) SKIPPED+=("$a") ;; esac
+done
+
+# Test-only (#307 smoke): print the resolved plan and stop before touching npm/pairing.
+if [ "${MACCHIATO_SELFTEST:-0}" = 1 ]; then
+  printf 'SELECTED:%s\n' "$(csv ${SELECTED[@]+"${SELECTED[@]}"})"
+  printf 'SKIPPED:%s\n' "$(csv ${SKIPPED[@]+"${SKIPPED[@]}"})"
+  exit 0
+fi
+
+# ── run the chosen installers ───────────────────────────────────────────────
+for a in "${SELECTED[@]}"; do
+  case "$a" in
+    hermes)      install_hermes ;;
+    openclaw)    install_openclaw ;;
+    claude-code) install_claude_code ;;
+    codex)       install_codex ;;
+    *)           fail "Internal: unknown agent '$a'" ;;
+  esac
+done
+
+if [ "${#SKIPPED[@]}" -gt 0 ]; then
+  say "Installed $(labels_of "${SELECTED[@]}"). Skipped $(labels_of "${SKIPPED[@]}") — re-run with --agents=$(IFS=,; echo "${SKIPPED[*]}") to add $([ "${#SKIPPED[@]}" -gt 1 ] && echo them || echo it)."
+fi
 say "Done! Open Macchiato — your conversations will start syncing."
