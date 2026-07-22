@@ -1,5 +1,5 @@
 {
-  "version": "1.5.36",
+  "version": "1.5.37",
   "files": {
   "connectors/claude-code/.gitignore": "4d56952b0fb13bf8f9b6c13a6d4c34a075bac3af447636a1df4335d7576e2f97",
   "connectors/claude-code/README.md": "f8194759d3b5c1548ebb6537a85dc5e8f76cb3ec18be61c5a5b1690beb01b9eb",
@@ -22,7 +22,7 @@
   "connectors/claude-code/src/e2e/crypto.ts": "84d55fc7d95257941d2b31cee0fdf7f458b29bec469e7260e184ec8dbe0c0285",
   "connectors/claude-code/src/e2e/keys.ts": "c896fd2cf3f1b0286307e55de8d2e25fa2725d306126d08b1b0c99530a63f5ec",
   "connectors/claude-code/src/health.ts": "d7a1060c96c507090ffb9b9eb9de6044f524ba1e822ac7ecac3e9725f4d6e722",
-  "connectors/claude-code/src/index.ts": "62adf50cf1fb4922295ad348734c65035ddd7e0a98f533e5232aefd7b11423d6",
+  "connectors/claude-code/src/index.ts": "14c03503034aef8426f405a057009a953cc915600bbe140d8ca9fb1f7f4dbefc",
   "connectors/claude-code/src/linkb/client.ts": "7b7862077fc40be8922b8a958ba9061a57765c9b576363ee4c6da20063056bb2",
   "connectors/claude-code/src/linkb/creds.ts": "f988e7987a7e4573e85a769353cc5960c475d05cc3bfff28cad4bf7c9da0e521",
   "connectors/claude-code/src/linkb/pairing.ts": "d86ac32b81deb70d6416819d152bab1f546ed263604395a0f72117376d927455",
@@ -73,7 +73,7 @@
   "connectors/codex/src/e2e/crypto.ts": "559e0b95deba19aa4adef0d922470383a3edf41960913098eab783e56275b2b2",
   "connectors/codex/src/e2e/keys.ts": "370884423a4e8197e8c5f54e0a97dc01762963751a7e87d0bc9d67f5be8e6768",
   "connectors/codex/src/health.ts": "23cd1d4e2b06184c0a2bb0f01a322a124b611ab2f5f9957c02382e13d9d2f947",
-  "connectors/codex/src/index.ts": "271e498e2156fa745fbaeff23bc26b422cc65e0cadfdbd786ff91d5bd8924efa",
+  "connectors/codex/src/index.ts": "7a9f23acbb5518b06dc97bc6243f9aa47aaef336bff15da7869d25c1a106b95e",
   "connectors/codex/src/linkb/client.ts": "aa289c9c511afb3db855cde37371d60d891e3404458b8f23b4fcbeedbb2c962a",
   "connectors/codex/src/linkb/creds.ts": "e1ea4c36a3e9841b90b080341dee2b46ded53d6fb1f245e6ef3e7fc8ec150530",
   "connectors/codex/src/linkb/pairing.ts": "8a1c5b40559f54712cd09fd6e425492c5ea63a5e5ec42dabf57922867e585b21",
@@ -101,13 +101,13 @@
   "connectors/codex/tsconfig.json": "a353353d0e9ff9d32180e84354309b57d0a3d54ee2c8a9a328abdfeb4c089dfc",
   "connectors/codex/vitest.config.ts": "b38f567bf70c192a544d39ac4c2373873207608757ec3e4ef469386ca9c5d975",
   "connectors/hermes/backfill.py": "43a26546be296218a54a21d56c49554521380dc63f796ba8a2e8bbbbaf7d40dc",
-  "connectors/hermes/connector.py": "b02c0e18f2470419fe5b7640dc1c36a11e161872f4bdf5309a583ea529df1afa",
+  "connectors/hermes/connector.py": "0a32c608173435f7a8e375d03ecf7b501c219d4c1e8e747079579abc0fb94bab",
   "connectors/hermes/e2e_crypto.py": "cd22ee138ff829317883551e07c3992da606951fd30e920fb03fbeebb97d6915",
-  "connectors/hermes/e2e_keys.py": "6b1db673c3968014673d64663461f6f6896ee9947a182ccd4815aaeaef17a074",
+  "connectors/hermes/e2e_keys.py": "dbc762c35f97e00b177ca13c682352db2bb00b543211a3d55476494f26e1851e",
   "connectors/hermes/gateway_client.py": "43acfcb81eb72da6729324e4224fbc43f9ff7a78a0614129ce35afd66412c413",
-  "connectors/hermes/pair.py": "bff6aeff9ff555180337a2afca1fe10212f9df812dc73b9b6392b8150832f748",
+  "connectors/hermes/pair.py": "8338e1ea5cd783630e4eac13b542bd66c12ce727d3fe8ab992685bd9da002767",
   "connectors/hermes/plugin/macchiato/__init__.py": "1792e361eab0aea87bc38b61e2e200f55b885fcaf0ae1897d332d3bdffa722e6",
-  "connectors/hermes/plugin/macchiato/adapter.py": "4ed26a296866847876b61bbe7f459b3a34b5b9a56422149426cad55678fd4d9b",
+  "connectors/hermes/plugin/macchiato/adapter.py": "9cda659af90269f24a8266c43108be78d3abb37256682798e7778a1c22aa0f8f",
   "connectors/hermes/plugin/macchiato/plugin.yaml": "800d349a44c95d18a52d1a659646101eec9fb0d6ae5dc39d924978ef1b290d38",
   "connectors/hermes/release_verify.py": "1894e5ea4a22e125c659eadeb3af9fbf0d9758ac94c0bde6f38eab98f684c54a",
   "connectors/hermes/tests/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -127,7 +127,7 @@
   "connectors/openclaw/src/e2e/crypto.ts": "84d55fc7d95257941d2b31cee0fdf7f458b29bec469e7260e184ec8dbe0c0285",
   "connectors/openclaw/src/e2e/keys.ts": "1512642afaf92f43e09eb7c3cb96d93793db998034d2c6939ab9f2f62f5d28df",
   "connectors/openclaw/src/health.ts": "032fec20ac0b6f09f838aa02ec625fccb8c55abf72a4cf790c3d6dbe83f2cbf9",
-  "connectors/openclaw/src/index.ts": "c5c97ab60b8567f38a7c39985472288daa87ff5aaac14f06747a50fef88e310a",
+  "connectors/openclaw/src/index.ts": "d286a089f853a13d347d56665970045fd3b8e81a21ff819ae6f0510529e44990",
   "connectors/openclaw/src/linkb/client.ts": "6dc6b65648a6a46a992200f24a0d139cc9d1c97647d881df87a37ae088a7a38b",
   "connectors/openclaw/src/linkb/creds.ts": "9d03a5ffd14e20ec2a38ccdcfb7ae7679ea41e3417749b3293d62023d261097a",
   "connectors/openclaw/src/linkb/pairing.ts": "eb0f2cd93a0ae317836c9f87754e54733009e50149234235b7eaa578dc6d2b8d",
@@ -166,6 +166,6 @@
   "connectors/openclaw/test/titles.test.ts": "60e8badef81c505623c4e378824e4068442bc7a9c65665f4036a152203ec7d76",
   "connectors/openclaw/tsconfig.json": "a353353d0e9ff9d32180e84354309b57d0a3d54ee2c8a9a328abdfeb4c089dfc",
   "connectors/openclaw/vitest.config.ts": "d48f83720e2ca423171489fd31f5a66f68639d95444e61e8c41e30ce7b44ba57",
-  "install.sh": "246e3bd2970e274401f123468e7b2340a8b4373b0d9b02c19d71ecff95751fe1"
+  "install.sh": "6080e24b0e2dca06057838ac1723e3d09d8b1404bfa267a9b966bff3ae709925"
   }
 }

@@ -24,7 +24,25 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 logger = logging.getLogger(__name__)
 
 # 連接器監聽的本地 unix socket（連接器側 asyncio.start_unix_server）。
-PUSH_SOCK = os.path.expanduser(os.environ.get("MACCHIATO_PUSH_SOCK", "~/.macchiato/push.sock"))
+# #309 多 profile:插件跑在 profile 的 gateway 進程裡,與連接器只共享「hermes home」這一個
+# 事實 → 從它零配置推導:非默認 profile → <home>/macchiato-push.sock;默認 → ~/.macchiato/
+# push.sock(與單實例時代 bit 級一致)。⚠️ 連接器側 connector.py _default_push_sock 同一規則,
+# 改動必須兩邊同步。get_hermes_home() 優先(-p 啟動不一定帶 HERMES_HOME env)。
+
+
+def _default_push_sock() -> str:
+    try:
+        from hermes_constants import get_hermes_home
+
+        hh = str(get_hermes_home())
+    except Exception:
+        hh = os.path.expanduser(os.environ.get("HERMES_HOME", "").strip() or "~/.hermes")
+    if os.path.realpath(hh) != os.path.realpath(os.path.expanduser("~/.hermes")):
+        return os.path.join(hh, "macchiato-push.sock")
+    return os.path.expanduser("~/.macchiato/push.sock")
+
+
+PUSH_SOCK = os.path.expanduser(os.environ.get("MACCHIATO_PUSH_SOCK") or _default_push_sock())
 SEND_TIMEOUT_S = 10.0
 
 # 裸 `deliver=macchiato` / send_message 的 home 目標 chat_id 來源：Hermes 用 **env var**

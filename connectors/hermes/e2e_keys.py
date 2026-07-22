@@ -12,7 +12,9 @@ import threading
 
 import e2e_crypto as ec
 
-E2E_STORE = os.path.expanduser(os.environ.get("MACCHIATO_E2E_STORE", "~/.macchiato/e2e.json"))
+# #309 多 profile 實例:落在每實例 STATE_DIR 下(K_S 各實例獨立;默認 ~/.macchiato 零遷移)。
+_STATE_DIR = os.path.expanduser(os.environ.get("MACCHIATO_STATE_DIR", "").strip() or "~/.macchiato")
+E2E_STORE = os.path.expanduser(os.environ.get("MACCHIATO_E2E_STORE") or os.path.join(_STATE_DIR, "e2e.json"))
 
 
 class E2EKeyStore:
