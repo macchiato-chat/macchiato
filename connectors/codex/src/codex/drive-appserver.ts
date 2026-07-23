@@ -98,10 +98,11 @@ export function toolCardForV2(it: any): { name: string; args: Record<string, unk
   return { name: type, args, resultText: String(it.command ?? it.text ?? it.status ?? "") };
 }
 
-/** app-server 的 UserInput(schema 0.144.1)。 */
+/** app-server 的 UserInput(schema 0.144.1;skill 臂 #317)。 */
 type UserInput =
   | { type: "text"; text: string }
-  | { type: "localImage"; path: string };
+  | { type: "localImage"; path: string }
+  | { type: "skill"; name: string; path: string };
 
 interface ActiveTurn {
   threadId: string;
@@ -163,6 +164,8 @@ export class AppServerDrive {
     private readonly e2e?: E2EKeyStore,
     /** #227 回合末惰性版本化鉤子。 */
     private readonly projects?: { checkTurnEnd(): void },
+    /** #317 skills 索引(name→SKILL.md 路徑),command.invoke 組 SkillUserInput 用。 */
+    private readonly skills?: { pathFor(name: string): string | undefined },
   ) {
     const st = loadDriveState();
     this.map = st.map;
@@ -246,6 +249,30 @@ export class AppServerDrive {
       switch (frame.method) {
         case "prompt.submit": {
           await this.onPrompt(sid, params);
+          return;
+        }
+        case "command.invoke": {
+          // #317 skill 調用(composer / 菜單選中):組原生 SkillUserInput {type:"skill",name,path}
+          // (schema 0.144.1;path 從 SkillsReporter 索引拿),args 附 text 項。索引未命中(skill
+          // 已刪/改名/枚舉未跑)→ 回退 `$name` 文本(codex 原生 mention 語法),消息不丟。
+          // E2E:invoke 幀本就明文(#199 既定設計),命令文本記入 pendingUser 供回合末密文回灌。
+          const name = String(params.command ?? "")
+            .trim()
+            .replace(/^\//, "");
+          if (!name) return;
+          const args = String(params.args ?? "").trim();
+          const path = this.skills?.pathFor(name);
+          const input: UserInput[] = path
+            ? [{ type: "skill", name, path }, ...(args ? [{ type: "text", text: args } as UserInput] : [])]
+            : [{ type: "text", text: `$${name}${args ? ` ${args}` : ""}` }];
+          const display = `/${name}${args ? ` ${args}` : ""}`;
+          if (this.e2e?.isE2E(sid)) {
+            const arr = this.pendingUser.get(sid) ?? [];
+            arr.push(display);
+            this.pendingUser.set(sid, arr);
+          }
+          console.log(`· #317 command.invoke ${display}${path ? "" : "(索引未命中,回退 $name 文本)"} → ${sid}`);
+          await this.dispatchInput(sid, input, display);
           return;
         }
         case "approval.respond": {
@@ -414,9 +441,15 @@ export class AppServerDrive {
     }
     if (attachNotes.length) text = [text, ...attachNotes].filter(Boolean).join("\n\n");
     const input: UserInput[] = [...(text ? [{ type: "text", text } as UserInput] : []), ...images];
+    await this.dispatchInput(sid, input, text);
+  }
 
-    // #132 mid-turn steer:回合進行中 → turn/steer 注入(expectedTurnId 防競態);
-    // steer 失敗(回合恰好剛結束/turnId 不匹配)→ 回退起新回合,消息絕不丟。
+  /**
+   * #132/#317 投遞一回合輸入(prompt.submit 與 command.invoke 共用):
+   * mid-turn steer:回合進行中 → turn/steer 注入(expectedTurnId 防競態);
+   * steer 失敗(回合恰好剛結束/turnId 不匹配)→ 回退起新回合,消息絕不丟。
+   */
+  private async dispatchInput(sid: string, input: UserInput[], firstText: string): Promise<void> {
     const running = this.active.get(sid);
     if (running?.turnId) {
       try {
@@ -429,7 +462,7 @@ export class AppServerDrive {
         console.log(`· steer 未命中(${(e as Error).message.slice(0, 120)})→ 起新回合`);
       }
     }
-    await this.runTurn(sid, input, text);
+    await this.runTurn(sid, input, firstText);
   }
 
   private async runTurn(sid: string, input: UserInput[], firstText: string): Promise<void> {

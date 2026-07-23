@@ -50,7 +50,7 @@ class FakeClient {
   }
 }
 
-function make() {
+function make(skills?: { pathFor(n: string): string | undefined }) {
   process.env.MACCHIATO_CODEX_SESSIONS = join(mkdtempSync(join(tmpdir(), "cx-v2-")), "sessions.json");
   process.env.MACCHIATO_CODEX_TITLE_MODE = "off";
   const sent: any[] = [];
@@ -71,7 +71,7 @@ function make() {
   const client = new FakeClient();
   client.queueResponse("thread/start", { thread: { id: TID } });
   const mirror: any = { driven: [] as string[], undriven: [] as string[], ff: [] as string[], setDriven(t: string) { this.driven.push(t); }, unsetDriven(t: string) { this.undriven.push(t); }, fastForward(t: string) { this.ff.push(t); }, tombstone() {} };
-  const d = new AppServerDrive(client as any, linkb, mirror);
+  const d = new AppServerDrive(client as any, linkb, mirror, undefined, undefined, skills);
   d.wire();
   return { d, client, linkb, sent, mirror };
 }
@@ -242,6 +242,50 @@ describe("#132 v2 steer", () => {
     client.queueResponse("turn/steer", new Error("expectedTurnId mismatch"));
     await linkb.deliver(tui("prompt.submit", SID, { text: "又一條" }));
     expect(client.requests.filter((r) => r.method === "turn/start")).toHaveLength(2);
+  });
+});
+
+describe("#317 command.invoke → SkillUserInput", () => {
+  // 注:別用 /home/... 假路徑——sync-public 敏感串掃描含 /home/[a-z]+/(私有路徑防洩),公開樹會中止。
+  const SKILL_PATH = "/data/codex-home/skills/.system/imagegen/SKILL.md";
+  const idx = { pathFor: (n: string) => (n === "imagegen" ? SKILL_PATH : undefined) };
+  it("索引命中:turn/start input = skill 項 + args text 項", async () => {
+    const { client, linkb } = make(idx);
+    await linkb.deliver(tui("command.invoke", SID, { command: "/imagegen", args: "畫個 logo" }));
+    await tick();
+    const ts = client.requests.find((r) => r.method === "turn/start")!;
+    expect(ts.params.input).toEqual([
+      { type: "skill", name: "imagegen", path: SKILL_PATH },
+      { type: "text", text: "畫個 logo" },
+    ]);
+  });
+  it("無 args:只有 skill 項;索引未命中 → 回退 $name 文本(消息不丟)", async () => {
+    const { client, linkb } = make(idx);
+    await linkb.deliver(tui("command.invoke", SID, { command: "imagegen" }));
+    await tick();
+    expect(client.requests.find((r) => r.method === "turn/start")!.params.input).toEqual([
+      { type: "skill", name: "imagegen", path: SKILL_PATH },
+    ]);
+    const { client: c2, linkb: l2 } = make(idx);
+    await l2.deliver(tui("command.invoke", SID, { command: "gone", args: "x" }));
+    await tick();
+    expect(c2.requests.find((r) => r.method === "turn/start")!.params.input).toEqual([{ type: "text", text: "$gone x" }]);
+  });
+  it("回合進行中:invoke 走 turn/steer 注入(與 prompt 同 dispatch 語義)", async () => {
+    const { client, linkb } = make(idx);
+    await linkb.deliver(tui("prompt.submit", SID, { text: "第一條" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    await linkb.deliver(tui("command.invoke", SID, { command: "imagegen", args: "改配色" }));
+    const steer = client.requests.find((r) => r.method === "turn/steer")!;
+    expect(steer.params).toMatchObject({
+      threadId: TID,
+      expectedTurnId: "t1",
+      input: [
+        { type: "skill", name: "imagegen", path: SKILL_PATH },
+        { type: "text", text: "改配色" },
+      ],
+    });
+    expect(client.requests.filter((r) => r.method === "turn/start")).toHaveLength(1); // 未起新回合
   });
 });
 
