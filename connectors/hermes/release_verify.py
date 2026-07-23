@@ -1,7 +1,8 @@
 """#1 發布簽名驗證(零依賴):純 Python ed25519(RFC 8032 參考實現)+ 清單校驗。
 
 self_update 此前 `curl install.sh | bash` 裸跑——repo/CDN 投毒或 server 沦陷即本機 RCE。
-現在:release.json + .sig 用內嵌公鑰驗簽 → 拒絕降級 → install.sh sha256 對上清單才執行。
+現在:release.json + .sig 用內嵌公鑰驗簽 → bootstrap bridge + 嚴格升版 → install.sh sha256
+對上清單才執行。
 信任根 = 發布機私鑰(~/.macchiato/release-signing.key,scripts/release/sign-manifest.mjs 簽)。
 純 Python 驗簽 ~100ms,一次性調用可接受;Hermes venv 只保證 websockets,不引第三方密碼庫。
 """
@@ -10,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 
 # 發布簽名公鑰(ed25519 raw 32B hex;與 TS 連接器 selfupdate.ts 同一把)。
 RELEASE_PUBKEY_HEX = "48d741eac2364340cfbd14502eac7506f8babcd4ce502775e831abcd1ed0f105"
@@ -95,31 +97,118 @@ def ed25519_verify(public: bytes, msg: bytes, signature: bytes) -> bool:
 
 
 # ── 清單校驗 ───────────────────────────────────────────────────────────────────
+_STRICT_SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._+@/-]+$")
+_SIGNATURE_RE = re.compile(r"^[A-Za-z0-9+/]{86}==\n?$")
+_MAX_SAFE_INTEGER = 2**53 - 1
+_MAX_MANIFEST_BYTES = 1024 * 1024
+
+
+def _parse_strict_semver(version: str) -> tuple[int, int, int]:
+    """只接受無前導零的 X.Y.Z；上限與 JS Number 安全整數一致，跨實現比較不失真。"""
+    if not isinstance(version, str):
+        raise ValueError("版本必須是字串")
+    match = _STRICT_SEMVER_RE.fullmatch(version)
+    if not match:
+        raise ValueError(f"版本格式不合法:{version}")
+    parts = tuple(int(x) for x in match.groups())
+    if any(x > _MAX_SAFE_INTEGER for x in parts):
+        raise ValueError(f"版本字段超出安全範圍:{version}")
+    return parts
+
+
+def _semver_compare(a: str, b: str) -> int:
+    pa = _parse_strict_semver(a)
+    pb = _parse_strict_semver(b)
+    return -1 if pa < pb else (1 if pa > pb else 0)
+
+
 def _semver_lt(a: str, b: str) -> bool:
-    pa = [int(x) for x in a.split(".") if x.isdigit() or x]
-    pb = [int(x) for x in b.split(".") if x.isdigit() or x]
-    for i in range(max(len(pa), len(pb))):
-        x = pa[i] if i < len(pa) else 0
-        y = pb[i] if i < len(pb) else 0
-        if x != y:
-            return x < y
-    return False
+    """a < b；格式畸形時拋錯，讓更新 fail closed。"""
+    return _semver_compare(a, b) < 0
 
 
 def verify_manifest(manifest_bytes: bytes, sig_b64: str, pubkey_hex: str = RELEASE_PUBKEY_HEX) -> dict:
     """驗簽 + 解析;失敗拋 ValueError。"""
-    sig = base64.b64decode(sig_b64.strip())
+    if not 0 < len(manifest_bytes) <= _MAX_MANIFEST_BYTES:
+        raise ValueError("release.json 結構不對:大小越界")
+    if not isinstance(sig_b64, str) or _SIGNATURE_RE.fullmatch(sig_b64) is None:
+        raise ValueError("release.json 簽名編碼不合法")
+    if not isinstance(pubkey_hex, str) or re.fullmatch(r"[0-9a-f]{64}", pubkey_hex) is None:
+        raise ValueError("release.json 公鑰編碼不合法")
+    sig = base64.b64decode(sig_b64.strip(), validate=True)
     if not ed25519_verify(bytes.fromhex(pubkey_hex), manifest_bytes, sig):
         raise ValueError("release.json 簽名驗證失敗(repo 被改?公鑰輪換?)")
-    m = json.loads(manifest_bytes)
-    if not isinstance(m.get("version"), str) or not isinstance(m.get("files"), dict):
+
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"release.json 結構不對:重複字段 {key}")
+            result[key] = value
+        return result
+
+    try:
+        m = json.loads(manifest_bytes.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("release.json 結構不對:JSON 非法") from exc
+    if (
+        not isinstance(m, dict)
+        or set(m) != {"version", "bootstrapVersion", "bootstrapSha256", "files"}
+        or type(m.get("bootstrapVersion")) is not int
+        or m["bootstrapVersion"] != 1
+        or not isinstance(m.get("bootstrapSha256"), str)
+        or _LOWER_SHA256_RE.fullmatch(m["bootstrapSha256"]) is None
+        or not isinstance(m.get("files"), dict)
+        or not 0 < len(m["files"]) <= 10_000
+    ):
         raise ValueError("release.json 結構不對")
+    _parse_strict_semver(m.get("version"))
+    for path, digest in m["files"].items():
+        if (
+            not isinstance(path, str)
+            or _SAFE_PATH_RE.fullmatch(path) is None
+            or path.startswith("/")
+            or "//" in path
+            or any(part in (".", "..") for part in path.split("/"))
+            or not isinstance(digest, str)
+            or _LOWER_SHA256_RE.fullmatch(digest) is None
+        ):
+            raise ValueError(f"release.json 結構不對:非法文件項 {path}")
+    if "install.sh" not in m["files"]:
+        raise ValueError("release.json 結構不對:缺 install.sh")
+    canonical_obj = {
+        "version": m["version"],
+        "bootstrapVersion": m["bootstrapVersion"],
+        "bootstrapSha256": m["bootstrapSha256"],
+        "files": dict(sorted(m["files"].items())),
+    }
+    canonical = (json.dumps(canonical_obj, indent=2).replace("\n    ", "\n  ") + "\n").encode()
+    if canonical != manifest_bytes:
+        raise ValueError("release.json 結構不對:非 canonical/歧義字段")
     return m
 
 
 def check_not_downgrade(manifest_version: str, current_version: str) -> None:
-    if _semver_lt(manifest_version, current_version):
-        raise ValueError(f"拒絕降級:清單 v{manifest_version} < 本機 v{current_version}")
+    """歷史 API 名稱保留；現在同版重放也拒絕，只允許嚴格升版。"""
+    order = _semver_compare(manifest_version, current_version)
+    if order <= 0:
+        relation = "<" if order < 0 else "="
+        raise ValueError(f"拒絕非升級清單:清單 v{manifest_version} {relation} 本機 v{current_version}")
+
+
+def check_self_update_allowed(manifest: dict, current_version: str) -> None:
+    """執行前再次要求 bootstrap 信任橋；verify_manifest 已对缺字段 fail closed。"""
+    if (
+        type(manifest.get("bootstrapVersion")) is not int
+        or manifest["bootstrapVersion"] != 1
+        or not isinstance(manifest.get("bootstrapSha256"), str)
+        or _SHA256_RE.fullmatch(manifest["bootstrapSha256"]) is None
+    ):
+        raise ValueError("release.json 缺少合法 bootstrap v1 信任橋")
+    check_not_downgrade(manifest.get("version"), current_version)
 
 
 def sha256_hex(data: bytes) -> str:

@@ -13,7 +13,7 @@ Bridges your local [OpenClaw](https://openclaw.ai) agent to [Macchiato](https://
 Use the one-line installer from the repo root (auto-detects OpenClaw):
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh | bash
+Open the Macchiato app or https://macchiato.chat and copy the versioned, SHA-256-verified install command.
 ```
 
 ### Manual

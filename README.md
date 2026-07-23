@@ -20,7 +20,7 @@ This repository distributes the **connector** — the small service you run next
 On the machine where your agent (Hermes, OpenClaw, Claude Code or Codex) runs:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh | bash
+Open the Macchiato app or https://macchiato.chat and copy the versioned, SHA-256-verified install command.
 ```
 
 The installer will:

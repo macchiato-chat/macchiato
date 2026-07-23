@@ -13,6 +13,7 @@
  * notLoaded 空數組——最終文本必須從 item/completed(agentMessage)累積;app-server 回合照寫
  * ~/.codex/sessions rollout(鏡像/導入零改動);thread/resume 接受 exec 建的既有 rollout id。
  */
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -24,12 +25,54 @@ import { fallbackTitle, titleMode } from "./titles";
 import { materializeAttachment } from "./attachments";
 import type { LinkBClient } from "../linkb/client";
 import type { E2EKeyStore } from "../e2e/keys";
+import {
+  canonicalE2EApprovalDisplay,
+  dispatchForE2EControl,
+  e2eApprovalRequestDigest,
+  E2EControlError,
+  E2EControlVerifier,
+  immutableE2EApprovalSnapshot,
+  type E2EControlEnvelopeV1,
+  type E2EControlKind,
+} from "../e2e/control";
 import type { Mirror } from "./mirror";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** 必须与 iOS E2EControlCrypto.maxPayloadBytes 一致；设备会拒绝更大的解密 JSON。 */
+const E2E_APPROVAL_PLAINTEXT_MAX_BYTES = 64 * 1024;
+
+function sameLocalUUID(a: string, b: string): boolean {
+  const lowerA = a.toLowerCase();
+  const lowerB = b.toLowerCase();
+  return UUID_RE.test(lowerA) && UUID_RE.test(lowerB) && lowerA === lowerB;
+}
 
 /** #279 E2E prompt 解密失敗的用戶可見回執(僅提示語,零內容洩漏;四連接器同文案)。 */
 const E2E_DECRYPT_FAIL_WARNING = "無法解密這條消息(設備與連接器的加密密鑰可能失步)——請重試,或重新關閉再開啟本會話的端到端加密。";
+
+const AUTHENTICATED_E2E_CONTROL = Symbol("authenticated-e2e-control");
+interface AuthenticatedControlTag {
+  kind: E2EControlKind;
+  msgId: string;
+  envelope: E2EControlEnvelopeV1;
+}
+type TaggedControlFrame = Record<string, unknown> & {
+  [AUTHENTICATED_E2E_CONTROL]?: AuthenticatedControlTag;
+};
+const E2E_SENSITIVE_METHODS = new Set([
+  "command.invoke",
+  "approval.respond",
+  "clarify.respond",
+  "secret.respond",
+  "session.create",
+  "session.interrupt",
+  "task.stop",
+  "session.e2e.disable",
+  "session.delete",
+  "session.rename",
+  "session.archive",
+  "session.retitle",
+]);
 
 
 function isDir(p: string): boolean {
@@ -122,10 +165,48 @@ interface ActiveTurn {
   interruptPending?: boolean;
 }
 
+type CodexApprovalKind = "command" | "fileChange";
+type CodexApprovalExecutionSnapshot = {
+  v: 1;
+  connector: "codex-app-server";
+  sessionId: string;
+  requestId: string;
+  method:
+    | "item/commandExecution/requestApproval"
+    | "item/fileChange/requestApproval";
+  params: Record<string, unknown>;
+};
+
+function codexApprovalExecutionRequest(
+  sid: string,
+  requestId: string,
+  kind: CodexApprovalKind,
+  params: Record<string, unknown>,
+): CodexApprovalExecutionSnapshot {
+  return {
+    v: 1,
+    connector: "codex-app-server",
+    sessionId: sid,
+    requestId,
+    method:
+      kind === "command"
+        ? "item/commandExecution/requestApproval"
+        : "item/fileChange/requestApproval",
+    params,
+  };
+}
+
 interface PendingApproval {
   sid: string;
   /** #245 反向請求的 itemId(隨 approval.request 的 request_id 上行;respond 回帶則精準配對)。 */
   requestId?: string;
+  /** #370 E2E 审批必须同时绑定请求摘要；非 E2E 保持 undefined。 */
+  requestDigest?: string;
+  /** digest、密文卡片以及该 reverse RPC decision 绑定的 immutable 完整请求。 */
+  executionSnapshot?: CodexApprovalExecutionSnapshot;
+  /** 仅用于执行前确认 AppServer 回调对象自请求后未发生 mutation。 */
+  sourceParams?: Record<string, unknown>;
+  kind?: CodexApprovalKind;
   resolve: (decision: string) => void;
 }
 
@@ -156,6 +237,9 @@ export class AppServerDrive {
   private readonly interruptedSids = new Set<string>();
   /** #224 自己 thread/name/set 寫過的 threadId→title(抑制回聲 thread/name/updated 重投 session.title)。 */
   private readonly renamedTitles = new Map<string, string>();
+  /** 僅主身份快照完整解析，或已把當前完整映射成功雙寫，才可放行非 UUID E2E wire sid。 */
+  private identityStateTrusted: boolean;
+  private readonly e2eControl?: E2EControlVerifier;
 
   constructor(
     private readonly client: AppServerClient,
@@ -166,6 +250,7 @@ export class AppServerDrive {
     private readonly projects?: { checkTurnEnd(): void },
     /** #317 skills 索引(name→SKILL.md 路徑),command.invoke 組 SkillUserInput 用。 */
     private readonly skills?: { pathFor(name: string): string | undefined },
+    e2eControl?: E2EControlVerifier,
   ) {
     const st = loadDriveState();
     this.map = st.map;
@@ -174,8 +259,10 @@ export class AppServerDrive {
     this.efforts = st.efforts;
     this.perms = st.perms;
     this.titled = st.titled;
+    this.identityStateTrusted = st.identityStateTrusted;
     this.abandonedTurns = st.pending;
     this.pending = new Set();
+    this.e2eControl = e2eControl ?? (e2e ? new E2EControlVerifier(e2e) : undefined);
     if (st.pending.length) this.saveMap();
 
     this.client.onNotification((m, p) => this.onNotification(m, p));
@@ -216,6 +303,77 @@ export class AppServerDrive {
     if (UUID_RE.test(sid)) return sid;
     return this.map[sid];
   }
+
+  /** E2E backfill 的本地 rollout 身份；wire sid 由控制層原樣保留。 */
+  localSessionIdFor(sid: string): string | undefined {
+    return this.threadFor(sid);
+  }
+
+  private protectedWireSids(): string[] {
+    const fn = (this.e2e as (E2EKeyStore & { protectedSessionIds?: () => string[] }) | undefined)
+      ?.protectedSessionIds;
+    return typeof fn === "function" ? fn.call(this.e2e) : [];
+  }
+
+  /** 禁止用 protected wire sid 对应的本地 thread UUID 另开明文身份直达同一线程。 */
+  private protectedInboundAliasOwner(sid: string): string | undefined {
+    return this.protectedWireSids().find((wireSid) => {
+      if (wireSid === sid) return false;
+      if (sameLocalUUID(wireSid, sid)) return true;
+      const localSid = this.map[wireSid];
+      return localSid !== undefined && (localSid === sid || sameLocalUUID(localSid, sid));
+    });
+  }
+
+  /** 見 exec Drive 同名方法：壞/缺 sid↔thread 身份快照時禁止任何 plaintext fallback。 */
+  assertE2EIdentitySafe(): void {
+    const requiringMap = this.protectedWireSids().filter((sid) => !UUID_RE.test(sid));
+    if (!requiringMap.length) return;
+    const missing = requiringMap.filter((sid) => !UUID_RE.test(this.map[sid] ?? ""));
+    if (!this.identityStateTrusted || missing.length) {
+      throw new Error(
+        `Codex E2E identity map unavailable/incomplete (trusted=${this.identityStateTrusted}, ` +
+          `missing=${missing.slice(0, 3).join(",") || "unknown"}); refusing plaintext fallback`,
+      );
+    }
+  }
+
+  plaintextLocalMirrorAllowed(): boolean {
+    try {
+      this.assertE2EIdentitySafe();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Mirror 的本地 UUID → E2E wire ULID 反向解析；只回傳仍受 E2E 保護的映射。 */
+  e2eWireSessionIdFor(localSid: string): string | undefined {
+    if (!this.e2e) return undefined;
+    for (const [wireSid, mappedLocalSid] of Object.entries(this.map)) {
+      if (mappedLocalSid === localSid && this.e2e.isE2E(wireSid)) return wireSid;
+    }
+    return undefined;
+  }
+
+  /** history import 的本地 UUID → wire sid E2E 判定快照；任一關聯 wire 為 E2E 即過濾。 */
+  localSessionE2EStatus(): { isE2E(localSid: string): boolean } {
+    const e2e = this.e2e;
+    if (!e2e) return { isE2E: () => false };
+    try {
+      this.assertE2EIdentitySafe();
+    } catch {
+      return { isE2E: () => true };
+    }
+    const protectedLocal = new Set<string>();
+    for (const [wireSid, localSid] of Object.entries(this.map)) {
+      if (e2e.isE2E(wireSid)) protectedLocal.add(localSid);
+    }
+    return {
+      isE2E: (localSid: string) => protectedLocal.has(localSid) || e2e.isE2E(localSid),
+    };
+  }
+
   private cwdFor(sid: string): string {
     const c = this.cwds[sid];
     if (!c) return workDir();
@@ -239,13 +397,127 @@ export class AppServerDrive {
 
   // ============================== 下行(server → 連接器) ==============================
 
+  private sendE2EControlResult(
+    rawEnvelope: unknown,
+    wireSid: string,
+    ok: boolean,
+    error?: "control_rejected" | "side_effect_failed",
+  ): void {
+    if (rawEnvelope === null || typeof rawEnvelope !== "object" || Array.isArray(rawEnvelope)) return;
+    const envelope = rawEnvelope as Partial<E2EControlEnvelopeV1>;
+    if (typeof envelope.sessionId !== "string" || !envelope.sessionId) return;
+    if (typeof envelope.msgId !== "string" || !envelope.msgId) return;
+    this.linkb.send({
+      t: "e2e_control_result",
+      agentLinkId: this.linkb.agentLinkId,
+      sessionId: envelope.sessionId,
+      hermesSessionId: wireSid,
+      msgId: envelope.msgId,
+      ok,
+      ...(error ? { error } : {}),
+    });
+  }
+
+  private async onE2EControl(wireSid: string, rawEnvelope: unknown): Promise<void> {
+    let dispatchStarted = false;
+    try {
+      if (!this.e2eControl) throw new E2EControlError("E2E control verifier unavailable");
+      const verified = this.e2eControl.verifyAndConsume(rawEnvelope, wireSid);
+      if (
+        verified.kind === "clarify.respond" ||
+        verified.kind === "secret.respond" ||
+        verified.kind === "task.stop"
+      ) {
+        throw new E2EControlError(`${verified.kind} is not supported by Codex`);
+      }
+      const dispatch = dispatchForE2EControl(verified.kind, verified.payload);
+      if (verified.kind === "command.invoke" && typeof dispatch.params.argsEnc === "string") {
+        if (!this.e2e) throw new E2EControlError("E2E command decryptor unavailable");
+        try {
+          dispatch.params.args = this.e2e.decryptText(wireSid, dispatch.params.argsEnc);
+          delete dispatch.params.argsEnc;
+        } catch (error) {
+          throw new E2EControlError("failed to decrypt authenticated command args", {
+            cause: error,
+          });
+        }
+      }
+      const tagged: TaggedControlFrame = {
+        t: "tui",
+        sessionId: wireSid,
+        frame: {
+          jsonrpc: "2.0",
+          method: dispatch.method,
+          params: { session_id: wireSid, ...dispatch.params },
+        },
+        [AUTHENTICATED_E2E_CONTROL]: {
+          kind: verified.kind,
+          msgId: verified.envelope.msgId,
+          envelope: verified.envelope,
+        },
+      };
+      dispatchStarted = true;
+      await this.onServerFrame(tagged);
+      this.sendE2EControlResult(verified.envelope, wireSid, true);
+    } catch (error) {
+      console.error(`[E2E control rejected ${wireSid}]`, error instanceof Error ? error.message : String(error));
+      this.sendE2EControlResult(
+        rawEnvelope,
+        wireSid,
+        false,
+        dispatchStarted ? "side_effect_failed" : "control_rejected",
+      );
+    }
+  }
+
   async onServerFrame(msg: Record<string, unknown>): Promise<void> {
     if (msg.t !== "tui" || !msg.frame) return;
     const frame = msg.frame as { method?: string; params?: Record<string, unknown> };
     const params = frame.params ?? {};
-    const sid = (msg.sessionId ?? params.session_id) as string | undefined;
+    const outerSid = typeof msg.sessionId === "string" ? msg.sessionId : undefined;
+    const paramsSid = typeof params.session_id === "string" ? params.session_id : undefined;
+    if (
+      (msg.sessionId !== undefined && !outerSid) ||
+      (params.session_id !== undefined && !paramsSid) ||
+      (outerSid && paramsSid && outerSid !== paramsSid)
+    ) {
+      console.error(
+        `[drive2 rejected] Link B outer/params session mismatch: ${String(msg.sessionId)} != ${String(params.session_id)}`,
+      );
+      return;
+    }
+    const sid = outerSid ?? paramsSid;
     if (!sid || !frame.method) return;
+    let aliasOwner: string | undefined;
     try {
+      aliasOwner = this.protectedInboundAliasOwner(sid);
+    } catch (error) {
+      console.error(
+        `[E2E inbound quarantined ${sid}] ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return;
+    }
+    if (aliasOwner) {
+      console.error(`[E2E local alias rejected ${sid}] canonical wire session is ${aliasOwner}`);
+      return;
+    }
+    const authenticated = (msg as TaggedControlFrame)[AUTHENTICATED_E2E_CONTROL];
+    if (frame.method === "e2e.control") {
+      if (authenticated || !outerSid || !paramsSid) return;
+      await this.onE2EControl(sid, params.envelope);
+      return;
+    }
+    try {
+      if (
+        this.e2e?.isE2E(sid) &&
+        E2E_SENSITIVE_METHODS.has(frame.method) &&
+        authenticated === undefined
+      ) {
+        console.error(`[E2E legacy control rejected ${sid}] ${frame.method}`);
+        return;
+      }
       switch (frame.method) {
         case "prompt.submit": {
           await this.onPrompt(sid, params);
@@ -271,8 +543,10 @@ export class AppServerDrive {
             arr.push(display);
             this.pendingUser.set(sid, arr);
           }
-          console.log(`· #317 command.invoke ${display}${path ? "" : "(索引未命中,回退 $name 文本)"} → ${sid}`);
-          await this.dispatchInput(sid, input, display);
+          const logDisplay =
+            authenticated && args ? `/${name} [encrypted args]` : display;
+          console.log(`· #317 command.invoke ${logDisplay}${path ? "" : "(索引未命中,回退 $name 文本)"} → ${sid}`);
+          await this.dispatchInput(sid, input, display, authenticated !== undefined);
           return;
         }
         case "approval.respond": {
@@ -283,25 +557,67 @@ export class AppServerDrive {
           const list = this.approvals.get(sid);
           if (!list?.length) {
             this.approvals.delete(sid);
+            if (authenticated) throw new E2EControlError("no matching pending approval");
             return;
           }
           const reqId = typeof params.request_id === "string" ? params.request_id : "";
+          const reqDigest = typeof params.requestDigest === "string" ? params.requestDigest : "";
           let p: PendingApproval | undefined;
-          if (reqId) {
-            const i = list.findIndex((x) => x.requestId === reqId);
+          if (authenticated) {
+            if (authenticated.kind !== "approval.respond" || !reqId || !reqDigest) {
+              throw new E2EControlError("authenticated approval is missing request identity");
+            }
+            const i = list.findIndex(
+              (item) => {
+                if (
+                  item.requestId !== reqId ||
+                  item.requestDigest !== reqDigest ||
+                  item.executionSnapshot === undefined ||
+                  item.sourceParams === undefined ||
+                  item.kind === undefined
+                ) {
+                  return false;
+                }
+                const key = this.e2e!.requireKey(sid);
+                // 同时核验 immutable snapshot 与当前 reverse-RPC 对象；后者若被回调方修改，
+                // 即使已签旧 digest 也不能放行。
+                return (
+                  e2eApprovalRequestDigest(key, item.executionSnapshot) === reqDigest &&
+                  e2eApprovalRequestDigest(
+                    key,
+                    codexApprovalExecutionRequest(
+                      sid,
+                      reqId,
+                      item.kind,
+                      item.sourceParams,
+                    ),
+                  ) === reqDigest
+                );
+              },
+            );
             if (i >= 0) p = list.splice(i, 1)[0];
+            if (!p) throw new E2EControlError("approval request id/digest mismatch");
+          } else {
+            if (reqId) {
+              const i = list.findIndex((x) => x.requestId === reqId);
+              if (i >= 0) p = list.splice(i, 1)[0];
+            }
+            p ??= list.shift();
           }
-          p ??= list.shift();
           if (!list.length) this.approvals.delete(sid);
           if (!p) return;
-          const allow = params.choice === "allow";
+          const choice = String(params.choice ?? "deny");
+          const allow = choice === "allow" || choice === "yes" || choice === "always";
           const all = params.all === true;
           p.resolve(allow ? (all ? "acceptForSession" : "accept") : "decline");
           return;
         }
         case "session.interrupt": {
           const t = this.active.get(sid);
-          if (!t) return;
+          if (!t) {
+            if (authenticated) throw new E2EControlError("no active turn to interrupt");
+            return;
+          }
           this.interruptedSids.add(sid);
           if (t.turnId) {
             await this.client.request("turn/interrupt", { threadId: t.threadId, turnId: t.turnId });
@@ -312,6 +628,19 @@ export class AppServerDrive {
             t.interruptPending = true;
             console.log(`· interrupt 掛起(turnId 未到位,到位即補發)→ ${sid}`);
           }
+          return;
+        }
+        case "session.e2e.disable": {
+          if (authenticated?.kind !== "session.e2e.disable") {
+            throw new E2EControlError("session.e2e.disable requires authenticated control");
+          }
+          if (!this.e2e || !this.mirror) {
+            throw new E2EControlError("E2E disable dependencies unavailable");
+          }
+          this.assertE2EIdentitySafe();
+          this.e2e.markServerE2E(sid, "disable");
+          this.e2e.beginDisable(sid, authenticated.envelope);
+          await this.mirror.backfillE2E(sid, this.localSessionIdFor(sid), "disable");
           return;
         }
         case "session.delete": {
@@ -358,31 +687,25 @@ export class AppServerDrive {
           // #257 codex 無歸檔概念(不像 Hermes 有 state.db archived 列)——明確 no-op,不落 default。
           return;
         case "session.create": {
-          const cwd = typeof params.cwd === "string" ? params.cwd.trim() : "";
-          if (cwd ? this.cwds[sid] !== cwd : this.cwds[sid] !== undefined) {
-            if (cwd) this.cwds[sid] = cwd;
-            else delete this.cwds[sid];
-            this.saveMap();
+          const partial = authenticated !== undefined;
+          if (!partial || Object.hasOwn(params, "cwd")) {
+            const cwd = typeof params.cwd === "string" ? params.cwd.trim() : "";
+            this.persistSessionSetting(this.cwds, sid, cwd, authenticated, "cwd");
           }
-          const md = typeof params.model === "string" ? params.model.trim() : "";
-          if (md ? this.models[sid] !== md : this.models[sid] !== undefined) {
-            if (md) this.models[sid] = md;
-            else delete this.models[sid];
-            this.saveMap();
+          if (!partial || Object.hasOwn(params, "model")) {
+            const md = typeof params.model === "string" ? params.model.trim() : "";
+            this.persistSessionSetting(this.models, sid, md, authenticated, "model");
           }
-          const ef = typeof params.effort === "string" ? params.effort.trim() : ""; // #231
-          if (ef ? this.efforts[sid] !== ef : this.efforts[sid] !== undefined) {
-            if (ef) this.efforts[sid] = ef;
-            else delete this.efforts[sid];
-            this.saveMap();
+          if (!partial || Object.hasOwn(params, "effort")) {
+            const ef = typeof params.effort === "string" ? params.effort.trim() : ""; // #231
+            this.persistSessionSetting(this.efforts, sid, ef, authenticated, "effort");
           }
           // #230 permissionMode(upsert)。空 = 回退進程級 env 默認。
-          const pm = typeof params.permissionMode === "string" ? params.permissionMode.trim() : "";
-          if (pm ? this.perms[sid] !== pm : this.perms[sid] !== undefined) {
-            if (pm) this.perms[sid] = pm;
-            else delete this.perms[sid];
-            this.saveMap();
+          if (!partial || Object.hasOwn(params, "permissionMode")) {
+            const pm = typeof params.permissionMode === "string" ? params.permissionMode.trim() : "";
+            this.persistSessionSetting(this.perms, sid, pm, authenticated, "permissionMode");
           }
+          const cwd = typeof params.cwd === "string" ? params.cwd.trim() : "";
           if (cwd && !this.e2e?.isE2E(sid) && !isDir(this.cwdFor(sid))) {
             this.emit(sid, "review.summary", { summary: `⚠️ 工作目錄不存在或不是目錄:${this.cwdFor(sid)}(連接器主機上)` });
           }
@@ -394,6 +717,7 @@ export class AppServerDrive {
     } catch (e) {
       this.counters.driveErrors += 1;
       console.error(`[drive2 ${frame.method} failed for ${sid}] ${(e as Error).message}`);
+      if (authenticated) throw e;
     }
   }
 
@@ -402,6 +726,11 @@ export class AppServerDrive {
     const atts = Array.isArray(params.attachments)
       ? (params.attachments as Array<{ id?: string; kind?: string; name?: string; mime?: string; url?: string }>)
       : [];
+    // E2E 附件没有端到端密文/完整性协议；在任何 STT、网络或落盘副作用前拒绝整帧。
+    if (atts.length && this.e2e?.isE2E(sid)) {
+      console.error(`[E2E prompt rejected ${sid}] attachments are not supported`);
+      return;
+    }
     const images: UserInput[] = [];
     const attachNotes: string[] = [];
     for (const a of atts) {
@@ -449,7 +778,12 @@ export class AppServerDrive {
    * mid-turn steer:回合進行中 → turn/steer 注入(expectedTurnId 防競態);
    * steer 失敗(回合恰好剛結束/turnId 不匹配)→ 回退起新回合,消息絕不丟。
    */
-  private async dispatchInput(sid: string, input: UserInput[], firstText: string): Promise<void> {
+  private async dispatchInput(
+    sid: string,
+    input: UserInput[],
+    firstText: string,
+    requireDelivery = false,
+  ): Promise<void> {
     const running = this.active.get(sid);
     if (running?.turnId) {
       try {
@@ -462,16 +796,22 @@ export class AppServerDrive {
         console.log(`· steer 未命中(${(e as Error).message.slice(0, 120)})→ 起新回合`);
       }
     }
-    await this.runTurn(sid, input, firstText);
+    await this.runTurn(sid, input, firstText, requireDelivery);
   }
 
-  private async runTurn(sid: string, input: UserInput[], firstText: string): Promise<void> {
+  private async runTurn(
+    sid: string,
+    input: UserInput[],
+    firstText: string,
+    requireDelivery = false,
+  ): Promise<void> {
     const isE2E = this.e2e?.isE2E(sid) ?? false;
     const cwd = this.cwdFor(sid);
     if (!isDir(cwd)) {
       const err = `⚠️ 工作目錄不存在或不是目錄:${cwd}(連接器主機上)。請修正會話目錄後重發。`;
       if (isE2E) this.sendE2ETurn(sid, err);
       else this.emit(sid, "review.summary", { summary: err });
+      if (requireDelivery) throw new E2EControlError(err);
       return;
     }
     let threadId = this.threadFor(sid);
@@ -521,6 +861,7 @@ export class AppServerDrive {
       if (isE2E) this.sendE2ETurn(sid, `❌ 回合啟動失敗:${msg}`);
       else this.emit(sid, "review.summary", { summary: `❌ 回合啟動失敗:${msg}` });
       this.counters.driveErrors += 1;
+      if (requireDelivery) throw e;
     }
   }
 
@@ -733,31 +1074,88 @@ export class AppServerDrive {
   }
 
   /** 反向請求 → approval.request 卡(payload 對齊 CC 的形狀);掛起等 approval.respond。 */
-  private onApprovalRequest(p: any, kind: "command" | "fileChange"): Promise<Record<string, unknown>> {
+  private onApprovalRequest(p: any, kind: CodexApprovalKind): Promise<Record<string, unknown>> {
     const sid = this.byThread.get(String(p?.threadId ?? ""));
     if (!sid) return Promise.resolve({ decision: "decline" }); // 不認識的 thread(不該發生)
     this.counters.approvalsRequested += 1;
-    const command =
-      kind === "command"
-        ? String(p.command ?? "")
-        : `修改文件:${(Array.isArray(p.changes) ? p.changes : []).map((c: any) => String(c?.path ?? "")).filter(Boolean).join(", ").slice(0, 300) || "(見詳情)"}`;
-    const reason = p.reason ? String(p.reason) : "";
-    const cmd = command.slice(0, 500);
-    const desc = reason || (kind === "command" ? `Codex 想在 ${String(p.cwd ?? "")} 執行命令` : "Codex 想寫入以上文件");
+    const sourceParams = p as Record<string, unknown>;
     // #240 E2E:命令全文/文件路徑/cwd 都敏感 → 加密進 enc,明文只留占位 + 類別 + request_id。
     const isE2E = this.e2e?.isE2E(sid) ?? false;
-    const enc = isE2E ? this.e2e!.encryptContent(sid, { command: cmd, description: desc }) : undefined;
+    const requestId = p.itemId ? String(p.itemId) : isE2E ? randomUUID() : undefined;
+    let executionSnapshot: CodexApprovalExecutionSnapshot | undefined;
+    let executionDisplay: string | undefined;
+    if (isE2E && requestId) {
+      try {
+        executionSnapshot = immutableE2EApprovalSnapshot<CodexApprovalExecutionSnapshot>(
+          codexApprovalExecutionRequest(sid, requestId, kind, sourceParams),
+        );
+        executionDisplay = canonicalE2EApprovalDisplay(executionSnapshot);
+      } catch (error) {
+        console.error(
+          `[E2E approval auto-declined ${sid}] ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return Promise.resolve({ decision: "decline" });
+      }
+    }
+    const request = executionSnapshot?.params ?? sourceParams;
+    const command =
+      kind === "command"
+        ? String(request.command ?? "")
+        : `修改文件:${(Array.isArray(request.changes) ? request.changes : []).map((c: any) => String(c?.path ?? "")).filter(Boolean).join(", ").slice(0, 300) || "(見詳情)"}`;
+    const reason = request.reason ? String(request.reason) : "";
+    const cmd = command.slice(0, 500);
+    const desc = reason || (kind === "command" ? `Codex 想在 ${String(request.cwd ?? "")} 執行命令` : "Codex 想寫入以上文件");
+    const patternKey = kind === "command" ? "shell" : "fileChange";
+    const requestDigest =
+      executionSnapshot
+        ? e2eApprovalRequestDigest(this.e2e!.requireKey(sid), executionSnapshot)
+        : undefined;
+    const approvalPlaintext =
+      isE2E && requestId && requestDigest
+        ? {
+            command: cmd,
+            description: desc,
+            patternKey,
+            requestId,
+            requestDigest,
+            executionRequest: executionSnapshot,
+            executionDisplay,
+          }
+        : undefined;
+    if (
+      approvalPlaintext
+      && Buffer.byteLength(JSON.stringify(approvalPlaintext), "utf8")
+        > E2E_APPROVAL_PLAINTEXT_MAX_BYTES
+    ) {
+      console.error(
+        `[E2E approval auto-declined ${sid}] encrypted approval payload exceeds device limit`,
+      );
+      return Promise.resolve({ decision: "decline" });
+    }
+    // 尺寸闸门必须先于 emit / approvals.push；否则设备拒绝卡片后本地反向请求会永久挂起。
+    const enc = approvalPlaintext
+      ? this.e2e!.encryptContent(sid, approvalPlaintext)
+      : undefined;
     this.emit(sid, "approval.request", {
       command: isE2E ? "🔒 加密審批請求" : cmd,
-      pattern_key: kind === "command" ? "shell" : "fileChange",
-      pattern_keys: [kind === "command" ? "shell" : "fileChange"],
+      pattern_key: patternKey,
+      pattern_keys: [patternKey],
       description: isE2E ? "" : desc,
       ...(enc ? { enc } : {}),
-      ...(p.itemId ? { request_id: String(p.itemId) } : {}),
+      ...(requestId ? { request_id: requestId } : {}),
+      ...(requestDigest ? { request_digest: requestDigest } : {}),
     });
     return new Promise((resolve) => {
       const list = this.approvals.get(sid) ?? [];
-      list.push({ sid, requestId: p.itemId ? String(p.itemId) : undefined, resolve: (decision) => resolve({ decision }) });
+      list.push({
+        sid,
+        requestId,
+        requestDigest,
+        executionSnapshot,
+        sourceParams: executionSnapshot ? sourceParams : undefined,
+        kind: executionSnapshot ? kind : undefined,
+        resolve: (decision) => resolve({ decision }),
+      });
       this.approvals.set(sid, list);
     });
   }
@@ -811,7 +1209,32 @@ export class AppServerDrive {
     this.linkb.send({ t: "mirror_append", agentLinkId: this.linkb.agentLinkId, sessions: [{ hermesSessionId: sid, source: "codex", e2e: true, messages: msgs }] });
   }
 
-  private saveMap(): void {
-    saveDriveState({ map: this.map, cwds: this.cwds, models: this.models, efforts: this.efforts, perms: this.perms, titled: this.titled, pending: this.pending });
+  private persistSessionSetting(
+    target: Record<string, string>,
+    sid: string,
+    value: string,
+    authenticated: AuthenticatedControlTag | undefined,
+    label: string,
+  ): void {
+    const hadPrevious = Object.hasOwn(target, sid);
+    const previous = target[sid];
+    if (value ? previous === value : !hadPrevious) return;
+    if (value) target[sid] = value;
+    else delete target[sid];
+    if (this.saveMap()) return;
+    if (hadPrevious) target[sid] = previous!;
+    else delete target[sid];
+    if (authenticated) {
+      throw new E2EControlError(`failed to persist authenticated ${label}`);
+    }
+  }
+
+  private saveMap(): boolean {
+    const saved = saveDriveState({ map: this.map, cwds: this.cwds, models: this.models, efforts: this.efforts, perms: this.perms, titled: this.titled, pending: this.pending });
+    if (saved) {
+      const protectedIds = this.protectedWireSids().filter((sid) => !UUID_RE.test(sid));
+      if (protectedIds.every((sid) => UUID_RE.test(this.map[sid] ?? ""))) this.identityStateTrusted = true;
+    }
+    return saved;
   }
 }

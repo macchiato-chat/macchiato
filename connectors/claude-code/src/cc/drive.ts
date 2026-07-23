@@ -36,6 +36,7 @@ import {
   type PermissionUpdate,
   type Query,
 } from "@anthropic-ai/claude-agent-sdk";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -45,13 +46,194 @@ import type { CommandsReporter } from "./commands";
 import { generateTitle } from "./titles";
 import type { LinkBClient } from "../linkb/client";
 import type { E2EKeyStore } from "../e2e/keys";
+import {
+  canonicalE2EApprovalDisplay,
+  dispatchForE2EControl,
+  e2eApprovalRequestDigest,
+  E2EControlError,
+  E2EControlVerifier,
+  immutableE2EApprovalSnapshot,
+  type E2EControlEnvelopeV1,
+  type E2EControlKind,
+} from "../e2e/control";
 import { discoverSessions, type Mirror } from "./mirror";
 import { foldEntries, readEntries } from "./transcripts";
 
 const CC_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** 必须与 iOS E2EControlCrypto.maxPayloadBytes 一致；设备会拒绝更大的解密 JSON。 */
+const E2E_APPROVAL_PLAINTEXT_MAX_BYTES = 64 * 1024;
+
+function sameLocalUUID(a: string, b: string): boolean {
+  const lowerA = a.toLowerCase();
+  const lowerB = b.toLowerCase();
+  return CC_UUID_RE.test(lowerA) && CC_UUID_RE.test(lowerB) && lowerA === lowerB;
+}
+
+const AUTHENTICATED_E2E_CONTROL = Symbol("authenticated-e2e-control");
+interface AuthenticatedControlTag {
+  kind: E2EControlKind;
+  msgId: string;
+  envelope: E2EControlEnvelopeV1;
+}
+type TaggedControlFrame = Record<string, unknown> & {
+  [AUTHENTICATED_E2E_CONTROL]?: AuthenticatedControlTag;
+};
+const E2E_SENSITIVE_METHODS = new Set([
+  "command.invoke",
+  "approval.respond",
+  "clarify.respond",
+  "secret.respond",
+  "session.create",
+  "session.interrupt",
+  "task.stop",
+  "session.e2e.disable",
+  "session.delete",
+  "session.rename",
+  "session.archive",
+  "session.retitle",
+]);
 
 function mapPath(): string {
   return process.env.MACCHIATO_CC_SESSIONS || join(homedir(), ".macchiato/claude-code-sessions.json");
+}
+
+interface PersistedDriveState {
+  map: Record<string, string>;
+  /** wire sid → 歷來由該會話產生過的所有 CC transcript uuid（含 map 的當前值）。 */
+  aliases: Record<string, string[]>;
+  cwds: Record<string, string>;
+  permModes: Record<string, string>;
+  models: Record<string, string>;
+  efforts: Record<string, string>;
+  pending: string[];
+  identityStateTrusted: boolean;
+  /**
+   * aliases 是否能證明涵蓋所有歷史 fork。舊 schema 即使能從 current map 補一項，
+   * 也無法證明過去沒有別的 uuid，故與 current-map trust 分開。
+   */
+  aliasHistoryTrusted: boolean;
+}
+
+function stringRecord(value: unknown, field: string): Record<string, string> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${field} must be an object`);
+  }
+  const out: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (!key || typeof item !== "string") throw new Error(`${field} contains an invalid entry`);
+    out[key] = item;
+  }
+  return out;
+}
+
+function stringArrayRecord(value: unknown, field: string): Record<string, string[]> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${field} must be an object`);
+  }
+  const out: Record<string, string[]> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (
+      !key ||
+      !Array.isArray(item) ||
+      item.some((entry) => typeof entry !== "string" || !entry)
+    ) {
+      throw new Error(`${field} contains an invalid entry`);
+    }
+    const localSids = item as string[];
+    if (new Set(localSids).size !== localSids.length) {
+      throw new Error(`${field} contains duplicate local session ids`);
+    }
+    out[key] = [...localSids];
+  }
+  return out;
+}
+
+/**
+ * v2 舊檔沒有 aliases；把 current map 補進已知 alias 只為維持 live/reverse lookup。
+ * 這不代表歷史完整——是否可放行 import/未知 mirror 由 aliasHistoryTrusted 另行決定。
+ */
+function withCurrentAliases(
+  map: Record<string, string>,
+  persisted: Record<string, string[]> = {},
+): Record<string, string[]> {
+  const aliases = Object.fromEntries(
+    Object.entries(persisted)
+      .filter(([, localSids]) => localSids.length > 0)
+      .map(([wireSid, localSids]) => [wireSid, [...localSids]]),
+  );
+  for (const [wireSid, localSid] of Object.entries(map)) {
+    const localSids = (aliases[wireSid] ??= []);
+    if (!localSids.includes(localSid)) localSids.push(localSid);
+  }
+  return aliases;
+}
+
+function parseDriveState(raw: string, identityStateTrusted: boolean): PersistedDriveState {
+  const parsed = JSON.parse(raw) as Record<string, unknown>;
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("state root must be an object");
+  }
+  if (parsed.v === 2) {
+    const map = stringRecord(parsed.map, "map");
+    if (
+      parsed.aliasHistoryTrusted !== undefined &&
+      typeof parsed.aliasHistoryTrusted !== "boolean"
+    ) {
+      throw new Error("aliasHistoryTrusted must be a boolean");
+    }
+    const pending = parsed.pending ?? [];
+    if (!Array.isArray(pending) || pending.some((sid) => typeof sid !== "string" || !sid)) {
+      throw new Error("pending must contain non-empty strings");
+    }
+    const declaredAliasHistoryTrusted = parsed.aliasHistoryTrusted === true;
+    const persistedAliases =
+      parsed.aliases === undefined ? {} : stringArrayRecord(parsed.aliases, "aliases");
+    if (declaredAliasHistoryTrusted) {
+      if (parsed.aliases === undefined) {
+        throw new Error("trusted alias history requires aliases");
+      }
+      for (const [wireSid, localSids] of Object.entries(persistedAliases)) {
+        if (!localSids.length) {
+          throw new Error(`trusted aliases for ${wireSid} must not be empty`);
+        }
+      }
+      for (const [wireSid, currentLocalSid] of Object.entries(map)) {
+        if (!persistedAliases[wireSid]?.includes(currentLocalSid)) {
+          throw new Error(`trusted aliases for ${wireSid} omit current map value`);
+        }
+      }
+    }
+    return {
+      // map 是 local↔wire E2E 安全邊界；缺字段不能再被 `?? {}` 洗成可信空映射。
+      map,
+      aliases: declaredAliasHistoryTrusted
+        ? persistedAliases
+        : withCurrentAliases(map, persistedAliases),
+      cwds: stringRecord(parsed.cwds ?? {}, "cwds"),
+      permModes: stringRecord(parsed.permModes ?? {}, "permModes"),
+      models: stringRecord(parsed.models ?? {}, "models"),
+      efforts: stringRecord(parsed.efforts ?? {}, "efforts"),
+      pending: pending as string[],
+      identityStateTrusted,
+      aliasHistoryTrusted:
+        identityStateTrusted &&
+        declaredAliasHistoryTrusted &&
+        parsed.aliases !== undefined,
+    };
+  }
+  // v1 是平面 wire sid → CC uuid；字段值必須全為 string 才可恢復。
+  const map = stringRecord(parsed, "legacy map");
+  return {
+    map,
+    aliases: withCurrentAliases(map),
+    cwds: {},
+    permModes: {},
+    models: {},
+    efforts: {},
+    pending: [],
+    identityStateTrusted,
+    aliasHistoryTrusted: false,
+  };
 }
 
 export function workDir(): string {
@@ -161,11 +343,24 @@ class PushStream<T> implements AsyncIterable<T> {
   }
 }
 
+type ClaudeApprovalExecutionSnapshot = {
+  v: 1;
+  connector: "claude-code";
+  sessionId: string;
+  requestId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+};
+
 interface PendingApproval {
   resolve: (allow: boolean, always: boolean) => void;
   toolName: string;
   /** #102 SDK 給的 toolUseID(隨 approval.request 上行;server 支持後 respond 回帶精準配對)。 */
   requestId?: string;
+  /** #370 E2E 审批响应还必须精确回带此摘要。 */
+  requestDigest?: string;
+  /** digest、加密卡片与最终 updatedInput 共用的 immutable 完整执行请求。 */
+  executionSnapshot?: ClaudeApprovalExecutionSnapshot;
   /** #238 SDK 給的窄規則建議——「總是允許」時存檔(alwaysRules)供通道重建回灌。 */
   suggestions?: PermissionUpdate[];
 }
@@ -187,6 +382,7 @@ export function ruleStringsFor(suggestions: PermissionUpdate[] | undefined, tool
 /** #109 AskUserQuestion 的單題掛起（clarify.respond 按 request_id 回填;empty answer = 跳過）。 */
 interface PendingClarify {
   sid: string;
+  requestDigest?: string;
   /** 記一題答案（null = 跳過）;組內全部到齊時解掛 canUseTool。 */
   record: (answer: string | null) => void;
 }
@@ -263,6 +459,11 @@ export class Drive {
   authFailed = false;
   /** serverSid → CC session uuid（跨重啟持久）。 */
   private map: Record<string, string>;
+  /**
+   * serverSid → 所有歷史 CC session uuid。CLI resume/fork 可能在 init 回一個新 uuid；
+   * 舊、新 transcript 都仍屬同一 wire 會話，尤其 E2E 下不可讓任一 alias 回落成明文。
+   */
+  private aliases: Record<string, string[]>;
   /** #105 serverSid → 會話工作目錄（session.create.cwd 下發；跨重啟持久，與 map 同文件 v2 存）。 */
   private cwds: Record<string, string>;
   /** #98 serverSid → UI 權限檔（session.create.permissionMode 下發；持久，同文件存）。 */
@@ -271,6 +472,12 @@ export class Drive {
   private models: Record<string, string>;
   /** #231 serverSid → reasoning effort(session.create.effort;持久,同文件存)。 */
   private efforts: Record<string, string>;
+  /** 主身份快照是否完整可信；只從舊 .bak/空 fallback 恢復時不得放行 E2E plaintext 路徑。 */
+  private identityStateTrusted: boolean;
+  /** 是否已知 aliases 涵蓋所有歷史 fork；舊 v2/legacy/backup 一律 false。 */
+  private aliasHistoryTrusted: boolean;
+  /** identity rotation 落盤失敗後即毒化；當前/後續 E2E live 不得繼續猜身份。 */
+  private identityPersistencePoisoned = false;
   /**
    * #200 一期(可見化):**在途回合**的 sid 集(持久)。回合起加、止刪;進程死在回合中途 →
    * 該 sid 留在盤上 → 下次啟動撈出、Link B ready 後回一條 system 提示「連接器重啟了,這條沒跑完,
@@ -297,6 +504,7 @@ export class Drive {
   private readonly alwaysRules = new Map<string, string[]>();
   /** §19 E2E：回合內暫存的（已解密）用戶消息，回合結束隨加密批投遞。 */
   private readonly pendingUser = new Map<string, string[]>();
+  private readonly e2eControl?: E2EControlVerifier;
 
   constructor(
     private readonly linkb: LinkBClient,
@@ -306,21 +514,33 @@ export class Drive {
     private readonly commands?: CommandsReporter,
     /** #227 回合末惰性版本化鉤子(掃備案目錄的 AGENTS.md)。 */
     private readonly projects?: { checkTurnEnd(): void },
+    e2eControl?: E2EControlVerifier,
   ) {
     const state = this.loadState();
     this.map = state.map;
+    this.aliases = state.aliases;
     this.cwds = state.cwds;
     this.permModes = state.permModes;
     this.models = state.models;
     this.efforts = state.efforts;
+    this.identityStateTrusted = state.identityStateTrusted;
+    this.aliasHistoryTrusted = state.aliasHistoryTrusted;
+    this.e2eControl = e2eControl ?? (e2e ? new E2EControlVerifier(e2e) : undefined);
     // 影子兜底:啟動時把既有 ULID→CLI 映射的 CLI uuid 全灌給鏡像(跨重啟持久),鏡像據此永不給
     // 這些「被驅動過」的 CLI 會話單獨建會話(防重啟後污染態丟失又復發)。
-    for (const cc of Object.values(this.map)) this.mirror?.markDrivenUuid(cc);
+    for (const localSids of Object.values(this.aliases)) {
+      for (const localSid of localSids) this.mirror?.markDrivenUuid(localSid);
+    }
     // #200 上個進程死時盤上還留著的在途回合 = 被殺掉的回合。撈出待 flush(ready 後告知),當即清盤
     // (新回合從空集重記,不與舊的混)。
     this.abandonedTurns = state.pending;
     this.pending = new Set();
-    if (state.pending.length) this.saveMap();
+    if (state.pending.length) {
+      // 進程可能死在 input.push 之後、SDK init/alias save 之前；本地已可能產生一個未知 fork。
+      // 清 crash marker 時必須同步撤銷 alias 完整性，不能讓舊 trusted=true 穿過重啟。
+      this.aliasHistoryTrusted = false;
+      this.saveMap();
+    }
     // task.sync:每次 Link B ready(含重連)全量上報仍活着的後台任務清單。連接器進程重啟後清單
     // 為空 → server 秒級收殮該 link 遺留的 running task 塊(進程死=任務死),不必等超齡殭屍清掃。
     // 舊 server 對未知事件 default 忽略,無害。時序:client 先 flushPending(斷線期間緩衝的
@@ -357,7 +577,11 @@ export class Drive {
    * (探測結論 3),打斷+接管是唯一真 steer;與 OpenClaw 在 Macchiato 的 steer 行為對齊。
    * 閒置 = 直接開新回合。
    */
-  private async dispatchContent(sid: string, content: TurnContent): Promise<void> {
+  private async dispatchContent(
+    sid: string,
+    content: TurnContent,
+    requireDelivery = false,
+  ): Promise<void> {
     const busy = this.channels.get(sid);
     if (busy?.turn) {
       const q = this.queued.get(sid) ?? [];
@@ -375,7 +599,7 @@ export class Drive {
       }
       return;
     }
-    this.startTurn(sid, content);
+    this.startTurn(sid, content, { requireDelivery });
   }
 
   /** #98 該會話當前 SDK 權限模式 + 編輯自動批策略。UI 檔優先,回退 env(逃生門)。permKey=通道重建判據。 */
@@ -450,14 +674,195 @@ export class Drive {
   }
 
   private ccSidFor(sid: string): string | undefined {
-    if (CC_UUID_RE.test(sid)) return sid; // 鏡像會話：sid 即 CC session id
-    return this.map[sid];
+    if (this.identityPersistencePoisoned && this.e2e?.isE2E(sid)) {
+      throw new Error(`Claude Code E2E identity persistence is poisoned for ${sid}`);
+    }
+    // 鏡像會話通常 sid 即 CC uuid；但 SDK resume/fork 也可能換 uuid，此後跟隨持久 current map。
+    return this.map[sid] ?? (CC_UUID_RE.test(sid) ? sid : undefined);
+  }
+
+  /** E2E backfill 的本地 transcript 身份；wire sid 仍由呼叫方原樣保留。 */
+  localSessionIdFor(sid: string): string | undefined {
+    return this.ccSidFor(sid);
+  }
+
+  /** Mirror / push 等本地 UUID 路徑使用的反向 wire identity。 */
+  e2eWireSessionIdFor(localSid: string): string | undefined {
+    if (!this.e2e) return undefined;
+    for (const wireSid of new Set([...Object.keys(this.aliases), ...Object.keys(this.map)])) {
+      if (this.localSessionIdsForWire(wireSid).includes(localSid) && this.e2e.isE2E(wireSid)) {
+        return wireSid;
+      }
+    }
+    return undefined;
+  }
+
+  private localSessionIdsForWire(wireSid: string): string[] {
+    return [...new Set([...(this.aliases[wireSid] ?? []), ...(this.map[wireSid] ? [this.map[wireSid]] : [])])];
+  }
+
+  private rememberLocalSessionId(wireSid: string, localSid: string): boolean {
+    const localSids = (this.aliases[wireSid] ??= []);
+    if (localSids.includes(localSid)) return false;
+    localSids.push(localSid);
+    return true;
+  }
+
+  private protectedWireSids(): string[] {
+    const fn = (this.e2e as (E2EKeyStore & { protectedSessionIds?: () => string[] }) | undefined)
+      ?.protectedSessionIds;
+    return typeof fn === "function" ? fn.call(this.e2e) : [];
+  }
+
+  /**
+   * CC resume/fork 会让一个 wire sid 对应多个本地 transcript UUID。任一本地 UUID 都不能
+   * 被 server 重新包装成未保护 sid，否则 prompt/control 会直达同一 transcript。
+   */
+  private protectedInboundAliasOwner(sid: string): string | undefined {
+    return this.protectedWireSids().find((wireSid) => {
+      if (wireSid === sid) return false;
+      if (sameLocalUUID(wireSid, sid)) return true;
+      return this.localSessionIdsForWire(wireSid).some(
+        (localSid) => localSid === sid || sameLocalUUID(localSid, sid),
+      );
+    });
+  }
+
+  private hasAuthoritativeServerSnapshot(): boolean {
+    if (!this.e2e) return true;
+    const fn = (this.e2e as E2EKeyStore & {
+      hasServerStateSnapshot?: () => boolean;
+    }).hasServerStateSnapshot;
+    return typeof fn === "function" && fn.call(this.e2e);
+  }
+
+  private fatalIdentityPersistence(message: string): never {
+    this.identityPersistencePoisoned = true;
+    this.dispose();
+    // 真 LinkBClient 具備兩者；測試/窄 mock 可省略。交 supervisor 重啟，不能留一個
+    // 身份盤已不確定但仍接受後續 prompt 的半活 connector。
+    this.linkb.close?.();
+    this.linkb.onFatal?.();
+    throw new Error(`fatal: ${message}`);
+  }
+
+  /** 壞/缺 wire↔CC UUID 身份快照時整體拒絕 ready，不能讓 live/mirror/import 猜成明文。 */
+  assertE2EIdentitySafe(): void {
+    const protectedWireSids = this.protectedWireSids();
+    if (this.identityPersistencePoisoned && protectedWireSids.length) {
+      throw new Error(
+        "Claude Code E2E identity persistence is poisoned; refusing all protected identity paths",
+      );
+    }
+    const requiringMap = protectedWireSids.filter(
+      (sid) =>
+        !CC_UUID_RE.test(sid) ||
+        this.map[sid] !== undefined ||
+        (this.aliases[sid]?.length ?? 0) > 0,
+    );
+    if (!requiringMap.length) return;
+    const missing = requiringMap.filter((sid) => {
+      const current = this.map[sid];
+      const localSids = this.localSessionIdsForWire(sid);
+      return (
+        !CC_UUID_RE.test(current ?? "") ||
+        !localSids.includes(current) ||
+        localSids.some((localSid) => !CC_UUID_RE.test(localSid))
+      );
+    });
+    if (!this.identityStateTrusted || missing.length) {
+      throw new Error(
+        `Claude Code E2E identity map unavailable/incomplete (trusted=${this.identityStateTrusted}, ` +
+          `poisoned=${this.identityPersistencePoisoned}, ` +
+          `missing=${missing.slice(0, 3).join(",") || "unknown"}); refusing plaintext fallback`,
+      );
+    }
+  }
+
+  /** 防禦縱深：整體 ready 閘之外，Mirror 每次明文 local UUID 發送前也即時詢問。 */
+  plaintextLocalMirrorAllowed(localSid: string): boolean {
+    const protectedIds = this.protectedWireSids();
+    if (!protectedIds.length) return true;
+    if (!this.aliasHistoryTrusted) return false;
+    try {
+      this.assertE2EIdentitySafe();
+    } catch {
+      return false;
+    }
+    // 有任一 protected 會話時，完全未知 UUID 可能是 crash-before-alias-save 的 E2E fork，
+    // 不得當作新 plaintext terminal session。只有持久 alias 明確指向非 E2E wire 才可明文。
+    for (const wireSid of new Set([...Object.keys(this.aliases), ...Object.keys(this.map)])) {
+      if (!this.localSessionIdsForWire(wireSid).includes(localSid)) continue;
+      return !this.e2e?.isE2E(wireSid);
+    }
+    return false;
+  }
+
+  /**
+   * history import 枚舉的是本地 CC uuid，E2E store 則以 server wire sid 為 key。
+   * 每次導入前拍一份反向映射；同一 local uuid 只要任一關聯 wire sid 為 E2E，就必須整條過濾。
+   */
+  localSessionE2EStatus(): { isE2E(localSid: string): boolean } {
+    const e2e = this.e2e;
+    if (!e2e) return { isE2E: () => false };
+    if (this.protectedWireSids().length && !this.aliasHistoryTrusted) {
+      return { isE2E: () => true };
+    }
+    try {
+      this.assertE2EIdentitySafe();
+    } catch {
+      return { isE2E: () => true };
+    }
+    const protectedLocal = new Set<string>();
+    const knownPlainLocal = new Set<string>();
+    for (const wireSid of new Set([...Object.keys(this.aliases), ...Object.keys(this.map)])) {
+      const target = e2e.isE2E(wireSid) ? protectedLocal : knownPlainLocal;
+      for (const localSid of this.localSessionIdsForWire(wireSid)) target.add(localSid);
+    }
+    return {
+      isE2E: (localSid: string) => {
+        if (protectedLocal.has(localSid) || e2e.isE2E(localSid)) return true;
+        if (knownPlainLocal.has(localSid)) return false;
+        // 與 mirror 同一 fail-closed 分類：protected>0 時未知 local 一律視為受保護。
+        return this.protectedWireSids().length > 0;
+      },
+    };
   }
 
   /** sid → 該會話進行中的後台 task_id 集合(task.stop 短 id 前綴還原兜底 + 展示去重)。 */
   private readonly sessionTasks = new Map<string, Set<string>>();
   /** task_id → 上次 progress 上報時刻(節流)。 */
   private readonly taskProgressAt = new Map<string, number>();
+  /** #384 task_id → 後台任務 output 文件路徑(從啟動回執解析;task_notification 讀真輸出作 report)。 */
+  private readonly taskOutputFiles = new Map<string, string>();
+  /** #384 report 上限:與 server TASK_REPORT_CAP 對齊(超長取尾——結局比開頭有用)。 */
+  private static readonly TASK_REPORT_CAP = 30_000;
+
+  /**
+   * #384 從後台任務啟動回執解析 output 文件路徑:
+   * 「Command running in background with ID: <id>. Output is being written to: <path>.」
+   * 這是「細節丟失只剩 task 編號」的修復根基——真輸出只存在於連接器主機的這個文件裡。
+   */
+  private captureTaskOutputFile(resultText: string): void {
+    const m = resultText.match(/Command running in background with ID:\s*(\S+?)\.?\s[\s\S]*?Output is being written to:\s*(\S+?)\.?(?:\s|$)/);
+    if (!m) return;
+    this.taskOutputFiles.set(m[1]!, m[2]!);
+    while (this.taskOutputFiles.size > 128) this.taskOutputFiles.delete(this.taskOutputFiles.keys().next().value!); // 防洩漏
+  }
+
+  /** #384 讀後台任務真輸出(文件尾,cap 30k)。讀不到(已清理/權限)→ undefined,report 缺席即回退舊行為。 */
+  private readTaskReport(taskId: string): string | undefined {
+    const file = this.taskOutputFiles.get(taskId);
+    if (!file) return undefined;
+    this.taskOutputFiles.delete(taskId);
+    try {
+      const text = readFileSync(file, "utf8");
+      if (!text.trim()) return undefined;
+      return text.length > Drive.TASK_REPORT_CAP ? `…(前略 ${text.length - Drive.TASK_REPORT_CAP} 字)\n${text.slice(-Drive.TASK_REPORT_CAP)}` : text;
+    } catch {
+      return undefined;
+    }
+  }
   /** #104 進度改原地更新(不再刷屏),節流可比文本行時代(15s)更密。 */
   private static readonly PROGRESS_THROTTLE_MS = 5_000;
 
@@ -591,11 +996,15 @@ export class Drive {
       // #222:終態統計(task_notification.usage)。
       const usage = (m.usage ?? {}) as Record<string, unknown>;
       if (visible) {
+        // #384 後台任務:讀 output 文件真輸出隨 task.end 上送(server 回填原工具塊,
+        // 覆蓋「Command running in background…」啟動回執)。subagent 無 output 文件,report 缺席。
+        const report = this.readTaskReport(taskId);
         this.emit(sid, "task.end", {
           task_id: taskId,
           status,
           ...(summary && summary !== desc ? { summary } : {}),
           ...(desc ? { desc } : {}),
+          ...(report ? { report } : {}),
           ...(typeof usage.tool_uses === "number" ? { tool_uses: usage.tool_uses } : {}),
           ...(typeof usage.total_tokens === "number" ? { total_tokens: usage.total_tokens } : {}),
         });
@@ -607,19 +1016,134 @@ export class Drive {
     // task_updated / task_summary:v1 不單獨展示(進度靠 task_progress,完成靠 notification)。
   }
 
+  private sendE2EControlResult(
+    rawEnvelope: unknown,
+    wireSid: string,
+    ok: boolean,
+    error?: "control_rejected" | "side_effect_failed",
+  ): void {
+    if (rawEnvelope === null || typeof rawEnvelope !== "object" || Array.isArray(rawEnvelope)) return;
+    const envelope = rawEnvelope as Partial<E2EControlEnvelopeV1>;
+    if (typeof envelope.sessionId !== "string" || !envelope.sessionId) return;
+    if (typeof envelope.msgId !== "string" || !envelope.msgId) return;
+    this.linkb.send({
+      t: "e2e_control_result",
+      agentLinkId: this.linkb.agentLinkId,
+      sessionId: envelope.sessionId,
+      hermesSessionId: wireSid,
+      msgId: envelope.msgId,
+      ok,
+      ...(error ? { error } : {}),
+    });
+  }
+
+  private async onE2EControl(wireSid: string, rawEnvelope: unknown): Promise<void> {
+    let dispatchStarted = false;
+    try {
+      if (!this.e2eControl) throw new E2EControlError("E2E control verifier unavailable");
+      const verified = this.e2eControl.verifyAndConsume(rawEnvelope, wireSid);
+      if (verified.kind === "secret.respond") {
+        throw new E2EControlError("secret.respond is not supported by Claude Code");
+      }
+      const dispatch = dispatchForE2EControl(verified.kind, verified.payload);
+      if (verified.kind === "command.invoke" && typeof dispatch.params.argsEnc === "string") {
+        if (!this.e2e) throw new E2EControlError("E2E command decryptor unavailable");
+        try {
+          dispatch.params.args = this.e2e.decryptText(wireSid, dispatch.params.argsEnc);
+          delete dispatch.params.argsEnc;
+        } catch (error) {
+          throw new E2EControlError("failed to decrypt authenticated command args", {
+            cause: error,
+          });
+        }
+      }
+      const tagged: TaggedControlFrame = {
+        t: "tui",
+        sessionId: wireSid,
+        frame: {
+          jsonrpc: "2.0",
+          method: dispatch.method,
+          params: { session_id: wireSid, ...dispatch.params },
+        },
+        [AUTHENTICATED_E2E_CONTROL]: {
+          kind: verified.kind,
+          msgId: verified.envelope.msgId,
+          envelope: verified.envelope,
+        },
+      };
+      dispatchStarted = true;
+      await this.onServerFrame(tagged);
+      this.sendE2EControlResult(verified.envelope, wireSid, true);
+    } catch (error) {
+      console.error(`[E2E control rejected ${wireSid}]`, error instanceof Error ? error.message : String(error));
+      this.sendE2EControlResult(
+        rawEnvelope,
+        wireSid,
+        false,
+        dispatchStarted ? "side_effect_failed" : "control_rejected",
+      );
+    }
+  }
+
   async onServerFrame(msg: Record<string, unknown>): Promise<void> {
     if (msg.t !== "tui" || !msg.frame) return;
     const frame = msg.frame as { method?: string; params?: Record<string, unknown> };
     const params = frame.params ?? {};
-    const sid = (msg.sessionId ?? params.session_id) as string | undefined;
+    const outerSid = typeof msg.sessionId === "string" ? msg.sessionId : undefined;
+    const paramsSid = typeof params.session_id === "string" ? params.session_id : undefined;
+    if (
+      (msg.sessionId !== undefined && !outerSid) ||
+      (params.session_id !== undefined && !paramsSid) ||
+      (outerSid && paramsSid && outerSid !== paramsSid)
+    ) {
+      console.error(
+        `[drive rejected] Link B outer/params session mismatch: ${String(msg.sessionId)} != ${String(params.session_id)}`,
+      );
+      return;
+    }
+    const sid = outerSid ?? paramsSid;
     if (!sid || !frame.method) return;
+    let aliasOwner: string | undefined;
     try {
+      aliasOwner = this.protectedInboundAliasOwner(sid);
+    } catch (error) {
+      console.error(
+        `[E2E inbound quarantined ${sid}] ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return;
+    }
+    if (aliasOwner) {
+      console.error(`[E2E local alias rejected ${sid}] canonical wire session is ${aliasOwner}`);
+      return;
+    }
+    const authenticated = (msg as TaggedControlFrame)[AUTHENTICATED_E2E_CONTROL];
+    if (frame.method === "e2e.control") {
+      if (authenticated || !outerSid || !paramsSid) return;
+      await this.onE2EControl(sid, params.envelope);
+      return;
+    }
+    try {
+      if (
+        this.e2e?.isE2E(sid) &&
+        E2E_SENSITIVE_METHODS.has(frame.method) &&
+        authenticated === undefined
+      ) {
+        console.error(`[E2E legacy control rejected ${sid}] ${frame.method}`);
+        return;
+      }
       switch (frame.method) {
         case "prompt.submit": {
           let text = String(params.text ?? "").trim();
           // #73 語音優雅降級:Claude Code 無 STT。audio 附件立即回「未能轉錄」——否則 server 的
           // 「轉錄中…」占位永久卡住(2026-07-06 實測)。雲端 STT(BYOK)見 #89,屆時 server 側路由。
           const atts = Array.isArray(params.attachments) ? (params.attachments as Record<string, unknown>[]) : [];
+          // E2E 附件没有端到端密文/完整性协议；在任何 STT、网络或落盘副作用前拒绝整帧。
+          if (atts.length && this.e2e?.isE2E(sid)) {
+            console.error(`[E2E prompt rejected ${sid}] attachments are not supported`);
+            return;
+          }
           const filePaths: string[] = [];
           const imageBlocks: unknown[] = [];
           for (const a of atts) {
@@ -693,61 +1217,83 @@ export class Drive {
             arr.push(text);
             this.pendingUser.set(sid, arr);
           }
-          console.log(`· command.invoke ${text} → ${sid}`);
-          await this.dispatchContent(sid, text);
+          const logText =
+            authenticated && args ? `/${name} [encrypted args]` : text;
+          console.log(`· command.invoke ${logText} → ${sid}`);
+          await this.dispatchContent(sid, text, authenticated !== undefined);
           return;
         }
         case "session.interrupt": {
           const ch = this.channels.get(sid);
-          if (ch?.turn && !ch.turn.completed) {
-            this.interruptedSids.add(sid); // #102 隨後的 result(error) 定性為 interrupted
-            await ch.q.interrupt(); // #116 g:interrupt 不殺通道,下一回合同通道照常
-            // ⚠️ 回歸契約:scripts/regression/run-cc-regression.mjs 斷言「Interrupted turn for」,改動需同步
-            console.log(`· Interrupted turn for ${sid}`);
+          if (!ch?.turn || ch.turn.completed) {
+            if (authenticated) throw new E2EControlError("no active turn to interrupt");
+            return;
           }
+          this.interruptedSids.add(sid); // #102 隨後的 result(error) 定性為 interrupted
+          await ch.q.interrupt(); // #116 g:interrupt 不殺通道,下一回合同通道照常
+          // ⚠️ 回歸契約:scripts/regression/run-cc-regression.mjs 斷言「Interrupted turn for」,改動需同步
+          console.log(`· Interrupted turn for ${sid}`);
+          return;
+        }
+        case "session.e2e.disable": {
+          if (authenticated?.kind !== "session.e2e.disable") {
+            throw new E2EControlError("session.e2e.disable requires authenticated control");
+          }
+          if (!this.e2e || !this.mirror) {
+            throw new E2EControlError("E2E disable dependencies unavailable");
+          }
+          this.assertE2EIdentitySafe();
+          this.e2e.markServerE2E(sid, "disable");
+          this.e2e.beginDisable(sid, authenticated.envelope);
+          await this.mirror.backfillE2E(sid, this.localSessionIdFor(sid), "disable");
           return;
         }
         case "session.create": {
+          const partial = authenticated !== undefined;
           // #105 upsert：登記/更新會話工作目錄（CC 會話本體仍由首次 prompt 的 init 建立）。
           // 草稿期改 cwd = server 重發本方法；不帶 cwd = 清回連接器默認。
           const cwd = typeof params.cwd === "string" ? params.cwd.trim() : "";
-          if (cwd ? this.cwds[sid] !== cwd : this.cwds[sid] !== undefined) {
-            if (cwd) this.cwds[sid] = cwd;
-            else delete this.cwds[sid];
-            this.saveMap();
-            console.log(`· session.create ${sid} cwd=${cwd || "(default)"}`);
+          if (!partial || Object.hasOwn(params, "cwd")) {
+            if (this.persistSessionSetting(this.cwds, sid, cwd, authenticated, "cwd")) {
+              console.log(`· session.create ${sid} cwd=${cwd || "(default)"}`);
+            }
           }
           // #98 權限檔(upsert;隨時可改,不像 cwd)。空/非法 = 清回 env 默認。
           const pm = typeof params.permissionMode === "string" ? params.permissionMode.trim() : "";
           const validPm = (UI_MODES as readonly string[]).includes(pm) ? pm : "";
-          if (validPm === "bypass" && !bypassAllowed()) {
+          if ((!partial || Object.hasOwn(params, "permissionMode")) && validPm === "bypass" && !bypassAllowed()) {
             // #255 高危檔本地未開放:記下用戶意圖(降級在 resolvePerm 生效),操作者可設 env 開放。
             console.error(
               `[drive] ${sid} 請求 bypass 但本地未開放 → 降級 ask;要允許請設 MACCHIATO_CC_ALLOW_BYPASS=1`,
             );
           }
-          if (validPm ? this.permModes[sid] !== validPm : this.permModes[sid] !== undefined) {
-            if (validPm) this.permModes[sid] = validPm;
-            else delete this.permModes[sid];
-            this.saveMap();
-            console.log(`· session.create ${sid} permissionMode=${validPm || "(env default)"}`);
+          if (!partial || Object.hasOwn(params, "permissionMode")) {
+            if (
+              this.persistSessionSetting(
+                this.permModes,
+                sid,
+                validPm,
+                authenticated,
+                "permissionMode",
+              )
+            ) {
+              console.log(`· session.create ${sid} permissionMode=${validPm || "(env default)"}`);
+            }
           }
           // #143 model(upsert;隨時可改)。空 = 清回連接器默認(env / CLI 配置)。自由字符串——
           // 不校驗枚舉(支持別名 opus/sonnet/haiku 或完整 id),連接器只透傳。
           const md = typeof params.model === "string" ? params.model.trim() : "";
-          if (md ? this.models[sid] !== md : this.models[sid] !== undefined) {
-            if (md) this.models[sid] = md;
-            else delete this.models[sid];
-            this.saveMap();
-            console.log(`· session.create ${sid} model=${md || "(default)"}`);
+          if (!partial || Object.hasOwn(params, "model")) {
+            if (this.persistSessionSetting(this.models, sid, md, authenticated, "model")) {
+              console.log(`· session.create ${sid} model=${md || "(default)"}`);
+            }
           }
           // #231 effort(upsert;隨時可改)。空 = 清回模型默認。自由字符串,連接器只透傳。
           const ef = typeof params.effort === "string" ? params.effort.trim() : "";
-          if (ef ? this.efforts[sid] !== ef : this.efforts[sid] !== undefined) {
-            if (ef) this.efforts[sid] = ef;
-            else delete this.efforts[sid];
-            this.saveMap();
-            console.log(`· session.create ${sid} effort=${ef || "(default)"}`);
+          if (!partial || Object.hasOwn(params, "effort")) {
+            if (this.persistSessionSetting(this.efforts, sid, ef, authenticated, "effort")) {
+              console.log(`· session.create ${sid} effort=${ef || "(default)"}`);
+            }
           }
           // #98/#118/#143 cwd/權限/model 是通道創建參數:閒置通道立即重建生效;回合進行中的留給回合末。
           const ch = this.channels.get(sid);
@@ -803,13 +1349,21 @@ export class Drive {
             const full = [...running].find((id) => id.startsWith(taskId));
             if (full) taskId = full;
           }
+          if (authenticated && (!running || !running.has(taskId))) {
+            throw new E2EControlError("no matching active task");
+          }
           const cur = this.channels.get(sid)?.q;
+          if (!cur || !taskId) {
+            if (authenticated) throw new E2EControlError("no matching active task");
+            return;
+          }
           if (cur && taskId) {
             try {
               await (cur as unknown as { stopTask(id: string): Promise<void> }).stopTask(taskId);
               console.log(`· stopTask ${taskId} for ${sid}`);
             } catch (e) {
               console.error(`[task.stop ${taskId} failed] ${(e as Error).message}`);
+              if (authenticated) throw e;
             }
           }
           return;
@@ -818,23 +1372,75 @@ export class Drive {
           // #109:AskUserQuestion 單題答案(answer=所選 label;空串=跳過)。恆帶 request_id。
           const reqId = String(params.request_id ?? "");
           const pending = this.clarifies.get(reqId);
-          if (!pending) return;
+          if (!pending) {
+            if (authenticated) throw new E2EControlError("no matching pending clarification");
+            return;
+          }
+          if (authenticated && pending.sid !== sid) {
+            throw new E2EControlError("clarification belongs to a different session");
+          }
+          if (
+            authenticated &&
+            (authenticated.kind !== "clarify.respond" ||
+              !pending.requestDigest ||
+              params.requestDigest !== pending.requestDigest)
+          ) {
+            throw new E2EControlError("clarification request id/digest mismatch");
+          }
+          let answer: string;
+          if (authenticated) {
+            const answerEnc = typeof params.answerEnc === "string" ? params.answerEnc : "";
+            if (!this.e2e || !answerEnc) {
+              throw new E2EControlError("authenticated clarification is missing ciphertext");
+            }
+            try {
+              // answerEnc 是 K_S AES-GCM 密文；只有本地 connector 能解，server 永远看不到答案。
+              answer = this.e2e.decryptText(sid, answerEnc);
+            } catch (error) {
+              throw new E2EControlError("failed to decrypt authenticated clarification", {
+                cause: error,
+              });
+            }
+          } else {
+            answer = typeof params.answer === "string" ? params.answer : "";
+          }
           this.clarifies.delete(reqId);
-          const answer = typeof params.answer === "string" ? params.answer : "";
           pending.record(answer || null);
           return;
         }
         case "approval.respond": {
           const list = this.approvals.get(sid);
-          if (!list?.length) return;
+          if (!list?.length) {
+            if (authenticated) throw new E2EControlError("no matching pending approval");
+            return;
+          }
           // #102:優先按 request_id 配對(server 開始回帶後端到端精準);缺省回退 FIFO(舊 server 兼容)。
           const reqId = typeof params.request_id === "string" ? params.request_id : "";
+          const reqDigest = typeof params.requestDigest === "string" ? params.requestDigest : "";
           let pending: PendingApproval | undefined;
-          if (reqId) {
-            const i = list.findIndex((p) => p.requestId === reqId);
+          if (authenticated) {
+            if (authenticated.kind !== "approval.respond" || !reqId || !reqDigest) {
+              throw new E2EControlError("authenticated approval is missing request identity");
+            }
+            const i = list.findIndex(
+              (item) =>
+                item.requestId === reqId &&
+                item.requestDigest === reqDigest &&
+                item.executionSnapshot !== undefined &&
+                e2eApprovalRequestDigest(
+                  this.e2e!.requireKey(sid),
+                  item.executionSnapshot,
+                ) === reqDigest,
+            );
             if (i >= 0) pending = list.splice(i, 1)[0];
+            if (!pending) throw new E2EControlError("approval request id/digest mismatch");
+          } else {
+            if (reqId) {
+              const i = list.findIndex((p) => p.requestId === reqId);
+              if (i >= 0) pending = list.splice(i, 1)[0];
+            }
+            pending ??= list.shift();
           }
-          pending ??= list.shift();
           if (!pending) return;
           const choice = String(params.choice ?? "deny");
           const allow = choice === "allow" || choice === "always" || choice === "yes";
@@ -856,6 +1462,7 @@ export class Drive {
     } catch (e) {
       this.counters.driveErrors += 1; // #10
       console.error(`[drive ${frame.method} failed for ${sid}] ${(e as Error).message}`);
+      if (authenticated) throw e;
     }
   }
 
@@ -871,7 +1478,11 @@ export class Drive {
    * #118 起一回合:確保通道存在(閒置回收/cwd 變更後重建,resume 續上下文)→ 建 TurnCtx → push。
    * 同步執行(openChannel 到 turn 賦值之間無 await)——保證 consume 循環首條消息到達時 turn 已就緒。
    */
-  private startTurn(sid: string, content: TurnContent, opts?: { retriedDelivery?: boolean }): void {
+  private startTurn(
+    sid: string,
+    content: TurnContent,
+    opts?: { retriedDelivery?: boolean; requireDelivery?: boolean },
+  ): void {
     const isE2E = this.e2e?.isE2E(sid) ?? false;
     // #105 每回合校驗工作目錄(用戶手輸的可能有 typo,也可能事後被刪):不存在就回提示、不起回合——
     // CC 在壞 cwd 下的報錯難懂。提示走 system 行(review.summary),agent 沒有回覆過 → server 側
@@ -881,6 +1492,7 @@ export class Drive {
       const errText = `⚠️ 工作目錄不存在或不是目錄：${cwd}（連接器主機上）。請修正會話目錄後重發。`;
       if (isE2E) this.sendE2ETurn(sid, errText);
       else this.emit(sid, "review.summary", { summary: errText });
+      if (opts?.requireDelivery) throw new E2EControlError(errText);
       return;
     }
     let ch = this.channels.get(sid);
@@ -932,7 +1544,18 @@ export class Drive {
     if (!isE2E) void this.snapshotUsageBaseline(ch, ch.turn);
     this.armTurnWatchdog(ch); // #253 起看門狗
     this.pending.add(sid); // #200 在途回合登記(進程死在此後 → 下次啟動提示重發)
-    this.saveMap();
+    if (!this.saveMap() && isE2E) {
+      // E2E 首回合若在 input.push 前連 pending 身份快照都落不了盤，CLI 一旦收件並換
+      // session_id，重啟後就可能只剩「看似可信的舊 aliases」。因此不准交付 prompt。
+      this.pending.delete(sid);
+      this.clearTurnWatchdog(ch);
+      ch.turn.completed = true;
+      ch.turn = undefined;
+      this.closeChannel(ch);
+      this.fatalIdentityPersistence(
+        `failed to persist Claude Code E2E turn identity before delivery (${sid})`,
+      );
+    }
     ch.input.push({
       type: "user",
       message: { role: "user", content },
@@ -1099,15 +1722,35 @@ export class Drive {
 
     if (m.type === "system" && m.subtype === "init" && typeof m.session_id === "string") {
       // #118:streaming 模式每回合一個 init。首回合據此存映射;每回合 setDriven(live 獨佔投遞)。
-      if (!this.map[sid] && !CC_UUID_RE.test(sid)) {
+      const currentLocalSid =
+        this.map[sid] ?? (CC_UUID_RE.test(sid) ? sid : undefined);
+      if (!currentLocalSid) {
         this.map[sid] = m.session_id;
-        this.saveMap();
-      } else if (this.map[sid] && this.map[sid] !== m.session_id && !CC_UUID_RE.test(sid)) {
-        // #266:CLI 給的 session_id 與既有映射不一致(如 CLI resume 時 fork 出新 uuid)——此前無感知,
-        // 後續仍 resume 舊 uuid → 上下文丟失,且 fork 的新 transcript 被鏡像撈成影子。至少打斷言日誌 +
-        // 計數(對齊 mirrorGhostBlocked 絆線哲學);markDrivenUuid 已把新 uuid 登記為被驅動、防影子。
+        this.rememberLocalSessionId(sid, m.session_id);
+        if (!this.saveMap() && isE2E) {
+          this.fatalIdentityPersistence(
+            `failed to persist Claude Code E2E identity for ${sid} (${m.session_id})`,
+          );
+        }
+      } else if (currentLocalSid !== m.session_id) {
+        // #266/#347:CLI resume/fork 可能換 uuid。map 跟隨當前 transcript，aliases 永久保留
+        // 舊、新 uuid 的共同 wire 身份（wire 本身是 UUID 也一樣）；先同步內存，再立即雙份持久，
+        // import/mirror 不得出現明文窗口。
+        const previous = currentLocalSid;
+        this.rememberLocalSessionId(sid, previous);
+        this.rememberLocalSessionId(sid, m.session_id);
+        this.map[sid] = m.session_id;
+        if (!this.saveMap()) {
+          this.fatalIdentityPersistence(
+            `failed to persist Claude Code identity rotation for ${sid} ` +
+              `(${previous} -> ${m.session_id})`,
+          );
+        }
         this.counters.initMapMismatch = (this.counters.initMapMismatch ?? 0) + 1;
-        console.error(`[#266 init session_id 不一致 sid=${sid} 映射=${this.map[sid]} 新=${m.session_id}(CLI fork/resume?)——仍用舊映射,新 uuid 已登記防影子]`);
+        console.error(
+          `[#266 init session_id 不一致 sid=${sid} 舊=${previous} 新=${m.session_id}` +
+            "（CLI fork/resume?）——已切換當前映射並持久保留兩個 alias]",
+        );
       }
       this.mirror?.setDriven(m.session_id); // 本回合 live 獨佔(per-turn)
       this.mirror?.markDrivenUuid(m.session_id); // 影子兜底:永久登記此 CLI uuid 為「被驅動過」
@@ -1224,6 +1867,8 @@ export class Drive {
                 .filter((x: any) => x?.type === "text")
                 .map((x: any) => x.text)
                 .join("");
+        // #384 後台任務啟動回執裡帶 output 文件路徑——記下來,task_notification 時讀真輸出作 report
+        this.captureTaskOutputFile(String(resultText));
         this.emit(sid, "tool.complete", {
           tool_id: b.tool_use_id,
           name: t.name,
@@ -1513,17 +2158,75 @@ export class Drive {
     input: Record<string, unknown>,
     opts?: { toolUseID?: string; suggestions?: PermissionUpdate[]; title?: string; description?: string },
   ): Promise<PermissionResult> {
+    const e2e = this.e2e?.isE2E(sid) ?? false;
+    const requestId = opts?.toolUseID || (e2e ? randomUUID() : undefined);
+    let executionSnapshot: ClaudeApprovalExecutionSnapshot | undefined;
+    let executionDisplay: string | undefined;
+    if (e2e && requestId) {
+      try {
+        executionSnapshot = immutableE2EApprovalSnapshot<ClaudeApprovalExecutionSnapshot>({
+          v: 1,
+          connector: "claude-code",
+          sessionId: sid,
+          requestId,
+          toolName,
+          input,
+        });
+        executionDisplay = canonicalE2EApprovalDisplay(executionSnapshot);
+      } catch (error) {
+        console.error(
+          `[E2E approval auto-denied ${sid}] ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return Promise.resolve({
+          behavior: "deny",
+          message: "E2E approval request cannot be displayed safely",
+        });
+      }
+    }
+    // E2E 下所有展示与获批后的 updatedInput 都从快照取值；调用方随后修改 input 无效。
+    const approvedInput = executionSnapshot?.input ?? input;
     // #99 Plan 模式:ExitPlanMode 經此橋;input.plan=計劃全文 → 作卡片正文(而非工具名+JSON)。
     const isPlan = toolName === "ExitPlanMode";
-    const planText = isPlan && typeof input?.plan === "string" ? (input.plan as string) : "";
-    const argsPreview = JSON.stringify(input ?? {}).slice(0, 500);
-    const command = isPlan ? "批准計劃並開始執行" : opts?.title || `${toolName} ${argsPreview}`;
+    const planText =
+      isPlan && typeof approvedInput.plan === "string" ? approvedInput.plan : "";
+    const argsPreview = JSON.stringify(approvedInput).slice(0, 500);
+    const command = isPlan ? "Approve plan and start execution" : opts?.title || `${toolName} ${argsPreview}`;
     const description = isPlan ? planText.slice(0, 8000) : opts?.description || `Claude Code wants to use ${toolName}`;
     // #240 E2E:命令/說明/計劃全文加密進 enc,明文只留占位 + pattern_key(工具名)+ request_id;
-    // server 盲存密文、不落明文,iOS 用 K_S 解密渲染。choice(yes/no/always)非敏感 → 回程照舊。
-    const e2e = this.e2e?.isE2E(sid) ?? false;
-    const encPayload = e2e
-      ? this.e2e!.encryptContent(sid, { command, description, ...(isPlan ? { plan: planText.slice(0, 20000) } : {}) })
+    // server 盲存密文、不落明文,iOS 用 K_S 解密渲染。完整执行请求一并置于密文，
+    // requestDigest 不再依赖 500 字预览；E2E 当前只接受单次 yes/no。
+    const requestDigest =
+      executionSnapshot
+        ? e2eApprovalRequestDigest(this.e2e!.requireKey(sid), executionSnapshot)
+        : undefined;
+    const approvalPlaintext = e2e
+      ? {
+          command,
+          description,
+          patternKey: toolName,
+          ...(isPlan ? { plan: planText.slice(0, 20000) } : {}),
+          requestId,
+          requestDigest,
+          executionRequest: executionSnapshot,
+          executionDisplay,
+        }
+      : undefined;
+    if (
+      approvalPlaintext
+      && Buffer.byteLength(JSON.stringify(approvalPlaintext), "utf8")
+        > E2E_APPROVAL_PLAINTEXT_MAX_BYTES
+    ) {
+      console.error(
+        `[E2E approval auto-denied ${sid}] encrypted approval payload exceeds device limit`,
+      );
+      return Promise.resolve({
+        behavior: "deny",
+        message: "E2E approval request cannot be displayed safely",
+      });
+    }
+    // 尺寸闸门必须先于 emit / approvals.push；否则设备拒绝卡片后 canUseTool 会永久挂起。
+    const encPayload = approvalPlaintext
+      ? this.e2e!.encryptContent(sid, approvalPlaintext)
       : undefined;
     this.emit(sid, "approval.request", {
       command: e2e ? "🔒 加密審批請求" : command,
@@ -1532,20 +2235,23 @@ export class Drive {
       description: e2e ? "" : description,
       ...(!e2e && isPlan ? { plan: planText.slice(0, 20000) } : {}),
       ...(encPayload ? { enc: encPayload } : {}),
-      ...(opts?.toolUseID ? { request_id: opts.toolUseID } : {}),
+      ...(requestId ? { request_id: requestId } : {}),
+      ...(requestDigest ? { request_digest: requestDigest } : {}),
     });
     return new Promise((resolve) => {
       const list = this.approvals.get(sid) ?? [];
       list.push({
         toolName,
-        requestId: opts?.toolUseID,
+        requestId,
+        requestDigest,
+        executionSnapshot,
         suggestions: opts?.suggestions,
         resolve: (allow, always) =>
           resolve(
             allow
               ? {
                   behavior: "allow",
-                  updatedInput: input,
+                  updatedInput: approvedInput,
                   ...(always
                     ? {
                         updatedPermissions: opts?.suggestions?.length
@@ -1574,6 +2280,11 @@ export class Drive {
     input: Record<string, unknown>,
     toolUseID?: string,
   ): Promise<PermissionResult> {
+    // clarify.request 是明文 TUI 控制幀；E2E 會話不得把問題/選項旁路送往 server。
+    // 無答案即是 SDK 已有的「跳過」語義，讓模型在本地自行繼續。
+    if (this.e2e?.isE2E(sid)) {
+      return Promise.resolve({ behavior: "allow", updatedInput: input });
+    }
     const questions = Array.isArray((input as { questions?: unknown }).questions)
       ? ((input as { questions: unknown[] }).questions as Record<string, unknown>[])
       : [];
@@ -1642,50 +2353,98 @@ export class Drive {
   }
 
   /** 存檔：v2 = `{v:2, map, cwds}`（#105 起）；舊版是平面 `Record<sid, ccSid>`，讀時兼容。 */
-  private loadState(): {
-    map: Record<string, string>;
-    cwds: Record<string, string>;
-    permModes: Record<string, string>;
-    models: Record<string, string>;
-    efforts: Record<string, string>;
-    pending: string[];
-  } {
-    try {
-      const parsed = JSON.parse(readFileSync(mapPath(), "utf8")) as Record<string, unknown>;
-      if (parsed && parsed.v === 2) {
-        return {
-          map: (parsed.map ?? {}) as Record<string, string>,
-          cwds: (parsed.cwds ?? {}) as Record<string, string>,
-          permModes: (parsed.permModes ?? {}) as Record<string, string>, // #98
-          models: (parsed.models ?? {}) as Record<string, string>, // #143
-          efforts: (parsed.efforts ?? {}) as Record<string, string>, // #231
-          pending: Array.isArray(parsed.pending) ? (parsed.pending as string[]) : [], // #200
-        };
-      }
-      return { map: (parsed ?? {}) as Record<string, string>, cwds: {}, permModes: {}, models: {}, efforts: {}, pending: [] };
-    } catch {
-      return { map: {}, cwds: {}, permModes: {}, models: {}, efforts: {}, pending: [] };
+  private persistSessionSetting(
+    target: Record<string, string>,
+    sid: string,
+    value: string,
+    authenticated: AuthenticatedControlTag | undefined,
+    label: string,
+  ): boolean {
+    const hadPrevious = Object.hasOwn(target, sid);
+    const previous = target[sid];
+    if (value ? previous === value : !hadPrevious) return false;
+    if (value) target[sid] = value;
+    else delete target[sid];
+    if (this.saveMap()) return true;
+    if (hadPrevious) target[sid] = previous!;
+    else delete target[sid];
+    if (authenticated) {
+      throw new E2EControlError(`failed to persist authenticated ${label}`);
     }
+    return false;
   }
-  private saveMap(): void {
+
+  private loadState(): PersistedDriveState {
+    for (const [path, isPrimary] of [[mapPath(), true], [`${mapPath()}.bak`, false]] as const) {
+      try {
+        return parseDriveState(readFileSync(path, "utf8"), isPrimary);
+      } catch {
+        /* 下一個候選；backup 是舊代，只作內容恢復，不提升身份信任。 */
+      }
+    }
+    return {
+      map: {},
+      aliases: {},
+      cwds: {},
+      permModes: {},
+      models: {},
+      efforts: {},
+      pending: [],
+      identityStateTrusted: false,
+      aliasHistoryTrusted: false,
+    };
+  }
+  private saveMap(): boolean {
     try {
       mkdirSync(dirname(mapPath()), { recursive: true });
       const tmp = `${mapPath()}.tmp`;
-      writeFileSync(
-        tmp,
-        JSON.stringify({
-          v: 2,
-          map: this.map,
-          cwds: this.cwds,
-          permModes: this.permModes,
-          models: this.models,
-          efforts: this.efforts, // #231
-          pending: [...this.pending], // #200 在途回合
-        }),
-      );
+      const backupTmp = `${mapPath()}.bak.tmp`;
+      const protectedIds = this.protectedWireSids();
+      // 無受保護會話時可建立新的完整基線；一旦已有 E2E，舊 schema/backup 的未知歷史
+      // 不能因 cwd/pending 等普通存檔「自我洗白」成完整 aliases。
+      const nextAliasHistoryTrusted =
+        protectedIds.length === 0 && this.hasAuthoritativeServerSnapshot()
+          ? true
+          : this.aliasHistoryTrusted;
+      const snapshot = JSON.stringify({
+        v: 2,
+        map: this.map,
+        aliases: this.aliases,
+        aliasHistoryTrusted: nextAliasHistoryTrusted,
+        cwds: this.cwds,
+        permModes: this.permModes,
+        models: this.models,
+        efforts: this.efforts, // #231
+        pending: [...this.pending], // #200 在途回合
+      });
+      writeFileSync(tmp, snapshot);
       renameSync(tmp, mapPath());
+      writeFileSync(backupTmp, snapshot);
+      renameSync(backupTmp, `${mapPath()}.bak`);
+      const protectedMappedIds = protectedIds.filter(
+        (sid) =>
+          !CC_UUID_RE.test(sid) ||
+          this.map[sid] !== undefined ||
+          (this.aliases[sid]?.length ?? 0) > 0,
+      );
+      if (
+        protectedMappedIds.every((sid) => {
+          const current = this.map[sid];
+          const localSids = this.localSessionIdsForWire(sid);
+          return (
+            CC_UUID_RE.test(current ?? "") &&
+            localSids.includes(current) &&
+            localSids.every((localSid) => CC_UUID_RE.test(localSid))
+          );
+        })
+      ) {
+        this.identityStateTrusted = true;
+      }
+      this.aliasHistoryTrusted = nextAliasHistoryTrusted;
+      return true;
     } catch (e) {
       console.error("[session map save failed]", (e as Error).message);
+      return false;
     }
   }
 }

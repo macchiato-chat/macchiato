@@ -23,12 +23,18 @@ describe("push handler（unix socket → connector_push）", () => {
   let dir: string;
   let handler: PushHandler;
   const sent: any[] = [];
+  let protectedSids: Set<string>;
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), "occ-push-"));
     process.env.MACCHIATO_OPENCLAW_PUSH_SOCK = join(dir, "push.sock");
     sent.length = 0;
+    protectedSids = new Set();
     const linkb: any = { isReady: true, agentLinkId: "al1", send: (m: any) => sent.push(m) };
-    handler = new PushHandler(linkb);
+    const e2e: any = {
+      isE2E: (sid: string) => protectedSids.has(sid),
+      protectedSessionIds: () => [...protectedSids],
+    };
+    handler = new PushHandler(linkb, e2e);
     handler.start();
     await new Promise((r) => setTimeout(r, 120)); // 等 listen
   });
@@ -61,10 +67,37 @@ describe("push handler（unix socket → connector_push）", () => {
   it("link B 未就緒 → retryable error", async () => {
     handler.stop();
     const linkb: any = { isReady: false, agentLinkId: "al1", send: () => {} };
-    handler = new PushHandler(linkb);
+    const e2e: any = {
+      isE2E: (sid: string) => protectedSids.has(sid),
+      protectedSessionIds: () => [...protectedSids],
+    };
+    handler = new PushHandler(linkb, e2e);
     handler.start();
     await new Promise((r) => setTimeout(r, 120));
     const ack = await req(process.env.MACCHIATO_OPENCLAW_PUSH_SOCK!, { chatId: "home", text: "x" });
     expect(ack).toMatchObject({ ok: false, retryable: true });
+  });
+
+  it.each(["home", "macchiato:home"])("E2E 目的會話 %s → 本地拒絕，不洩露明文", async (protectedSid) => {
+    protectedSids.add(protectedSid);
+    const ack = await req(process.env.MACCHIATO_OPENCLAW_PUSH_SOCK!, {
+      chatId: "home",
+      text: "secret",
+    });
+    expect(ack).toEqual({ ok: false, error: "E2E push unsupported" });
+    expect(sent).toEqual([]);
+  });
+
+  it.each([
+    ["01UPPERWIRE", "01upperwire"],
+    ["01UPPERWIRE", "agent:main:macchiato:01upperwire"],
+  ])("E2E wire %s 的本地身份 %s → 本地拒絕，不依賴 drive map", async (wireSid, chatId) => {
+    protectedSids.add(wireSid);
+    const ack = await req(process.env.MACCHIATO_OPENCLAW_PUSH_SOCK!, {
+      chatId,
+      text: "secret",
+    });
+    expect(ack).toEqual({ ok: false, error: "E2E push unsupported" });
+    expect(sent).toEqual([]);
   });
 });

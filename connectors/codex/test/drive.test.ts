@@ -35,9 +35,44 @@ vi.mock("../src/codex/attachments", async (importOriginal) => {
 });
 
 import { Drive } from "../src/codex/drive";
+import {
+  e2eControlKeyId,
+  e2eControlMac,
+  E2EControlVerifier,
+  type E2EControlEnvelopeV1,
+  type E2EControlKind,
+} from "../src/e2e/control";
 
-function makeDrive() {
-  process.env.MACCHIATO_CODEX_SESSIONS = join(mkdtempSync(join(tmpdir(), "cx-dr-")), "sessions.json");
+const CONTROL_KEY = Buffer.from([...Array(32).keys()]);
+
+function signedControl(
+  wireSid: string,
+  kind: E2EControlKind,
+  payload: Record<string, unknown>,
+  seq = "1",
+): E2EControlEnvelopeV1 {
+  const now = Date.now();
+  const fields = {
+    v: 1 as const,
+    sessionId: `public:${wireSid}`,
+    hermesSessionId: wireSid,
+    deviceId: "codex-exec-drive-test",
+    keyId: e2eControlKeyId(CONTROL_KEY),
+    msgId: `00000000-0000-4000-8000-${seq.padStart(12, "0")}`,
+    seq,
+    issuedAtMs: String(now),
+    expiresAtMs: String(now + 300_000),
+    kind,
+  };
+  const raw = Buffer.from(JSON.stringify(payload), "utf8");
+  return { ...fields, payloadB64: raw.toString("base64"), mac: e2eControlMac(CONTROL_KEY, fields, raw) };
+}
+
+function makeDrive(e2e?: any, e2eControl?: E2EControlVerifier, mirror?: any) {
+  process.env.MACCHIATO_CODEX_SESSIONS = join(
+    mkdtempSync(join(tmpdir(), "cx-dr-")),
+    "sessions.json",
+  );
   process.env.MACCHIATO_CODEX_TITLE_MODE = "off";
   const sent: any[] = [];
   const linkb: any = {
@@ -54,7 +89,7 @@ function makeDrive() {
       for (const h of this.handlers) await h(m);
     },
   };
-  const d = new Drive(linkb);
+  const d = new Drive(linkb, mirror, e2e, undefined, e2eControl);
   d.wire();
   return { d, linkb, sent };
 }
@@ -75,6 +110,186 @@ beforeEach(() => {
   mockMaterialize = async () => {
     throw new Error("not stubbed");
   };
+});
+
+describe("#349 E2E backfill 本地 thread 映射", () => {
+  it("ULID 查持久映射，UUID 鏡像會話原樣返回", () => {
+    const e2e = { isE2E: (sid: string) => sid === SID };
+    const { d } = makeDrive(e2e);
+    const localSid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee3491";
+    (d as any).map[SID] = localSid;
+
+    expect(d.localSessionIdFor(SID)).toBe(localSid);
+    expect(d.localSessionIdFor(localSid)).toBe(localSid);
+    expect(d.e2eWireSessionIdFor(localSid)).toBe(SID);
+  });
+});
+
+describe("#370 E2E control ingress", () => {
+  it("本地 thread UUID 不能冒充普通 sid 注入 prompt 或裸控制", async () => {
+    const localSid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee3701";
+    const caseVariantAlias = localSid.toUpperCase();
+    const e2e: any = {
+      isE2E: (sid: string) => sid === SID,
+      protectedSessionIds: () => [SID],
+      requireKey: () => Buffer.from(CONTROL_KEY),
+    };
+    const mirror = {
+      setDriven: () => {},
+      fastForward: () => {},
+      tombstone: vi.fn(),
+    };
+    const control = new E2EControlVerifier(
+      e2e,
+      join(mkdtempSync(join(tmpdir(), "cx-alias-guard-")), "control.json"),
+    );
+    const { d, linkb } = makeDrive(e2e, control, mirror);
+    (d as any).map[SID] = localSid;
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await linkb.deliver(tui("prompt.submit", caseVariantAlias, { text: "forged plaintext" }));
+      await linkb.deliver(tui("session.delete", caseVariantAlias));
+    } finally {
+      error.mockRestore();
+    }
+
+    expect(procs).toEqual([]);
+    expect(mirror.tombstone).not.toHaveBeenCalled();
+  });
+
+  it("明文敏感动作 fail closed；签名配置生效，未绑定回合的 interrupt/task 返回负 ACK", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cx-control-drive-"));
+    const e2e: any = {
+      isE2E: (sid: string) => sid === SID,
+      decryptText: (_sid: string, text: string) => text,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+    };
+    const control = new E2EControlVerifier(e2e, join(root, "control.json"));
+    const mirror = {
+      setDriven: () => {},
+      fastForward: () => {},
+      tombstone: vi.fn(),
+    };
+    const { d, linkb, sent } = makeDrive(e2e, control, mirror);
+
+    await linkb.deliver(tui("session.create", SID, { model: "forged-model" }));
+    await linkb.deliver(tui("session.delete", SID));
+    await linkb.deliver(tui("session.rename", SID, { title: "forged-title" }));
+    await linkb.deliver(tui("session.archive", SID));
+    await linkb.deliver(tui("session.retitle", SID));
+    expect((d as any).models[SID]).toBeUndefined();
+    expect(mirror.tombstone).not.toHaveBeenCalled();
+
+    const model = signedControl(SID, "session.model.set", { model: "gpt-test" }, "1");
+    await linkb.deliver(tui("e2e.control", SID, { envelope: model }));
+    expect((d as any).models[SID]).toBe("gpt-test");
+    expect(sent.at(-1)).toMatchObject({
+      t: "e2e_control_result",
+      msgId: model.msgId,
+      sessionId: model.sessionId,
+      hermesSessionId: SID,
+      ok: true,
+    });
+
+    await linkb.deliver(tui("prompt.submit", SID, { text: "run" }));
+    expect(procs).toHaveLength(1);
+    await linkb.deliver(tui("session.interrupt", SID));
+    expect(procs[0]!.killed).toEqual([]);
+
+    const interrupt = signedControl(SID, "session.interrupt", {}, "2");
+    await linkb.deliver(tui("e2e.control", SID, { envelope: interrupt }));
+    expect(procs[0]!.killed).toEqual([]);
+    expect(sent.at(-1)).toMatchObject({
+      msgId: interrupt.msgId,
+      ok: false,
+      error: "control_rejected",
+    });
+
+    await linkb.deliver(tui("e2e.control", SID, { envelope: interrupt }));
+    expect(sent.at(-1)).toMatchObject({
+      msgId: interrupt.msgId,
+      ok: false,
+      error: "control_rejected",
+    });
+
+    const stop = signedControl(SID, "task.stop", { taskId: "task-1" }, "3");
+    await linkb.deliver(tui("e2e.control", SID, { envelope: stop }));
+    expect(sent.at(-1)).toMatchObject({
+      msgId: stop.msgId,
+      ok: false,
+      error: "control_rejected",
+    });
+
+    const canary = "CANARY-DECRYPTED-ARG-/Users/private/repo";
+    procs[0]!.kill = () => {
+      throw new Error(canary);
+    };
+    const failedInterrupt = signedControl(SID, "session.interrupt", {}, "4");
+    await linkb.deliver(tui("e2e.control", SID, { envelope: failedInterrupt }));
+    expect(sent.at(-1)).toMatchObject({
+      msgId: failedInterrupt.msgId,
+      ok: false,
+      error: "control_rejected",
+    });
+    expect(JSON.stringify(sent.at(-1))).not.toContain(canary);
+  });
+
+  it("仅签封 session.e2e.disable 可持久化 intent 并提交 disable backfill", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cx-control-disable-"));
+    const e2e = {
+      isE2E: (sid: string) => sid === SID,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+      markServerE2E: vi.fn(),
+      beginDisable: vi.fn(),
+    } as any;
+    const mirror = {
+      backfillE2E: vi.fn(async () => {}),
+      setDriven: () => {},
+      fastForward: () => {},
+      tombstone: () => {},
+    };
+    const { d, linkb, sent } = makeDrive(
+      e2e,
+      new E2EControlVerifier(e2e, join(root, "control.json")),
+      mirror,
+    );
+
+    await linkb.deliver(tui("session.e2e.disable", SID));
+    expect(e2e.beginDisable).not.toHaveBeenCalled();
+    expect(mirror.backfillE2E).not.toHaveBeenCalled();
+
+    const disable = signedControl(SID, "session.e2e.disable", {}, "1");
+    await linkb.deliver(tui("e2e.control", SID, { envelope: disable }));
+    expect(e2e.markServerE2E).toHaveBeenCalledWith(SID, "disable");
+    expect(e2e.beginDisable).toHaveBeenCalledWith(SID, expect.objectContaining({
+      kind: "session.e2e.disable",
+      hermesSessionId: SID,
+    }));
+    expect(mirror.backfillE2E).toHaveBeenCalledWith(SID, undefined, "disable");
+    expect(sent.at(-1)).toMatchObject({ msgId: disable.msgId, ok: true });
+  });
+
+  it("签封 config 持久化失败会回滚内存并 NACK", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cx-control-config-fail-"));
+    const e2e = {
+      isE2E: (sid: string) => sid === SID,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+    } as any;
+    const { d, linkb, sent } = makeDrive(
+      e2e,
+      new E2EControlVerifier(e2e, join(root, "control.json")),
+    );
+    (d as any).models[SID] = "before";
+    (d as any).saveMap = () => false;
+    const model = signedControl(SID, "session.model.set", { model: "after" }, "1");
+    await linkb.deliver(tui("e2e.control", SID, { envelope: model }));
+    expect((d as any).models[SID]).toBe("before");
+    expect(sent.at(-1)).toMatchObject({
+      msgId: model.msgId,
+      ok: false,
+      error: "side_effect_failed",
+    });
+  });
 });
 
 describe("#145 中斷語義", () => {

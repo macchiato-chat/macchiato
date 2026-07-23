@@ -35,6 +35,22 @@ export function loadStateFile<T>(path: string, revive: (raw: any) => T, fallback
   return fallback();
 }
 
+/** 與 loadStateFile 同樣恢復內容，但額外保留「身份是否來自主檔」；舊代 .bak 不可證明 E2E 映射完整。 */
+export function loadStateFileWithTrust<T>(
+  path: string,
+  revive: (raw: any) => T,
+  fallback: () => T,
+): { state: T; identityStateTrusted: boolean } {
+  for (const [p, isPrimary] of [[path, true], [`${path}.bak`, false]] as Array<[string, boolean]>) {
+    try {
+      return { state: revive(JSON.parse(readFileSync(p, "utf8"))), identityStateTrusted: isPrimary };
+    } catch {
+      /* 下一個候選 */
+    }
+  }
+  return { state: fallback(), identityStateTrusted: false };
+}
+
 export function saveStateFile(path: string, data: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp`;
@@ -92,7 +108,7 @@ const BATCH_MAX = Number(process.env.MACCHIATO_OPENCLAW_BATCH_MAX ?? 150);
  * §9 鏡像去重身份：OpenClaw .jsonl 消息無穩定 id → 用內容指紋（role+text+createdAt 的 sha256 前綴）。
  * 連接器重發時同一 .jsonl 行逐字節相同 → 指紋相同 → server 據 (session, srcId) 去重。確定性、無狀態。
  */
-function srcIdFor(m: MirrorMessage): string {
+export function srcIdFor(m: MirrorMessage): string {
   return createHash("sha256")
     .update(`${m.role}\u0000${m.text}\u0000${m.createdAt ?? ""}`)
     .digest("hex")
@@ -241,6 +257,15 @@ export function deriveSource(s: { channel?: string; origin?: { provider?: string
   return s.channel || s.origin?.provider || "openclaw";
 }
 
+/** #347 只有与方向一致的事务结果才可提交水位线/密钥状态。 */
+export function isCommittedE2EBackfillResult(
+  mode: "enable" | "disable",
+  ok: unknown,
+  e2e: unknown,
+): boolean {
+  return ok === true && (mode === "enable" ? e2e === true : e2e === false);
+}
+
 /**
  * cron 會話（key 含 `:cron:`）：OpenClaw 已把 cron 輸出**插入 deliver target 的聊天記錄**, 
  * 單獨鏡像/導入會重複 → 跳過（與 Hermes 的 §16 cron feed 不同, OpenClaw 不需要合成 feed）。
@@ -312,10 +337,25 @@ interface State {
    * .jsonl(2026-07-14 OpenClaw 2026.7.1 實測)——舊字節水位線壓在新文件上 offset>size → 永久靜默
    * 跳過。fileId 變 → 從 0 重讀(srcId 內容指紋去重,重讀安全)。 */
   fileIds?: Record<string, string>;
+  /**
+   * #347 E2E identity aliases：同一 key 歷代所有 transcript sessionId。
+   * fileIds 只代表當前檔；rotation 覆蓋後舊 .jsonl 仍留在磁碟，history import 只看 local UUID，
+   * 故舊 UUID 也必須永久保留在保護集合。缺此字段的舊 schema 不可宣告 E2E identity 完整。
+   */
+  fileIdAliases?: Record<string, string[]>;
+  /**
+   * aliases 是否涵蓋此 registry 建立以來的完整歷史。不可由「字段存在」推斷：
+   * 舊 schema 在 protected 狀態下補 seed 仍可能早已丟過 rotation alias，必須持久 false。
+   */
+  aliasHistoryTrusted?: boolean;
 }
 
 export class Mirror {
   private state: State;
+  /** key↔本地 transcript 身份只在主 mirror state 完整解析時可信。 */
+  private identityStateTrusted = false;
+  /** 歷代 local UUID registry 只有新 schema 主檔可證明完整；舊 schema/backup 不得靠普通 save 自升。 */
+  private aliasHistoryTrusted = false;
   private timer: ReturnType<typeof setInterval> | null = null;
   private batchId = 0;
   private readonly rewind: Array<{ id: number; prev: Record<string, number> }> = [];
@@ -323,6 +363,12 @@ export class Mirror {
   private readonly drivenKeys = new Set<string>();
   /** #147 driven key → server sid(真大小寫;mirror_append 的 hermesSessionId 用它,sidForKey 會丟大小寫)。 */
   private readonly drivenSidByKey = new Map<string, string>();
+  private driveIdentityResolver?: (identity: string) => string | undefined;
+  private plaintextLocalAllowed?: () => boolean;
+  /** identity state 寫失敗後保持 poison；任何內容路徑須等同一完整快照重試成功才可繼續。 */
+  private identityPersistenceDirty = false;
+  /** 每次 history import 前須先以 gateway 當前 key→sessionId 對賬，防離線 rotation 新 UUID 漏保護。 */
+  private identityPreflightComplete = false;
   /** 健康：最近一次 poll 完成時刻（watchdog 用）。 */
   lastPollAt = Date.now();
   /** 健康：最近一次 poll 錯誤（成功清空）。 */
@@ -330,6 +376,19 @@ export class Mirror {
   /** #10:累計計數(進程生命週期),健康上報帶出。 */
   readonly counters: Record<string, number> = { mirrorBatches: 0, mirrorMessages: 0, mirrorNacks: 0, mirrorErrors: 0 };
   private polling = false;
+  /** #347 backfill send 不是提交成功；水位线/K_S 要等 server 事务 ACK。 */
+  private readonly pendingE2EBackfills = new Map<
+    string,
+    { key: string; newOffset?: number }
+  >();
+
+  /** backfill ACK 前冻结该会话所有水位推进；ACK 丢失时宁可重试/停住，不能跳过唯一历史。 */
+  private isE2ETransitionLocked(key: string): boolean {
+    for (const pending of this.pendingE2EBackfills.values()) {
+      if (pending.key === key) return true;
+    }
+    return false;
+  }
 
   /** #161 墓碑:永不再鏡像/打撈此 key(持久;agent 側檔案不動)。 */
   tombstone(key: string): void {
@@ -346,8 +405,196 @@ export class Mirror {
     if (sid) this.drivenSidByKey.set(key, sid);
   }
 
+  setDriveIdentityResolver(
+    resolver: (identity: string) => string | undefined,
+    plaintextLocalAllowed: () => boolean,
+  ): void {
+    this.driveIdentityResolver = resolver;
+    this.plaintextLocalAllowed = plaintextLocalAllowed;
+  }
+
+  /**
+   * 同一 key 換 transcript 時，current 與歷代 alias 必須在讀/發新文件前一起持久化。
+   * 返回是否改變；呼叫方可據此決定是否同步 save。
+   */
+  private recordFileIdentity(key: string, localSid: string): boolean {
+    const fileIds = (this.state.fileIds ??= {});
+    const aliasesByKey = (this.state.fileIdAliases ??= {});
+    const aliases = (aliasesByKey[key] ??= []);
+    let changed = false;
+    const previous = fileIds[key];
+    if (previous && !aliases.includes(previous)) {
+      aliases.push(previous);
+      changed = true;
+    }
+    if (!aliases.includes(localSid)) {
+      aliases.push(localSid);
+      changed = true;
+    }
+    if (previous !== localSid) {
+      fileIds[key] = localSid;
+      changed = true;
+    }
+    return changed;
+  }
+
+  private persistIdentityStateOrThrow(context: string): void {
+    if (!this.save()) {
+      this.identityPersistenceDirty = true;
+      throw new Error(`OpenClaw E2E mirror identity persistence failed (${context})`);
+    }
+    this.identityPersistenceDirty = false;
+  }
+
+  /**
+   * import/announce 前的同步身份對賬：OpenClaw 可在 connector 停機時把同一 key 換成新 transcript。
+   * 未完成（含 gateway/磁碟錯）時 localSessionE2EStatus 會全擋，不存在 crash-before-save 明文窗。
+   */
+  async reconcileIdentityPreflight(): Promise<void> {
+    this.identityPreflightComplete = false;
+    const list = await this.gw.sessionsList();
+    let changed =
+      this.identityPersistenceDirty ||
+      (!this.aliasHistoryTrusted && this.canSafelyMigrateAliasHistory());
+    for (const session of Array.isArray(list?.sessions) ? list.sessions : []) {
+      if (typeof session?.key !== "string" || !session.key) continue;
+      if (typeof session?.sessionId !== "string" || !session.sessionId) continue;
+      changed = this.recordFileIdentity(session.key, session.sessionId) || changed;
+    }
+    if (changed) this.persistIdentityStateOrThrow("preflight");
+    this.identityPreflightComplete = true;
+  }
+
+  /** key 或 transcript sessionId → 原始 wire sid（保留 ULID 大小寫）。 */
+  wireSessionIdForLocalIdentity(identity: string): string | undefined {
+    const direct = this.driveIdentityResolver?.(identity) ?? this.drivenSidByKey.get(identity);
+    if (direct) return direct;
+    const protectedByKey = new Map(
+      this.protectedSessionIds().map((sid) => [keyForSid(sid), sid] as const),
+    );
+    const allKeys = new Set([
+      ...Object.keys(this.state.fileIds ?? {}),
+      ...Object.keys(this.state.fileIdAliases ?? {}),
+    ]);
+    for (const key of allKeys) {
+      const aliases = this.state.fileIdAliases?.[key] ?? [];
+      if (this.state.fileIds?.[key] !== identity && !aliases.includes(identity)) continue;
+      return (
+        protectedByKey.get(key.toLowerCase()) ??
+        this.driveIdentityResolver?.(key) ??
+        this.drivenSidByKey.get(key)
+      );
+    }
+    return undefined;
+  }
+
+  private protectedSessionIds(): string[] {
+    const fn = (this.e2e as (E2EKeyStore & { protectedSessionIds?: () => string[] }) | undefined)
+      ?.protectedSessionIds;
+    return typeof fn === "function" ? fn.call(this.e2e) : [];
+  }
+
+  private canSafelyMigrateAliasHistory(protectedIds = this.protectedSessionIds()): boolean {
+    if (protectedIds.length > 0) return false;
+    if (!this.e2e) return true;
+    const fn = (this.e2e as E2EKeyStore & { hasServerStateSnapshot?: () => boolean })
+      .hasServerStateSnapshot;
+    return typeof fn === "function" && fn.call(this.e2e);
+  }
+
+  /**
+   * mirror state 壞/缺時，local transcript UUID 無法再安全關聯任何 E2E wire sid。
+   * allowMissingSids 只供 ready 快照中的 pending-enable bootstrap：server 會緊接著下發 backfill，
+   * 由 gateway 權威 sessionId 補圖。它不豁免 state trust，且所有內容路徑仍使用無參 strict assert。
+   */
+  assertE2EIdentitySafe(allowMissingSids: ReadonlySet<string> = new Set()): void {
+    if (this.identityPersistenceDirty) {
+      throw new Error("OpenClaw E2E mirror identity persistence is dirty; refusing content");
+    }
+    const protectedIds = this.protectedSessionIds();
+    if (!protectedIds.length) return;
+    // agent:* 也不能豁免：current transcript 仍須能由 key 精確分類；pending-enable 是唯一暫缺窗口。
+    const missingFileIds = protectedIds.filter(
+      (sid) => !allowMissingSids.has(sid) && !(this.state.fileIds?.[keyForSid(sid)]),
+    );
+    if (
+      !this.identityStateTrusted ||
+      this.plaintextLocalAllowed?.() === false ||
+      missingFileIds.length > 0
+    ) {
+      throw new Error(
+        `OpenClaw E2E mirror identity state unavailable (trusted=${this.identityStateTrusted}, ` +
+          `missing=${missingFileIds.slice(0, 3).join(",") || "unknown"}); ` +
+          "refusing plaintext fallback",
+      );
+    }
+  }
+
+  /**
+   * history import 以本地 transcript sessionId 枚舉，E2E store 則以 wire sid 持鑰。
+   * fileIds 是已持久化的 key → transcript 映射；drivenSidByKey 保留 server sid 的原始大小寫。
+   * 即使會話已從 gateway 活躍列表消失，歸檔 transcript 也不能被當成新的明文 shadow 導入。
+   */
+  localSessionE2EStatus(): { isE2E(localSid: string): boolean } {
+    // 不可回傳 protection floor 的快照：runImport 會先 await gateway，期間 online enable 可提升
+    // server floor。每次 filter 都重新分類，才能阻止舊 closure 把 archived alias 當明文 shadow。
+    return { isE2E: (identity) => this.isLocalIdentityProtected(identity) };
+  }
+
+  private isLocalIdentityProtected(identity: string): boolean {
+    const e2e = this.e2e;
+    if (!e2e) return false;
+    const protectedIds = this.protectedSessionIds();
+    if (!protectedIds.length) return e2e.isE2E(identity);
+    try {
+      this.assertE2EIdentitySafe();
+      if (
+        protectedIds.length > 0 &&
+        (!this.aliasHistoryTrusted || !this.identityPreflightComplete)
+      ) {
+        throw new Error("OpenClaw E2E alias history is incomplete");
+      }
+    } catch {
+      return true;
+    }
+    const protectedByKey = new Map(
+      protectedIds.map((sid) => [keyForSid(sid), sid] as const),
+    );
+    const protectedIdentities = new Set<string>();
+    const knownIdentities = new Set<string>();
+    const allKeys = new Set([
+      ...Object.keys(this.state.fileIds ?? {}),
+      ...Object.keys(this.state.fileIdAliases ?? {}),
+    ]);
+    for (const key of allKeys) {
+      const protectedWireSid = protectedByKey.get(key.toLowerCase());
+      const wireSid =
+        protectedWireSid ??
+        this.drivenSidByKey.get(key) ??
+        (key.startsWith(MACCHIATO_PREFIX) ? sidForKey(key) : key);
+      const target =
+        protectedWireSid || e2e.isE2E(wireSid)
+          ? protectedIdentities
+          : knownIdentities;
+      target.add(key);
+      target.add(wireSid);
+      if (protectedWireSid) target.add(protectedWireSid);
+      for (const localSid of new Set([
+        ...(this.state.fileIdAliases?.[key] ?? []),
+        ...(this.state.fileIds?.[key] ? [this.state.fileIds[key]!] : []),
+      ])) {
+        target.add(localSid);
+      }
+    }
+    if (protectedIdentities.has(identity) || e2e.isE2E(identity)) return true;
+    if (knownIdentities.has(identity)) return false;
+    // 任一 protected E2E 存在時，未被可信 registry 分類的 identity 默認 secret。
+    return true;
+  }
+
   /** 回合結束:打撈該 key 新寫入的 tool/thinking 塊(#147)並推進水位線(文字 live 已投,不重發)。 */
   fastForward(key: string): void {
+    if (this.isE2ETransitionLocked(key)) return;
     // 下一輪 poll 對 driven key 也會打撈;這裡主動立即跑一次, 縮小競態窗口。
     void this.salvageToEnd(key);
   }
@@ -356,8 +603,10 @@ export class Mirror {
     // #252 Link B 未 ready 時整體跳過:不拉 sessionsList、不推水位線、不發——否則 salvageDriven
     // 已推 offset(:401)但 mirror_append 被 client 丟(非 E2E 不緩衝),tool/thinking 永久缺失。
     // 下輪 pollOnce(ready 後)照樣對 driven key 打撈(:575),水位線沒動 → 補得回。同 pollOnce(:542)。
-    if (!this.linkb.isReady) return;
+    if (!this.linkb.isReady || this.isE2ETransitionLocked(key)) return;
     try {
+      // pending-enable ready bootstrap 只准控制面補 fileId；映射補齊前所有 mirror 水位/明文都凍結。
+      this.assertE2EIdentitySafe();
       const list = await this.gw.sessionsList();
       const s = (list?.sessions ?? []).find((x: any) => x.key === key);
       if (!s?.sessionId) return;
@@ -388,6 +637,18 @@ export class Mirror {
    * 文件末(舊歷史已按完整消息鏡像過/或屬導入範疇,不重複)。返回 batch entry 或 null;推進水位線。
    */
   private salvageDriven(key: string, file: string): { hermesSessionId: string; source: string; messages: any[] } | null {
+    if (this.isE2ETransitionLocked(key)) return null;
+    const resolvedWireSid =
+      this.driveIdentityResolver?.(key) ??
+      this.drivenSidByKey.get(key);
+    if (
+      key.startsWith(MACCHIATO_PREFIX) &&
+      !resolvedWireSid &&
+      this.plaintextLocalAllowed?.() === false
+    ) {
+      console.error(`[mirror] E2E driven identity 不可信，凍結 ${key}，不推水位/不發明文`);
+      return null;
+    }
     const size = statSync(file).size;
     const off = this.state.offsets[key];
     if (off === undefined) {
@@ -396,7 +657,7 @@ export class Mirror {
     }
     const from = this.state.offsets[key] ?? 0;
     if (size <= from) return null;
-    const sid = this.drivenSidByKey.get(key) ?? sidForKey(key);
+    const sid = resolvedWireSid ?? sidForKey(key);
     if (this.e2e?.isE2E(sid) || this.e2e?.isE2E(key)) {
       this.state.offsets[key] = size; // E2E:加密批投遞,明文打撈不做
       return null;
@@ -428,7 +689,13 @@ export class Mirror {
     private readonly linkb: LinkBClient,
     private readonly e2e?: E2EKeyStore,
   ) {
-    this.state = this.load();
+    const loaded = this.load();
+    this.state = loaded.state;
+    this.identityStateTrusted = loaded.identityStateTrusted;
+    this.aliasHistoryTrusted =
+      loaded.identityStateTrusted &&
+      loaded.state.fileIdAliases !== undefined &&
+      loaded.state.aliasHistoryTrusted === true;
   }
 
   start(): void {
@@ -453,6 +720,20 @@ export class Mirror {
     for (const [k, off] of Object.entries(e.prev)) this.state.offsets[k] = off;
     this.save();
     console.warn(`· mirror_nack batch ${batchId} → rewinding watermark for resend`);
+  }
+
+  handleE2EBackfillResult(
+    sid: string,
+    mode: "enable" | "disable",
+    ok: boolean,
+  ): void {
+    const pendingKey = `${mode}:${sid}`;
+    const pending = this.pendingE2EBackfills.get(pendingKey);
+    this.pendingE2EBackfills.delete(pendingKey);
+    if (!ok || !pending || pending.newOffset === undefined) return;
+    this.state.offsets[pending.key] = Math.max(this.state.offsets[pending.key] ?? 0, pending.newOffset);
+    this.save();
+    console.log(`· E2E backfill ACK(${mode}): ${sid} (watermark → ${pending.newOffset})`);
   }
 
   private async poll(): Promise<void> {
@@ -481,7 +762,7 @@ export class Mirror {
   /**
    * §19 D2 / 關閉：把該會話 .jsonl 全量歷史以 `e2e_backfill` 回灌（server 事務內原地替換）。
    * mode="enable"（新開啟）：K_S 重加密回灌, 清 KEK 可解的舊明文 payload。
-   * mode="disable"（關閉）：**明文**回灌（server 恢復可讀+投影）, 成功後刪本地 K_S。
+   * mode="disable"（關閉）：**明文**回灌（server 恢復可讀+投影）, server ACK 後才刪本地 K_S。
    * 找不到會話/無消息 → found:false：enable 時 server 不動內容；disable 時關閉失敗、K_S 保留。
    * 完成後把水位線推到快照末尾——回灌已含全歷史, 鏡像不得再按舊 offset 追加。
    * 借 polling 標誌與輪詢互斥（poll 對 polling=true 直接讓路）。
@@ -490,8 +771,10 @@ export class Mirror {
     if (!this.e2e) return;
     while (this.polling) await new Promise((r) => setTimeout(r, 50));
     this.polling = true;
+    const key = keyForSid(sid);
+    // 先上 transition lock 再碰 gateway/filesystem；否则并发 fastForward 可在快照完成前推进 offset。
+    this.pendingE2EBackfills.set(`${mode}:${sid}`, { key });
     try {
-      const key = keyForSid(sid);
       let found: any;
       try {
         const list = await this.gw.sessionsList();
@@ -502,7 +785,11 @@ export class Mirror {
       const file = found?.sessionId ? join(sessionsDir(), `${found.sessionId}.jsonl`) : null;
       const notFound = () => {
         this.linkb.send({
-          t: "e2e_backfill", agentLinkId: this.linkb.agentLinkId, hermesSessionId: sid, mode, found: false,
+          t: "e2e_backfill",
+          agentLinkId: this.linkb.agentLinkId,
+          hermesSessionId: sid,
+          mode,
+          found: false,
         });
         console.warn(
           `· E2E backfill(${mode}): no transcript for ${sid} → found:false` +
@@ -510,6 +797,14 @@ export class Mirror {
         );
       };
       if (!file || !existsSync(file)) return notFound();
+      // online enable 可能發生在 mirror 首次看見該 key 之前；backfill 已拿到權威 file identity，
+      // 必須先持久綁定，否則 ACK 後立刻歸檔時 history import 只見 local UUID，會失去 E2E 關聯。
+      if (this.recordFileIdentity(key, found.sessionId)) {
+        // pending-enable 唯一允許的補圖窗口：protection floor 已抬高（import 全擋、poll 有 transition
+        // lock），先把 gateway 給出的權威 file identity 落盤，再恢復嚴格 assert / 提交 backfill。
+        this.persistIdentityStateOrThrow(`backfill ${sid}`);
+      }
+      this.assertE2EIdentitySafe();
       const { messages, newOffset } = readNewMessages(file, 0);
       if (!messages.length) return notFound();
       const session =
@@ -522,6 +817,7 @@ export class Mirror {
               messages: messages.map((m) => ({
                 role: m.role,
                 createdAt: m.createdAt,
+                srcId: srcIdFor(m),
                 enc: this.e2e!.encryptContent(sid, {
                   text: m.text,
                   ...(m.reasoning ? { reasoning: m.reasoning } : {}),
@@ -533,8 +829,11 @@ export class Mirror {
               hermesSessionId: sid,
               title: deriveTitle(found),
               source: deriveSource(found),
-              messages,
+              messages: messages.map((m) => ({ ...m, srcId: srcIdFor(m) })),
             };
+      // 只有完整明文 snapshot 已成功构造后才签 completion receipt；先双快照持久化再发送。
+      const disableReceipt =
+        mode === "disable" ? this.e2e.disableReceiptForBackfill(sid) : undefined;
       this.linkb.send({
         t: "e2e_backfill",
         agentLinkId: this.linkb.agentLinkId,
@@ -542,11 +841,10 @@ export class Mirror {
         mode,
         found: true,
         session,
+        ...(disableReceipt ? { disableReceipt } : {}),
       });
-      this.state.offsets[key] = Math.max(this.state.offsets[key] ?? 0, newOffset);
-      this.save();
-      if (mode === "disable") this.e2e.remove(sid); // 關閉完成：刪 K_S, live/mirror 回明文路徑
-      console.log(`· E2E backfill(${mode}): ${sid} — ${messages.length} message(s) (watermark → ${newOffset})`);
+      this.pendingE2EBackfills.set(`${mode}:${sid}`, { key, newOffset });
+      console.log(`· E2E backfill submitted(${mode}): ${sid} — ${messages.length} message(s), waiting for server ACK`);
     } finally {
       this.polling = false;
     }
@@ -554,6 +852,9 @@ export class Mirror {
 
   private async pollOnce(): Promise<void> {
     if (!this.linkb.isReady) return;
+    // ready callback 可精確豁免 pending-enable 的「待補 fileId」，但內容面永遠 strict；
+    // bootstrap control 尚未到或上次崩在補圖前時，不讀、不推水位、不發任何 mirror payload。
+    this.assertE2EIdentitySafe();
     let list: any;
     try {
       list = await this.gw.sessionsList();
@@ -571,15 +872,20 @@ export class Mirror {
       const sessionId: string | undefined = s.sessionId;
       if (!key || !sessionId || isCronSession(key)) continue; // cron 不鏡像（已在目標聊天裡）
       if (this.state.tombstones?.includes(key)) continue; // #161 app 刪過 → 永不再撈(含打撈)
+      if (this.isE2ETransitionLocked(key)) continue; // #347 ACK 前不得由 poll/fastForward 旁路推进
       // #211 文件輪換偵測:同一 key 換了 sessionId(gateway 升級/會話重置)→ 舊字節水位線作廢,
       // 從 0 重讀新文件(srcId 指紋去重防重複)。否則 offset>size 永久靜默卡死(2026-07-14 實測)。
-      const fids = (this.state.fileIds ??= {});
-      if (fids[key] !== sessionId) {
-        if (fids[key] !== undefined && this.state.offsets[key] !== undefined) {
-          console.log(`· #211 ${key} 文件輪換(${fids[key]?.slice(0, 8)}→${String(sessionId).slice(0, 8)}),水位線歸零重讀`);
+      const previousFileId = this.state.fileIds?.[key];
+      if (previousFileId !== sessionId) {
+        if (previousFileId !== undefined && this.state.offsets[key] !== undefined) {
+          console.log(`· #211 ${key} 文件輪換(${previousFileId.slice(0, 8)}→${String(sessionId).slice(0, 8)}),水位線歸零重讀`);
           this.state.offsets[key] = 0;
         }
-        fids[key] = sessionId;
+      }
+      // crash-before-save 不能留下「新 transcript 已讀/發、alias 尚未落盤」的證明窗口。
+      // 即使 current 未變，也會補齊新 schema 中 current∈aliases 的不變量。
+      if (this.recordFileIdentity(key, sessionId)) {
+        this.persistIdentityStateOrThrow(`rotation ${key} → ${sessionId}`);
       }
       if (key.startsWith(MACCHIATO_PREFIX) || this.drivenKeys.has(key)) {
         // #147 drive 的會話:文字由 live 投遞;鏡像打撈 tool/thinking(去正文)補進歷史,推進水位線。
@@ -686,23 +992,120 @@ export class Mirror {
     if (pruned) console.log(`· #9 裁剪 ${pruned} 個消失會話的水位線(剩 ${Object.keys(this.state.offsets).length})`);
   }
 
-  private load(): State {
-    return loadStateFile(
+  private load(): { state: State; identityStateTrusted: boolean } {
+    return loadStateFileWithTrust<State>(
       statePath(),
-      (raw) => ({ offsets: raw.offsets ?? {}, missingAt: raw.missingAt ?? {}, tombstones: raw.tombstones ?? [], fileIds: raw.fileIds ?? {} }), // #161/#211
-      () => ({ offsets: {}, missingAt: {} }),
+      (raw) => {
+        if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+          throw new Error("mirror state root must be an object");
+        }
+        const record = (value: unknown, kind: "number" | "string"): Record<string, any> => {
+          if (value === null || typeof value !== "object" || Array.isArray(value)) {
+            throw new Error("mirror state map must be an object");
+          }
+          for (const [key, item] of Object.entries(value)) {
+            if (
+              !key ||
+              (kind === "number"
+                ? typeof item !== "number" || !Number.isFinite(item) || item < 0
+                : typeof item !== "string" || !item)
+            ) {
+              throw new Error("mirror state map contains an invalid entry");
+            }
+          }
+          return value as Record<string, any>;
+        };
+        if (!Array.isArray(raw.tombstones ?? []) || (raw.tombstones ?? []).some((v: unknown) => typeof v !== "string")) {
+          throw new Error("mirror tombstones must be strings");
+        }
+        // fileIds 缺字段是舊格式，內容可恢復，但不能被當成完整 E2E identity 快照。
+        if (raw.fileIds === undefined) throw new Error("mirror state lacks fileIds identity map");
+        const fileIds = record(raw.fileIds, "string") as Record<string, string>;
+        let fileIdAliases: Record<string, string[]> | undefined;
+        if (raw.fileIdAliases !== undefined) {
+          if (raw.fileIdAliases === null || typeof raw.fileIdAliases !== "object" || Array.isArray(raw.fileIdAliases)) {
+            throw new Error("mirror fileIdAliases must be an object");
+          }
+          fileIdAliases = {};
+          for (const [key, value] of Object.entries(raw.fileIdAliases)) {
+            if (
+              !key ||
+              !Array.isArray(value) ||
+              value.length === 0 ||
+              value.some((item) => typeof item !== "string" || !item) ||
+              new Set(value).size !== value.length
+            ) {
+              throw new Error("mirror fileIdAliases contains an invalid/non-unique entry");
+            }
+            fileIdAliases[key] = [...value];
+          }
+          for (const [key, current] of Object.entries(fileIds)) {
+            if (!fileIdAliases[key]?.includes(current)) {
+              throw new Error("mirror fileIdAliases must contain every current fileId");
+            }
+          }
+        }
+        if (
+          raw.aliasHistoryTrusted !== undefined &&
+          typeof raw.aliasHistoryTrusted !== "boolean"
+        ) {
+          throw new Error("mirror aliasHistoryTrusted must be boolean");
+        }
+        if (raw.aliasHistoryTrusted === true && fileIdAliases === undefined) {
+          throw new Error("trusted alias history requires fileIdAliases");
+        }
+        return {
+          offsets: record(raw.offsets ?? {}, "number"),
+          missingAt: record(raw.missingAt ?? {}, "number"),
+          tombstones: raw.tombstones ?? [],
+          fileIds,
+          ...(fileIdAliases ? { fileIdAliases } : {}),
+          ...(raw.aliasHistoryTrusted !== undefined
+            ? { aliasHistoryTrusted: raw.aliasHistoryTrusted }
+            : {}),
+        };
+      },
+      () => ({
+        offsets: {},
+        missingAt: {},
+        fileIds: {},
+        fileIdAliases: {},
+        aliasHistoryTrusted: false,
+      }),
     );
   }
   private lastSaved = "";
-  private save(): void {
+  private save(): boolean {
     try {
+      const protectedIds = this.protectedSessionIds();
+      const canMigrateAliases = this.canSafelyMigrateAliasHistory(protectedIds);
+      if (canMigrateAliases && !this.aliasHistoryTrusted) {
+        // 沒有任何 E2E 保護承諾時，舊 schema 可安全升級：至少把當前映射種進歷代 registry。
+        // 有 protected sid 時絕不走此路，否則一次普通 poll 就會把已遺失的舊 alias 冒充完整。
+        this.state.fileIdAliases = {};
+        for (const [key, localSid] of Object.entries(this.state.fileIds ?? {})) {
+          this.state.fileIdAliases[key] = [localSid];
+        }
+        this.state.aliasHistoryTrusted = true;
+      } else if (!this.aliasHistoryTrusted) {
+        // protected 下補出的 aliases 只能作正向安全分類，不能冒充「歷史完整」；重啟後仍須全擋 unknown。
+        this.state.aliasHistoryTrusted = false;
+      }
       // #262 dirty 判斷:與上次落盤相同 → 跳過(每輪 poll 無條件雙寫傷 SD 卡)。
       const json = JSON.stringify(this.state);
-      if (json === this.lastSaved) return;
+      if (json === this.lastSaved) return true;
       saveStateFile(statePath(), this.state);
       this.lastSaved = json;
+      // 壞/缺 identity 快照後，寫入一個只看見「當前 active 普通會話」的新檔不能證明已重建
+      // 歸檔 E2E transcript 的 aliases；本進程保持 fail-closed，待人工恢復或無 E2E 時重建。
+      if (canMigrateAliases) {
+        this.identityStateTrusted = true;
+        this.aliasHistoryTrusted = true;
+      }
+      return true;
     } catch {
       /* 持久化失敗不致命 */
+      return false;
     }
   }
 }

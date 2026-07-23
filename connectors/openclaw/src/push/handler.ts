@@ -7,7 +7,9 @@ import { existsSync, unlinkSync, chmodSync, mkdirSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import type { E2EKeyStore } from "../e2e/keys";
 import type { LinkBClient } from "../linkb/client";
+import { keyForSid } from "../openclaw/mirror";
 
 export function pushSockPath(): string {
   return process.env.MACCHIATO_OPENCLAW_PUSH_SOCK || join(homedir(), ".macchiato/openclaw-push.sock");
@@ -17,7 +19,24 @@ export class PushHandler {
   private server: Server | null = null;
   private pushSeq = 0;
 
-  constructor(private readonly linkb: LinkBClient) {}
+  constructor(
+    private readonly linkb: LinkBClient,
+    private readonly e2e: E2EKeyStore,
+  ) {}
+
+  private isProtectedTarget(chatId: string): boolean {
+    if (this.e2e.isE2E(chatId) || this.e2e.isE2E(`macchiato:${chatId}`)) return true;
+    const target = chatId.trim().toLowerCase();
+    const protectedIds = this.e2e.protectedSessionIds();
+    return protectedIds.some((sid) => {
+      const wire = sid.toLowerCase();
+      return (
+        target === wire ||
+        target === keyForSid(sid).toLowerCase() ||
+        `macchiato:${target}` === wire
+      );
+    });
+  }
 
   start(): void {
     const path = pushSockPath();
@@ -60,6 +79,11 @@ export class PushHandler {
       const chatId = String(req.chatId ?? "");
       const text = String(req.text ?? "");
       if (!chatId || !text) return reply({ ok: false, error: "missing chatId/text" });
+      if (this.isProtectedTarget(chatId)) {
+        // connector_push 只有明文 text；目的會話（含 server inbox fallback sid）
+        // 受 E2E 保護時必須在本機拒絕，不能先把正文交給 server。
+        return reply({ ok: false, error: "E2E push unsupported" });
+      }
       if (!this.linkb.isReady) return reply({ ok: false, error: "link B down", retryable: true });
       this.pushSeq += 1;
       const msg: Record<string, unknown> = {

@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { deriveMeta, threadIdFromFile } from "../src/codex/mirror";
+import { describe, expect, it, vi } from "vitest";
+import { deriveMeta, Mirror, srcIdFor, threadIdFromFile } from "../src/codex/mirror";
 
 describe("codex mirror 派生", () => {
   it("threadIdFromFile:從 rollout 文件名提 uuid", () => {
@@ -21,6 +21,124 @@ describe("codex mirror 派生", () => {
 
   it("無 user 消息 → 標題回退 Codex", () => {
     expect(deriveMeta(JSON.stringify({ type: "session_meta", payload: {} })).title).toBe("Codex");
+  });
+});
+
+describe("#347 identity map fail-closed", () => {
+  it("未知 local rollout 在身份映射不可信时不发明文且不推水位", async () => {
+    const { mkdirSync, mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const root = mkdtempSync(join(tmpdir(), "cx-identity-guard-"));
+    const previousSessions = process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+    const previousMirror = process.env.MACCHIATO_CODEX_MIRROR;
+    try {
+      process.env.MACCHIATO_CODEX_SESSIONS_DIR = join(root, "sessions");
+      process.env.MACCHIATO_CODEX_MIRROR = join(root, "mirror.json");
+      const localSid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee3407";
+      const rolloutDir = join(root, "sessions", "2026", "07", "23");
+      mkdirSync(rolloutDir, { recursive: true });
+      writeFileSync(
+        join(rolloutDir, `rollout-2026-07-23T00-00-00-${localSid}.jsonl`),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "绝不能明文发送" } }) + "\n",
+      );
+      writeFileSync(process.env.MACCHIATO_CODEX_MIRROR, JSON.stringify({ offsets: {}, ords: {}, seeded: true }));
+      const sent: any[] = [];
+      const mirror = new Mirror(
+        { agentLinkId: "al", isReady: true, send: (frame: unknown) => sent.push(frame) } as any,
+        undefined,
+        () => undefined,
+        () => false,
+      );
+      (mirror as any).pollOnce();
+      expect(sent.filter((frame) => frame.t === "mirror_append")).toEqual([]);
+      expect((mirror as any).state.offsets[localSid]).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      if (previousSessions === undefined) delete process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+      else process.env.MACCHIATO_CODEX_SESSIONS_DIR = previousSessions;
+      if (previousMirror === undefined) delete process.env.MACCHIATO_CODEX_MIRROR;
+      else process.env.MACCHIATO_CODEX_MIRROR = previousMirror;
+    }
+  });
+});
+
+describe("#347 disable backfill ACK 邊界", () => {
+  it("發送明文 backfill 後保留 K_S；Mirror 不再自行 remove", async () => {
+    const { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const root = mkdtempSync(join(tmpdir(), "cx-e2e-disable-"));
+    const previousSessions = process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+    const previousMirror = process.env.MACCHIATO_CODEX_MIRROR;
+    try {
+      process.env.MACCHIATO_CODEX_SESSIONS_DIR = join(root, "sessions");
+      process.env.MACCHIATO_CODEX_MIRROR = join(root, "mirror.json");
+      const localSid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee3470";
+      const wireSid = "01K0CODEXBACKFILLWIRE000001";
+      const rolloutDir = join(root, "sessions", "2026", "07", "23");
+      mkdirSync(rolloutDir, { recursive: true });
+      const rollout = join(rolloutDir, `rollout-2026-07-23T00-00-00-${localSid}.jsonl`);
+      writeFileSync(
+        rollout,
+        [
+          JSON.stringify({
+            type: "event_msg",
+            payload: { type: "user_message", message: "祕密問題" },
+          }),
+          JSON.stringify({
+            type: "event_msg",
+            payload: { type: "agent_message", message: "祕密回答" },
+          }),
+          "",
+        ].join("\n"),
+      );
+      const sent: any[] = [];
+      const remove = vi.fn();
+      const mirror = new Mirror(
+        { agentLinkId: "al", isReady: true, send: (msg: any) => sent.push(msg) } as any,
+        { remove, disableReceiptForBackfill: () => ({ receipt: "test" }) } as any,
+      );
+
+      await mirror.backfillE2E(wireSid, localSid, "disable");
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toMatchObject({
+        t: "e2e_backfill",
+        hermesSessionId: wireSid,
+        mode: "disable",
+        found: true,
+        session: { hermesSessionId: wireSid },
+      });
+      expect(sent[0].session.messages.map((m: any) => m.text)).toEqual(["祕密問題", "祕密回答"]);
+      expect(sent[0].session.messages.map((m: any) => m.srcId)).toEqual([
+        srcIdFor(localSid, { role: "user", text: "祕密問題", ord: 0 }),
+        srcIdFor(localSid, { role: "agent", text: "祕密回答", ord: 1 }),
+      ]);
+      expect(remove).not.toHaveBeenCalled();
+      expect((mirror as any).state.offsets[localSid]).toBeUndefined();
+      expect((mirror as any).state.offsets[wireSid]).toBeUndefined();
+      expect((mirror as any).pendingE2EBackfills.size).toBe(1);
+      mirror.fastForward(localSid);
+      expect((mirror as any).state.offsets[localSid]).toBeUndefined(); // driven 回合旁路也必須服從 pending lock。
+
+      mirror.handleE2EBackfillResult(wireSid, "disable", false);
+      expect((mirror as any).state.offsets[localSid]).toBeUndefined();
+      expect((mirror as any).pendingE2EBackfills.size).toBe(0);
+      expect(remove).not.toHaveBeenCalled();
+
+      await mirror.backfillE2E(wireSid, localSid, "disable");
+      mirror.handleE2EBackfillResult(wireSid, "disable", true);
+      expect((mirror as any).state.offsets[localSid]).toBe(statSync(rollout).size);
+      expect((mirror as any).state.offsets[wireSid]).toBeUndefined();
+      expect((mirror as any).pendingE2EBackfills.size).toBe(0);
+      expect(remove).not.toHaveBeenCalled(); // key 刪除只歸 index 的成功 ACK 分支。
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      if (previousSessions === undefined) delete process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+      else process.env.MACCHIATO_CODEX_SESSIONS_DIR = previousSessions;
+      if (previousMirror === undefined) delete process.env.MACCHIATO_CODEX_MIRROR;
+      else process.env.MACCHIATO_CODEX_MIRROR = previousMirror;
+    }
   });
 });
 
@@ -179,6 +297,47 @@ describe("#236 seeded 基線語義(pollOnce 核心路徑)", () => {
     m.pollOnce();
     expect(sent.filter((x) => x.t === "mirror_append")).toHaveLength(0); // driven → 不鏡像投遞
     expect(m.state.offsets[T2]).toBeGreaterThan(0); // 只快進水位線
+  });
+
+  it("#349 app-driven E2E unsetDriven 後 terminal 續聊仍回 wire ULID 加密，不建明文 UUID 影子", async () => {
+    const { Mirror, rollout, appendFileSync, line } = await mkWorld();
+    rollout(T1, "存量");
+    const wireSid = "01K0CODEXMIRRORWIRE00000001";
+    const sent: any[] = [];
+    const e2e: any = {
+      isE2E: (sid: string) => sid === wireSid,
+      encryptText: (sid: string, text: string) => `title:${sid}:${text}`,
+      encryptContent: (sid: string, content: { text: string }) => `enc:${sid}:${content.text}`,
+    };
+    const m: any = new Mirror(
+      { agentLinkId: "al", isReady: true, send: (x: any) => sent.push(x), onFrame: () => () => {} } as any,
+      e2e,
+      (localSid: string) => (localSid === T2 ? wireSid : undefined),
+    );
+    m.pollOnce(); // seeded
+
+    m.setDriven(T2);
+    const f = rollout(T2, "app live user");
+    appendFileSync(f, line("agent_message", "app live reply"));
+    m.pollOnce(); // live 路徑獨佔，只快進本地 UUID 水位
+    m.unsetDriven(T2);
+    appendFileSync(f, line("user_message", "terminal secret"));
+    appendFileSync(f, line("agent_message", "terminal answer"));
+    m.pollOnce();
+
+    const batches = sent.filter((x) => x.t === "mirror_append");
+    expect(batches).toHaveLength(1);
+    expect(batches[0].sessions).toHaveLength(1);
+    expect(batches[0].sessions[0]).toMatchObject({
+      hermesSessionId: wireSid,
+      e2e: true,
+      messages: [
+        { role: "user", enc: `enc:${wireSid}:terminal secret` },
+        { role: "agent", enc: `enc:${wireSid}:terminal answer` },
+      ],
+    });
+    expect(batches[0].sessions[0].messages.every((message: any) => message.text === undefined)).toBe(true);
+    expect(sent.some((frame) => frame.sessions?.some((session: any) => session.hermesSessionId === T2))).toBe(false);
   });
 
   it("#268 mirror_nack 回退水位線 → 重發同批", async () => {

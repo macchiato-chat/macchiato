@@ -102,6 +102,16 @@ describe("Mirror", () => {
     expect(last.messages.map((x: any) => x.text)).toEqual(["new message"]);
   });
 
+  it("#347 身份映射不可信時未知 local UUID 不發明文且不推水位", () => {
+    setupEnv();
+    writeFileSync(file, userLine("绝不能明文发送"));
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb, undefined, () => undefined, () => false);
+    (m as any).doPoll();
+    expect(appends(sent)).toEqual([]);
+    expect((m as any).state.offsets[SID]).toBe(0);
+  });
+
   it("#318 markLivePosted 吞回合末晚落盤殘片:同 message.id 不重複投", () => {
     setupEnv();
     // 已存在會話(有真人消息+標題)——復現 bug:live 已投遞的最後一塊 text 晚落盤逃過 fastForward。

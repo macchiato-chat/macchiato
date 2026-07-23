@@ -25,14 +25,104 @@ import type { OpenClawGateway, GatewayEvent } from "./gateway";
 import { keyForSid, sidForKey, type Mirror } from "./mirror";
 import { generateTitle, loadTitled, saveTitled } from "./titles";
 import { extractMediaPaths, readMediaFile } from "./media";
-import type { E2EKeyStore } from "../e2e/keys";
+import type { E2EKeyStore, ServerE2EStateV1 } from "../e2e/keys";
+import {
+  dispatchForE2EControl,
+  E2EControlError,
+  E2EControlVerifier,
+  type E2EControlEnvelopeV1,
+  type E2EControlKind,
+} from "../e2e/control";
 
 // key ↔ sid 映射移居 mirror.ts（E2E 回灌也要用）；re-export 保持既有導入面不變。
 export { keyForSid, sidForKey };
 
+const AUTHENTICATED_E2E_CONTROL = Symbol("authenticated-e2e-control");
+interface AuthenticatedControlTag {
+  kind: E2EControlKind;
+  msgId: string;
+  envelope: E2EControlEnvelopeV1;
+}
+type TaggedControlFrame = Record<string, unknown> & {
+  [AUTHENTICATED_E2E_CONTROL]?: AuthenticatedControlTag;
+};
+const E2E_SENSITIVE_METHODS = new Set([
+  "command.invoke",
+  "approval.respond",
+  "clarify.respond",
+  "secret.respond",
+  "session.create",
+  "session.interrupt",
+  "task.stop",
+  "session.e2e.disable",
+  "session.delete",
+  "session.rename",
+  "session.archive",
+  "session.retitle",
+]);
+
+/**
+ * Link B ready 的 E2E 身份閘門。pending-enable 的 bootstrap control 一定排在 ready 後：
+ * 僅准該快照中的 sid 暫缺 mirror fileId，以便收到 backfill 後用 gateway 權威 sessionId 補圖。
+ * drive identity、mirror state trust、stable/disable 的 fileId 都不得豁免；內容面另走 strict assert。
+ */
+export function applyReadyE2EIdentityState(
+  e2e: E2EKeyStore,
+  drive: Pick<Drive, "assertE2EIdentitySafe">,
+  mirror: Pick<Mirror, "assertE2EIdentitySafe">,
+  rawState: unknown,
+): string[] {
+  const blocked = e2e.applyServerState(rawState);
+  // applyServerState 已完整驗證 shape，之後才可读取 pending-enable 精確白名單。
+  const state = rawState as ServerE2EStateV1;
+  const pendingEnables = new Set(
+    state.sessions
+      .filter((session) => session.pendingOp === "enable")
+      .map((session) => session.hermesSessionId),
+  );
+  drive.assertE2EIdentitySafe();
+  mirror.assertE2EIdentitySafe(pendingEnables);
+  return blocked;
+}
+
 /** #202 drive 持久狀態文件(driven key→sid + 對賬水位線)。 */
 function driveStatePath(): string {
   return process.env.MACCHIATO_OPENCLAW_DRIVE || join(homedir(), ".macchiato/openclaw-drive.json");
+}
+
+interface PersistedDriveState {
+  driven: Record<string, string>;
+  wm: Record<string, number>;
+  identityStateTrusted: boolean;
+}
+
+function parseDriveState(raw: string, identityStateTrusted: boolean): PersistedDriveState {
+  const value = JSON.parse(raw) as Record<string, unknown>;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("drive state root must be an object");
+  }
+  const drivenRaw = value.driven;
+  const wmRaw = value.wm ?? {};
+  if (drivenRaw === null || typeof drivenRaw !== "object" || Array.isArray(drivenRaw)) {
+    throw new Error("driven must be an object");
+  }
+  if (wmRaw === null || typeof wmRaw !== "object" || Array.isArray(wmRaw)) {
+    throw new Error("wm must be an object");
+  }
+  const driven: Record<string, string> = {};
+  for (const [key, sid] of Object.entries(drivenRaw)) {
+    if (!key || typeof sid !== "string" || !sid) throw new Error("driven contains an invalid entry");
+    if (keyForSid(sid) !== key) throw new Error("driven key does not canonically match its wire sid");
+    driven[key] = sid;
+  }
+  const wm: Record<string, number> = {};
+  for (const [key, seq] of Object.entries(wmRaw)) {
+    if (!key || typeof seq !== "number" || !Number.isFinite(seq) || seq < 0) {
+      throw new Error("wm contains an invalid entry");
+    }
+    wm[key] = seq;
+  }
+  return { driven, wm, identityStateTrusted };
 }
 
 /** #261 工具卡 args_text:JSON 化(截斷,防超大 args 撐爆幀)。 */
@@ -83,6 +173,8 @@ export class Drive {
    */
   private wmByKey: Record<string, number> = {};
   private drivenPersist: Record<string, string> = {};
+  /** 主 driven key↔wire sid 快照是否完整可信；backup/空 fallback 不足以證明 E2E identity。 */
+  private identityStateTrusted = false;
 
   /** E2E 會話：runId 前暫存的（已解密）用戶消息, 回合結束隨加密批一起投遞。 */
   private readonly pendingUser = new Map<string, string[]>();
@@ -95,6 +187,7 @@ export class Drive {
 
   /** #113 已自動生成過標題的 sid(持久,重啟不重生、不覆蓋用戶手改)。 */
   private readonly titled = loadTitled();
+  private readonly e2eControl?: E2EControlVerifier;
 
   /** #4 已重投過的 `sid:text哈希`——每條 prompt 最多重投一次,寧丟勿雙發。 */
   private readonly promptRetried = new Set<string>();
@@ -112,20 +205,30 @@ export class Drive {
     private readonly linkb: LinkBClient,
     private readonly mirror?: Mirror,
     private readonly e2e?: E2EKeyStore,
+    e2eControl?: E2EControlVerifier,
   ) {
     // #202 載入持久對賬狀態;歷史 driven key 重新登記(鏡像跳過 + 事件路由 + 對賬覆蓋)。
-    try {
-      const st = JSON.parse(readFileSync(driveStatePath(), "utf8")) as Record<string, unknown>;
-      this.drivenPersist = (st.driven ?? {}) as Record<string, string>;
-      this.wmByKey = (st.wm ?? {}) as Record<string, number>;
-    } catch {
-      /* 首跑/損壞 → 空狀態 */
+    for (const [path, isPrimary] of [[driveStatePath(), true], [`${driveStatePath()}.bak`, false]] as const) {
+      try {
+        const st = parseDriveState(readFileSync(path, "utf8"), isPrimary);
+        this.drivenPersist = st.driven;
+        this.wmByKey = st.wm;
+        this.identityStateTrusted = st.identityStateTrusted;
+        break;
+      } catch {
+        /* backup 是舊代，只恢復內容，不把 E2E identity 提升成可信。 */
+      }
     }
     for (const [key, sid] of Object.entries(this.drivenPersist)) {
       this.driven.add(key);
       this.sidByKey.set(key, sid);
       this.mirror?.setDriven(key, sid);
     }
+    this.e2eControl = e2eControl ?? (e2e ? new E2EControlVerifier(e2e) : undefined);
+    this.mirror?.setDriveIdentityResolver?.(
+      (identity) => this.wireSessionIdForLocalIdentity(identity),
+      () => this.plaintextLocalIdentityAllowed(),
+    );
   }
 
   private saveDriveState(): void {
@@ -133,11 +236,67 @@ export class Drive {
       const p = driveStatePath();
       mkdirSync(dirname(p), { recursive: true });
       const tmp = `${p}.tmp`;
-      writeFileSync(tmp, JSON.stringify({ v: 1, driven: this.drivenPersist, wm: this.wmByKey }));
+      const backupTmp = `${p}.bak.tmp`;
+      const snapshot = JSON.stringify({ v: 1, driven: this.drivenPersist, wm: this.wmByKey });
+      writeFileSync(tmp, snapshot);
       renameSync(tmp, p);
+      writeFileSync(backupTmp, snapshot);
+      renameSync(backupTmp, `${p}.bak`);
+      const requiringMap = this.protectedWireSids().filter((sid) => !sid.startsWith("agent:"));
+      if (requiringMap.every((sid) => this.drivenPersist[keyForSid(sid)] === sid)) {
+        this.identityStateTrusted = true;
+      }
     } catch (e) {
       console.error("[drive state save failed]", (e as Error).message);
     }
+  }
+
+  private protectedWireSids(): string[] {
+    const fn = (this.e2e as (E2EKeyStore & { protectedSessionIds?: () => string[] }) | undefined)
+      ?.protectedSessionIds;
+    return typeof fn === "function" ? fn.call(this.e2e) : [];
+  }
+
+  /**
+   * OpenClaw 的本地 key 可由 wire sid 确定性推导。恶意 server 若把
+   * `agent:main:macchiato:<sid>` 当成新 sid，下游仍会命中同一 gateway 会话；必须反查
+   * canonical protected wire identity 后拒绝整帧。
+   */
+  private protectedInboundAliasOwner(sid: string): string | undefined {
+    const key = keyForSid(sid);
+    return this.protectedWireSids().find(
+      (wireSid) => wireSid !== sid && keyForSid(wireSid) === key,
+    );
+  }
+
+  /** E2E wire ULID 必須能由持久 driven key 精確還原大小寫；否則禁止整個內容面 ready。 */
+  assertE2EIdentitySafe(): void {
+    const requiringMap = this.protectedWireSids().filter((sid) => !sid.startsWith("agent:"));
+    if (!requiringMap.length) return;
+    const missing = requiringMap.filter((sid) => this.drivenPersist[keyForSid(sid)] !== sid);
+    if (!this.identityStateTrusted || missing.length) {
+      throw new Error(
+        `OpenClaw E2E driven identity map unavailable/incomplete (trusted=${this.identityStateTrusted}, ` +
+          `missing=${missing.slice(0, 3).join(",") || "unknown"}); refusing plaintext fallback`,
+      );
+    }
+  }
+
+  plaintextLocalIdentityAllowed(): boolean {
+    try {
+      this.assertE2EIdentitySafe();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** plugin / mirror 可傳 driven key 或本地 transcript id；回 server 前統一還原原始 wire sid。 */
+  wireSessionIdForLocalIdentity(identity: string): string | undefined {
+    if (!identity) return undefined;
+    const direct = this.sidByKey.get(identity) ?? this.sidByKey.get(identity.toLowerCase());
+    if (direct) return direct;
+    return undefined;
   }
 
   /** 掛上兩側監聽（linkb.start 前調用）。 */
@@ -247,14 +406,128 @@ export class Drive {
     }
   }
 
+  private sendE2EControlResult(
+    rawEnvelope: unknown,
+    wireSid: string,
+    ok: boolean,
+    error?: "control_rejected" | "side_effect_failed",
+  ): void {
+    if (rawEnvelope === null || typeof rawEnvelope !== "object" || Array.isArray(rawEnvelope)) return;
+    const envelope = rawEnvelope as Partial<E2EControlEnvelopeV1>;
+    if (typeof envelope.sessionId !== "string" || !envelope.sessionId) return;
+    if (typeof envelope.msgId !== "string" || !envelope.msgId) return;
+    this.linkb.send({
+      t: "e2e_control_result",
+      agentLinkId: this.linkb.agentLinkId,
+      sessionId: envelope.sessionId,
+      hermesSessionId: wireSid,
+      msgId: envelope.msgId,
+      ok,
+      ...(error ? { error } : {}),
+    });
+  }
+
+  private async onE2EControl(wireSid: string, rawEnvelope: unknown): Promise<void> {
+    let dispatchStarted = false;
+    try {
+      if (!this.e2eControl) throw new E2EControlError("E2E control verifier unavailable");
+      const verified = this.e2eControl.verifyAndConsume(rawEnvelope, wireSid);
+      if (
+        verified.kind !== "command.invoke" &&
+        verified.kind !== "session.interrupt" &&
+        verified.kind !== "session.e2e.disable"
+      ) {
+        throw new E2EControlError(`${verified.kind} is not supported by OpenClaw`);
+      }
+      const dispatch = dispatchForE2EControl(verified.kind, verified.payload);
+      if (verified.kind === "command.invoke" && typeof dispatch.params.argsEnc === "string") {
+        if (!this.e2e) throw new E2EControlError("E2E command decryptor unavailable");
+        try {
+          dispatch.params.args = this.e2e.decryptText(wireSid, dispatch.params.argsEnc);
+          delete dispatch.params.argsEnc;
+        } catch (error) {
+          throw new E2EControlError("failed to decrypt authenticated command args", {
+            cause: error,
+          });
+        }
+      }
+      const tagged: TaggedControlFrame = {
+        t: "tui",
+        sessionId: wireSid,
+        frame: {
+          jsonrpc: "2.0",
+          method: dispatch.method,
+          params: { session_id: wireSid, ...dispatch.params },
+        },
+        [AUTHENTICATED_E2E_CONTROL]: {
+          kind: verified.kind,
+          msgId: verified.envelope.msgId,
+          envelope: verified.envelope,
+        },
+      };
+      dispatchStarted = true;
+      await this.onServerFrame(tagged);
+      this.sendE2EControlResult(verified.envelope, wireSid, true);
+    } catch (error) {
+      console.error(`[E2E control rejected ${wireSid}]`, error instanceof Error ? error.message : String(error));
+      this.sendE2EControlResult(
+        rawEnvelope,
+        wireSid,
+        false,
+        dispatchStarted ? "side_effect_failed" : "control_rejected",
+      );
+    }
+  }
+
   async onServerFrame(msg: Record<string, unknown>): Promise<void> {
     if (msg.t !== "tui" || !msg.frame) return;
     const frame = msg.frame as { method?: string; params?: Record<string, unknown> };
     const params = frame.params ?? {};
-    const sid = (msg.sessionId ?? params.session_id) as string | undefined;
+    const outerSid = typeof msg.sessionId === "string" ? msg.sessionId : undefined;
+    const paramsSid = typeof params.session_id === "string" ? params.session_id : undefined;
+    if (
+      (msg.sessionId !== undefined && !outerSid) ||
+      (params.session_id !== undefined && !paramsSid) ||
+      (outerSid && paramsSid && outerSid !== paramsSid)
+    ) {
+      console.error(
+        `[drive rejected] Link B outer/params session mismatch: ${String(msg.sessionId)} != ${String(params.session_id)}`,
+      );
+      return;
+    }
+    const sid = outerSid ?? paramsSid;
     if (!sid || !frame.method) return;
+    let aliasOwner: string | undefined;
+    try {
+      aliasOwner = this.protectedInboundAliasOwner(sid);
+    } catch (error) {
+      console.error(
+        `[E2E inbound quarantined ${sid}] ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return;
+    }
+    if (aliasOwner) {
+      console.error(`[E2E local alias rejected ${sid}] canonical wire session is ${aliasOwner}`);
+      return;
+    }
+    const authenticated = (msg as TaggedControlFrame)[AUTHENTICATED_E2E_CONTROL];
+    if (frame.method === "e2e.control") {
+      if (authenticated || !outerSid || !paramsSid) return;
+      await this.onE2EControl(sid, params.envelope);
+      return;
+    }
     const key = keyForSid(sid);
     try {
+      if (
+        this.e2e?.isE2E(sid) &&
+        E2E_SENSITIVE_METHODS.has(frame.method) &&
+        authenticated === undefined
+      ) {
+        console.error(`[E2E legacy control rejected ${sid}] ${frame.method}`);
+        return;
+      }
       switch (frame.method) {
         case "prompt.submit": {
           // #73/#89 語音優雅降級：OpenClaw 無 STT——audio 附件立即回「未能轉錄」失敗回執，
@@ -263,6 +536,11 @@ export class Drive {
           const atts = Array.isArray(params.attachments)
             ? (params.attachments as Array<{ id?: string; kind?: string }>)
             : [];
+          // E2E 附件没有端到端密文/完整性协议；在任何 STT、网络或落盘副作用前拒绝整帧。
+          if (atts.length && this.e2e?.isE2E(sid)) {
+            console.error(`[E2E prompt rejected ${sid}] attachments are not supported`);
+            return;
+          }
           for (const a of atts) {
             if (a?.kind === "audio" && a.id) {
               this.linkb.send({
@@ -337,8 +615,10 @@ export class Drive {
             this.pendingUser.set(key, arr);
           }
           await this.markDriven(key, sid);
-          console.log(`· #199 command.invoke ${text} → ${key}`);
-          await this.sendPrompt(key, sid, text);
+          const logText =
+            authenticated && args ? `/skill ${name} [encrypted args]` : text;
+          console.log(`· #199 command.invoke ${logText} → ${key}`);
+          await this.sendPrompt(key, sid, text, [], authenticated === undefined);
           return;
         }
         case "session.interrupt":
@@ -348,6 +628,19 @@ export class Drive {
             console.log(`· 用戶中斷 → 取消待重投 prompt(${key})`);
           }
           await this.gw.request("sessions.abort", { key });
+          return;
+        case "session.e2e.disable":
+          if (authenticated?.kind !== "session.e2e.disable") {
+            throw new E2EControlError("session.e2e.disable requires authenticated control");
+          }
+          if (!this.e2e || !this.mirror) {
+            throw new E2EControlError("E2E disable dependencies unavailable");
+          }
+          this.assertE2EIdentitySafe();
+          this.mirror.assertE2EIdentitySafe();
+          this.e2e.markServerE2E(sid, "disable");
+          this.e2e.beginDisable(sid, authenticated.envelope);
+          await this.mirror.backfillE2E(sid, "disable");
           return;
         case "session.delete": {
           // #161 墓碑:app 刪會話 → 鏡像/打撈/對賬永不再碰;不刪 agent 側 .jsonl。
@@ -368,6 +661,7 @@ export class Drive {
     } catch (e) {
       this.counters.driveErrors += 1; // #10
       console.error(`[drive ${frame.method} failed for ${sid}] ${(e as Error).message}`);
+      if (authenticated) throw e;
     }
   }
 
@@ -388,7 +682,13 @@ export class Drive {
 
   /** #4:提交 prompt(回合進行中 → steer 注入);連接死於在途 → 排一次重投。
    * #60:attachments 隨 chat.send 送達(steer 無附件通道——回合進行中只 steer 文字+回執說明)。 */
-  private async sendPrompt(key: string, sid: string, text: string, attachments: ChatAttachment[] = []): Promise<void> {
+  private async sendPrompt(
+    key: string,
+    sid: string,
+    text: string,
+    attachments: ChatAttachment[] = [],
+    retryOnDisconnect = true,
+  ): Promise<void> {
     const idem = `mc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     try {
       if (this.active.has(key)) {
@@ -421,6 +721,9 @@ export class Drive {
       // 只重投「連接死亡」類失敗(請求確定沒送達)。timeout 不重投:daemon 可能仍在處理,
       // steer 無冪等鍵,重投有雙發風險——寧丟勿雙發。業務錯誤(gateway error: …)照舊上拋記日誌。
       if (!m.includes("gateway connection lost") && !m.includes("gateway not connected")) throw e;
+      // 签名控制已经持久消费 seq；不能一边排异步重试一边回 ok，否则设备 NACK 后
+      // 以新 seq 重发会与旧重试双投。认证命令只在同步 gateway 请求成功后 ACK。
+      if (!retryOnDisconnect) throw e;
       this.retryTask = this.retryPrompt(key, sid, text, idem, attachments);
     }
   }

@@ -1,12 +1,46 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Drive, keyForSid, sidForKey } from "../src/openclaw/drive";
 import { MACCHIATO_PREFIX } from "../src/openclaw/mirror";
 import { titlegenKey } from "../src/openclaw/titles";
+import {
+  e2eControlKeyId,
+  e2eControlMac,
+  E2EControlVerifier,
+  type E2EControlEnvelopeV1,
+  type E2EControlKind,
+} from "../src/e2e/control";
 
-function makeDrive(opts: { titleMode?: string } = {}) {
+const CONTROL_KEY = Buffer.from([...Array(32).keys()]);
+
+function signedControl(
+  wireSid: string,
+  kind: E2EControlKind,
+  payload: Record<string, unknown>,
+  seq = "1",
+): E2EControlEnvelopeV1 {
+  const now = Date.now();
+  const fields = {
+    v: 1 as const,
+    sessionId: `public:${wireSid}`,
+    hermesSessionId: wireSid,
+    deviceId: "openclaw-drive-test",
+    keyId: e2eControlKeyId(CONTROL_KEY),
+    msgId: `00000000-0000-4000-8000-${seq.padStart(12, "0")}`,
+    seq,
+    issuedAtMs: String(now),
+    expiresAtMs: String(now + 300_000),
+    kind,
+  };
+  const raw = Buffer.from(JSON.stringify(payload), "utf8");
+  return { ...fields, payloadB64: raw.toString("base64"), mac: e2eControlMac(CONTROL_KEY, fields, raw) };
+}
+
+function makeDrive(
+  opts: { titleMode?: string; e2e?: any; e2eControl?: E2EControlVerifier; mirror?: any } = {},
+) {
   // #113:標題持久集隔離到臨時文件;默認 off(專項測試才開),免干擾既有 calls/sent 斷言
   process.env.MACCHIATO_OPENCLAW_TITLED = join(mkdtempSync(join(tmpdir(), "oc-titled-")), "titled.json");
   process.env.MACCHIATO_OPENCLAW_DRIVE = join(mkdtempSync(join(tmpdir(), "oc-drive-")), "drive.json"); // #202 隔離對賬狀態
@@ -68,8 +102,8 @@ function makeDrive(opts: { titleMode?: string } = {}) {
       for (const h of this.handlers) await h(m);
     },
   };
-  const mirror: any = { drivenSet: [] as string[], ff: [] as string[], setDriven(k: string) { this.drivenSet.push(k); }, fastForward(k: string) { this.ff.push(k); } };
-  const drive = new Drive(gw, linkb, mirror);
+  const mirror: any = opts.mirror ?? { drivenSet: [] as string[], ff: [] as string[], setDriven(k: string) { this.drivenSet.push(k); }, fastForward(k: string) { this.ff.push(k); } };
+  const drive = new Drive(gw, linkb, mirror, opts.e2e, opts.e2eControl);
   drive.wire();
   return { drive, gw, linkb, mirror, calls, sent };
 }
@@ -113,6 +147,163 @@ describe("drive 下行分派", () => {
     const { linkb, calls } = makeDrive();
     await linkb.deliver(tui("session.interrupt", "agent:main:discord:channel:9"));
     expect(calls[0]).toMatchObject({ method: "sessions.abort", params: { key: "agent:main:discord:channel:9" } });
+  });
+});
+
+describe("#370 E2E control ingress", () => {
+  it("派生 OpenClaw local key 不能冒充普通 sid 注入 prompt 或裸控制", async () => {
+    const sid = "01OCALIASGUARD000000000000";
+    const alias = `${MACCHIATO_PREFIX}${sid.toLowerCase()}`;
+    const e2e = {
+      isE2E: (candidate: string) => candidate === sid,
+      protectedSessionIds: () => [sid],
+      requireKey: () => Buffer.from(CONTROL_KEY),
+    } as any;
+    const replayPath = join(mkdtempSync(join(tmpdir(), "oc-alias-guard-")), "control.json");
+    const { drive, calls, mirror } = makeDrive({
+      e2e,
+      e2eControl: new E2EControlVerifier(e2e, replayPath),
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await drive.onServerFrame(tui("prompt.submit", alias, { text: "forged plaintext" }));
+      await drive.onServerFrame(tui("session.interrupt", alias));
+    } finally {
+      error.mockRestore();
+    }
+
+    expect(keyForSid(alias)).toBe(keyForSid(sid));
+    expect(calls).toEqual([]);
+    expect(mirror.drivenSet).toEqual([]);
+  });
+
+  it("明文控制与缺可信 catalog/turn identity 的签封 command/interrupt 均 fail closed", async () => {
+    const sid = "01OCE2ECONTROL000000000000";
+    const e2e = {
+      isE2E: (candidate: string) => candidate === sid,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+      decryptText: vi.fn((_candidate: string, ciphertext: string) => {
+        if (ciphertext !== "cipher-args") throw new Error("bad ciphertext");
+        return "Shanghai";
+      }),
+    } as any;
+    const replayPath = join(mkdtempSync(join(tmpdir(), "oc-control-drive-")), "control.json");
+    const { drive, calls, sent } = makeDrive({
+      e2e,
+      e2eControl: new E2EControlVerifier(e2e, replayPath),
+    });
+
+    await drive.onServerFrame(tui("command.invoke", sid, { command: "weather" }));
+    await drive.onServerFrame(tui("session.interrupt", sid));
+    expect(calls).toHaveLength(0);
+
+    const command = signedControl(
+      sid,
+      "command.invoke",
+      { command: "weather", argsEnc: "cipher-args" },
+      "1",
+    );
+    expect(Buffer.from(command.payloadB64, "base64").toString("utf8")).not.toContain("Shanghai");
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    await drive.onServerFrame(tui("e2e.control", sid, { envelope: command }));
+    expect(e2e.decryptText).not.toHaveBeenCalled();
+    expect(log.mock.calls.flat().join(" ")).not.toContain("Shanghai");
+    log.mockRestore();
+    expect(calls).toEqual([]);
+    expect(sent.at(-1)).toMatchObject({
+      msgId: command.msgId,
+      sessionId: command.sessionId,
+      hermesSessionId: sid,
+      ok: false,
+      error: "control_rejected",
+    });
+
+    const interrupt = signedControl(sid, "session.interrupt", {}, "2");
+    await drive.onServerFrame(tui("e2e.control", sid, { envelope: interrupt }));
+    expect(calls).toEqual([]);
+    expect(sent.at(-1)).toMatchObject({
+      msgId: interrupt.msgId,
+      ok: false,
+      error: "control_rejected",
+    });
+
+    const callCount = calls.length;
+    await drive.onServerFrame(tui("e2e.control", sid, { envelope: interrupt }));
+    expect(calls).toHaveLength(callCount);
+    expect(sent.at(-1)).toMatchObject({ msgId: interrupt.msgId, ok: false });
+
+    const stop = signedControl(sid, "task.stop", { taskId: "task-1" }, "3");
+    await drive.onServerFrame(tui("e2e.control", sid, { envelope: stop }));
+    expect(sent.at(-1)).toMatchObject({
+      msgId: stop.msgId,
+      ok: false,
+      error: "control_rejected",
+    });
+  });
+
+  it("仅签封 disable 可回灌；不支持 config NACK；下游异常不泄露 canary", async () => {
+    const sid = "01OCE2EDISABLE00000000000";
+    const e2e = {
+      isE2E: (candidate: string) => candidate === sid,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+      markServerE2E: vi.fn(),
+      beginDisable: vi.fn(),
+    } as any;
+    const mirror = {
+      setDriven: () => {},
+      fastForward: () => {},
+      assertE2EIdentitySafe: vi.fn(),
+      backfillE2E: vi.fn(async () => {}),
+      tombstone: vi.fn(),
+    } as any;
+    const replayPath = join(mkdtempSync(join(tmpdir(), "oc-control-disable-")), "control.json");
+    const { drive, gw, sent } = makeDrive({
+      e2e,
+      mirror,
+      e2eControl: new E2EControlVerifier(e2e, replayPath),
+    });
+
+    await drive.onServerFrame(tui("session.e2e.disable", sid));
+    await drive.onServerFrame(tui("session.delete", sid));
+    await drive.onServerFrame(tui("session.rename", sid, { title: "forged-title" }));
+    await drive.onServerFrame(tui("session.archive", sid));
+    await drive.onServerFrame(tui("session.retitle", sid));
+    expect(e2e.beginDisable).not.toHaveBeenCalled();
+    expect(mirror.backfillE2E).not.toHaveBeenCalled();
+    expect(mirror.tombstone).not.toHaveBeenCalled();
+
+    const disable = signedControl(sid, "session.e2e.disable", {}, "1");
+    await drive.onServerFrame(tui("e2e.control", sid, { envelope: disable }));
+    expect(e2e.markServerE2E).toHaveBeenCalledWith(sid, "disable");
+    expect(e2e.beginDisable).toHaveBeenCalledWith(sid, expect.objectContaining({
+      kind: "session.e2e.disable",
+      hermesSessionId: sid,
+    }));
+    expect(mirror.backfillE2E).toHaveBeenCalledWith(sid, "disable");
+    expect(sent.at(-1)).toMatchObject({ msgId: disable.msgId, ok: true });
+
+    const config = signedControl(sid, "session.model.set", { model: "forged" }, "2");
+    await drive.onServerFrame(tui("e2e.control", sid, { envelope: config }));
+    expect(sent.at(-1)).toMatchObject({
+      msgId: config.msgId,
+      ok: false,
+      error: "control_rejected",
+    });
+
+    const canary = "CANARY-DECRYPTED-ARG-/Users/private/repo";
+    const downstream = vi.fn(async () => {
+      throw new Error(canary);
+    });
+    gw.request = downstream;
+    const interrupt = signedControl(sid, "session.interrupt", {}, "3");
+    await drive.onServerFrame(tui("e2e.control", sid, { envelope: interrupt }));
+    expect(sent.at(-1)).toMatchObject({
+      msgId: interrupt.msgId,
+      ok: false,
+      error: "control_rejected",
+    });
+    expect(downstream).not.toHaveBeenCalled();
+    expect(JSON.stringify(sent.at(-1))).not.toContain(canary);
   });
 });
 

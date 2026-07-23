@@ -27,12 +27,14 @@ describe("#248 codex drive state .bak 韌性", () => {
 
   it("主檔損壞 → 從 .bak 恢復(sid↔thread 映射不蒸發)", () => {
     saveDriveState(st({ s1: "t1" })); // 首存
-    saveDriveState(st({ s1: "t1", s2: "t2" })); // 二存 → 好的第一版輪替進 .bak
+    saveDriveState(st({ s1: "t1", s2: "t2" })); // 二存 → main/.bak 都是當前完整身份代
     writeFileSync(mapPath(), "{壞了"); // 主檔損壞
-    expect(loadDriveState().map).toEqual({ s1: "t1" }); // .bak 恢復,不回空
+    const recovered = loadDriveState();
+    expect(recovered.map).toEqual({ s1: "t1", s2: "t2" });
+    expect(recovered.identityStateTrusted).toBe(false); // fallback 仍不證明主檔 crash 前沒有更晚一代
   });
 
   it("兩檔都無 → 空狀態(全新安裝)", () => {
-    expect(loadDriveState().map).toEqual({});
+    expect(loadDriveState()).toMatchObject({ map: {}, identityStateTrusted: false });
   });
 });

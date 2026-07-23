@@ -14,9 +14,40 @@ vi.mock("../src/codex/attachments", async (importOriginal) => {
 });
 
 import { AppServerDrive, toolCardForV2 } from "../src/codex/drive-appserver";
+import {
+  e2eControlKeyId,
+  e2eControlMac,
+  E2EControlVerifier,
+  type E2EControlEnvelopeV1,
+  type E2EControlKind,
+} from "../src/e2e/control";
 
 const SID = "01CXV2TESTSID0000000000000";
 const TID = "aaaaaaaa-0000-4000-8000-000000000001";
+const CONTROL_KEY = Buffer.from([...Array(32).keys()]);
+
+function signedControl(
+  wireSid: string,
+  kind: E2EControlKind,
+  payload: Record<string, unknown>,
+  seq = "1",
+): E2EControlEnvelopeV1 {
+  const now = Date.now();
+  const fields = {
+    v: 1 as const,
+    sessionId: `public:${wireSid}`,
+    hermesSessionId: wireSid,
+    deviceId: "drive-appserver-test",
+    keyId: e2eControlKeyId(CONTROL_KEY),
+    msgId: `00000000-0000-4000-8000-${seq.padStart(12, "0")}`,
+    seq,
+    issuedAtMs: String(now),
+    expiresAtMs: String(now + 300_000),
+    kind,
+  };
+  const raw = Buffer.from(JSON.stringify(payload), "utf8");
+  return { ...fields, payloadB64: raw.toString("base64"), mac: e2eControlMac(CONTROL_KEY, fields, raw) };
+}
 
 class FakeClient {
   requests: Array<{ method: string; params: any }> = [];
@@ -132,10 +163,12 @@ describe("#258 未知通知告警", () => {
 
 describe("#132 v2 回合生命週期", () => {
   it("prompt → thread/start+turn/start;delta 流→message.delta;completed 不重發已流部分;usage 隨 complete", async () => {
-    const { client, linkb, sent } = make();
+    const { d, client, linkb, sent } = make();
     await linkb.deliver(tui("prompt.submit", SID, { text: "你好" }));
     expect(client.requests.map((r) => r.method)).toEqual(["thread/start", "turn/start"]);
     expect(client.requests[1]!.params.input).toEqual([{ type: "text", text: "你好" }]);
+    expect(d.localSessionIdFor(SID)).toBe(TID);
+    expect(d.localSessionIdFor(TID)).toBe(TID);
     client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
     client.fire("item/agentMessage/delta", { threadId: TID, itemId: "m1", delta: "早上" });
     client.fire("item/agentMessage/delta", { threadId: TID, itemId: "m1", delta: "好" });
@@ -433,13 +466,23 @@ describe("#132 v2 附件/resume/重啟", () => {
 
   it("#240 E2E 審批卡:命令加密進 enc,明文只留占位 + 類別", async () => {
     const store: string[] = [];
-    const e2e: any = { isE2E: () => true, decryptText: (_s: string, t: string) => t, encryptContent: (_s: string, o: any) => { store.push(JSON.stringify(o)); return `enc#${store.length - 1}`; } };
+    const e2e: any = {
+      isE2E: () => true,
+      decryptText: (_s: string, t: string) => t,
+      encryptContent: (_s: string, o: any) => {
+        store.push(JSON.stringify(o));
+        return `enc#${store.length - 1}`;
+      },
+      requireKey: () => Buffer.from(CONTROL_KEY),
+    };
     const d2sent: any[] = [];
     const lb: any = { agentLinkId: "al", isReady: true, handlers: [], onFrame(h: any) { this.handlers.push(h); }, send: (m: any) => d2sent.push(m), async deliver(m: any) { for (const h of this.handlers) await h(m); } };
     const c2 = new FakeClient();
     c2.queueResponse("thread/start", { thread: { id: TID } });
-    process.env.MACCHIATO_CODEX_SESSIONS = join(mkdtempSync(join(tmpdir(), "cx-v2ea-")), "s.json");
-    const d = new AppServerDrive(c2 as any, lb, undefined, e2e);
+    const root = mkdtempSync(join(tmpdir(), "cx-v2ea-"));
+    process.env.MACCHIATO_CODEX_SESSIONS = join(root, "s.json");
+    const control = new E2EControlVerifier(e2e, join(root, "control.json"));
+    const d = new AppServerDrive(c2 as any, lb, undefined, e2e, undefined, undefined, control);
     d.wire();
     await lb.deliver(tui("prompt.submit", SID, { text: "秘密" }));
     await tick(); // 等 thread/start 解析 → byThread 有 TID(否則反向請求找不到 sid)
@@ -451,12 +494,216 @@ describe("#132 v2 附件/resume/重啟", () => {
     expect(card.command).toBe("🔒 加密審批請求");
     expect(card.pattern_key).toBe("shell");
     expect(card.request_id).toBe("e1");
+    expect(card.request_digest).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(typeof card.enc).toBe("string");
     expect(JSON.stringify(card).includes("rm -rf")).toBe(false); // 命令全文不在明文
     expect(store.some((s) => s.includes("rm -rf /secret"))).toBe(true);
-    // choice 回程照舊
+    expect(store.some((s) => s.includes(card.request_digest))).toBe(true);
+    expect(JSON.parse(store.at(-1)!)).toMatchObject({ patternKey: "shell" });
+    // E2E 会话的旧明文控制必须 fail closed，不能提前解挂审批。
+    let settled = false;
+    void p.finally(() => {
+      settled = true;
+    });
     await lb.deliver(tui("approval.respond", SID, { choice: "allow", request_id: "e1" }));
+    await tick();
+    expect(settled).toBe(false);
+    const envelope = signedControl(SID, "approval.respond", {
+      blockId: "block-e1",
+      requestId: card.request_id,
+      requestDigest: card.request_digest,
+      choice: "yes",
+      all: false,
+    });
+    await lb.deliver(tui("e2e.control", SID, { envelope }));
     expect(await p).toEqual({ decision: "accept" });
+    expect(
+      d2sent.find((f) => f.t === "e2e_control_result" && f.msgId === envelope.msgId),
+    ).toMatchObject({
+      sessionId: envelope.sessionId,
+      hermesSessionId: SID,
+      ok: true,
+    });
+  });
+
+  it("#370 E2E 審批完整明文超過設備 64KiB 時先本地拒絕，不 emit 或掛 pending", async () => {
+    const encryptContent = vi.fn((_sid: string, _obj: unknown) => "enc");
+    const e2e: any = {
+      isE2E: () => true,
+      decryptText: (_sid: string, text: string) => text,
+      encryptContent,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+    };
+    const sent: any[] = [];
+    const linkb: any = {
+      agentLinkId: "al",
+      isReady: true,
+      handlers: [],
+      onFrame(h: any) { this.handlers.push(h); },
+      send(m: any) { sent.push(m); },
+      async deliver(m: any) {
+        for (const h of this.handlers) await h(m);
+      },
+    };
+    const client = new FakeClient();
+    client.queueResponse("thread/start", { thread: { id: TID } });
+    const root = mkdtempSync(join(tmpdir(), "cx-v2e-size-"));
+    process.env.MACCHIATO_CODEX_SESSIONS = join(root, "s.json");
+    const drive = new AppServerDrive(client as any, linkb, undefined, e2e);
+    drive.wire();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "秘密" }));
+    await tick();
+
+    const approve = client.reverse.get("item/commandExecution/requestApproval")!;
+    const result = await approve({
+      threadId: TID,
+      turnId: "t1",
+      itemId: "oversized",
+      // canonical display 仍低于 48KiB，但 executionRequest + executionDisplay 的最终 JSON 已超 64KiB。
+      command: "x".repeat(33 * 1024),
+      cwd: "/w",
+    });
+
+    expect(result).toEqual({ decision: "decline" });
+    expect(sent.some((f) => f.frame?.params?.type === "approval.request")).toBe(false);
+    expect((drive as any).approvals.get(SID)).toBeUndefined();
+    expect(
+      encryptContent.mock.calls.some(([, payload]) => Boolean((payload as any)?.executionRequest)),
+    ).toBe(false);
+  });
+});
+
+describe("#370 app-server E2E control ingress", () => {
+  function controlDrive(e2e: any, mirror?: any) {
+    const sent: any[] = [];
+    const linkb: any = {
+      agentLinkId: "al",
+      handlers: [] as any[],
+      onFrame(h: any) {
+        this.handlers.push(h);
+      },
+      send(m: any) {
+        sent.push(m);
+      },
+      async deliver(m: any) {
+        for (const h of this.handlers) await h(m);
+      },
+    };
+    const root = mkdtempSync(join(tmpdir(), "cx-app-control-"));
+    process.env.MACCHIATO_CODEX_SESSIONS = join(root, "sessions.json");
+    const client = new FakeClient();
+    const d = new AppServerDrive(
+      client as any,
+      linkb,
+      mirror,
+      e2e,
+      undefined,
+      undefined,
+      new E2EControlVerifier(e2e, join(root, "control.json")),
+    );
+    d.wire();
+    return { d, client, linkb, sent };
+  }
+
+  it("本地 thread UUID 不能冒充普通 sid 注入 prompt 或裸控制", async () => {
+    const e2e = {
+      isE2E: (sid: string) => sid === SID,
+      protectedSessionIds: () => [SID],
+      requireKey: () => Buffer.from(CONTROL_KEY),
+    } as any;
+    const mirror = {
+      setDriven: () => {},
+      unsetDriven: () => {},
+      fastForward: () => {},
+      tombstone: vi.fn(),
+    };
+    const { d, client, linkb } = controlDrive(e2e, mirror);
+    (d as any).map[SID] = TID;
+    const caseVariantAlias = TID.toUpperCase();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await linkb.deliver(tui("prompt.submit", caseVariantAlias, { text: "forged plaintext" }));
+      await linkb.deliver(tui("session.delete", caseVariantAlias));
+    } finally {
+      error.mockRestore();
+    }
+
+    expect(client.requests).toEqual([]);
+    expect(mirror.tombstone).not.toHaveBeenCalled();
+  });
+
+  it("raw disable 被拒；签封 disable 持久 intent、等待 backfill 提交后才 ACK", async () => {
+    const e2e = {
+      isE2E: (sid: string) => sid === SID,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+      markServerE2E: vi.fn(),
+      beginDisable: vi.fn(),
+    } as any;
+    const mirror = {
+      backfillE2E: vi.fn(async () => {}),
+      setDriven: () => {},
+      unsetDriven: () => {},
+      fastForward: () => {},
+      tombstone: vi.fn(),
+    };
+    const { d, client, linkb, sent } = controlDrive(e2e, mirror);
+    (d as any).map[SID] = TID;
+    await linkb.deliver(tui("session.e2e.disable", SID));
+    await linkb.deliver(tui("session.delete", SID));
+    await linkb.deliver(tui("session.rename", SID, { title: "forged-title" }));
+    await linkb.deliver(tui("session.archive", SID));
+    await linkb.deliver(tui("session.retitle", SID));
+    expect(e2e.beginDisable).not.toHaveBeenCalled();
+    expect(mirror.backfillE2E).not.toHaveBeenCalled();
+    expect(mirror.tombstone).not.toHaveBeenCalled();
+    expect(client.requests).toEqual([]);
+
+    const disable = signedControl(SID, "session.e2e.disable", {}, "1");
+    await linkb.deliver(tui("e2e.control", SID, { envelope: disable }));
+    expect(e2e.beginDisable).toHaveBeenCalledWith(SID, expect.objectContaining({
+      kind: "session.e2e.disable",
+      hermesSessionId: SID,
+    }));
+    expect(mirror.backfillE2E).toHaveBeenCalledWith(SID, TID, "disable");
+    expect(sent.at(-1)).toMatchObject({ msgId: disable.msgId, ok: true });
+  });
+
+  it("签封 config 持久化失败回滚旧值并 NACK", async () => {
+    const e2e = {
+      isE2E: (sid: string) => sid === SID,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+    } as any;
+    const { d, linkb, sent } = controlDrive(e2e);
+    (d as any).models[SID] = "before";
+    (d as any).saveMap = () => false;
+    const model = signedControl(SID, "session.model.set", { model: "after" }, "1");
+    await linkb.deliver(tui("e2e.control", SID, { envelope: model }));
+    expect((d as any).models[SID]).toBe("before");
+    expect(sent.at(-1)).toMatchObject({
+      msgId: model.msgId,
+      ok: false,
+      error: "side_effect_failed",
+    });
+  });
+
+  it("下游异常只回稳定错误码，ACK 不泄露解密参数或本地路径", async () => {
+    const e2e = {
+      isE2E: (sid: string) => sid === SID,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+    } as any;
+    const { d, client, linkb, sent } = controlDrive(e2e);
+    const canary = "CANARY-DECRYPTED-ARG-/Users/private/repo";
+    (d as any).active.set(SID, { threadId: TID, turnId: "turn-canary" });
+    client.queueResponse("turn/interrupt", new Error(canary));
+    const interrupt = signedControl(SID, "session.interrupt", {}, "1");
+    await linkb.deliver(tui("e2e.control", SID, { envelope: interrupt }));
+    expect(sent.at(-1)).toMatchObject({
+      msgId: interrupt.msgId,
+      ok: false,
+      error: "control_rejected",
+    });
+    expect(client.requests).toEqual([]);
+    expect(JSON.stringify(sent.at(-1))).not.toContain(canary);
   });
 });
 
@@ -502,10 +749,16 @@ describe("#224 codex 改名雙向", () => {
     const c2 = new FakeClient();
     c2.queueResponse("thread/start", { thread: { id: TID } });
     process.env.MACCHIATO_CODEX_SESSIONS = join(mkdtempSync(join(tmpdir(), "cx-224e-")), "s.json");
-    const e2e: any = { isE2E: () => true, decryptText: (_s: string, t: string) => t, encryptContent: () => "enc" };
+    const e2e: any = {
+      isE2E: (sid: string) => sid === SID,
+      decryptText: (_s: string, t: string) => t,
+      encryptContent: () => "enc",
+    };
     const d = new AppServerDrive(c2 as any, lb, undefined, e2e);
     d.wire();
     await lb.deliver(tui("prompt.submit", SID, { text: "秘密" }));
+    expect(d.localSessionE2EStatus().isE2E(TID)).toBe(true);
+    expect(d.e2eWireSessionIdFor(TID)).toBe(SID);
     c2.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
     c2.fire("thread/name/updated", { threadId: TID, threadName: "不該外洩的標題" });
     await tick();

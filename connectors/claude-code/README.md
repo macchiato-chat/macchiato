@@ -8,7 +8,7 @@ native image input, and automatic session titles.
 ## Install (one-liner, from the repo root README)
 
 ```
-curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh | MACCHIATO_ONLY=claude-code bash
+Open the Macchiato app or https://macchiato.chat and copy the versioned, SHA-256-verified install command.
 ```
 
 Requires: the `claude` CLI (2.1.x+) logged in on this machine, plus Node 20+.
@@ -22,6 +22,6 @@ Requires: the `claude` CLI (2.1.x+) logged in on this machine, plus Node 20+.
 | `MACCHIATO_CC_WORKDIR` | `$HOME` | default working directory for new sessions |
 | `MACCHIATO_CC_PERMISSION_MODE` | (ask) | `bypassPermissions` / `acceptEdits` / … |
 | `MACCHIATO_CC_IDLE_S` | `600` | idle seconds before the per-session CLI process is recycled (resume is seamless) |
-| `MACCHIATO_CC_TITLE_MODE` | `summary` | `summary` / `firstmsg` / `off` |
+| `MACCHIATO_CC_TITLE_MODE` | `firstmsg` | `summary` / `firstmsg` / `off` |
 
 Run tests: `npm install && npm test`.

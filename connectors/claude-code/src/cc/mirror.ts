@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import { dirname, join, basename } from "node:path";
 import type { LinkBClient } from "../linkb/client";
 import type { E2EKeyStore } from "../e2e/keys";
+import type { E2EDisableReceiptV1 } from "../e2e/control";
 import { foldEntries, projectsDir, readEntries, type CCMessage } from "./transcripts";
 
 const POLL_MS = Number(process.env.MACCHIATO_CC_POLL_MS) || 5000;
@@ -21,12 +22,63 @@ const PRUNE_MS = Number(process.env.MACCHIATO_MIRROR_PRUNE_MS) || 7 * 24 * 3600 
 /** 單批最多消息數（防單帧超 server maxPayload）。運行時讀 env,便於測試覆蓋。 */
 const batchMax = (): number => Number(process.env.MACCHIATO_CC_BATCH_MAX) || 150;
 
+/** 公開 connector 不依賴私有 protocol package；此處鏡像 packages/protocol 的導入 wire shape。 */
+interface ImportToolCall {
+  callId: string;
+  name: string;
+  input?: unknown;
+  output?: unknown;
+  state: "ok" | "error";
+}
+
+export interface ImportMessage {
+  role: "user" | "agent" | "system";
+  text: string;
+  reasoning?: string;
+  tools?: ImportToolCall[];
+  createdAt?: string | number;
+  srcId?: string;
+  enc?: string;
+}
+
+interface ImportSession {
+  hermesSessionId: string;
+  title?: string;
+  source?: string;
+  e2e?: boolean;
+  messages: ImportMessage[];
+}
+
+interface E2EBackfillBase {
+  t: "e2e_backfill";
+  agentLinkId: string;
+  hermesSessionId: string;
+  mode?: "enable" | "disable";
+}
+
+type ConnectorE2EBackfill =
+  | (E2EBackfillBase & { found: false; session?: never; disableReceipt?: never })
+  | (E2EBackfillBase & {
+      found: true;
+      session: ImportSession;
+      disableReceipt?: E2EDisableReceiptV1;
+    });
+
+/** 只有 server 明确回报目标终态的成功 ACK 才算 backfill 事务提交。 */
+export function isCommittedE2EBackfillResult(
+  mode: "enable" | "disable",
+  ok: unknown,
+  e2e: unknown,
+): boolean {
+  return ok === true && e2e === (mode === "enable");
+}
+
 function statePath(): string {
   return process.env.MACCHIATO_CC_MIRROR || join(homedir(), ".macchiato/claude-code-mirror.json");
 }
 
 /** CCMessage → 協議 ImportMessage（tools 對齊 ImportToolCall：input/output/state,別發自造字段）。 */
-export function toImportMessage(m: CCMessage): Record<string, unknown> {
+export function toImportMessage(m: CCMessage): ImportMessage {
   return {
     role: m.role,
     text: m.text,
@@ -140,6 +192,11 @@ export class Mirror {
     mirrorGhostBlocked: 0, // 影子 session 兜底:攔下的「為 driven CLI 會話憑空建會話」次數(正常應恆 0)
   };
   private polling = false;
+  /**
+   * #347 send 只代表提交请求；server ACK 前既不能删 K_S，也不能推进/另行消费 transcript 水位线。
+   * key 用 wire sid 接 server ACK；value 保留本地 CC uuid，供 poll/fastForward 锁定和 ACK 提交水位。
+   */
+  private readonly pendingE2EBackfills = new Map<string, { localSid: string; endOffset: number }>();
 
   /** #308 MACCHIATO_MIRROR=off:停鏡像輪詢(終端側活動不進 app)。⚠️ 只停這一樣——
    * fastForward/墓碑/markLivePosted/E2E backfill 是 driven 會話衛生,必須照常跑,
@@ -149,6 +206,10 @@ export class Mirror {
   constructor(
     private readonly linkb: LinkBClient,
     private readonly e2e?: E2EKeyStore,
+    /** app-driven 本地 CC uuid → E2E wire sid；terminal 續聊仍歸原加密會話。 */
+    private readonly e2eWireSidForLocal?: (localSid: string) => string | undefined,
+    /** 身份快照無法證明完整時，未知 local uuid 不能回落成 plaintext shadow。 */
+    private readonly plaintextLocalAllowed?: (localSid: string) => boolean,
   ) {
     this.state = this.load();
   }
@@ -233,6 +294,7 @@ export class Mirror {
 
   /** 回合結束：driven 會話水位線快進到文件末（live 已投遞，鏡像別重複）。 */
   fastForward(sid: string): void {
+    if (this.hasPendingE2EBackfill(sid)) return;
     const f = this.fileForSid(sid);
     if (!f) return;
     try {
@@ -260,6 +322,27 @@ export class Mirror {
     }
     this.save();
     console.warn(`· mirror_nack batch ${batchId} → rewinding watermark for resend`);
+  }
+
+  /** server 的 backfill 事务结果：只有成功 ACK 才提交对应快照水位线。 */
+  handleE2EBackfillResult(
+    wireSid: string,
+    mode: "enable" | "disable",
+    committed: boolean,
+  ): void {
+    const pendingKey = `${mode}:${wireSid}`;
+    const pending = this.pendingE2EBackfills.get(pendingKey);
+    this.pendingE2EBackfills.delete(pendingKey);
+    if (!committed || !pending) return;
+    this.state.offsets[pending.localSid] = Math.max(this.state.offsets[pending.localSid] ?? 0, pending.endOffset);
+    this.save();
+    console.log(
+      `· E2E backfill ACK(${mode}): ${wireSid} (local ${pending.localSid}; watermark → ${pending.endOffset})`,
+    );
+  }
+
+  private hasPendingE2EBackfill(localSid: string): boolean {
+    return [...this.pendingE2EBackfills.values()].some((pending) => pending.localSid === localSid);
   }
 
   private async poll(): Promise<void> {
@@ -298,6 +381,8 @@ export class Mirror {
       this.lastSizeAt.set(sid, size);
       const grew = prevSize !== undefined && size !== prevSize;
       if (grew) this.lastGrowthAt.set(sid, now);
+      // backfill 快照已发送但 server 尚未 ACK：冻结该 sid，避免普通 poll 抢先发送同一段或推进水位。
+      if (this.hasPendingE2EBackfill(sid)) continue;
       // #154 基線策略(拍板翻轉,對齊 codex):**首掃**把既有 transcript 基線到文件末——裝上連接器
       // 不再把全部舊會話不請自來灌進側欄,歷史改走「導入」提示(全量/按 project/不導,app 端三選)。
       // 首掃之後新發現的會話 = 連接器運行期間新建 → 照舊從 0 全量鏡像(終端新會話實時可見不變)。
@@ -348,6 +433,15 @@ export class Mirror {
         const candidate = title ?? (this.state.titles[sid] ? undefined : firstUser);
         const newTitle = candidate && candidate !== this.state.titles[sid] ? candidate : undefined;
         if (messages.length || newTitle) {
+          const mappedWireSid = this.e2eWireSidForLocal?.(sid);
+          const directE2ESid = this.e2e?.isE2E(sid) ? sid : undefined;
+          const targetSid = mappedWireSid ?? directE2ESid ?? sid;
+          if (!mappedWireSid && !directE2ESid && this.plaintextLocalAllowed?.(sid) === false) {
+            console.error(
+              `[mirror] E2E identity map 不可信，凍結未知 CC transcript ${sid}，不推水位/不發明文`,
+            );
+            break;
+          }
           // 兜底自檢(2026-07-13):若竟為 driven CLI 會話走到「首次 emit(=建會話)」,說明上面兩道守衛
           // 有洞——這正是影子 session。阻止落地 + 記 mirrorGhostBlocked(健康上報帶出;正常恆 0,非 0=有洞
           // 當場可見)+ 錯誤日誌。正常路徑上這永遠不觸發(主守衛已攔)——它是防未來回歸的絆線。
@@ -357,7 +451,11 @@ export class Mirror {
               `[mirror] ⚠️ 影子 session 兜底觸發:阻止為 driven CLI 會話 ${sid} 憑空建鏡像會話(守衛有洞?mirrorGhostBlocked=${this.counters.mirrorGhostBlocked})`,
             );
           } else {
-            this.sendOne(sid, this.entry(sid, newTitle ?? this.state.titles[sid] ?? "Claude Code", messages), off);
+            this.sendOne(
+              sid,
+              this.entry(targetSid, newTitle ?? this.state.titles[sid] ?? "Claude Code", messages),
+              off,
+            );
             if (newTitle) this.state.titles[sid] = newTitle;
           }
         }
@@ -427,39 +525,69 @@ export class Mirror {
     return { hermesSessionId: sid, title, source: "claude-code", messages: mapped };
   }
 
-  /** §19 D2：E2E 開啟/關閉時全量歷史回灌（enable=密文、disable=明文）。 */
-  async backfillE2E(sid: string, mode: "enable" | "disable" = "enable"): Promise<void> {
-    const file = this.fileForSid(sid);
-    const base = { t: "e2e_backfill", agentLinkId: this.linkb.agentLinkId, hermesSessionId: sid, mode };
-    if (!file) {
-      this.linkb.send({ ...base, found: false });
-      return;
-    }
+  /** §19 D2：E2E 開啟/關閉時全量歷史回灌（enable=密文、disable=明文；ACK 后才删 K_S）。 */
+  async backfillE2E(
+    wireSid: string,
+    localSid: string | undefined,
+    mode: "enable" | "disable" = "enable",
+  ): Promise<void> {
+    const e2e = this.e2e;
+    if (!e2e) return;
+    const file = localSid ? this.fileForSid(localSid) : null;
+    const base = {
+      t: "e2e_backfill" as const,
+      agentLinkId: this.linkb.agentLinkId,
+      hermesSessionId: wireSid,
+      mode,
+    };
+    const notFound = (): void => {
+      const frame = { ...base, found: false } satisfies ConnectorE2EBackfill;
+      this.linkb.send(frame);
+      console.warn(
+        `· E2E backfill(${mode}): no settled transcript for ${wireSid}` +
+          (localSid ? ` (local ${localSid})` : " (no local session mapping)") +
+          " → found:false" +
+          (mode === "disable" ? " (disable failed, K_S kept)" : " (server history NOT replaced)"),
+      );
+    };
+    if (!localSid || !file) return notFound();
     const { entries, endOffset } = readEntries(file, 0);
     const { messages, title } = foldEntries(entries, endOffset, Number.MAX_SAFE_INTEGER); // 全結算（歷史快照）
-    const t = title ?? this.state.titles[sid] ?? "Claude Code";
-    const msgs = messages.map((m) => {
+    if (!messages.length) return notFound();
+    const t = title ?? this.state.titles[localSid] ?? "Claude Code";
+    const msgs: ImportMessage[] = messages.map((m) => {
       const im = toImportMessage(m);
       return mode === "enable"
         ? {
-            role: m.role,
-            createdAt: m.createdAt,
-            srcId: m.srcId,
-            enc: this.e2e!.encryptContent(sid, { text: im.text, reasoning: im.reasoning, tools: im.tools }),
+            role: im.role,
+            text: "", // ImportMessage wire 必填；密文路徑 server 只讀 enc，不投影此空字串。
+            ...(im.createdAt !== undefined ? { createdAt: im.createdAt } : {}),
+            ...(im.srcId ? { srcId: im.srcId } : {}),
+            enc: e2e.encryptContent(wireSid, { text: im.text, reasoning: im.reasoning, tools: im.tools }),
           }
         : im;
     });
-    this.linkb.send({
+    const session = {
+      hermesSessionId: wireSid,
+      title: mode === "enable" ? e2e.encryptText(wireSid, t) : t,
+      source: "claude-code",
+      ...(mode === "enable" ? { e2e: true } : {}),
+      messages: msgs,
+    } satisfies ImportSession;
+    // 只有完整明文 snapshot 已成功构造后才签 release receipt；先持久化 receipt，再释放 frame。
+    const disableReceipt =
+      mode === "disable" ? e2e.disableReceiptForBackfill(wireSid) : undefined;
+    const frame = {
       ...base,
       found: true,
-      title: mode === "enable" ? this.e2e!.encryptText(sid, t) : t,
-      messages: msgs,
-    });
-    // 回灌覆蓋全歷史 → 水位線推到文件末防重複
-    this.state.offsets[sid] = endOffset;
-    this.save();
-    if (mode === "disable") this.e2e?.remove(sid);
-    console.log(`· E2E backfill(${mode}) sent for ${sid} (${msgs.length} messages)`);
+      session,
+      ...(disableReceipt ? { disableReceipt } : {}),
+    } satisfies ConnectorE2EBackfill;
+    this.linkb.send(frame);
+    this.pendingE2EBackfills.set(`${mode}:${wireSid}`, { localSid, endOffset });
+    console.log(
+      `· E2E backfill(${mode}) submitted for ${wireSid} (local ${localSid}; ${msgs.length} messages; waiting for server ACK)`,
+    );
   }
 
   /** #9:offsets/titles 無界增長治理——轉錄文件消失連續 PRUNE_MS 才裁(短暫缺席回歸即清)。

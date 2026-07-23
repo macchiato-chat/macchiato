@@ -9,7 +9,7 @@ hardcodes a provider.
 ## Install (one-liner)
 
 ```
-curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh | MACCHIATO_ONLY=codex bash
+Open the Macchiato app or https://macchiato.chat and copy the versioned, SHA-256-verified install command.
 ```
 
 Requires: the `codex` CLI (0.140+) logged in on this machine (`codex login`), plus Node 20+.

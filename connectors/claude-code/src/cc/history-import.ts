@@ -5,6 +5,7 @@
  *  - server 端按會話冪等（重導 = 刪重插），tools 走 ImportToolCall 形狀。
  */
 import type { LinkBClient } from "../linkb/client";
+import type { E2EKeyStore } from "../e2e/keys";
 import { foldEntries, readEntries, type CCMessage } from "./transcripts";
 import { discoverSessions, toImportMessage } from "./mirror";
 
@@ -15,9 +16,15 @@ interface BuiltSession {
   hermesSessionId: string;
   title: string;
   source: string;
-  messages: Record<string, unknown>[];
+  messages: ReturnType<typeof toImportMessage>[];
   /** #154 所屬 project(transcript 條目的 cwd;拿不到回退目錄 slug)——按 project 導入的分組鍵。 */
   project: string;
+}
+
+type E2EStatus = Pick<E2EKeyStore, "isE2E">;
+
+function withoutE2ESessions(built: BuiltSession[], e2e: E2EStatus): BuiltSession[] {
+  return built.filter((session) => !e2e.isE2E(session.hermesSessionId));
 }
 
 export function collectImportSessions(): BuiltSession[] {
@@ -52,8 +59,8 @@ export function groupProjects(built: { project: string }[]): { name: string; cou
   return [...byName.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count);
 }
 
-export function announceImportAvailable(linkb: LinkBClient): void {
-  const built = collectImportSessions();
+export function announceImportAvailable(linkb: LinkBClient, e2e: E2EStatus): void {
+  const built = withoutE2ESessions(collectImportSessions(), e2e);
   const projects = groupProjects(built);
   linkb.send({ t: "import_available", count: built.length, projects });
   console.log(`· import_available: ${built.length} sessions importable(${projects.length} projects)`);
@@ -79,9 +86,9 @@ export function packFrames(built: BuiltSession[], budget = FRAME_BUDGET): BuiltS
 }
 
 /** 收到 import_start：枚舉(可按 projects 過濾,#154),按字節預算分帧 import_batch 回傳（最後 done:true）。 */
-export function runImport(linkb: LinkBClient, projects?: string[]): void {
+export function runImport(linkb: LinkBClient, e2e: E2EStatus, projects?: string[]): void {
   console.log(`· import_start received — enumerating transcripts…${projects?.length ? `(僅 ${projects.length} 個 project)` : ""}`);
-  let built = collectImportSessions();
+  let built = withoutE2ESessions(collectImportSessions(), e2e);
   if (projects?.length) {
     const want = new Set(projects);
     built = built.filter((s) => want.has(s.project));

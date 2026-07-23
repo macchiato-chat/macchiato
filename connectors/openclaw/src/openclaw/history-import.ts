@@ -9,6 +9,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import type { E2EKeyStore } from "../e2e/keys";
 import type { LinkBClient } from "../linkb/client";
 import type { OpenClawGateway } from "./gateway";
 import {
@@ -33,6 +34,12 @@ interface ImportSession {
   title: string;
   source: string;
   messages: MirrorMessage[];
+}
+
+type E2EStatus = Pick<E2EKeyStore, "isE2E">;
+
+function withoutE2ESessions(built: ImportSession[], e2e: E2EStatus): ImportSession[] {
+  return built.filter((session) => !e2e.isE2E(session.hermesSessionId));
 }
 
 interface ActiveMeta {
@@ -172,16 +179,16 @@ async function collectImportSessions(gw: OpenClawGateway): Promise<ImportSession
 }
 
 /** 上報可導入會話數（Link B ready 後調一次）。 */
-export async function announceImportAvailable(gw: OpenClawGateway, linkb: LinkBClient): Promise<void> {
-  const built = await collectImportSessions(gw);
+export async function announceImportAvailable(gw: OpenClawGateway, linkb: LinkBClient, e2e: E2EStatus): Promise<void> {
+  const built = withoutE2ESessions(await collectImportSessions(gw), e2e);
   linkb.send({ t: "import_available", count: built.length });
   console.log(`· import_available: ${built.length} sessions importable (incl. archived; cron/automation filtered)`);
 }
 
 /** 收到 import_start：深度枚舉（含歸檔）, 分批 import_batch 回傳（最後 done:true）。 */
-export async function runImport(gw: OpenClawGateway, linkb: LinkBClient): Promise<void> {
+export async function runImport(gw: OpenClawGateway, linkb: LinkBClient, e2e: E2EStatus): Promise<void> {
   console.log("· import_start received — enumerating full history (incl. archived)…");
-  const built = await collectImportSessions(gw);
+  const built = withoutE2ESessions(await collectImportSessions(gw), e2e);
   if (!built.length) {
     linkb.send({ t: "import_batch", sessions: [], done: true });
     console.log("  → no history, sending empty done");

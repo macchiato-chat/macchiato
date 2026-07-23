@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Macchiato Connector — one-line installer
-#   curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh | bash
+# Macchiato Connector installer (verified artifact entrypoint).
+#
+# MACCHIATO_VERIFIED_BUNDLE_V2
+# Do not download or pipe this file directly. Start from the versioned,
+# independently hash-pinned bootstrap command shown by the Macchiato app or
+# https://macchiato.chat. Direct first install fails closed below.
 #
 # Detects which agent(s) you run — Hermes, OpenClaw, Claude Code and/or Codex — and installs
 # the matching connector(s): download → pair (one-time code) → background service
@@ -36,12 +40,25 @@
 #   MACCHIATO_CODEX_BIN    (absolute path to the codex CLI, if auto-detect fails)
 #   MACCHIATO_ONLY         ("hermes" | "openclaw" | "claude-code" | "codex" — legacy single-select;
 #                           --agents supersedes it and takes a list)
-#   MACCHIATO_MANIFEST     (path to a pre-verified release.json — self_update passes it;
-#                           every installed file is sha256-checked against it before use)
+#   MACCHIATO_MANIFEST     (path to a connector-preverified legacy manifest, or the
+#                           bootstrap-verified v2 manifest)
+#   MACCHIATO_VERIFIED_ROOT (private extracted v2 artifact root; bootstrap only)
 
 set -euo pipefail
 
-REPO_TARBALL="https://github.com/macchiato-chat/macchiato/tarball/main"
+# Supported callers start this file with `bash -p`. Clear inherited functions
+# and runtime/loader hooks again before any verified payload invokes tools.
+while IFS= read -r inherited_function; do
+  builtin unset -f "$inherited_function"
+done < <(builtin compgen -A function)
+unset BASH_ENV ENV CDPATH GLOBIGNORE NODE_OPTIONS NODE_PATH \
+  PYTHONPATH PYTHONHOME PYTHONSTARTUP TAR_OPTIONS GZIP BZIP BZIP2 XZ_OPT \
+  RUBYOPT RUBYLIB PERL5OPT PERL5LIB CURL_HOME \
+  LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH \
+  2>/dev/null || true
+umask 077
+
+ORIGINAL_ARGS=("$@")
 UNIT_DIR="$HOME/.config/systemd/user"
 
 say()  { printf '\033[1;35m[macchiato]\033[0m %s\n' "$*"; }
@@ -114,7 +131,8 @@ sha256_of() {
   else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
 verify_tree() { # $1=dir under $TMP  $2=repo-relative prefix (e.g. connectors/hermes)
-  [ -z "${MACCHIATO_MANIFEST:-}" ] && return 0
+  [ -n "${MACCHIATO_MANIFEST:-}" ] \
+    || fail "missing verified manifest — direct/unverified install is forbidden"
   local f rel want got n=0
   while IFS= read -r -d '' f; do
     rel="$2/${f#"$1"/}"
@@ -165,8 +183,44 @@ install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
   say "Service $1 running ✓   Update anytime by re-running this installer. Logs: journalctl --user -u $1 -f"
 }
 
+# A legacy connector has already verified release.json with its embedded Ed25519
+# key before launching this file. Bridge it into the v2 bootstrap whose exact hash
+# is carried by that signed legacy manifest. A bare first install has no such proof
+# and is deliberately rejected.
+bridge_to_verified_bootstrap() {
+  [ -n "${MACCHIATO_MANIFEST:-}" ] \
+    || fail "unsafe direct install blocked — copy the verified command from the Macchiato app or https://macchiato.chat"
+  [ -f "$MACCHIATO_MANIFEST" ] && [ ! -L "$MACCHIATO_MANIFEST" ] \
+    || fail "pre-verified manifest is not a regular file"
+  local version bootstrap_sha bridge_dir bootstrap_url bootstrap_path actual
+  version="$(grep -E '^  "version": "[0-9]+\.[0-9]+\.[0-9]+",$' "$MACCHIATO_MANIFEST" | sed -E 's/.*"([^"]+)".*/\1/' | head -1 || true)"
+  bootstrap_sha="$(grep -E '^  "bootstrapSha256": "[0-9a-f]{64}",?$' "$MACCHIATO_MANIFEST" | grep -oE '[0-9a-f]{64}' | head -1 || true)"
+  [ -n "$version" ] && [ -n "$bootstrap_sha" ] \
+    || fail "signed manifest lacks the v2 bootstrap bridge — update cannot continue safely"
+  bridge_dir="$(command mktemp -d "${TMPDIR:-/tmp}/macchiato-bridge.XXXXXX")"
+  bootstrap_path="$bridge_dir/bootstrap-v1.sh"
+  bootstrap_url="https://raw.githubusercontent.com/macchiato-chat/macchiato/connectors-v$version/bootstrap-v1.sh"
+  trap 'command rm -rf "$bridge_dir"' EXIT HUP INT TERM
+  command curl --disable --silent --show-error --fail --proto '=https' --tlsv1.2 --max-redirs 0 \
+    --connect-timeout 15 --max-time 120 --max-filesize 2097152 \
+    --output "$bootstrap_path" "$bootstrap_url" \
+    || fail "versioned bootstrap download failed (redirects are forbidden)"
+  actual="$(sha256_of "$bootstrap_path")"
+  [ "$actual" = "$bootstrap_sha" ] \
+    || fail "versioned bootstrap sha256 mismatch — refusing to execute"
+  /bin/bash -p "$bootstrap_path" --release="$version" --bootstrap-sha256="$bootstrap_sha" -- "${ORIGINAL_ARGS[@]}"
+  local status=$?
+  command rm -rf "$bridge_dir"
+  trap - EXIT HUP INT TERM
+  exit "$status"
+}
+
+if [ "${MACCHIATO_SELFTEST:-0}" != 1 ] && [ -z "${MACCHIATO_VERIFIED_ROOT:-}" ]; then
+  case "${1:-}" in -h|--help) ;; *) bridge_to_verified_bootstrap ;; esac
+fi
+
 # ═════════════════════════════ agent selection (#307) ═══════════════════════
-# Parsed here (before the download) so --help and bad flags cost nothing.
+# Parsed after the trust bridge. --help remains available through bootstrap.
 # Pretty display name for a canonical agent key.
 agent_label() {
   case "$1" in
@@ -219,8 +273,8 @@ usage() {
   cat <<'EOF'
 Macchiato connector installer
 
-  curl -sSL https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh | bash
-  … | bash -s -- [options]
+  Start with the download → SHA-256 verify → execute command shown by the
+  Macchiato app or https://macchiato.chat. Piping install.sh to bash is blocked.
 
 Options:
   --agents=LIST   comma-separated connectors to install:
@@ -280,14 +334,15 @@ if [ -n "${MACCHIATO_HERMES_PROFILE:-}" ] && [ "$REQUESTED" != "all" ] && [ -n "
   REQUESTED="$_nr"
 fi
 
-# ── shared: download repo once ──────────────────────────────────────────────
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-# Test-only (#307): selftest resolves the plan and exits before install — skip the download.
+# ── shared: consume only the already-verified, safely extracted artifact ────
+TMP=""
 if [ "${MACCHIATO_SELFTEST:-0}" != 1 ]; then
-  say "Downloading Macchiato connectors…"
-  curl -sSL --fail --proto '=https' "$REPO_TARBALL" | tar -xz -C "$TMP" --strip-components=1
-  [ -d "$TMP/connectors" ] || fail "Downloaded repo has no connectors/ (repo layout changed?)"
+  [ -n "${MACCHIATO_VERIFIED_ROOT:-}" ] \
+    || fail "internal: verified artifact root is missing"
+  case "$MACCHIATO_VERIFIED_ROOT" in /*) ;; *) fail "verified artifact root must be absolute" ;; esac
+  [ -d "$MACCHIATO_VERIFIED_ROOT/connectors" ] \
+    || fail "verified artifact has no connectors directory"
+  TMP="$MACCHIATO_VERIFIED_ROOT"
 fi
 
 # ═════════════════════════════ Hermes ═══════════════════════════════════════

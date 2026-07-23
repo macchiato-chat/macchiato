@@ -33,7 +33,7 @@ CRED_PATH = os.path.expanduser(os.environ.get("MACCHIATO_CRED") or os.path.join(
 # #254:配對碼此前寫 /tmp 世界可讀——共享機他人可讀碼、搶先 claim 把 agent 綁到攻擊者帳號。
 # 改寫 ~/.macchiato/ 0600(下方 _write_private)。可 env 覆蓋但默認私有。
 CODE_FILE = os.path.expanduser(os.environ.get("MACCHIATO_CODE_FILE") or os.path.join(STATE_DIR, "pair-code.txt"))
-PROTO = 3  # 對齊 server 的 LINK_B_PROTO（packages/protocol）；不符會被拒 "proto mismatch"
+PROTO = 4  # 對齊 server 的 LINK_B_PROTO（packages/protocol）；不符會被拒 "proto mismatch"
 WAIT_S = 30 * 60  # overall pairing window (we refresh the code well within the server TTL)
 REFRESH_S = 6 * 60 + 30  # re-request a fresh code before the server's 8-min code TTL
 

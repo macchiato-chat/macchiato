@@ -66,6 +66,38 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 }));
 
 import { Drive } from "../src/cc/drive";
+import {
+  e2eControlKeyId,
+  e2eControlMac,
+  E2EControlVerifier,
+  type E2EControlEnvelopeV1,
+  type E2EControlKind,
+} from "../src/e2e/control";
+
+const CONTROL_KEY = Buffer.from([...Array(32).keys()]);
+
+function signedControl(
+  wireSid: string,
+  kind: E2EControlKind,
+  payload: Record<string, unknown>,
+  seq = "1",
+): E2EControlEnvelopeV1 {
+  const now = Date.now();
+  const fields = {
+    v: 1 as const,
+    sessionId: `public:${wireSid}`,
+    hermesSessionId: wireSid,
+    deviceId: "cc-drive-test",
+    keyId: e2eControlKeyId(CONTROL_KEY),
+    msgId: `00000000-0000-4000-8000-${seq.padStart(12, "0")}`,
+    seq,
+    issuedAtMs: String(now),
+    expiresAtMs: String(now + 300_000),
+    kind,
+  };
+  const raw = Buffer.from(JSON.stringify(payload), "utf8");
+  return { ...fields, payloadB64: raw.toString("base64"), mac: e2eControlMac(CONTROL_KEY, fields, raw) };
+}
 
 function fakeLinkb() {
   const sent: Record<string, unknown>[] = [];
@@ -161,6 +193,30 @@ describe("Drive", () => {
     fire(tuiFrame("01ULIDSERVERSID000000000AA", "prompt.submit", { text: "second" }));
     await new Promise((r) => setTimeout(r, 20));
     expect(lastOptions.resume).toBe(CC_SID); // 續聊走映射
+    expect(d.localSessionIdFor("01ULIDSERVERSID000000000AA")).toBe(CC_SID);
+  });
+
+  it("#347 E2E 回合在 input.push 前身份快照落盘失败 → poison/fatal，prompt 未交付 SDK", async () => {
+    const sid = "01E2EPERSISTFAIL0000000001";
+    const { linkb } = fakeLinkb();
+    const d = new Drive(
+      linkb,
+      undefined,
+      {
+        isE2E: (candidate: string) => candidate === sid,
+        protectedSessionIds: () => [sid],
+        hasServerStateSnapshot: () => true,
+      } as any,
+    );
+    (d as any).saveMap = () => false;
+    expect(() => (d as any).startTurn(sid, "绝不能交付")).toThrow(
+      /fatal: failed to persist Claude Code E2E turn identity before delivery/,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(pushedMessages).toEqual([]);
+    expect((d as any).channels.has(sid)).toBe(false);
+    expect((d as any).pending.has(sid)).toBe(false);
+    expect((d as any).identityPersistencePoisoned).toBe(true);
   });
 
   it("canUseTool → approval.request,approval.respond allow/deny 解掛;all=true 記住工具", async () => {
@@ -313,6 +369,16 @@ describe("#109 AskUserQuestion → clarify 問答", () => {
     expect(r.updatedInput.answers).toBeUndefined();
   });
 
+  it("E2E 會話本地跳過，不把 question/choices 以 clarify.request 明文送 server", async () => {
+    const { linkb, sent } = fakeLinkb();
+    const d = new Drive(linkb, undefined, { isE2E: () => true } as any);
+    const r = await (d as any).requestAnswers(CC_SID, INPUT, "toolu_e2e");
+
+    expect(r.behavior).toBe("allow");
+    expect(r.updatedInput.answers).toBeUndefined();
+    expect(sent.some((f: any) => f.frame?.params?.type === "clarify.request")).toBe(false);
+  });
+
   it("canUseTool 對 AskUserQuestion 走 clarify 而非 approval 卡", async () => {
     emitScript = [
       { type: "system", subtype: "init", session_id: CC_SID },
@@ -437,6 +503,47 @@ describe("#97→#104 background task 結構化事件 + 停止", () => {
     expect(starts[0]).toMatchObject({ task_id: "bg12345678", kind: "background", desc: "抓论文" });
     expect(ends).toHaveLength(1);
     expect(ends[0]).toMatchObject({ task_id: "bg12345678", status: "completed", summary: "抓了30篇" });
+  });
+
+  it("#384 後台任務真輸出:啟動回執解析 output 文件 → task.end 帶 report(文件尾)", async () => {
+    const outFile = join(mkdtempSync(join(tmpdir(), "cc-task-out-")), "bgtask9.output");
+    writeFileSync(outFile, "BUILD OK\n工件已產出\n");
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "stream_event", event: { type: "content_block_start", content_block: { type: "tool_use", id: "tu-bg", name: "Bash" } } },
+      { type: "system", subtype: "task_started", task_id: "bgtask9", tool_use_id: "tu-bg", description: "背景構建", subagent_type: "" },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu-bg", content: `Command running in background with ID: bgtask9. Output is being written to: ${outFile}. You will be notified when it completes.` }] } },
+      { type: "system", subtype: "task_notification", task_id: "bgtask9", status: "completed", summary: "Background command completed (exit code 0)" },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "go" }));
+    await new Promise((r) => setTimeout(r, 30));
+    const ends = sent.filter((f: any) => f.frame?.params?.type === "task.end").map((f: any) => f.frame.params.payload);
+    expect(ends).toHaveLength(1);
+    expect(ends[0].report).toContain("BUILD OK"); // 真輸出上送——「只剩 task 編號」的修復
+    // start 帶 tool_use_id(server 錨定工具塊的鑰匙)
+    const starts = sent.filter((f: any) => f.frame?.params?.type === "task.start").map((f: any) => f.frame.params.payload);
+    expect(starts[0]).toMatchObject({ task_id: "bgtask9", tool_use_id: "tu-bg" });
+  });
+
+  it("#384 report 讀不到(文件已清理)→ task.end 無 report 字段,其餘照舊", async () => {
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "system", subtype: "task_started", task_id: "bg-gone", tool_use_id: "tu-x", description: "無回執任務", subagent_type: "" },
+      { type: "system", subtype: "task_notification", task_id: "bg-gone", status: "completed", summary: "done" },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "go" }));
+    await new Promise((r) => setTimeout(r, 30));
+    const ends = sent.filter((f: any) => f.frame?.params?.type === "task.end").map((f: any) => f.frame.params.payload);
+    expect(ends).toHaveLength(1);
+    expect(ends[0].report).toBeUndefined();
   });
 
   it("task.sync:每次 ready 全量上報存活任務;任務結束後清單縮空", async () => {
@@ -742,9 +849,18 @@ describe("#102 審批 request_id + always 持久化", () => {
         store.set(b, JSON.stringify(obj));
         return b;
       },
+      requireKey: () => Buffer.from(CONTROL_KEY),
     } as any;
     const { linkb, sent, fire } = fakeLinkb();
-    const d = new Drive(linkb, undefined, e2e);
+    const replayPath = join(mkdtempSync(join(tmpdir(), "cc-control-drive-")), "control.json");
+    const d = new Drive(
+      linkb,
+      undefined,
+      e2e,
+      undefined,
+      undefined,
+      new E2EControlVerifier(e2e, replayPath),
+    );
     d.wire();
     const p = (d as any).requestApproval(CC_SID, "Bash", { command: "rm -rf /secret" }, { toolUseID: "e1", description: "刪除機密目錄" });
     const req = (sent.find((f: any) => f.frame?.params?.type === "approval.request") as any).frame.params.payload;
@@ -752,13 +868,70 @@ describe("#102 審批 request_id + always 持久化", () => {
     expect(req.description).toBe("");
     expect(req.pattern_key).toBe("Bash"); // 元數據明文
     expect(req.request_id).toBe("e1");
+    expect(req.request_digest).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(typeof req.enc).toBe("string");
     // enc 解出真實命令/說明(rm 全文不在明文任何字段)
     expect(JSON.stringify(req).includes("rm -rf")).toBe(false);
-    expect(JSON.parse(store.get(req.enc)!)).toMatchObject({ command: expect.stringContaining("rm -rf /secret"), description: "刪除機密目錄" });
-    // choice 回程照舊
+    expect(JSON.parse(store.get(req.enc)!)).toMatchObject({
+      command: expect.stringContaining("rm -rf /secret"),
+      description: "刪除機密目錄",
+      patternKey: "Bash",
+      requestId: "e1",
+      requestDigest: req.request_digest,
+    });
+    // E2E 会话的旧明文控制必须 fail closed，不能提前解挂审批。
+    let settled = false;
+    void p.finally(() => {
+      settled = true;
+    });
     fire(tuiFrame(CC_SID, "approval.respond", { choice: "allow", request_id: "e1" }));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(settled).toBe(false);
+    const envelope = signedControl(CC_SID, "approval.respond", {
+      blockId: "block-e1",
+      requestId: req.request_id,
+      requestDigest: req.request_digest,
+      choice: "yes",
+      all: false,
+    });
+    await d.onServerFrame(tuiFrame(CC_SID, "e2e.control", { envelope }));
     expect((await p).behavior).toBe("allow");
+    expect(
+      sent.find((f: any) => f.t === "e2e_control_result" && f.msgId === envelope.msgId),
+    ).toMatchObject({
+      sessionId: envelope.sessionId,
+      hermesSessionId: CC_SID,
+      ok: true,
+    });
+  });
+
+  it("#370 E2E 審批完整明文超過設備 64KiB 時先本地 deny，不 emit 或掛 pending", async () => {
+    const encryptContent = vi.fn((_sid: string, _obj: unknown) => "enc");
+    const e2e = {
+      isE2E: (sid: string) => sid === CC_SID,
+      encryptContent,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+    } as any;
+    const { linkb, sent } = fakeLinkb();
+    const drive = new Drive(linkb, undefined, e2e);
+    drive.wire();
+
+    const result = await (drive as any).requestApproval(
+      CC_SID,
+      "Bash",
+      // canonical display 仍低于 48KiB，但 executionRequest + executionDisplay 的最终 JSON 已超 64KiB。
+      { command: "x".repeat(33 * 1024) },
+      { toolUseID: "oversized" },
+    );
+
+    expect(result).toMatchObject({
+      behavior: "deny",
+      message: "E2E approval request cannot be displayed safely",
+    });
+    expect(sent.some((f: any) => f.frame?.params?.type === "approval.request")).toBe(false);
+    expect((drive as any).approvals.get(CC_SID)).toBeUndefined();
+    expect(encryptContent).not.toHaveBeenCalled();
+    drive.dispose();
   });
 });
 
@@ -1028,7 +1201,7 @@ describe("#118 streaming-input 長活通道", () => {
     d.dispose();
   });
 
-  it("#237 E2E×附件:先解密再拼註記,整條不再被靜默丟", async () => {
+  it("#372 E2E×附件 fail closed：不下载、不把 server URL/本地路径拼入 agent prompt", async () => {
     const dir = mkdtempSync(join(tmpdir(), "cc-e2eatt-"));
     const pdf = join(dir, "doc.pdf");
     writeFileSync(pdf, Buffer.alloc(8, 3));
@@ -1051,14 +1224,11 @@ describe("#118 streaming-input 長活通道", () => {
       attachments: [{ id: "e1", kind: "file", mime: "application/pdf", name: "doc.pdf", url: "https://files.example/e" }],
     }));
     await new Promise((r) => setTimeout(r, 50));
-    const content = pushedMessages[0]?.message?.content;
-    expect(typeof content).toBe("string");
-    expect(content).toContain("明文問題"); // 解密成功(未被註記污染)
-    expect(content).toContain(pdf); // 附件註記在解密後拼上
+    expect(pushedMessages).toEqual([]);
     d.dispose();
   });
 
-  it("#237 E2E 附件-only:註記即正文,不走解密不被丟", async () => {
+  it("#372 E2E 附件-only 同样 fail closed，不把未认证附件变成本地 agent 输入", async () => {
     const dir = mkdtempSync(join(tmpdir(), "cc-e2eatt2-"));
     const pdf = join(dir, "r.pdf");
     writeFileSync(pdf, Buffer.alloc(8, 5));
@@ -1079,9 +1249,7 @@ describe("#118 streaming-input 長活通道", () => {
       attachments: [{ id: "e2", kind: "file", mime: "application/pdf", name: "r.pdf", url: "https://files.example/r" }],
     }));
     await new Promise((r) => setTimeout(r, 50));
-    const content = pushedMessages[0]?.message?.content;
-    expect(typeof content).toBe("string");
-    expect(content).toContain(pdf); // 舊實現:註記被當密文解密失敗 → 整條丟
+    expect(pushedMessages).toEqual([]);
     d.dispose();
   });
 
@@ -1096,6 +1264,248 @@ describe("#118 streaming-input 長活通道", () => {
     d.dispose();
     await new Promise((r) => setTimeout(r, 20));
     expect((d as any).channels.size).toBe(0);
+  });
+});
+
+describe("#370 E2E control ingress", () => {
+  it("current/历史 transcript UUID 不能冒充普通 sid 注入 prompt 或裸控制", async () => {
+    const wireSid = "01CCALIASGUARD000000000000";
+    const e2e = {
+      isE2E: (sid: string) => sid === wireSid,
+      protectedSessionIds: () => [wireSid],
+      requireKey: () => Buffer.from(CONTROL_KEY),
+    } as any;
+    const replayPath = join(mkdtempSync(join(tmpdir(), "cc-alias-guard-")), "control.json");
+    const { linkb } = fakeLinkb();
+    const d = new Drive(
+      linkb,
+      undefined,
+      e2e,
+      undefined,
+      undefined,
+      new E2EControlVerifier(e2e, replayPath),
+    );
+    (d as any).map[wireSid] = CC_SID;
+    (d as any).aliases[wireSid] = [CC_SID];
+    const caseVariantAlias = CC_SID.toUpperCase();
+    const renameCount = renameCalls.length;
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await d.onServerFrame(tuiFrame(caseVariantAlias, "prompt.submit", { text: "forged plaintext" }));
+      await d.onServerFrame(tuiFrame(caseVariantAlias, "session.rename", { title: "forged title" }));
+    } finally {
+      error.mockRestore();
+    }
+
+    expect(queryCalls).toBe(0);
+    expect(pushedMessages).toEqual([]);
+    expect(renameCalls).toHaveLength(renameCount);
+  });
+
+  it("明文与未绑定 turn/task identity 的签封 interrupt/task.stop 均 fail closed", async () => {
+    const e2e = {
+      isE2E: (sid: string) => sid === CC_SID,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+    } as any;
+    const replayPath = join(mkdtempSync(join(tmpdir(), "cc-control-ingress-")), "control.json");
+    const { linkb, sent } = fakeLinkb();
+    const d = new Drive(
+      linkb,
+      undefined,
+      e2e,
+      undefined,
+      undefined,
+      new E2EControlVerifier(e2e, replayPath),
+    );
+    const q = {
+      interrupt: vi.fn(async () => {}),
+      stopTask: vi.fn(async (_id: string) => {}),
+    };
+    (d as any).channels.set(CC_SID, { q, turn: { completed: false } });
+    (d as any).sessionTasks.set(CC_SID, new Set(["task-123"]));
+
+    await d.onServerFrame(tuiFrame(CC_SID, "session.interrupt"));
+    await d.onServerFrame(tuiFrame(CC_SID, "task.stop", { taskId: "task-123" }));
+    expect(q.interrupt).not.toHaveBeenCalled();
+    expect(q.stopTask).not.toHaveBeenCalled();
+
+    const interrupt = signedControl(CC_SID, "session.interrupt", {}, "1");
+    await d.onServerFrame(tuiFrame(CC_SID, "e2e.control", { envelope: interrupt }));
+    expect(q.interrupt).not.toHaveBeenCalled();
+    expect(sent.at(-1)).toMatchObject({
+      msgId: interrupt.msgId,
+      ok: false,
+      error: "control_rejected",
+    });
+
+    const stop = signedControl(CC_SID, "task.stop", { taskId: "task-123" }, "2");
+    await d.onServerFrame(tuiFrame(CC_SID, "e2e.control", { envelope: stop }));
+    expect(q.stopTask).not.toHaveBeenCalled();
+    expect(sent.at(-1)).toMatchObject({
+      msgId: stop.msgId,
+      ok: false,
+      error: "control_rejected",
+    });
+
+    (d as any).channels.delete(CC_SID);
+    const missing = signedControl(CC_SID, "task.stop", { taskId: "task-missing" }, "3");
+    await d.onServerFrame(tuiFrame(CC_SID, "e2e.control", { envelope: missing }));
+    expect(sent.at(-1)).toMatchObject({
+      msgId: missing.msgId,
+      ok: false,
+      error: "control_rejected",
+    });
+  });
+
+  it("仅签封 disable 可持久 intent；config 落盘失败回滚并 NACK", async () => {
+    const e2e = {
+      isE2E: (sid: string) => sid === CC_SID,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+      markServerE2E: vi.fn(),
+      beginDisable: vi.fn(),
+    } as any;
+    const mirror = {
+      markDrivenUuid: () => {},
+      backfillE2E: vi.fn(async () => {}),
+      tombstone: vi.fn(),
+    } as any;
+    const replayPath = join(mkdtempSync(join(tmpdir(), "cc-control-disable-")), "control.json");
+    const { linkb, sent } = fakeLinkb();
+    const d = new Drive(
+      linkb,
+      mirror,
+      e2e,
+      undefined,
+      undefined,
+      new E2EControlVerifier(e2e, replayPath),
+    );
+
+    await d.onServerFrame(tuiFrame(CC_SID, "session.e2e.disable"));
+    const renameCount = renameCalls.length;
+    await d.onServerFrame(tuiFrame(CC_SID, "session.delete"));
+    await d.onServerFrame(tuiFrame(CC_SID, "session.rename", { title: "forged-title" }));
+    await d.onServerFrame(tuiFrame(CC_SID, "session.archive"));
+    await d.onServerFrame(tuiFrame(CC_SID, "session.retitle"));
+    expect(e2e.beginDisable).not.toHaveBeenCalled();
+    expect(mirror.backfillE2E).not.toHaveBeenCalled();
+    expect(mirror.tombstone).not.toHaveBeenCalled();
+    expect(renameCalls).toHaveLength(renameCount);
+
+    const disable = signedControl(CC_SID, "session.e2e.disable", {}, "1");
+    await d.onServerFrame(tuiFrame(CC_SID, "e2e.control", { envelope: disable }));
+    expect(e2e.markServerE2E).toHaveBeenCalledWith(CC_SID, "disable");
+    expect(e2e.beginDisable).toHaveBeenCalledWith(CC_SID, expect.objectContaining({
+      kind: "session.e2e.disable",
+      hermesSessionId: CC_SID,
+    }));
+    expect(mirror.backfillE2E).toHaveBeenCalledWith(CC_SID, CC_SID, "disable");
+    expect(sent.at(-1)).toMatchObject({ msgId: disable.msgId, ok: true });
+
+    (d as any).models[CC_SID] = "before";
+    (d as any).saveMap = () => false;
+    const model = signedControl(CC_SID, "session.model.set", { model: "after" }, "2");
+    await d.onServerFrame(tuiFrame(CC_SID, "e2e.control", { envelope: model }));
+    expect((d as any).models[CC_SID]).toBe("before");
+    expect(sent.at(-1)).toMatchObject({
+      msgId: model.msgId,
+      ok: false,
+      error: "side_effect_failed",
+    });
+  });
+
+  it("下游异常 ACK 只含稳定错误码，不回传 canary secret", async () => {
+    const e2e = {
+      isE2E: (sid: string) => sid === CC_SID,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+    } as any;
+    const replayPath = join(mkdtempSync(join(tmpdir(), "cc-control-canary-")), "control.json");
+    const { linkb, sent } = fakeLinkb();
+    const d = new Drive(
+      linkb,
+      undefined,
+      e2e,
+      undefined,
+      undefined,
+      new E2EControlVerifier(e2e, replayPath),
+    );
+    const canary = "CANARY-DECRYPTED-ARG-/Users/private/repo";
+    const interruptSideEffect = vi.fn(async () => {
+      throw new Error(canary);
+    });
+    (d as any).channels.set(CC_SID, {
+      q: { interrupt: interruptSideEffect },
+      turn: { completed: false },
+    });
+    const interrupt = signedControl(CC_SID, "session.interrupt", {}, "1");
+    await d.onServerFrame(tuiFrame(CC_SID, "e2e.control", { envelope: interrupt }));
+    expect(sent.at(-1)).toMatchObject({
+      msgId: interrupt.msgId,
+      ok: false,
+      error: "control_rejected",
+    });
+    expect(interruptSideEffect).not.toHaveBeenCalled();
+    expect(JSON.stringify(sent.at(-1))).not.toContain(canary);
+  });
+
+  it("clarify 先匹配 pending digest，再用 K_S 解 answerEnc；明文 answer 永不接受", async () => {
+    const decryptText = vi.fn((_sid: string, ciphertext: string) => {
+      if (ciphertext !== "cipher-answer") throw new Error("bad ciphertext");
+      return "選項 A";
+    });
+    const e2e = {
+      isE2E: (sid: string) => sid === CC_SID,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+      decryptText,
+    } as any;
+    const replayPath = join(mkdtempSync(join(tmpdir(), "cc-control-clarify-")), "control.json");
+    const { linkb, sent } = fakeLinkb();
+    const d = new Drive(
+      linkb,
+      undefined,
+      e2e,
+      undefined,
+      undefined,
+      new E2EControlVerifier(e2e, replayPath),
+    );
+    const digest = "A".repeat(43);
+    const recorded: Array<string | null> = [];
+    (d as any).clarifies.set("request-1", {
+      sid: CC_SID,
+      requestDigest: digest,
+      record: (answer: string | null) => recorded.push(answer),
+    });
+
+    const valid = signedControl(
+      CC_SID,
+      "clarify.respond",
+      {
+        blockId: "block-1",
+        requestId: "request-1",
+        requestDigest: digest,
+        answerEnc: "cipher-answer",
+      },
+      "1",
+    );
+    expect(Buffer.from(valid.payloadB64, "base64").toString("utf8")).not.toContain("選項 A");
+    await d.onServerFrame(tuiFrame(CC_SID, "e2e.control", { envelope: valid }));
+    expect(decryptText).toHaveBeenCalledWith(CC_SID, "cipher-answer");
+    expect(recorded).toEqual(["選項 A"]);
+    expect(sent.at(-1)).toMatchObject({ msgId: valid.msgId, ok: true });
+
+    const plaintext = signedControl(
+      CC_SID,
+      "clarify.respond",
+      {
+        blockId: "block-2",
+        requestId: "request-2",
+        requestDigest: digest,
+        answer: "server-visible",
+      },
+      "2",
+    );
+    await d.onServerFrame(tuiFrame(CC_SID, "e2e.control", { envelope: plaintext }));
+    expect(decryptText).toHaveBeenCalledTimes(1);
+    expect(sent.at(-1)).toMatchObject({ msgId: plaintext.msgId, ok: false });
   });
 });
 
@@ -1211,7 +1621,8 @@ describe("#98 每會話權限模式", () => {
     d.wire();
     const p = (d as any).requestApproval(CC_SID, "ExitPlanMode", { plan: "1. 加 /health 路由\n2. 返回 200" }, { toolUseID: "t1" });
     const req = sent.find((f: any) => f.frame?.params?.type === "approval.request") as any;
-    expect(req.frame.params.payload.command).toContain("批准計劃");
+    expect(req.frame.params.payload.command).toBe("Approve plan and start execution");
+    expect(req.frame.params.payload.pattern_key).toBe("ExitPlanMode");
     expect(req.frame.params.payload.plan).toContain("/health 路由");
     expect(req.frame.params.payload.description).toContain("/health 路由");
     fire(tuiFrame(CC_SID, "approval.respond", { choice: "allow", request_id: "t1" }));

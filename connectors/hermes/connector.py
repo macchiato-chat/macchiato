@@ -39,8 +39,10 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import traceback
+import uuid
 from collections import deque
 from urllib.parse import urlparse
 
@@ -50,6 +52,15 @@ import hashlib
 
 from gateway_client import GatewayClient, GatewayDied, GatewayError
 from e2e_keys import E2EKeyStore
+from e2e_control import (
+    E2EControlError,
+    E2EControlVerifier,
+    create_disable_receipt,
+    request_digest,
+    validate_disable_receipt_shape,
+    verify_disable_receipt,
+    visible_stable_json,
+)
 from backfill import (
     count_importable,
     enumerate_importable,
@@ -63,19 +74,52 @@ from backfill import (
     session_snapshot,
 )
 
-LINK_B_PROTO = 3  # 對齊 server（packages/protocol：B=3，附件雙向那版；嚴格校驗）
+LINK_B_PROTO = 4  # 對齊 server（packages/protocol：B=4，#370 E2E 控制認證；嚴格校驗）
 # §update 連接器發布版本:對齊 packages/protocol CONNECTOR_VERSION。⚠️ 發版必須**五處同步 bump**:
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.38"
+CONNECTOR_VERSION = "1.5.45"
+E2E_APPROVAL_PLAINTEXT_MAX = 64 * 1024
 # #279 E2E prompt 解密失敗的用戶可見回執(僅提示語,零內容洩漏;四連接器同文案)。
 E2E_DECRYPT_FAIL_WARNING = "無法解密這條消息(設備與連接器的加密密鑰可能失步)——請重試,或重新關閉再開啟本會話的端到端加密。"
-# 自更新拉取的安裝腳本（拉最新版 + 重啟服務，配對保留）。可經 env 覆蓋（測試/私有分發）。
-INSTALL_URL = os.environ.get(
-    "MACCHIATO_INSTALL_URL",
-    "https://raw.githubusercontent.com/macchiato-chat/macchiato/main/install.sh",
+_UUID_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+
+
+def _same_local_uuid(a: str, b: str) -> bool:
+    return bool(_UUID_ID_RE.fullmatch(a) and _UUID_ID_RE.fullmatch(b) and a.lower() == b.lower())
+
+
+_SAFE_INSTALLER_ENV = {
+    "HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "TMP", "TEMP", "SHELL", "TERM",
+    "LANG", "LANGUAGE", "TZ",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "NVM_DIR", "VOLTA_HOME", "PNPM_HOME", "BUN_INSTALL",
+    "HERMES_HOME", "HERMES_PYTHON",
+    "MACCHIATO_STATE_DIR", "MACCHIATO_HERMES_PROFILE",
+    "MACCHIATO_SERVER_URL", "MACCHIATO_WEB_URL", "MACCHIATO_MIRROR",
+    "MACCHIATO_CLAUDE_BIN", "MACCHIATO_CODEX_BIN",
+}
+
+
+def _build_installer_env(source: dict[str, str], manifest_path: str) -> dict[str, str]:
+    """只传安装所需环境；测试信任根、loader/runtime/shell hook 默认全部丢弃。"""
+    env = {
+        key: value
+        for key, value in source.items()
+        if key in _SAFE_INSTALLER_ENV or key.startswith("LC_")
+    }
+    env["MACCHIATO_ONLY"] = "hermes"
+    env["MACCHIATO_MANIFEST"] = manifest_path
+    return env
+
+
 IMPORT_BATCH = 20
 # §15 全渠道持續鏡像（tail state.db）——默認常開;#308 MACCHIATO_MIRROR=off 可停(見 MIRROR_OFF)。
 MIRROR_POLL_S = float(os.environ.get("MACCHIATO_MIRROR_POLL_S", "2"))  # 輪詢間隔（小=更即時、多步回合更增量）
@@ -460,6 +504,10 @@ class Connector:
         self._linkb_ready = False  # #251 收到 t:"ready" 才置真:handshaking 窗口不直發未認證幀、走緩衝
         self._on_fatal = lambda: sys.exit(1)  # #246 auth_error 終端態 → 退出交 supervisor(測試可覆蓋)
         self._e2e = E2EKeyStore()  # §19 per-session E2E 密鑰管理（持 K_S、封裝給設備、加解密內容）
+        self._e2e_control = E2EControlVerifier(self._e2e)  # #370 设备认证控制 + 持久防重放
+        # Hermes gateway 的原生 approval.respond 只有 session FIFO。E2E 下自行赋 request id +
+        # digest，并严格只允许签封响应消费队首，绝不把“第二张卡的批准”错批给第一张。
+        self._e2e_approvals: dict[str, deque] = {}
         self._mirror_lock = None  # 鏡像輪詢 ↔ E2E 歷史回灌互斥（防舊 floor 追加與整段替換競態）
         # 自驅會話持久映射（server sid ↔ state.db id）。跨進程/gateway 重啟保留——E2E 鏡像投遞、
         # resume 帶上下文、歸檔回寫都靠它。
@@ -473,14 +521,31 @@ class Connector:
             # agent → you: translate real session id back to the server's, then forward.
             real_sid = params.get("session_id")
             server_sid = self._rev.get(real_sid, real_sid)
-            if self._e2e.is_e2e(server_sid):
+            if self._e2e.is_protected(server_sid):
+                if not self._e2e.is_e2e(server_sid):
+                    print(
+                        f"[E2E quarantine {server_sid}] protected session has no K_S; "
+                        "local event suppressed",
+                        file=sys.stderr,
+                    )
+                    return
                 # §19 E2E:內容事件(message.*/tool.*)走加密鏡像抑制;但 #240 交互事件不能一起黑洞——
                 # approval.request 加密後放行(否則 agent 要審批用戶永遠看不到、回合卡死),媒體放行
                 # (照 e2e.md 既定邊界:附件不 E2E、存 server 可讀桶)。clarify/secret 的雙向加密走 follow-up。
                 etype = params.get("type")
+                # E2E 内容本身被抑制/镜像，但 active 生命周期仍是本地可信事实；签封
+                # interrupt 靠它区分“正在运行”与会取消未来无关回合的 idle 假成功。
+                if etype == "message.start":
+                    self._live_inflight.add(server_sid)
+                elif etype == "message.complete":
+                    self._live_inflight.discard(server_sid)
                 fwd = self._e2e_live_frame(server_sid, etype, params.get("payload") or {})
                 if fwd is not None:
                     loop.create_task(self._to_server(server_sid, fwd))
+                elif etype == "approval.request":
+                    # 缺 provenance / 无法规范化 / 完整正文过大时不能给设备一张可批准的
+                    # 摘要卡；本地直接 deny，避免 agent 永久挂起。
+                    loop.create_task(self._deny_e2e_approval(real_sid))
                 if etype == "message.complete":
                     text = (params.get("payload") or {}).get("text") or ""
                     if text:
@@ -537,6 +602,8 @@ class Connector:
                 "connectorToken": self.connector_token,
                 "agentLinkId": self.agent_link_id,
                 "proto": LINK_B_PROTO,
+                "e2eFailClosed": 1,
+                "e2eControlAuth": 1,
             }
         )
         # 保活心跳 + 自動重連：Fly 邊緣會掐閒置 WS；gateway 與 session 映射跨重連保留。
@@ -594,6 +661,196 @@ class Connector:
             {"t": "tui", "agentLinkId": self.agent_link_id, "sessionId": server_sid, "frame": frame}
         )
 
+    @staticmethod
+    def _outbound_session_ids(msg: dict) -> set[str]:
+        ids: set[str] = set()
+        for field in ("sessionId", "hermesSessionId", "chatId"):
+            value = msg.get(field)
+            if isinstance(value, str) and value:
+                ids.add(value)
+        frame = msg.get("frame")
+        if isinstance(frame, dict):
+            params = frame.get("params")
+            if isinstance(params, dict):
+                value = params.get("session_id")
+                if isinstance(value, str) and value:
+                    ids.add(value)
+        return ids
+
+    @staticmethod
+    def _safe_e2e_mirror_session(session: object) -> bool:
+        if not isinstance(session, dict) or session.get("e2e") is not True:
+            return False
+        messages = session.get("messages")
+        if not isinstance(messages, list):
+            return False
+        return all(
+            isinstance(message, dict)
+            and isinstance(message.get("enc"), str)
+            and bool(message["enc"])
+            and not str(message.get("text") or "").strip()
+            and not str(message.get("reasoning") or "").strip()
+            and not (message.get("tools") or [])
+            for message in messages
+        )
+
+    def _safe_e2e_control_result(self, msg: dict) -> bool:
+        base = {
+            "t",
+            "agentLinkId",
+            "sessionId",
+            "hermesSessionId",
+            "msgId",
+            "ok",
+        }
+        ok = msg.get("ok")
+        if set(msg) != (base if ok is True else base | {"error"}):
+            return False
+        if (
+            msg.get("t") != "e2e_control_result"
+            or msg.get("agentLinkId") != self.agent_link_id
+            or not isinstance(msg.get("sessionId"), str)
+            or not msg["sessionId"]
+            or not isinstance(msg.get("hermesSessionId"), str)
+            or not msg["hermesSessionId"]
+            or not isinstance(msg.get("msgId"), str)
+            or not msg["msgId"]
+            or not isinstance(ok, bool)
+        ):
+            return False
+        return ok is True or msg.get("error") in {
+            "control_rejected",
+            "side_effect_failed",
+        }
+
+    def _sanitize_protected_outbound(self, msg: dict) -> dict | None:
+        """最终出站闸门：持久 protection floor 建立后，任何迟到 producer 都不能发明文。
+
+        这不是只靠 ready 时清一次队列：一个旧 plaintext 任务可能在清队列之后才 await 到
+        `_send`。因此每次发送都按当前本地 floor 重验，E2E 只放行严格密文 mirror/approval、
+        key/backfill 协议和无正文 usage。
+        """
+        # 结果帧必须在 floor/route 判定前全局验 strict shape；否则空/伪造 sid 可绕过
+        # protected intersection，异常详情也可能借 error 字段成为 server 可见侧信道。
+        if msg.get("t") == "e2e_control_result":
+            if self._safe_e2e_control_result(msg):
+                return msg
+            print("[E2E outbound dropped] invalid e2e_control_result", file=sys.stderr)
+            return None
+        try:
+            protected = self._e2e.protected_session_ids()
+        except Exception as exc:
+            # keystore 已 poison/并发版本不确定时，所有可能带会话内容的出站都全局停住。
+            if msg.get("t") in {
+                "tui",
+                "import_batch",
+                "mirror_append",
+                "connector_push",
+                "voice_transcript",
+                "message_srcid",
+                "e2e_key",
+                "e2e_backfill",
+            }:
+                print(f"[E2E outbound quarantined] {exc!r}", file=sys.stderr)
+                return None
+            return msg
+        if not protected:
+            return msg
+
+        t = msg.get("t")
+        if t in ("import_batch", "mirror_append") and isinstance(msg.get("sessions"), list):
+            kept = []
+            for session in msg["sessions"]:
+                sid = session.get("hermesSessionId") if isinstance(session, dict) else None
+                if sid not in protected:
+                    kept.append(session)
+                elif t == "mirror_append" and self._safe_e2e_mirror_session(session):
+                    kept.append(session)
+                else:
+                    print(
+                        f"[E2E outbound dropped] {t} plaintext/invalid protected session {sid!r}",
+                        file=sys.stderr,
+                    )
+            if not kept and not (t == "import_batch" and msg.get("done") is True):
+                return None
+            return {**msg, "sessions": kept}
+
+        if not self._outbound_session_ids(msg).intersection(protected):
+            return msg
+        if t in ("e2e_key", "e2e_backfill"):
+            return msg
+        if t == "tui":
+            frame = msg.get("frame")
+            params = frame.get("params") if isinstance(frame, dict) else None
+            event_type = params.get("type") if isinstance(params, dict) else None
+            if event_type == "turn.usage":
+                return msg
+            payload = params.get("payload") if isinstance(params, dict) else None
+            if (
+                event_type == "approval.request"
+                and isinstance(payload, dict)
+                and payload.get("command") == "🔒 加密審批請求"
+                and payload.get("description") in (None, "")
+                and isinstance(payload.get("enc"), str)
+                and bool(payload["enc"])
+                and isinstance(payload.get("request_id"), str)
+                and bool(payload["request_id"])
+                and isinstance(payload.get("request_digest"), str)
+                and bool(payload["request_digest"])
+            ):
+                return msg
+        print(
+            f"[E2E outbound dropped] protected session plaintext frame {t!r}",
+            file=sys.stderr,
+        )
+        return None
+
+    def _drop_queued_for_protected(self, protected: set[str]) -> None:
+        """ready floor 提升时丢弃此前按 plaintext 状态积压的整帧/批内 session。"""
+        if not protected or not self._out_pending:
+            return
+        kept: deque = deque(maxlen=self._out_pending.maxlen)
+        dropped_frames = 0
+        dropped_sessions = 0
+        for raw in self._out_pending:
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                dropped_frames += 1
+                continue
+            if not isinstance(msg, dict):
+                dropped_frames += 1
+                continue
+            if msg.get("t") in ("import_batch", "mirror_append") and isinstance(
+                msg.get("sessions"), list
+            ):
+                sessions = [
+                    session
+                    for session in msg["sessions"]
+                    if not (
+                        isinstance(session, dict)
+                        and session.get("hermesSessionId") in protected
+                    )
+                ]
+                dropped_sessions += len(msg["sessions"]) - len(sessions)
+                if not sessions and not (
+                    msg.get("t") == "import_batch" and msg.get("done") is True
+                ):
+                    dropped_frames += 1
+                    continue
+                msg = {**msg, "sessions": sessions}
+            if self._outbound_session_ids(msg).intersection(protected):
+                dropped_frames += 1
+                continue
+            kept.append(json.dumps(msg, ensure_ascii=False))
+        self._out_pending = kept
+        if dropped_frames or dropped_sessions:
+            print(
+                "⚠️ E2E ready 对账清除首连前明文："
+                f"{dropped_frames} 帧、{dropped_sessions} 个批次 session",
+                file=sys.stderr,
+            )
+
     def _on_gateway_restart(self) -> None:
         # #302 gateway 死亡:在途 live 回合永收不到 message.complete → server 卡 streaming、
         # 用戶氣泡永轉圈。對齊 CC 語義:立即定稿 error(可見可重試);內容若已落 state.db,
@@ -626,7 +883,7 @@ class Connector:
         # 把該會話的運行時 id 與持久化 id 都排除出 driven。
         e2e_skip = set()
         for real_id, server_sid in self._rev.items():
-            if self._e2e.is_e2e(server_sid):
+            if self._e2e.is_protected(server_sid):
                 e2e_skip.add(real_id)
                 e2e_skip.add(server_sid)
         driven = [s for s in (list(self._rev.keys()) + list(self._fwd.keys())) if s not in e2e_skip]
@@ -785,26 +1042,94 @@ class Connector:
             print(f"[auto_title gen failed] {exc!r}", file=sys.stderr)
             return ""
 
+    async def _deny_e2e_approval(self, real_sid: str) -> None:
+        try:
+            if self.gw is not None:
+                await self.gw.request(
+                    "approval.respond",
+                    {"session_id": real_sid, "choice": "no", "all": False},
+                )
+        except Exception as exc:
+            print(f"[E2E approval auto-deny failed {real_sid}] {exc!r}", file=sys.stderr)
+
     def _e2e_live_frame(self, server_sid: str, etype: str, payload: dict) -> dict | None:
         """§19 E2E 會話的 live 事件過濾(#240)。返回要轉發的 event frame,或 None(抑制)。
         - approval.request:命令/說明加密進 enc,明文只留占位 + pattern_key/request_id(元數據);
-          server 盲存密文、不落明文,iOS 用 K_S 解密渲染。choice 回程非敏感,照 approval.respond 舊路。
+          #370 request_id + request_digest 同时放进密文，设备签封回带；server 不能换卡/伪造 always。
         - 其餘(message.*/tool.* 走加密鏡像;clarify/secret 待雙向加密 follow-up):抑制。"""
         if etype != "approval.request":
             return None
-        enc = self._e2e.encrypt_content(
-            server_sid,
-            {"command": payload.get("command", ""), "description": payload.get("description", "")},
+        request_id = str(payload.get("request_id") or f"hermes-{uuid.uuid4()}")
+        pattern_key = str(payload.get("pattern_key") or "")
+        if not pattern_key:
+            print(
+                f"[E2E approval rejected {server_sid}] missing authenticated pattern key",
+                file=sys.stderr,
+            )
+            return None
+        try:
+            # JSON round-trip freezes the exact local gateway request. Neither later mutation of
+            # `payload` nor server-side display fields may alter what this approval authorizes.
+            request_snapshot = json.loads(visible_stable_json(payload))
+            execution_request = {
+                "v": 1,
+                "connector": "hermes",
+                "sessionId": server_sid,
+                "requestId": request_id,
+                "method": "approval.respond",
+                "request": request_snapshot,
+            }
+            execution_display = visible_stable_json(execution_request)
+            if len(execution_display.encode("utf-8")) > 48 * 1024:
+                raise ValueError("canonical approval display exceeds 48 KiB")
+        except Exception as exc:
+            print(
+                f"[E2E approval rejected {server_sid}] cannot freeze full request: {exc!r}",
+                file=sys.stderr,
+            )
+            return None
+        digest = request_digest(
+            self._e2e.require_key(server_sid),
+            execution_request,
         )
+        approval_payload = {
+            "command": request_snapshot.get("command", ""),
+            "description": request_snapshot.get("description", ""),
+            # UI 的本地化/详情选择会受 patternKey 影响；必须和 command 一样来自 K_S
+            # 密文，不能继续信任 server 可改写的 outer pattern_key。
+            "patternKey": pattern_key,
+            "requestId": request_id,
+            "requestDigest": digest,
+            "executionRequest": execution_request,
+            "executionDisplay": execution_display,
+        }
+        approval_plaintext = visible_stable_json(approval_payload)
+        if len(approval_plaintext.encode("utf-8")) > E2E_APPROVAL_PLAINTEXT_MAX:
+            print(
+                f"[E2E approval rejected {server_sid}] encrypted plaintext exceeds 64 KiB",
+                file=sys.stderr,
+            )
+            return None
+        enc = self._e2e.encrypt_serialized_content(server_sid, approval_plaintext)
         out = {
             "command": "🔒 加密審批請求",
             "pattern_key": payload.get("pattern_key", ""),
             "pattern_keys": payload.get("pattern_keys", []),
             "description": "",
+            "request_id": request_id,
+            "request_digest": digest,
             "enc": enc,
         }
-        if payload.get("request_id"):
-            out["request_id"] = payload["request_id"]
+        if not hasattr(self, "_e2e_approvals"):
+            self._e2e_approvals = {}
+        pending = self._e2e_approvals.setdefault(server_sid, deque())
+        pending.append(
+            {
+                "requestId": request_id,
+                "requestDigest": digest,
+                "executionRequest": execution_request,
+            }
+        )
         return {
             "jsonrpc": "2.0",
             "method": "event",
@@ -863,6 +1188,49 @@ class Connector:
             os.replace(tmp, SESSIONS_MAP)
         except Exception as exc:
             print(f"[sessions map save failed] {exc!r}", file=sys.stderr)
+
+    def _protected_inbound_alias_owner(self, identity: str) -> str | None:
+        """把 state.db/runtime 本地 id 反查到 canonical protected wire sid。
+
+        `_ensure_session(identity)` 会优先直接 resume identity；若不做反查，server 可把受保护
+        会话的本地 id 当成一条未保护会话，绕过 prompt 解密与控制认证。
+        """
+        protected = self._e2e.protected_session_ids()
+        for wire_sid in protected:
+            if wire_sid == identity:
+                continue
+            if _same_local_uuid(wire_sid, identity):
+                return wire_sid
+            stored = self._stored.get(wire_sid)
+            runtime = self._fwd.get(wire_sid)
+            if (
+                stored == identity
+                or runtime == identity
+                or isinstance(stored, str)
+                and _same_local_uuid(stored, identity)
+                or isinstance(runtime, str)
+                and _same_local_uuid(runtime, identity)
+            ):
+                return wire_sid
+        reverse_identities = {identity}
+        if _UUID_ID_RE.fullmatch(identity):
+            lower_identity = identity.lower()
+            reverse_identities.update(
+                key
+                for key in (*self._stored_rev.keys(), *self._rev.keys())
+                if isinstance(key, str)
+                and _UUID_ID_RE.fullmatch(key)
+                and key.lower() == lower_identity
+            )
+        for reverse_identity in reverse_identities:
+            owners = (
+                self._stored_rev.get(reverse_identity),
+                self._rev.get(reverse_identity),
+            )
+            for owner in owners:
+                if owner and owner != identity and owner in protected:
+                    return owner
+        return None
 
     async def _ensure_session(self, server_sid: str) -> str:
         real = self._fwd.get(server_sid)
@@ -991,6 +1359,9 @@ class Connector:
         回覆/標題被靜默丟掉,會話卡成「影子」,2026-07-12 實測)。鏡像/健康/pong 有自愈或時效性,照舊丟。
         返回「是否已實際發出」(緩衝/丟棄 → False)——鏡像靠它決定推不推水位線(#239):
         失敗批若照推,server 沒收到就永不 nack,消息永久丟失且無自愈路徑。"""
+        msg = self._sanitize_protected_outbound(msg)
+        if msg is None:
+            return False
         data = json.dumps(msg, ensure_ascii=False)
         # #251:只在 ready(已收 t:"ready")後直發——handshaking 窗口(ws 已置但未認證)直發會發出
         # 未認證幀;ready 補發期間新幀也走緩衝、由補發循環按序帶出,不繞過隊列亂序。
@@ -1033,6 +1404,10 @@ class Connector:
             text = req.get("text") or ""
             if not chat_id or not text:
                 ack = {"ok": False, "error": "missing chatId/text"}
+            elif self._e2e.is_protected(chat_id) or self._e2e.is_protected(f"macchiato:{chat_id}"):
+                # connector_push 的 wire shape 只有明文 text。目的會話（含 server 的
+                # inbox fallback sid）受 E2E 保護時必須在本機拒絕，不能先把正文交給 server。
+                ack = {"ok": False, "error": "E2E push unsupported"}
             elif self.ws is None:
                 ack = {"ok": False, "error": "link B down", "retryable": True}
             else:
@@ -1223,9 +1598,14 @@ class Connector:
 
     def _self_update(self) -> None:
         """§update：收到 server 的 self_update → **驗證鏈全過才執行**（#1 供應鏈加固）：
-        release.json+.sig 內嵌公鑰驗簽 → 拒絕降級 → install.sh sha256 對上清單 → 從本地
-        臨時文件跑（非 curl|bash 管道），清單經 MACCHIATO_MANIFEST 傳入供逐文件校驗。
+        release.json+.sig 內嵌公鑰驗簽 → bootstrap bridge + 嚴格升版 → install.sh sha256
+        對上清單 → 從本地臨時文件跑（非 curl|bash 管道），清單經 MACCHIATO_MANIFEST 傳入
+        供逐文件校驗。
         systemd 重啟會殺掉本進程並起新版；非 systemd（手動跑）則只更新文件、下次重啟生效。"""
+        if getattr(self, "_self_update_started", False):
+            print("[self_update ignored] 已在本进程启动，拒绝并发/重放安装", file=sys.stderr)
+            return
+        self._self_update_started = True
         print("· 收到 self_update → 驗證發布簽名…", file=sys.stderr)
         try:
             import tempfile
@@ -1238,17 +1618,34 @@ class Connector:
                 "https://raw.githubusercontent.com/macchiato-chat/macchiato/main",
             )
 
-            def fetch(path: str) -> bytes:
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+
+            opener = urllib.request.build_opener(NoRedirect)
+
+            def fetch(path: str, maximum: int) -> bytes:
                 url = f"{base}/{path}"
                 if not url.startswith("https://"):
                     raise ValueError(f"拒絕非 https:{url}")
-                with urllib.request.urlopen(url, timeout=30) as r:  # noqa: S310  # https 已強制
-                    return r.read()
+                with opener.open(url, timeout=30) as r:  # noqa: S310  # https + 禁 redirect
+                    if r.getcode() != 200 or r.geturl() != url:
+                        raise ValueError(f"拒絕 redirect/非 200:{url}")
+                    declared = r.headers.get("Content-Length")
+                    if declared is not None and (not declared.isdigit() or int(declared) > maximum):
+                        raise ValueError(f"HTTP body 超過 {maximum} bytes:{url}")
+                    body = r.read(maximum + 1)
+                    if len(body) > maximum:
+                        raise ValueError(f"HTTP body 超過 {maximum} bytes:{url}")
+                    return body
 
-            manifest_bytes = fetch("release.json")
-            m = rv.verify_manifest(manifest_bytes, fetch("release.json.sig").decode())
-            rv.check_not_downgrade(m["version"], CONNECTOR_VERSION)
-            install_sh = fetch("install.sh")
+            manifest_bytes = fetch("release.json", 1024 * 1024)
+            m = rv.verify_manifest(
+                manifest_bytes,
+                fetch("release.json.sig", 1024).decode("ascii"),
+            )
+            rv.check_self_update_allowed(m, CONNECTOR_VERSION)
+            install_sh = fetch("install.sh", 2 * 1024 * 1024)
             want = m["files"].get("install.sh")
             got = rv.sha256_hex(install_sh)
             if not want or got != want:
@@ -1261,16 +1658,22 @@ class Connector:
             with open(mf_path, "wb") as f:
                 f.write(manifest_bytes)
             print(f"· 簽名/版本/哈希全過(v{m['version']})→ 後台安裝…", file=sys.stderr)
-            env = dict(os.environ, MACCHIATO_ONLY="hermes", MACCHIATO_MANIFEST=mf_path)
+            env = _build_installer_env(dict(os.environ), mf_path)
             # detached：脫離本進程，免得服務重啟殺自己時把更新也中斷
-            subprocess.Popen(
-                ["bash", sh_path],
+            child = subprocess.Popen(
+                ["/bin/bash", "-p", sh_path],
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            def watch_installer() -> None:
+                if child.wait() != 0:
+                    self._self_update_started = False
+
+            threading.Thread(target=watch_installer, daemon=True).start()
         except Exception as exc:
+            self._self_update_started = False
             print(f"[self_update failed] {exc!r}", file=sys.stderr)
             self._last_error = f"self_update failed: {exc}"
 
@@ -1452,7 +1855,16 @@ class Connector:
                 if maxid is not None and maxid > wm.get(sid, 0):
                     wm[sid] = maxid
                 continue
-            e2e = self._e2e.is_e2e(pid)  # §19：E2E 會話走加密鏡像（方案 A），不跳過
+            protected = self._e2e.is_protected(pid)
+            if protected and not self._e2e.is_e2e(pid):
+                # server-positive floor 已落盘但本机没有 K_S：宁可保留水位、反复告警，
+                # 也不能把历史按非 E2E 明文镜像出去。
+                print(
+                    f"[E2E mirror quarantined {pid}] protected session has no K_S",
+                    file=sys.stderr,
+                )
+                continue
+            e2e = protected  # §19：E2E 會話走加密鏡像（方案 A），不跳過
             if (sid in self._rev or sid in self._fwd or sid in self._stored_rev) and not e2e:
                 # 續聊 Discord 會話（source=discord，經 tui 驅動）：運行時 id ≠ 持久化 id、消息落
                 # 持久化 id 下、鏡像看到的是它，故連 _fwd 一起查,否則重複投遞。macchiato 新建會話
@@ -1576,21 +1988,43 @@ class Connector:
                 server_sid, snap["title"], snap["source"], snap["archived"], snap["messages"],
                 mode == "enable",
             )
-            await self._send({
+            backfill = {
                 "t": "e2e_backfill",
                 "agentLinkId": self.agent_link_id,
                 "hermesSessionId": server_sid,
                 "mode": mode,
                 "found": True,
                 "session": entry,
-            })
+            }
+            if mode == "disable":
+                # 关闭回灌会把 plaintext 交给不可信 server。先为设备签名 intent 生成
+                # connector-authenticated release receipt 并和 K_S 原子落盘；只有之后才允许
+                # plaintext 离开本机。重试必须复用同一 receipt，不能生成第二份模糊结算状态。
+                pending = self._e2e.pending_disable(server_sid)
+                if pending is None:
+                    raise E2EControlError(
+                        "disable backfill has no authenticated durable intent"
+                    )
+                receipt = pending["receipt"]
+                if receipt is None:
+                    receipt = create_disable_receipt(
+                        self._e2e.require_key(server_sid),
+                        pending["intent"],
+                    )
+                    self._e2e.save_disable_receipt(server_sid, receipt)
+                else:
+                    verify_disable_receipt(
+                        self._e2e.require_key(server_sid),
+                        receipt,
+                        expected_intent=pending["intent"],
+                    )
+                backfill["disableReceipt"] = receipt
+            await self._send(backfill)
             st = self._mirror_st or self._load_mirror_state()
             wm = st["sessions"]
             if snap["cover"] > wm.get(state_sid, 0):
                 wm[state_sid] = snap["cover"]
                 self._save_mirror_state(st)
-            if mode == "disable":
-                self._e2e.remove(server_sid)  # 關閉完成：刪 K_S，live/mirror 回明文路徑
             print(
                 f"· E2E 回灌({mode})：{server_sid} 全歷史 {len(snap['messages'])} 條已回傳"
                 f"（水位線→{snap['cover']}）"
@@ -1603,7 +2037,7 @@ class Connector:
         assert self.gw is not None
         # #13:記回合 floor——此後 > floor 的 state.db 行即本回合所寫,
         # 回合結束(message.complete)按它定位行 id 回填 live 消息身份。
-        if self._stored.get(server_sid) and not self._e2e.is_e2e(server_sid):
+        if self._stored.get(server_sid) and not self._e2e.is_protected(server_sid):
             try:
                 self._turn_floor[server_sid] = await current_max_id()
             except Exception:
@@ -1839,9 +2273,13 @@ class Connector:
             except Exception:
                 pass  # 單目錄壞不擋其餘
 
-    def _dispatch_session(self, server_sid: str, coro_factory) -> None:
+    def _dispatch_session(self, server_sid: str, coro_factory, *, propagate: bool = False):
         """#148:把慢工作掛到該會話的串行鏈上。讀循環立刻返回;同會話按序、跨會話並發。
-        前任異常不斷鏈(已各自記日誌/計數);鏈尾完成且仍是尾 → 清條目防字典緩慢積長。"""
+        前任異常不斷鏈(已各自記日誌/計數);鏈尾完成且仍是尾 → 清條目防字典緩慢積長。
+
+        #370 的認證控制必須等真實副作用完成後才 ACK，因此可要求把當前任務異常重新拋給
+        `_on_server_msg`；普通 prompt/非 E2E 控制仍保持既有 fire-and-forget 行為。
+        """
         prev = self._session_chains.get(server_sid)
 
         async def run():
@@ -1855,6 +2293,8 @@ class Connector:
             except Exception as exc:
                 self._count("dispatchErrors")  # #10
                 print(f"[dispatch failed prompt.submit {server_sid}] {exc!r}", file=sys.stderr)
+                if propagate:
+                    raise
 
         task = asyncio.create_task(run())
         self._session_chains[server_sid] = task
@@ -1864,6 +2304,7 @@ class Connector:
                 self._session_chains.pop(server_sid, None)
 
         task.add_done_callback(_cleanup)
+        return task
 
     async def _on_server_msg(self, raw) -> None:
         try:
@@ -1871,10 +2312,150 @@ class Connector:
         except json.JSONDecodeError:
             return
         t = msg.get("t")
+        if not self._linkb_ready and t not in ("ready", "auth_error", "ping"):
+            # 在 ready E2E snapshot 验证并把 positive floor 持久化以前，任何业务帧都
+            # 不能进入 legacy 路径；畸形 ready 后同一恶意连接继续发帧也一律丢弃。
+            print(f"[pre-ready frame rejected] {t!r}", file=sys.stderr)
+            return
         if t == "ready":
+            # #370：disable backfill 的提交 ACK 可能在断线中丢失。server 的 e2e:false 或
+            # ready omission 都不是可信降级证明；只有当前 K_S 能验过、且与本地 durable
+            # intent/release 完全相同的 connector receipt 才能结算并删除 K_S。
+            state = msg.get("e2eState")
+            try:
+                if not isinstance(state, dict) or state.get("version") != 1:
+                    raise ValueError("missing/invalid e2eState")
+                rows = state.get("sessions")
+                if not isinstance(rows, list):
+                    raise ValueError("invalid e2eState sessions")
+                server_e2e: dict[str, str | None] = {}
+                for row in rows:
+                    if (
+                        not isinstance(row, dict)
+                        or set(row) != {"hermesSessionId", "pendingOp"}
+                        or not isinstance(row.get("hermesSessionId"), str)
+                        or not row["hermesSessionId"]
+                        or row.get("pendingOp") not in (None, "enable", "disable")
+                        or row["hermesSessionId"] in server_e2e
+                    ):
+                        raise ValueError("invalid/duplicate e2eState session")
+                    server_e2e[row["hermesSessionId"]] = row["pendingOp"]
+                receipts = state.get("disabledReceipts")
+                if not isinstance(receipts, list):
+                    raise ValueError("invalid e2eState disabledReceipts")
+                receipt_by_sid: dict[str, dict] = {}
+                exact_receipt_keys = {
+                    "v",
+                    "kind",
+                    "sessionId",
+                    "hermesSessionId",
+                    "keyId",
+                    "intentDeviceId",
+                    "intentMsgId",
+                    "intentSeq",
+                    "receiptId",
+                    "mac",
+                }
+                for receipt in receipts:
+                    if (
+                        not isinstance(receipt, dict)
+                        or set(receipt) != exact_receipt_keys
+                        or not isinstance(receipt.get("hermesSessionId"), str)
+                        or not receipt["hermesSessionId"]
+                        or receipt["hermesSessionId"] in receipt_by_sid
+                    ):
+                        raise ValueError("invalid/duplicate disabled receipt")
+                    validate_disable_receipt_shape(receipt)
+                    receipt_by_sid[receipt["hermesSessionId"]] = receipt
+
+                # 先单调持久化 server-positive floor，再处理 receipt / flush。即使本机 K_S
+                # 已丢，后续 raw prompt/control/mirror 也只能 quarantine，绝不降到明文。
+                self._e2e.protect_sessions(set(server_e2e))
+                # floor 提升前断线缓冲里可能已有 plaintext TUI/import；必须在任何 receipt
+                # 结算和 ready flush 之前按“提升后的完整保护域”过滤。后续迟到 producer
+                # 仍由 `_send` 的最终出站闸门逐帧重验。
+                self._drop_queued_for_protected(
+                    self._e2e.protected_session_ids()
+                )
+                completed: set[str] = set()
+                for sid in self._e2e.pending_disable_sessions():
+                    receipt = receipt_by_sid.get(sid)
+                    pending = self._e2e.pending_disable(sid)
+                    remote_op = server_e2e.get(sid)
+                    if remote_op == "enable":
+                        # ACK 丢失后用户可能立刻重新开启：server 此时仍在同一 ready
+                        # 中携 R1。只有本地 K1 能验过且与 durable release 完全一致的 R1
+                        # 才允许退休 K1；随后保留 floor，wrap 必须生成全新的 K2。
+                        if (
+                            receipt is None
+                            or pending is None
+                            or pending["receipt"] != receipt
+                        ):
+                            raise ValueError(
+                                "pending re-enable has no matching authenticated disable receipt"
+                            )
+                        verify_disable_receipt(
+                            self._e2e.require_key(sid),
+                            receipt,
+                            expected_intent=pending["intent"],
+                        )
+                        self._e2e.complete_disable_for_reenable(sid, receipt)
+                        completed.add(sid)
+                        continue
+                    if receipt is None or pending is None or pending["receipt"] != receipt:
+                        continue
+                    if sid in server_e2e:
+                        # stable E2E / pending-disable 与“旧 plaintext release 已提交”
+                        # 同时出现是矛盾状态，不能任选其一继续。
+                        raise ValueError(
+                            "disable receipt conflicts with active E2E server state"
+                        )
+                    verify_disable_receipt(
+                        self._e2e.require_key(sid),
+                        receipt,
+                        expected_intent=pending["intent"],
+                    )
+                    self._e2e.complete_disable(sid, receipt)
+                    completed.add(sid)
+                if completed:
+                    # 这些旧 epoch 已由 server 提交；断线期间缓存的旧密文/回灌帧不能再补发。
+                    # re-enable 会话仍由 retained protection floor 保持隔离，直到生成 K2。
+                    kept = deque()
+                    for pending_raw in self._out_pending:
+                        try:
+                            pending_msg = json.loads(pending_raw)
+                        except Exception:
+                            kept.append(pending_raw)
+                            continue
+                        pending_sid = pending_msg.get("hermesSessionId") or pending_msg.get("sessionId")
+                        nested_sessions = pending_msg.get("sessions")
+                        touches_completed = pending_sid in completed or (
+                            isinstance(nested_sessions, list)
+                            and any(
+                                isinstance(item, dict)
+                                and item.get("hermesSessionId") in completed
+                                for item in nested_sessions
+                            )
+                        )
+                        if not touches_completed:
+                            kept.append(pending_raw)
+                    self._out_pending = kept
+                    print(
+                        f"· E2E disable ACK 丢失恢复：已按认证 receipt 结算 {len(completed)} 个会话"
+                    )
+            except Exception as exc:
+                self._linkb_state = "e2e_state_error"
+                self._last_error = "invalid E2E ready state"
+                print(
+                    f"[E2E ready rejected; no queued frame flushed] {exc!r}",
+                    file=sys.stderr,
+                )
+                if getattr(self, "ws", None) is not None:
+                    await self.ws.close(code=1008, reason="invalid E2E ready state")
+                return
             self._linkb_state = "connected"
             print("✓ link B ready — 連接器上線，等待 server 下達")
-            if self._out_pending and self.ws is not None:
+            if self._out_pending and getattr(self, "ws", None) is not None:
                 n = len(self._out_pending)
                 try:
                     # #251:先 peek 再 popleft——send 失敗時該幀不丟(此前 popleft 後 send 拋即丟一幀)。
@@ -1919,6 +2500,23 @@ class Connector:
             # §19：iOS 開啟某會話 E2E / 新設備加入 → 生成或取出 K_S，封裝給各設備公鑰、回傳。
             sid = msg.get("hermesSessionId")
             if sid:
+                pending = self._e2e.pending_disable(sid)
+                if pending is not None:
+                    # disable 已提交但 ACK 丢失时，server 可能在同一连接上立刻收到用户
+                    # re-enable，来不及经过下一次 ready 对账。此时绝不能 createForEnable
+                    # 复用 K1；live 请求也必须携带并通过本地 K1 验证 R1，先原子退休旧
+                    # epoch、保留 protection floor，随后才可生成 K2。
+                    receipt = msg.get("disableReceipt")
+                    if receipt != pending.get("receipt") or receipt is None:
+                        raise E2EControlError(
+                            "pending re-enable has no matching authenticated disable receipt"
+                        )
+                    verify_disable_receipt(
+                        self._e2e.require_key(sid),
+                        receipt,
+                        expected_intent=pending["intent"],
+                    )
+                    self._e2e.complete_disable_for_reenable(sid, receipt)
                 wrapped = self._e2e.wrap_for_devices(sid, msg.get("devices") or [])
                 await self._send({
                     "t": "e2e_key",
@@ -1932,10 +2530,69 @@ class Connector:
                     asyncio.create_task(self._e2e_backfill_history(sid))
             return
         if t == "e2e_disable_request":
-            # §19 關閉：明文回灌（server 恢復可讀+投影）→ 成功後刪本地 K_S。
+            # 仅用于断线恢复：发起动作必须先经过 `session.e2e.disable` 设备签封，
+            # 并在本地持久化 pending marker。server 单方面发裸帧绝不能触发明文回灌。
             sid = msg.get("hermesSessionId")
-            if sid:
+            if sid and self._e2e.has_pending_disable(sid):
                 asyncio.create_task(self._e2e_backfill_history(sid, mode="disable"))
+            elif sid:
+                print(
+                    f"[E2E disable resume rejected {sid}] no authenticated local intent",
+                    file=sys.stderr,
+                )
+                # server 可能因 ACK timeout 保守保留 pending；显式 found:false 让其安全清掉
+                # pending、维持 e2e/K_S，用户随后可用新 seq 重试。绝不发送明文 snapshot。
+                await self._send(
+                    {
+                        "t": "e2e_backfill",
+                        "agentLinkId": self.agent_link_id,
+                        "hermesSessionId": sid,
+                        "mode": "disable",
+                        "found": False,
+                    }
+                )
+            return
+        if t == "e2e_backfill_result":
+            sid = msg.get("hermesSessionId")
+            mode = msg.get("mode")
+            if mode == "disable" and isinstance(sid, str) and sid:
+                try:
+                    if msg.get("ok") is True and msg.get("e2e") is False:
+                        pending = self._e2e.pending_disable(sid)
+                        if pending is None or pending["receipt"] is None:
+                            raise E2EControlError(
+                                "disable result has no matching local release"
+                            )
+                        receipt = msg.get("disableReceipt")
+                        if receipt != pending["receipt"]:
+                            raise E2EControlError("disable result receipt mismatch")
+                        verify_disable_receipt(
+                            self._e2e.require_key(sid),
+                            receipt,
+                            expected_intent=pending["intent"],
+                        )
+                        self._e2e.complete_disable(sid, receipt)
+                        print(f"· E2E 關閉提交 ACK：已刪除 {sid} 的 K_S")
+                    else:
+                        pending = self._e2e.pending_disable(sid)
+                        if pending is not None and pending["receipt"] is None:
+                            self._e2e.cancel_disable(sid)
+                            print(
+                                f"[E2E disable not committed {sid}] K_S retained",
+                                file=sys.stderr,
+                            )
+                        elif pending is not None:
+                            # plaintext + receipt 已经离机，不能信 server 的失败帧撤销本地
+                            # release；保留 K_S/receipt，重连后重发或按 ready receipt 结算。
+                            print(
+                                f"[E2E disable result untrusted after release {sid}] "
+                                "K_S/receipt retained",
+                                file=sys.stderr,
+                            )
+                except Exception as exc:
+                    # 持久状态无法安全结算时保持进程 fail noisy；不能吞掉后继续猜测明文态。
+                    print(f"[E2E disable settle failed {sid}] {exc!r}", file=sys.stderr)
+                    raise
             return
         if t == "project_op":
             await self._project_op(msg)
@@ -1946,25 +2603,190 @@ class Connector:
         frame = msg.get("frame") or {}
         method = frame.get("method")
         params = frame.get("params") or {}
-        server_sid = params.get("session_id") or msg.get("sessionId")
+        outer_sid = msg.get("sessionId")
+        params_sid = params.get("session_id")
+        if (
+            isinstance(outer_sid, str)
+            and isinstance(params_sid, str)
+            and outer_sid != params_sid
+        ):
+            print(
+                f"[dispatch rejected] Link B outer/params session mismatch: {outer_sid!r} != {params_sid!r}",
+                file=sys.stderr,
+            )
+            return
+        server_sid = params_sid or outer_sid
+        if not isinstance(server_sid, str) or not server_sid:
+            return
+        try:
+            alias_owner = self._protected_inbound_alias_owner(server_sid)
+        except Exception as exc:
+            print(
+                f"[E2E inbound quarantined {server_sid}] {exc!r}",
+                file=sys.stderr,
+            )
+            return
+        if alias_owner is not None:
+            print(
+                f"[E2E local alias rejected {server_sid}] "
+                f"canonical wire session is {alias_owner}",
+                file=sys.stderr,
+            )
+            return
         assert self.gw is not None
 
+        authenticated_control = False
+        control_msg_id = None
+        control_session_id = None
+        control_error = None
+        if method == "e2e.control":
+            envelope = params.get("envelope")
+            control_msg_id = envelope.get("msgId") if isinstance(envelope, dict) else None
+            control_session_id = envelope.get("sessionId") if isinstance(envelope, dict) else None
+            try:
+                method, payload = self._e2e_control.verify_and_consume(envelope, server_sid)
+                # 认证 payload 必须 shape 唯一；不能让不同语言/旧逻辑对额外字段作不同解释。
+                keys = set(payload)
+                if method == "command.invoke":
+                    if keys not in ({"command"}, {"command", "argsEnc"}):
+                        raise E2EControlError("invalid command.invoke payload")
+                    # `/commands` catalog 目前来自不可信 server，设备无法证明 slug/展开语义；
+                    # 即使信封本身有效也不能签执行。用户仍可把 `/foo` 当普通 E2E prompt 输入。
+                    raise E2EControlError(
+                        "command.invoke unsupported until command catalog is authenticated"
+                    )
+                elif method == "approval.respond":
+                    required = {"blockId", "requestId", "requestDigest", "choice", "all"}
+                    if keys != required:
+                        raise E2EControlError("invalid approval.respond payload")
+                    if any(not isinstance(payload.get(k), str) or not payload[k] for k in ("blockId", "requestId", "requestDigest", "choice")):
+                        raise E2EControlError("invalid authenticated approval identity")
+                    if not isinstance(payload.get("all"), bool):
+                        raise E2EControlError("approval all must be explicit boolean")
+                    if payload["choice"] not in ("yes", "no"):
+                        raise E2EControlError("invalid authenticated approval choice")
+                    if payload["all"]:
+                        raise E2EControlError(
+                            "persistent approval scope is unsupported for E2E"
+                        )
+                elif method == "clarify.respond":
+                    required = {"blockId", "requestId", "requestDigest", "answerEnc"}
+                    if keys != required or any(
+                        not isinstance(payload.get(k), str) or not payload[k] for k in required
+                    ):
+                        raise E2EControlError("invalid clarify.respond payload")
+                    # 协议预留完整认证 kind；Hermes 当前没有安全的 E2E request/UI 回路（#273），
+                    # 因而响应也 fail closed，不能把 server 自造值喂给 gateway。
+                    raise E2EControlError(
+                        "clarify.respond unsupported until encrypted request channel exists"
+                    )
+                elif method == "secret.respond":
+                    required = {"blockId", "requestId", "requestDigest", "secretEnc"}
+                    if keys != required or any(
+                        not isinstance(payload.get(k), str) or not payload[k] for k in required
+                    ):
+                        raise E2EControlError("invalid secret.respond payload")
+                    # 协议预留完整认证 kind；Hermes 当前没有安全的 E2E request/UI 回路（#273），
+                    # 因而响应也 fail closed，不能把 server 自造值喂给 gateway。
+                    raise E2EControlError(
+                        "secret.respond unsupported until encrypted request channel exists"
+                    )
+                elif method == "session.cwd.set":
+                    if keys != {"cwd"} or payload["cwd"] is not None and not isinstance(payload["cwd"], str):
+                        raise E2EControlError("invalid session.cwd.set payload")
+                    # Hermes 的 `_cwds` 目前只是进程内状态，且 busy/重启无法证明设置已持久
+                    # 生效。签封路径不能因此回成功 ACK；等有本地事务化 settings store 再开放。
+                    raise E2EControlError("session.cwd.set is not safely supported by Hermes")
+                elif method in ("session.permission.set", "session.model.set", "session.effort.set"):
+                    # Hermes 没有这些 per-session 控制；不要 ACK 一个实际未应用的设置。
+                    raise E2EControlError(f"{method} is not supported by Hermes")
+                elif method == "session.interrupt":
+                    if keys:
+                        raise E2EControlError("invalid session.interrupt payload")
+                    # 空 payload 没有绑定 connector 认证的当前 turn。server 可把用户为 A
+                    # 签的 stop 延迟到 B 才投递；在引入本地 turn nonce 前必须 fail closed。
+                    raise E2EControlError(
+                        "session.interrupt unsupported until active turn is authenticated"
+                    )
+                elif method == "session.e2e.disable":
+                    if keys:
+                        raise E2EControlError("invalid session.e2e.disable payload")
+                elif method == "task.stop":
+                    # Hermes gateway 尚无后台任务 stop method；明确 NACK，不能把 no-op 当成功。
+                    raise E2EControlError("task.stop is not supported by Hermes")
+                else:
+                    raise E2EControlError("unsupported authenticated control kind")
+                params = {**payload, "session_id": server_sid}
+                authenticated_control = True
+            except Exception as exc:
+                control_error = str(exc)
+                print(f"[E2E control rejected {server_sid}] {exc}", file=sys.stderr)
+                if isinstance(control_msg_id, str) and control_msg_id:
+                    await self._send(
+                        {
+                            "t": "e2e_control_result",
+                            "agentLinkId": self.agent_link_id,
+                            "sessionId": control_session_id,
+                            "hermesSessionId": server_sid,
+                            "msgId": control_msg_id,
+                            "ok": False,
+                            # 不可信 server 不应从下游异常侧信道拿到已解密 args/本地路径。
+                            # 细节已写本地 stderr；wire 只给稳定泛化码。
+                            "error": "control_rejected",
+                        }
+                    )
+                return
+
+        sensitive_methods = {
+            "command.invoke",
+            "approval.respond",
+            "clarify.respond",
+            "secret.respond",
+            "session.create",
+            "session.cwd.set",
+            "session.permission.set",
+            "session.model.set",
+            "session.effort.set",
+            "session.interrupt",
+            "task.stop",
+            "session.e2e.disable",
+            # 这些虽然不是 agent prompt，却会写本机 transcript/镜像墓碑/归档状态；
+            # E2E 下同样不能把 server 的裸帧当成用户意图。
+            "session.delete",
+            "session.rename",
+            "session.archive",
+            "session.retitle",
+        }
+        if self._e2e.is_protected(server_sid) and method in sensitive_methods and not authenticated_control:
+            print(f"[E2E legacy control rejected {server_sid}] {method}", file=sys.stderr)
+            return
+
+        control_accepted = False
         try:
             if method == "prompt.submit":
                 # #148:慢路徑(resume 往返/附件下載/STT)出讀循環——經 per-session 串行鏈派發,
                 # 某會話的大附件/慢 STT 不再 head-of-line 阻塞其他會話。同會話仍按序。
                 async def _do_prompt(params=params, server_sid=server_sid):
+                    attachments = params.get("attachments") or []
+                    if self._e2e.is_protected(server_sid) and attachments:
+                        # v1 E2E 设备端不支持附件；该数组仍是 server 可改写的明文。绝不能
+                        # 在密文 prompt 旁边接受它，否则 server 可触发下载/SSRF/STT/本地
+                        # attach，并把任意路径注入 agent。
+                        print(
+                            f"[E2E prompt rejected {server_sid}] unauthenticated attachments",
+                            file=sys.stderr,
+                        )
+                        return
                     # #251(#1):文本裝配(標題/解密/STT)提前到 _ensure_session **之前**——這樣 gateway
                     # 死於建會話時,能拿已裝配好的 final_text 走重投(而非 _ensure_session 誤建空會話)。
-                    attachments = params.get("attachments") or []
                     parts = []
                     base = (params.get("text") or "").strip()
                     # #94：Macchiato 發起的會話首次發話 → 立即用首條 user 文本自動生成標題(越早越好)。
                     # E2E 跳過(明文);已標題過跳過;_titled 防會話內重複。
-                    if base and server_sid not in self._titled and not self._e2e.is_e2e(server_sid):
+                    if base and server_sid not in self._titled and not self._e2e.is_protected(server_sid):
                         self._titled.add(server_sid)
                         asyncio.create_task(self._auto_title(server_sid, base))
-                    if base and self._e2e.is_e2e(server_sid):
+                    if base and self._e2e.is_protected(server_sid):
                         # §19 E2E：iOS 發來的是密文 → 解密後再提交 agent（gated，非 E2E 會話不走這）。
                         try:
                             base = self._e2e.decrypt_text(server_sid, base).strip()
@@ -2034,32 +2856,101 @@ class Connector:
                         print(f"· #199 dispatch 未展開 /{name},原文提交兜底", file=sys.stderr)
                     await self._submit_final(server_sid, real, text, [])
                     print(f"· #199 command.invoke /{name} → {server_sid}(展開 {len(text)} 字)")
-                self._dispatch_session(server_sid, _do_invoke)
+                invoke_task = self._dispatch_session(
+                    server_sid, _do_invoke, propagate=authenticated_control
+                )
+                if authenticated_control:
+                    await invoke_task
+                control_accepted = authenticated_control
             elif method == "approval.respond":
                 # #251(#4):此前在讀循環內聯調 _ensure_session,與同會話 _do_prompt 的
                 # _ensure_session 併發 → 雙 create、_fwd 覆寫、洩漏 gateway 會話。掛進 per-session
                 # 串行鏈,和 prompt/invoke 排同一隊(審批發生在回合中、鏈通常已空,不增延遲)。
                 async def _do_approval(params=params, server_sid=server_sid):
+                    if authenticated_control:
+                        pending = self._e2e_approvals.get(server_sid)
+                        head = pending[0] if pending else None
+                        frozen_digest = (
+                            request_digest(
+                                self._e2e.require_key(server_sid),
+                                head.get("executionRequest"),
+                            )
+                            if head is not None and isinstance(head.get("executionRequest"), dict)
+                            else None
+                        )
+                        if (
+                            head is None
+                            or frozen_digest != head.get("requestDigest")
+                            or params.get("requestId") != head.get("requestId")
+                            or params.get("requestDigest") != head.get("requestDigest")
+                        ):
+                            raise E2EControlError("approval request id/digest does not match FIFO head")
+                        # Hermes gateway 的 approval.respond 沒有 request id / idempotency key。
+                        # RPC 若已在 gateway 生效、但回包前斷線，保留本地 head 會讓同一張已簽卡
+                        # 以 fresh seq 重試並誤批 FIFO 的下一張。故在任何下游副作用前不可逆
+                        # 消費本地 capability；不確定結果犧牲可用性，也不能重新開放授權。
+                        pending.popleft()
+                        if not pending:
+                            self._e2e_approvals.pop(server_sid, None)
                     real = await self._ensure_session(server_sid)
                     await self.gw.request(
                         "approval.respond",
                         {"session_id": real, "choice": params.get("choice", "deny"), "all": params.get("all", False)},
                     )
-                self._dispatch_session(server_sid, _do_approval)
+                # requestId/digest 在排队前同步核对一次，避免先 ACK 后才在异步链发现错卡。
+                if authenticated_control:
+                    pending = self._e2e_approvals.get(server_sid)
+                    head = pending[0] if pending else None
+                    frozen_digest = (
+                        request_digest(
+                            self._e2e.require_key(server_sid),
+                            head.get("executionRequest"),
+                        )
+                        if head is not None and isinstance(head.get("executionRequest"), dict)
+                        else None
+                    )
+                    if (
+                        head is None
+                        or frozen_digest != head.get("requestDigest")
+                        or params.get("requestId") != head.get("requestId")
+                        or params.get("requestDigest") != head.get("requestDigest")
+                    ):
+                        raise E2EControlError("approval request id/digest does not match FIFO head")
+                approval_task = self._dispatch_session(
+                    server_sid, _do_approval, propagate=authenticated_control
+                )
+                if authenticated_control:
+                    await approval_task
+                control_accepted = authenticated_control
             elif method == "session.interrupt":
                 # #5:重投等待期(#4)收到中斷 → 取消重投——用戶已叫停的 prompt 不許復活雙發。
                 rt = self._retry_tasks.pop(server_sid, None)
-                if rt is not None and not rt.done():
+                retry_active = rt is not None and not rt.done()
+                chain = self._session_chains.get(server_sid)
+                chain_active = chain is not None and not chain.done()
+                live_active = server_sid in self._live_inflight
+                if authenticated_control and not (retry_active or chain_active or live_active):
+                    raise E2EControlError("no active turn to interrupt")
+                if retry_active:
                     rt.cancel()
                     print(f"· 用戶中斷 → 取消待重投 prompt({server_sid})")
                 real = self._fwd.get(server_sid)
-                if real:
+                if real and (not authenticated_control or chain_active or live_active):
                     await self.gw.interrupt(real)
-                else:
+                elif not authenticated_control or chain_active or live_active:
                     # 回合真正開始前到達的中斷：會話映射尚未建立 → 別丟，記為 pending，
                     # 等 prompt 建立映射、回合起步後一起取消（見 prompt.submit 末尾）。
                     self._pending_interrupt.add(server_sid)
                     print(f"· interrupt 早到（{server_sid} 未映射）→ pending", file=sys.stderr)
+                control_accepted = authenticated_control
+            elif method == "session.e2e.disable":
+                if not authenticated_control:
+                    raise E2EControlError("E2E disable requires authenticated device intent")
+                # 先把 intent 与 K_S 同一快照持久化，随后才 ACK/启动明文回灌。断线重启
+                # 时 server 的 raw resume 也只能在这个 marker 存在时续跑。
+                self._e2e.begin_disable(server_sid, envelope)
+                asyncio.create_task(self._e2e_backfill_history(server_sid, mode="disable"))
+                control_accepted = True
             elif method == "session.create":
                 # #227 cwd:草稿期傳來的工作目錄。未建會話 → 存起來,create 時帶上;已建 → session.cwd.set
                 # 中途改(gateway 支持;session busy=agent 回覆過返 4009,Macchiato 側本就鎖 cwd、不該發)。
@@ -2083,7 +2974,12 @@ class Connector:
                         except GatewayError as exc:
                             if exc.code != 4009:  # 4009=busy(已鎖),其餘上拋
                                 raise
-                self._dispatch_session(server_sid, _do_create)
+                create_task = self._dispatch_session(
+                    server_sid, _do_create, propagate=authenticated_control
+                )
+                if authenticated_control:
+                    await create_task
+                control_accepted = authenticated_control
             elif method == "session.archive":
                 await self._set_hermes_archived(server_sid, bool(params.get("archived", True)))
             elif method == "session.delete":
@@ -2110,6 +3006,24 @@ class Connector:
             self._count("dispatchErrors")  # #10
             print(f"[dispatch {method} failed] {exc!r}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
+            control_error = (
+                "control_rejected"
+                if isinstance(exc, E2EControlError)
+                else "side_effect_failed"
+            )
+
+        if authenticated_control and isinstance(control_msg_id, str) and control_msg_id:
+            await self._send(
+                {
+                    "t": "e2e_control_result",
+                    "agentLinkId": self.agent_link_id,
+                    "sessionId": control_session_id,
+                    "hermesSessionId": server_sid,
+                    "msgId": control_msg_id,
+                    "ok": bool(control_accepted and control_error is None),
+                    **({"error": control_error} if control_error else {}),
+                }
+            )
 
 
 async def _main() -> int:

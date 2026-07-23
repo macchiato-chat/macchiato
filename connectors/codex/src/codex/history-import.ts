@@ -3,6 +3,7 @@
  * 標題/cwd 從 rollout 自身派生。.jsonl.zst(壓縮的舊會話)v1 跳過並記數(不靜默丟)。
  */
 import { readFileSync } from "node:fs";
+import type { E2EKeyStore } from "../e2e/keys";
 import type { LinkBClient } from "../linkb/client";
 import { deriveMeta, discoverRollouts } from "./mirror";
 import { readNewMessages } from "./transcripts";
@@ -16,6 +17,12 @@ interface BuiltSession {
   messages: Record<string, unknown>[];
   /** #154 所屬 project(rollout session_meta.cwd)——按 project 導入的分組鍵。 */
   project: string;
+}
+
+type E2EStatus = Pick<E2EKeyStore, "isE2E">;
+
+function withoutE2ESessions(built: BuiltSession[], e2e: E2EStatus): BuiltSession[] {
+  return built.filter((session) => !e2e.isE2E(session.hermesSessionId));
 }
 
 export function collectImportSessions(): { built: BuiltSession[]; compressed: number } {
@@ -49,8 +56,10 @@ export function groupProjects(built: { project: string }[]): { name: string; cou
   return [...byName.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count);
 }
 
-export function announceImportAvailable(linkb: LinkBClient): void {
-  const { built, compressed } = collectImportSessions();
+export function announceImportAvailable(linkb: LinkBClient, e2e: E2EStatus): void {
+  const collected = collectImportSessions();
+  const built = withoutE2ESessions(collected.built, e2e);
+  const { compressed } = collected;
   const projects = groupProjects(built);
   linkb.send({ t: "import_available", count: built.length, projects });
   console.log(`· import_available: ${built.length} sessions importable(${projects.length} projects)${compressed ? ` (${compressed} 個已壓縮會話跳過)` : ""}`);
@@ -74,8 +83,9 @@ export function packFrames(built: BuiltSession[], budget = FRAME_BUDGET): BuiltS
   return frames;
 }
 
-export function runImport(linkb: LinkBClient, projects?: string[]): void {
+export function runImport(linkb: LinkBClient, e2e: E2EStatus, projects?: string[]): void {
   let { built, compressed } = collectImportSessions();
+  built = withoutE2ESessions(built, e2e);
   if (projects?.length) {
     const want = new Set(projects);
     built = built.filter((s) => want.has(s.project)); // #154 按 project 過濾

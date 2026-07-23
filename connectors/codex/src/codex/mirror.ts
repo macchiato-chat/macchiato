@@ -89,7 +89,7 @@ export function deriveMeta(content: string): { title: string; cwd?: string } {
 }
 
 /** §9 去重身份:rollout 行無 uuid → 內容指紋(role+text+ord 的 sha256 前綴),確定性、逐字節穩定。 */
-function srcIdFor(threadId: string, m: CodexMessage): string {
+export function srcIdFor(threadId: string, m: CodexMessage): string {
   return createHash("sha256").update(`${threadId} ${m.role} ${m.ord} ${m.text}`).digest("hex").slice(0, 24);
 }
 
@@ -110,6 +110,14 @@ export class Mirror {
   private batchId = 0;
   private readonly rewind: Array<{ id: number; prev: Record<string, number>; prevOrd: Record<string, number> }> = [];
   private readonly drivenIds = new Set<string>();
+  /**
+   * backfill 已送、server 尚未確認提交：key 用 wire sid 接 ACK；value 保留本地 thread uuid，
+   * 供 poll/fastForward 凍結及 ACK 後提交本地水位。
+   */
+  private readonly pendingE2EBackfills = new Map<
+    string,
+    { localSid: string; endOffset: number; endOrd: number }
+  >();
   lastPollAt = Date.now();
   lastError: string | null = null;
   /** #10:累計計數(進程生命週期),健康上報帶出。 */
@@ -123,6 +131,10 @@ export class Mirror {
   constructor(
     private readonly linkb: LinkBClient,
     private readonly e2e?: E2EKeyStore,
+    /** app-driven 會話的本地 thread UUID → E2E wire ULID；避免終端續聊另建明文影子會話。 */
+    private readonly e2eWireSidForLocal?: (localSid: string) => string | undefined,
+    /** 身份快照不可信時，未知本地 UUID 不得回落成 plaintext shadow。 */
+    private readonly plaintextLocalAllowed?: () => boolean,
   ) {
     this.state = this.load();
   }
@@ -144,8 +156,14 @@ export class Mirror {
     this.drivenIds.delete(threadId);
   }
 
+  private hasPendingE2EBackfill(localSid: string): boolean {
+    return [...this.pendingE2EBackfills.values()].some((pending) => pending.localSid === localSid);
+  }
+
   /** 回合結束:driven 會話水位線快進到文件末(live 已投遞,鏡像別重複)。 */
   fastForward(threadId: string): void {
+    // backfill 快照尚未 ACK 時，任何旁路都不能越過其暫存水位線。
+    if (this.hasPendingE2EBackfill(threadId)) return;
     const rf = discoverRollouts().rollouts.find((r) => r.threadId === threadId);
     if (!rf || !existsSync(rf.file)) return;
     try {
@@ -187,6 +205,27 @@ export class Mirror {
     console.warn(`· mirror_nack batch ${batchId} → rewinding watermark for resend`);
   }
 
+  /** server backfill 事務結果：只有成功 ACK 才提交對應快照水位線。 */
+  handleE2EBackfillResult(
+    wireSid: string,
+    mode: "enable" | "disable",
+    committed: boolean,
+  ): void {
+    const pendingKey = `${mode}:${wireSid}`;
+    const pending = this.pendingE2EBackfills.get(pendingKey);
+    this.pendingE2EBackfills.delete(pendingKey);
+    if (!committed || !pending) return;
+    this.state.offsets[pending.localSid] = Math.max(
+      this.state.offsets[pending.localSid] ?? 0,
+      pending.endOffset,
+    );
+    this.state.ords[pending.localSid] = Math.max(this.state.ords[pending.localSid] ?? 0, pending.endOrd);
+    this.save();
+    console.log(
+      `· E2E backfill ACK(${mode}): ${wireSid} (local ${pending.localSid}; watermark → ${pending.endOffset})`,
+    );
+  }
+
   private async poll(): Promise<void> {
     if (this.polling) return;
     this.polling = true;
@@ -212,6 +251,8 @@ export class Mirror {
     const prevOrd: Record<string, number> = {};
     for (const { file, threadId } of rollouts) {
       if (this.state.tombstones?.includes(threadId)) continue; // #161 app 刪過 → 永不再撈
+      // backfill 快照已送但 server 尚未 ACK：避免普通 poll 跨過/混入同一轉換窗口。
+      if (this.hasPendingE2EBackfill(threadId)) continue;
       // #262 stat-first:非 driven 且水位線已到檔末 → 跳過,不 readFileSync。每 5s 對每個未變
       // rollout 全量重讀是 Pi 上的主要開銷(CC 鏡像早已 stat-first);driven/首基線仍讀。
       const off0 = this.state.offsets[threadId];
@@ -254,18 +295,28 @@ export class Mirror {
         prev[threadId] = startOff;
         prevOrd[threadId] = ordBase;
         const { title } = deriveMeta(content);
-        if (this.e2e?.isE2E(threadId)) {
+        // app-driven E2E 的 key/session identity 掛在 wire ULID，rollout 則以本地 UUID 命名。
+        // unsetDriven 後 terminal 續聊必須仍回到 wire session 並用 wire key 加密，不能另建
+        // local UUID 的 plaintext shadow session。
+        const mappedWireSid = this.e2eWireSidForLocal?.(threadId);
+        const e2eSid = mappedWireSid ?? (this.e2e?.isE2E(threadId) ? threadId : undefined);
+        if (e2eSid) {
           batch.push({
-            hermesSessionId: threadId,
-            title: this.e2e.encryptText(threadId, title),
+            hermesSessionId: e2eSid,
+            title: this.e2e!.encryptText(e2eSid, title),
             source: "codex",
             e2e: true,
             messages: messages.map((m) => ({
               role: m.role,
               srcId: srcIdFor(threadId, m),
-              enc: this.e2e!.encryptContent(threadId, { text: m.text }),
+              enc: this.e2e!.encryptContent(e2eSid, { text: m.text }),
             })),
           });
+        } else if (this.plaintextLocalAllowed?.() === false) {
+          console.error(
+            `[mirror] E2E identity map 不可信，凍結未知 Codex rollout ${threadId}，不推水位/不發明文`,
+          );
+          continue;
         } else {
           batch.push({
             hermesSessionId: threadId,
@@ -292,15 +343,28 @@ export class Mirror {
 
   /**
    * §19 D2 / 關閉:把該會話 rollout 全量歷史以 e2e_backfill 回灌(server 事務內原地替換)。
-   * enable:K_S 重加密;disable:明文回灌 + 刪 K_S。找不到會話/無消息 → found:false。
+   * enable:K_S 重加密;disable:明文回灌。K_S 只由 index 在 server ACK ok/e2e:false 後刪除。
+   * 找不到會話/無消息 → found:false。
    */
-  async backfillE2E(threadId: string, mode: "enable" | "disable" = "enable"): Promise<void> {
+  async backfillE2E(
+    wireSid: string,
+    localSid: string | undefined,
+    mode: "enable" | "disable" = "enable",
+  ): Promise<void> {
     if (!this.e2e) return;
-    const rf = discoverRollouts().rollouts.find((r) => r.threadId === threadId);
+    const rf = localSid
+      ? discoverRollouts().rollouts.find((r) => r.threadId === localSid)
+      : undefined;
     const notFound = (): void => {
-      this.linkb.send({ t: "e2e_backfill", agentLinkId: this.linkb.agentLinkId, hermesSessionId: threadId, mode, found: false });
+      this.linkb.send({
+        t: "e2e_backfill",
+        agentLinkId: this.linkb.agentLinkId,
+        hermesSessionId: wireSid,
+        mode,
+        found: false,
+      });
     };
-    if (!rf || !existsSync(rf.file)) return notFound();
+    if (!localSid || !rf || !existsSync(rf.file)) return notFound();
     let content: string;
     try {
       content = readFileSync(rf.file, "utf8");
@@ -313,18 +377,46 @@ export class Mirror {
     const session =
       mode === "enable"
         ? {
-            hermesSessionId: threadId,
-            title: this.e2e.encryptText(threadId, title),
+            hermesSessionId: wireSid,
+            title: this.e2e.encryptText(wireSid, title),
             source: "codex",
             e2e: true,
-            messages: messages.map((m) => ({ role: m.role, enc: this.e2e!.encryptContent(threadId, { text: m.text }) })),
+            messages: messages.map((m) => ({
+              role: m.role,
+              srcId: srcIdFor(localSid, m),
+              enc: this.e2e!.encryptContent(wireSid, { text: m.text }),
+            })),
           }
-        : { hermesSessionId: threadId, title, source: "codex", messages: messages.map((m) => ({ role: m.role, text: m.text })) };
-    this.linkb.send({ t: "e2e_backfill", agentLinkId: this.linkb.agentLinkId, hermesSessionId: threadId, mode, found: true, session });
-    this.state.offsets[threadId] = Buffer.byteLength(content, "utf8");
-    this.state.ords[threadId] = content.split("\n").length;
-    this.save();
-    if (mode === "disable") this.e2e.remove(threadId);
+        : {
+            hermesSessionId: wireSid,
+            title,
+            source: "codex",
+            messages: messages.map((m) => ({
+              role: m.role,
+              text: m.text,
+              srcId: srcIdFor(localSid, m),
+            })),
+          };
+    // 只有完整明文 snapshot 已成功构造后才签 completion receipt；先双快照持久化再发送。
+    const disableReceipt =
+      mode === "disable" ? this.e2e.disableReceiptForBackfill(wireSid) : undefined;
+    this.linkb.send({
+      t: "e2e_backfill",
+      agentLinkId: this.linkb.agentLinkId,
+      hermesSessionId: wireSid,
+      mode,
+      found: true,
+      session,
+      ...(disableReceipt ? { disableReceipt } : {}),
+    });
+    this.pendingE2EBackfills.set(`${mode}:${wireSid}`, {
+      localSid,
+      endOffset: Buffer.byteLength(content, "utf8"),
+      endOrd: content.split("\n").length,
+    });
+    console.log(
+      `· E2E backfill(${mode}) submitted for ${wireSid} (local ${localSid}; ${messages.length} messages; waiting for server ACK)`,
+    );
   }
 
   /** #9:offsets/ords 無界增長治理——rollout 消失連續 PRUNE_MS 才裁(7 天後壓縮 .zst 即「消失」)。

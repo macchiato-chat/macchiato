@@ -2,7 +2,7 @@
  * #132 exec v1 / app-server v2 兩個 drive 共用的持久狀態(~/.macchiato/codex-sessions.json):
  * sid↔thread 映射、cwd/model、#113 已標題集、#200 在途回合。單寫者(同一進程只跑一個 drive)。
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -19,39 +19,86 @@ export interface DriveState {
   perms: Record<string, string>;
   titled: Set<string>;
   pending: string[];
+  /**
+   * sid↔thread 身份快照是否由主檔完整、嚴格解析而來。
+   * .bak 是舊一代，缺/壞主檔時只能作可用性恢復，不能證明沒有漏掉最新 E2E 映射。
+   */
+  identityStateTrusted: boolean;
+}
+
+function stringRecord(value: unknown, field: string): Record<string, string> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${field} must be an object`);
+  }
+  const out: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (!key || typeof item !== "string") throw new Error(`${field} contains an invalid entry`);
+    out[key] = item;
+  }
+  return out;
+}
+
+function parseDriveState(raw: string, identityStateTrusted: boolean): DriveState {
+  const p = JSON.parse(raw) as Record<string, unknown>;
+  if (p === null || typeof p !== "object" || Array.isArray(p)) throw new Error("state root must be an object");
+  const pending = p.pending === undefined ? [] : p.pending;
+  const titled = p.titled === undefined ? [] : p.titled;
+  if (!Array.isArray(pending) || pending.some((sid) => typeof sid !== "string" || !sid)) {
+    throw new Error("pending must contain non-empty strings");
+  }
+  if (!Array.isArray(titled) || titled.some((sid) => typeof sid !== "string" || !sid)) {
+    throw new Error("titled must contain non-empty strings");
+  }
+  return {
+    // map 是 E2E local↔wire 的安全邊界，缺字段不能再被 `?? {}` 靜默洗成可信空映射。
+    map: stringRecord(p.map, "map"),
+    cwds: stringRecord(p.cwds ?? {}, "cwds"),
+    models: stringRecord(p.models ?? {}, "models"),
+    efforts: stringRecord(p.efforts ?? {}, "efforts"),
+    perms: stringRecord(p.perms ?? {}, "perms"),
+    titled: new Set<string>(titled as string[]),
+    pending: pending as string[],
+    identityStateTrusted,
+  };
 }
 
 export function loadDriveState(): DriveState {
   // #248 主檔壞/缺 → 試 .bak(此前無備份:codex-sessions.json 損壞即 sid↔thread 映射蒸發、
   // 全會話丟上下文)。兩檔都壞才回空。
-  for (const path of [mapPath(), mapPath() + ".bak"]) {
+  for (const [path, isPrimary] of [[mapPath(), true], [mapPath() + ".bak", false]] as const) {
     try {
-      const p = JSON.parse(readFileSync(path, "utf8"));
-      return {
-        map: p.map ?? {},
-        cwds: p.cwds ?? {},
-        models: p.models ?? {}, // #143
-        efforts: p.efforts ?? {}, // #231
-        perms: p.perms ?? {}, // #230
-        titled: new Set<string>(Array.isArray(p.titled) ? p.titled : []),
-        pending: Array.isArray(p.pending) ? (p.pending as string[]) : [], // #200
-      };
+      return parseDriveState(readFileSync(path, "utf8"), isPrimary);
     } catch {
       /* 試下一個 */
     }
   }
-  return { map: {}, cwds: {}, models: {}, efforts: {}, perms: {}, titled: new Set(), pending: [] };
+  return {
+    map: {},
+    cwds: {},
+    models: {},
+    efforts: {},
+    perms: {},
+    titled: new Set(),
+    pending: [],
+    identityStateTrusted: false,
+  };
 }
 
-export function saveDriveState(st: { map: Record<string, string>; cwds: Record<string, string>; models: Record<string, string>; efforts: Record<string, string>; perms: Record<string, string>; titled: Iterable<string>; pending: Iterable<string> }): void {
+export function saveDriveState(st: { map: Record<string, string>; cwds: Record<string, string>; models: Record<string, string>; efforts: Record<string, string>; perms: Record<string, string>; titled: Iterable<string>; pending: Iterable<string> }): boolean {
   try {
     mkdirSync(dirname(mapPath()), { recursive: true });
+    const snapshot = JSON.stringify({ v: 1, map: st.map, cwds: st.cwds, models: st.models, efforts: st.efforts, perms: st.perms, titled: [...st.titled], pending: [...st.pending] });
     const tmp = `${mapPath()}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ v: 1, map: st.map, cwds: st.cwds, models: st.models, efforts: st.efforts, perms: st.perms, titled: [...st.titled], pending: [...st.pending] }));
-    if (existsSync(mapPath())) renameSync(mapPath(), mapPath() + ".bak"); // #248 輪替備份(load 側有 .bak 回退)
+    const backupTmp = `${mapPath()}.bak.tmp`;
+    writeFileSync(tmp, snapshot);
     renameSync(tmp, mapPath());
+    // 身份備份也保存當前完整代，避免主檔 crash 後回退到漏最新 E2E 映射的上一代。
+    writeFileSync(backupTmp, snapshot);
+    renameSync(backupTmp, mapPath() + ".bak");
+    return true;
   } catch (e) {
     console.error("[session map save failed]", (e as Error).message);
+    return false;
   }
 }
 
