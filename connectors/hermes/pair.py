@@ -60,13 +60,19 @@ def _save_cred(msg: dict, label: str) -> None:
     _write_private(CRED_PATH, json.dumps(cred, indent=2))
 
 
+# 多連接器/多 profile 順序配對時分不清哪個碼是誰的——banner 自報家門。
+# profile 名由 install.sh 經 MACCHIATO_HERMES_PROFILE 傳入(#309;缺省=默認 Hermes)。
+_PAIR_PROFILE = os.environ.get("MACCHIATO_HERMES_PROFILE", "").strip()
+_PAIR_WHO = f"Hermes profile '{_PAIR_PROFILE}'" if _PAIR_PROFILE else "Hermes"
+
+
 def _show_code(code: str, fresh: bool) -> None:
     try:
         _write_private(CODE_FILE, code)  # #254 0600 私有(此前 /tmp 世界可讀 → 他人可搶 claim)
     except Exception:
         pass
     print("\n" + "=" * 54)
-    print("  Pairing code" + (" (refreshed)" if fresh else "") + ":")
+    print(f"  Pairing code for {_PAIR_WHO}" + (" (refreshed)" if fresh else "") + ":")
     print(f"        >>>  {code}  <<<")
     print(f"  Sign in at {WEB_URL} → \"Pair connector\" → enter this code.")
     print("=" * 54 + "\nWaiting for you to claim it…", flush=True)
