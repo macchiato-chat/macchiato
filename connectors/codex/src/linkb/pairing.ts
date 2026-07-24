@@ -25,6 +25,10 @@ function showCode(code: string, webUrl: string, fresh: boolean): void {
   console.log(`  Pairing code for Codex${fresh ? " (refreshed)" : ""}:`);
   console.log(`        >>>  ${code}  <<<`);
   console.log(`  Sign in at ${webUrl} → \"Pair connector\" → enter this code.`);
+  // #388 一碼多綁:同批安裝的其餘 agent 免碼自動綁定(安裝器設 MACCHIATO_PAIR_BATCH_MANY)
+  if (process.env.MACCHIATO_PAIR_BATCH && process.env.MACCHIATO_PAIR_BATCH_MANY) {
+    console.log("  Other agents from this install will pair automatically with this code.");
+  }
   console.log(`${line}\nWaiting for you to claim it…`);
 }
 
@@ -35,7 +39,7 @@ function attempt(serverUrl: string, webUrl: string, label: string, fresh: boolea
     let seenFirst = false;
     let refresher: ReturnType<typeof setInterval> | null = null;
     let settled = false;
-    const sendPair = (): void => ws.send(JSON.stringify({ t: "pair_request", proto: LINK_B_PROTO, label, kind: "codex" }));
+    const sendPair = (): void => ws.send(JSON.stringify({ t: "pair_request", proto: LINK_B_PROTO, label, kind: "codex", ...(process.env.MACCHIATO_PAIR_BATCH ? { batch: process.env.MACCHIATO_PAIR_BATCH } : {}) }));
     const done = (fn: () => void): void => {
       if (settled) return;
       settled = true;
@@ -64,6 +68,8 @@ function attempt(serverUrl: string, webUrl: string, label: string, fresh: boolea
       } else if (msg.t === "paired" && msg.connectorToken && msg.agentLinkId) {
         const creds: Creds = { serverUrl, connectorToken: msg.connectorToken, agentLinkId: msg.agentLinkId, label };
         saveCreds(creds);
+        // #388 一碼多綁:沒展示過碼就 paired = 同批安裝免碼自動綁定(server 認 batch)
+        if (!seenFirst) console.log(`\n✓ Paired automatically — claimed with the same code as the first agent in this install.`);
         console.log(`\n✓ Paired! agent_link=${msg.agentLinkId}`);
         console.log("  Credentials saved (connector_token shown in plaintext only this once).");
         done(() => resolve(creds));

@@ -196,6 +196,18 @@ describe("Drive", () => {
     expect(d.localSessionIdFor("01ULIDSERVERSID000000000AA")).toBe(CC_SID);
   });
 
+  it("#389 通道帶 env:聲明 entrypoint=macchiato(終端 /resume 可見)且展開了 process.env", async () => {
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame("01ULIDSERVERSID000000000AA", "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastOptions.env.CLAUDE_CODE_ENTRYPOINT).toBe("macchiato");
+    // SDK 是**整份替換**子進程環境:漏了展開就會丟 PATH/HOME/認證,子進程直接廢掉。
+    expect(lastOptions.env.PATH).toBe(process.env.PATH);
+    expect(lastOptions.env.HOME).toBe(process.env.HOME);
+  });
+
   it("#347 E2E 回合在 input.push 前身份快照落盘失败 → poison/fatal，prompt 未交付 SDK", async () => {
     const sid = "01E2EPERSISTFAIL0000000001";
     const { linkb } = fakeLinkb();

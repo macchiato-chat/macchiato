@@ -64,6 +64,8 @@ def _save_cred(msg: dict, label: str) -> None:
 # profile 名由 install.sh 經 MACCHIATO_HERMES_PROFILE 傳入(#309;缺省=默認 Hermes)。
 _PAIR_PROFILE = os.environ.get("MACCHIATO_HERMES_PROFILE", "").strip()
 _PAIR_WHO = f"Hermes profile '{_PAIR_PROFILE}'" if _PAIR_PROFILE else "Hermes"
+# #388 一碼多綁:安裝器生成的批次 id(僅 WSS 內傳輸);同批第一個被 claim 後本連接器免碼自動綁定
+_PAIR_BATCH = os.environ.get("MACCHIATO_PAIR_BATCH", "").strip()
 
 
 def _show_code(code: str, fresh: bool) -> None:
@@ -75,6 +77,8 @@ def _show_code(code: str, fresh: bool) -> None:
     print(f"  Pairing code for {_PAIR_WHO}" + (" (refreshed)" if fresh else "") + ":")
     print(f"        >>>  {code}  <<<")
     print(f"  Sign in at {WEB_URL} → \"Pair connector\" → enter this code.")
+    if _PAIR_BATCH and os.environ.get("MACCHIATO_PAIR_BATCH_MANY"):
+        print("  Other agents from this install will pair automatically with this code.")
     print("=" * 54 + "\nWaiting for you to claim it…", flush=True)
 
 
@@ -88,9 +92,15 @@ async def _attempt(label: str, fresh: bool) -> str:
         async def refresher() -> None:
             while True:
                 await asyncio.sleep(REFRESH_S)
-                await ws.send(json.dumps({"t": "pair_request", "proto": PROTO, "label": label, "kind": "hermes"}))
+                await ws.send(json.dumps({
+            "t": "pair_request", "proto": PROTO, "label": label, "kind": "hermes",
+            **({"batch": _PAIR_BATCH} if _PAIR_BATCH else {}),
+        }))
 
-        await ws.send(json.dumps({"t": "pair_request", "proto": PROTO, "label": label, "kind": "hermes"}))
+        await ws.send(json.dumps({
+            "t": "pair_request", "proto": PROTO, "label": label, "kind": "hermes",
+            **({"batch": _PAIR_BATCH} if _PAIR_BATCH else {}),
+        }))
         seen_first = False
         ref = asyncio.create_task(refresher())
         try:
@@ -104,6 +114,9 @@ async def _attempt(label: str, fresh: bool) -> str:
                     print(f"FAIL: {msg.get('reason')}", file=sys.stderr)
                     return "auth_error"
                 elif t == "paired":
+                    if not seen_first:
+                        # #388:沒展示過碼就 paired = 同批安裝免碼自動綁定
+                        print("\n✓ Paired automatically — claimed with the same code as the first agent in this install.")
                     _save_cred(msg, label)
                     try:
                         os.remove(CODE_FILE)

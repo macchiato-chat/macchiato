@@ -42,6 +42,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { imageBlockFor, materializeAttachment } from "./attachments";
 import { claudeBinIsAbsolute, resolveClaudeBin } from "./claude-bin";
+import { sdkEnv } from "./sdk-env";
 import type { CommandsReporter } from "./commands";
 import { generateTitle } from "./titles";
 import type { LinkBClient } from "../linkb/client";
@@ -1580,6 +1581,10 @@ export class Drive {
       prompt: input as AsyncIterable<never>,
       options: {
         cwd, // #105 per-session 工作目錄（cwdFor 已解析，回退連接器默認）
+        // #389 聲明 entrypoint=macchiato,讓本會話出現在用戶終端的 `claude --resume` 選擇器
+        // (SDK 默認標 sdk-ts → 命中 picker 的 programmatic 黑名單 → 隱身)。sdkEnv 已展開
+        // process.env——SDK 是**整份替換**子進程環境,不可只傳兩個變量。詳見 sdk-env.ts。
+        env: sdkEnv(),
         ...(resume ? { resume } : {}),
         ...(claudeBinIsAbsolute() ? { pathToClaudeCodeExecutable: resolveClaudeBin() } : {}),
         ...(model ? { model } : {}), // #143 per-session model(空 = 不傳,用 CLI 配置默認)
