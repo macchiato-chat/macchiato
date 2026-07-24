@@ -257,6 +257,7 @@ normalize_agent() {
 REQUESTED=""    # space-separated canonical keys parsed from --agents / MACCHIATO_ONLY, or "all"
 ASSUME_YES=0
 MIRROR_MODE=""  # "" = undecided (env default → interactive prompt → on); "on" | "off"
+MIRROR_EXPLICIT=0  # 1 = flag/env 明確指定(覆蓋既有 unit 的設置);交互/默認只作用於新裝 agent
 add_requested() { # $1 = comma/space-separated token list
   local tok norm
   local IFS=', '
@@ -305,8 +306,8 @@ while [ $# -gt 0 ]; do
     --agents=*)    add_requested "${1#*=}" ;;
     --agents|-A)   shift; [ $# -gt 0 ] || fail "--agents needs a value (e.g. --agents=claude-code,codex)"; add_requested "$1" ;;
     --all)         REQUESTED="all" ;;
-    --no-mirror)   MIRROR_MODE="off" ;;
-    --mirror)      MIRROR_MODE="on" ;;
+    --no-mirror)   MIRROR_MODE="off"; MIRROR_EXPLICIT=1 ;;
+    --mirror)      MIRROR_MODE="on"; MIRROR_EXPLICIT=1 ;;
     -y|--yes|--non-interactive) ASSUME_YES=1 ;;
     -h|--help)     usage; exit 0 ;;
     *)             fail "Unknown option: $1 (try --help)" ;;
@@ -318,8 +319,8 @@ done
 # MACCHIATO_MIRROR env (automation without flags) — flags above take precedence.
 if [ -z "$MIRROR_MODE" ]; then
   case "$(printf '%s' "${MACCHIATO_MIRROR:-}" | tr '[:upper:]' '[:lower:]')" in
-    off|0|false|no) MIRROR_MODE="off" ;;
-    on|1|true|yes)  MIRROR_MODE="on" ;;
+    off|0|false|no) MIRROR_MODE="off"; MIRROR_EXPLICIT=1 ;;
+    on|1|true|yes)  MIRROR_MODE="on"; MIRROR_EXPLICIT=1 ;;
   esac
 fi
 # #309 self-update from a profile instance: the connector re-runs this installer with its
@@ -402,7 +403,6 @@ MACCHIATO_HERMES_PROFILE=$PROFILE"
     if [ -n "$PROFILE" ]; then
       # Label carries the profile so the app can tell multiple Hermes agents apart.
       env "HERMES_HOME=$HH" "MACCHIATO_STATE_DIR=$STATE" "MACCHIATO_HERMES_PROFILE=$PROFILE" \
-        "MACCHIATO_LABEL=$(hostname 2>/dev/null || uname -n) ($PROFILE)" \
         "$PY" "$APP/pair.py" || fail "Pairing not completed. Re-run this script to continue."
     else
       "$PY" "$APP/pair.py" || fail "Pairing not completed. Re-run this script to continue."
@@ -411,7 +411,7 @@ MACCHIATO_HERMES_PROFILE=$PROFILE"
     say "$WHAT credentials found, skipping pairing"
   fi
   MACCHIATO_UNIT_EXTRA_ENV="$PROFILE_ENV
-${MIRROR_ENV:-}" install_unit "$UNIT" "$PY $APP/connector.py"
+$(mirror_env_for "$UNIT" "$WHAT")" install_unit "$UNIT" "$PY $APP/connector.py"
   # Platform plugin: lets Hermes proactively deliver to Macchiato (best effort).
   # Installed into THIS profile's home — its gateway loads it, and the plugin derives the
   # per-profile push socket from its own HERMES_HOME (same rule as the connector).
@@ -442,7 +442,7 @@ install_openclaw() {
   else
     say "OpenClaw credentials found, skipping pairing"
   fi
-  MACCHIATO_UNIT_EXTRA_ENV="${MIRROR_ENV:-}" install_unit "macchiato-openclaw-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
+  MACCHIATO_UNIT_EXTRA_ENV="$(mirror_env_for macchiato-openclaw-connector OpenClaw)" install_unit "macchiato-openclaw-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
   # Channel plugin: lets OpenClaw proactively deliver to Macchiato (best effort)
   if command -v openclaw >/dev/null 2>&1; then
     if openclaw plugins install --force "$APP/plugin" >/dev/null 2>&1 && openclaw plugins enable macchiato >/dev/null 2>&1; then
@@ -485,7 +485,7 @@ install_claude_code() {
   # PATH: user systemd units often miss ~/.local/bin → the connector could not find the claude CLI.
   MACCHIATO_UNIT_EXTRA_ENV="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 MACCHIATO_CLAUDE_BIN=$CLAUDE
-${MIRROR_ENV:-}"     install_unit "macchiato-claude-code-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
+$(mirror_env_for macchiato-claude-code-connector "Claude Code")"     install_unit "macchiato-claude-code-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
 }
 
 # ═════════════════════════════ Codex ════════════════════════════════════════
@@ -519,7 +519,7 @@ install_codex() {
   fi
   MACCHIATO_UNIT_EXTRA_ENV="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 MACCHIATO_CODEX_BIN=$CODEX
-${MIRROR_ENV:-}"     install_unit "macchiato-codex-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
+$(mirror_env_for macchiato-codex-connector Codex)"     install_unit "macchiato-codex-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
 }
 
 # ── detect installed agents ─────────────────────────────────────────────────
@@ -682,6 +682,29 @@ fi
 [ -z "$MIRROR_MODE" ] && MIRROR_MODE="on"   # no terminal / -y → default on
 # Connectors read MACCHIATO_MIRROR=off from their service env: polling stops (terminal
 # sessions stay out of the app) while app-driven sessions keep working untouched.
+
+# ── mirror per-agent 解析(#308 續):既有安裝沿用其現有設置,交互/默認答案只作用於新裝;
+#    --mirror/--no-mirror/MACCHIATO_MIRROR 明確指定則對本次所選全部生效。 ──
+previous_mirror() { # $1=unit-name → "off"/"on"(有既有 unit)或 ""(全新)
+  local f="$UNIT_DIR/$1.service" p="$HOME/Library/LaunchAgents/chat.macchiato.$1.plist"
+  if [ -f "$f" ]; then grep -q "MACCHIATO_MIRROR=off" "$f" && echo off || echo on; return; fi
+  if [ -f "$p" ]; then grep -q "<key>MACCHIATO_MIRROR</key><string>off</string>" "$p" && echo off || echo on; return; fi
+  echo ""
+}
+mirror_env_for() { # $1=unit-name $2=顯示名 → stdout 給 unit 的 env 行(或空);結論 say 到 stderr
+  local prev mode note=""
+  prev="$(previous_mirror "$1")"
+  if [ "$MIRROR_EXPLICIT" = 1 ] || [ -z "$prev" ]; then
+    mode="$MIRROR_MODE"
+  else
+    mode="$prev"
+    [ "$prev" != "$MIRROR_MODE" ] && note=" (kept from previous install — pass --mirror/--no-mirror to change)"
+  fi
+  say "$2 mirror: $mode$note" >&2
+  [ "$mode" = "off" ] && echo "MACCHIATO_MIRROR=off"
+  return 0
+}
+
 MIRROR_ENV=""
 [ "$MIRROR_MODE" = "off" ] && MIRROR_ENV="MACCHIATO_MIRROR=off"
 
