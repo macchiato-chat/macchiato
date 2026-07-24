@@ -36,7 +36,7 @@ function attempt(serverUrl: string, webUrl: string, label: string, fresh: boolea
     let seenFirst = false;
     let refresher: ReturnType<typeof setInterval> | null = null;
     let settled = false;
-    const sendPair = (): void => ws.send(JSON.stringify({ t: "pair_request", proto: LINK_B_PROTO, label }));
+    const sendPair = (): void => ws.send(JSON.stringify({ t: "pair_request", proto: LINK_B_PROTO, label, kind: "claude-code" }));
     const done = (fn: () => void): void => {
       if (settled) return;
       settled = true;
@@ -81,7 +81,7 @@ function attempt(serverUrl: string, webUrl: string, label: string, fresh: boolea
 export async function runPairing(opts: PairOptions = {}): Promise<Creds> {
   const serverUrl = opts.serverUrl || process.env.MACCHIATO_SERVER_URL || DEFAULT_SERVER_URL;
   const webUrl = opts.webUrl || process.env.MACCHIATO_WEB_URL || DEFAULT_WEB_URL;
-  const label = opts.label || process.env.MACCHIATO_LABEL || hostname();
+  const label = opts.label || process.env.MACCHIATO_LABEL || `Claude Code (${hostname()})`;
   const deadline = Date.now() + (opts.windowMs ?? WINDOW_MS);
   let fresh = false;
   while (Date.now() < deadline) {

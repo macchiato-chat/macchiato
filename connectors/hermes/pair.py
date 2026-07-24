@@ -88,9 +88,9 @@ async def _attempt(label: str, fresh: bool) -> str:
         async def refresher() -> None:
             while True:
                 await asyncio.sleep(REFRESH_S)
-                await ws.send(json.dumps({"t": "pair_request", "proto": PROTO, "label": label}))
+                await ws.send(json.dumps({"t": "pair_request", "proto": PROTO, "label": label, "kind": "hermes"}))
 
-        await ws.send(json.dumps({"t": "pair_request", "proto": PROTO, "label": label}))
+        await ws.send(json.dumps({"t": "pair_request", "proto": PROTO, "label": label, "kind": "hermes"}))
         seen_first = False
         ref = asyncio.create_task(refresher())
         try:
@@ -118,7 +118,10 @@ async def _attempt(label: str, fresh: bool) -> str:
 
 
 async def main() -> int:
-    label = os.environ.get("MACCHIATO_LABEL") or socket.gethostname()
+    default_label = (
+        f"Hermes:{_PAIR_PROFILE} ({socket.gethostname()})" if _PAIR_PROFILE else f"Hermes ({socket.gethostname()})"
+    )
+    label = os.environ.get("MACCHIATO_LABEL") or default_label
     loop = asyncio.get_running_loop()
     deadline = loop.time() + WAIT_S
     fresh = False
