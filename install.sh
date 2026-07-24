@@ -714,14 +714,48 @@ if [ "${MACCHIATO_SELFTEST:-0}" = 1 ]; then
   exit 0
 fi
 
+# ── per-agent 定位助手(單元名/憑證路徑;與各 install_* 內的路徑推導保持一致) ──
+unit_for() { # $1=canonical agent key → systemd/launchd 單元名
+  case "$1" in
+    hermes)      echo "macchiato-connector" ;;
+    hermes:*)    echo "macchiato-connector-${1#hermes:}" ;;
+    openclaw)    echo "macchiato-openclaw-connector" ;;
+    claude-code) echo "macchiato-claude-code-connector" ;;
+    codex)       echo "macchiato-codex-connector" ;;
+  esac
+}
+cred_for() { # $1=canonical agent key → 配對憑證路徑
+  case "$1" in
+    hermes)      echo "$HOME/.macchiato/connector.json" ;;
+    hermes:*)    echo "$HOME/.macchiato/hermes-${1#hermes:}/connector.json" ;;
+    openclaw)    echo "$HOME/.macchiato/openclaw-connector.json" ;;
+    claude-code) echo "$HOME/.macchiato/claude-code-connector.json" ;;
+    codex)       echo "$HOME/.macchiato/codex-connector.json" ;;
+  esac
+}
+
 # #388 一碼多綁:本次安裝的批次 id(高熵,僅在連接器→server 的 WSS 內傳輸)。
 # 同批第一個配對碼被 claim 後,其餘 agent 在窗口內免碼自動綁定;老 server 忽略,各自出碼。
 PAIR_BATCH="$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')"
+# 出碼 banner 列「本批全部待配對 agent」(已配對的不出碼、不進名單);export 供各連接器
+# 的配對進程繼承(MACCHIATO_PAIR_GROUP)。MANY 按待配對數而非所選數(已配對的不消耗碼)。
+PAIR_GROUP=""
+TO_PAIR=0
+for a in "${SELECTED[@]}"; do
+  if [ ! -f "$(cred_for "$a")" ]; then
+    PAIR_GROUP="${PAIR_GROUP:+$PAIR_GROUP/}$(agent_label "$a")"
+    TO_PAIR=$((TO_PAIR + 1))
+  fi
+done
+export MACCHIATO_PAIR_GROUP="$PAIR_GROUP"
 PAIR_BATCH_MANY=""
-[ "${#SELECTED[@]}" -gt 1 ] && PAIR_BATCH_MANY=1
+[ "$TO_PAIR" -gt 1 ] && PAIR_BATCH_MANY=1
 
 # ── run the chosen installers ───────────────────────────────────────────────
+SUMMARY=""
 for a in "${SELECTED[@]}"; do
+  had_cred=0
+  [ -f "$(cred_for "$a")" ] && had_cred=1
   case "$a" in
     hermes)      install_hermes ;;
     hermes:*)    install_hermes "${a#hermes:}" ;;   # #309 per-profile instance
@@ -730,9 +764,17 @@ for a in "${SELECTED[@]}"; do
     codex)       install_codex ;;
     *)           fail "Internal: unknown agent '$a'" ;;
   esac
+  # #388 總結行:配對狀態(裝前有憑證=already paired)+ 實際寫入 unit 的 mirror 設置
+  pair_state="paired ✓"
+  [ "$had_cred" = 1 ] && pair_state="already paired"
+  m="$(previous_mirror "$(unit_for "$a")")"
+  SUMMARY="${SUMMARY}  · $(agent_label "$a") — ${pair_state} · mirror ${m:-on}
+"
 done
 
 if [ "${#SKIPPED[@]}" -gt 0 ]; then
   say "Installed $(labels_of "${SELECTED[@]}"). Skipped $(labels_of "${SKIPPED[@]}") — re-run with --agents=$(IFS=,; echo "${SKIPPED[*]}") to add $([ "${#SKIPPED[@]}" -gt 1 ] && echo them || echo it)."
 fi
+say "Summary:"
+printf '%s' "$SUMMARY"
 say "Done! Open Macchiato — your conversations will start syncing."
