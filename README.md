@@ -55,6 +55,17 @@ With no `--agents` and no terminal to prompt, it installs **every** detected con
 
 **Updating:** re-run the same one-line installer. It re-downloads the latest connector, keeps your existing pairing, and restarts the service so the new version takes effect immediately — no re-pairing needed.
 
+**Unpairing / uninstalling:** the same one-liner takes subcommands. `unpair` unbinds connector(s) from your Macchiato account — it revokes them server-side (they disappear from the app), stops the service and removes the local credentials, while keeping the connector code around so pairing again later is instant. `uninstall` unpairs everything and removes all Macchiato connector files from the machine:
+
+```bash
+# unpair one agent (or use the interactive picker / --agents=all)
+curl -fsSL https://macchiato.chat/install.sh | bash -s -- unpair --agents=codex
+# remove everything (asks to confirm; -y skips the prompt)
+curl -fsSL https://macchiato.chat/install.sh | bash -s -- uninstall
+```
+
+Removing an agent from the web or iOS app works too: the connector notices, retires its local credentials and stops — no manual cleanup needed on the machine.
+
 **Platforms & Hermes install methods:**
 - **Linux (incl. Raspberry Pi, WSL2)** — fully supported; systemd service installed automatically.
 - **macOS** — fully supported; the installer sets up a launchd LaunchAgent automatically (logs: `~/.macchiato/logs/`).

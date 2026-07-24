@@ -32,6 +32,12 @@
 #   -y, --yes       install every detected connector, no prompt
 #   -h, --help      show usage and exit
 #
+# Subcommands (#387) — same one-liner, add the word after `bash -s --`:
+#   unpair     unbind connector(s) from your Macchiato account (revokes them server-side,
+#              stops the service, removes local credentials). Pick with --agents=LIST,
+#              or interactively; app files stay so pairing again later is fast.
+#   uninstall  unpair everything + remove all Macchiato connector files from this machine.
+#
 # Env overrides:
 #   MACCHIATO_SERVER_URL   (default wss://api.macchiato.chat/connector)
 #   MACCHIATO_MIRROR       ("off" = same as --no-mirror; flags take precedence)
@@ -166,6 +172,10 @@ install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
     echo "ExecStart=$2"
     echo "Restart=always"
     echo "RestartSec=5"
+    # #387: 78 = EX_CONFIG — the connector exits 78 when this agent is unpaired from the
+    # Macchiato app (credentials revoked). Don't flap-restart a service that can never auth.
+    echo "RestartPreventExitStatus=78"
+    echo "SuccessfulExitStatus=78"
     echo "Environment=PYTHONUNBUFFERED=1"
     if [ -n "${MACCHIATO_UNIT_EXTRA_ENV:-}" ]; then
       while IFS= read -r kv; do [ -n "$kv" ] && echo "Environment=$kv"; done <<< "$MACCHIATO_UNIT_EXTRA_ENV"
@@ -255,6 +265,7 @@ normalize_agent() {
 }
 
 REQUESTED=""    # space-separated canonical keys parsed from --agents / MACCHIATO_ONLY, or "all"
+SUBCOMMAND="install"   # #387: install (default) | unpair | uninstall
 ASSUME_YES=0
 MIRROR_MODE=""  # "" = undecided (env default → interactive prompt → on); "on" | "off"
 MIRROR_EXPLICIT=0  # 1 = flag/env 明確指定(覆蓋既有 unit 的設置);交互/默認只作用於新裝 agent
@@ -292,6 +303,15 @@ Options:
   -y, --yes       install every detected connector without prompting
   -h, --help      show this help
 
+Subcommands (add the word after `bash -s --`, before any options):
+  unpair          unbind connector(s) from your Macchiato account: revokes them
+                  server-side (they disappear from the app), stops the service
+                  and removes local credentials. Choose with --agents=LIST /
+                  --agents=all, or interactively. App files stay, so pairing
+                  again later is just re-running the install command.
+  uninstall       unpair everything + remove all Macchiato connector files
+                  from this machine (services, credentials, app files, E2E keys).
+
 With no --agents and a terminal attached, an interactive picker appears when
 more than one agent is detected. Without a terminal it installs all detected.
 Mirroring defaults to ON; with a terminal attached a one-key [Y/n] prompt asks.
@@ -303,6 +323,8 @@ EOF
 # ── parse CLI args (curl|bash passes them via `bash -s -- …`) ────────────────
 while [ $# -gt 0 ]; do
   case "$1" in
+    unpair|--unpair)       SUBCOMMAND="unpair" ;;      # #387 解綁(server 撤銷+停服務+清憑證)
+    uninstall|--uninstall) SUBCOMMAND="uninstall" ;;   # #387 全卸載
     --agents=*)    add_requested "${1#*=}" ;;
     --agents|-A)   shift; [ $# -gt 0 ] || fail "--agents needs a value (e.g. --agents=claude-code,codex)"; add_requested "$1" ;;
     --all)         REQUESTED="all" ;;
@@ -412,6 +434,7 @@ MACCHIATO_HERMES_PROFILE=$PROFILE"
   else
     say "$WHAT credentials found, skipping pairing"
   fi
+  rm -f "$CRED.revoked"   # #387 重新配對成功,清掉舊解綁標記
   MACCHIATO_UNIT_EXTRA_ENV="$PROFILE_ENV
 $(mirror_env_for "$UNIT" "$WHAT")" install_unit "$UNIT" "$PY $APP/connector.py"
   # Platform plugin: lets Hermes proactively deliver to Macchiato (best effort).
@@ -444,6 +467,7 @@ install_openclaw() {
   else
     say "OpenClaw credentials found, skipping pairing"
   fi
+  rm -f "$CRED.revoked"   # #387 重新配對成功,清掉舊解綁標記
   MACCHIATO_UNIT_EXTRA_ENV="$(mirror_env_for macchiato-openclaw-connector OpenClaw)" install_unit "macchiato-openclaw-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
   # Channel plugin: lets OpenClaw proactively deliver to Macchiato (best effort)
   if command -v openclaw >/dev/null 2>&1; then
@@ -484,6 +508,7 @@ install_claude_code() {
   else
     say "Claude Code credentials found, skipping pairing"
   fi
+  rm -f "$CRED.revoked"   # #387 重新配對成功,清掉舊解綁標記
   # PATH: user systemd units often miss ~/.local/bin → the connector could not find the claude CLI.
   MACCHIATO_UNIT_EXTRA_ENV="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 MACCHIATO_CLAUDE_BIN=$CLAUDE
@@ -519,6 +544,7 @@ install_codex() {
   else
     say "Codex credentials found, skipping pairing"
   fi
+  rm -f "$CRED.revoked"   # #387 重新配對成功,清掉舊解綁標記
   MACCHIATO_UNIT_EXTRA_ENV="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 MACCHIATO_CODEX_BIN=$CODEX
 $(mirror_env_for macchiato-codex-connector Codex)"     install_unit "macchiato-codex-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
@@ -639,6 +665,174 @@ pick_agents() {
   [ "${#SELECTED[@]}" -gt 0 ] || fail "No connectors selected — re-run and tick at least one, or pass --agents=<list>."
 }
 
+# ── per-agent 定位助手(單元名/憑證路徑;與各 install_* 內的路徑推導保持一致) ──
+unit_for() { # $1=canonical agent key → systemd/launchd 單元名
+  case "$1" in
+    hermes)      echo "macchiato-connector" ;;
+    hermes:*)    echo "macchiato-connector-${1#hermes:}" ;;
+    openclaw)    echo "macchiato-openclaw-connector" ;;
+    claude-code) echo "macchiato-claude-code-connector" ;;
+    codex)       echo "macchiato-codex-connector" ;;
+  esac
+}
+cred_for() { # $1=canonical agent key → 配對憑證路徑
+  case "$1" in
+    hermes)      echo "$HOME/.macchiato/connector.json" ;;
+    hermes:*)    echo "$HOME/.macchiato/hermes-${1#hermes:}/connector.json" ;;
+    openclaw)    echo "$HOME/.macchiato/openclaw-connector.json" ;;
+    claude-code) echo "$HOME/.macchiato/claude-code-connector.json" ;;
+    codex)       echo "$HOME/.macchiato/codex-connector.json" ;;
+  esac
+}
+
+# ═════════════════════════ unpair / uninstall (#387) ════════════════════════
+unit_exists() { [ -f "$UNIT_DIR/$1.service" ] || [ -f "$HOME/Library/LaunchAgents/chat.macchiato.$1.plist" ]; }
+
+# 本機已裝的連接器實例(憑證/隔離標記/服務單元任一存在即算),一行一個 key。
+installed_agents() {
+  if [ "${MACCHIATO_SELFTEST:-0}" = 1 ]; then
+    local a
+    for a in ${MACCHIATO_FAKE_INSTALLED:-}; do echo "$a"; done
+    return 0
+  fi
+  local a d p
+  for a in hermes openclaw claude-code codex; do
+    if [ -f "$(cred_for "$a")" ] || [ -f "$(cred_for "$a").revoked" ] || unit_exists "$(unit_for "$a")"; then
+      echo "$a"
+    fi
+  done
+  for d in "$HOME/.macchiato"/hermes-*/; do   # #309 per-profile instances
+    [ -d "$d" ] || continue
+    p="${d%/}"; p="${p##*/}"; p="${p#hermes-}"
+    case "$p" in ""|*[!a-z0-9_-]*) continue ;; esac
+    echo "hermes:$p"
+  done
+}
+
+json_field() { # $1=file $2=key → 值(我們自己寫的憑證 JSON;鍵唯一,單行/多行皆可)
+  sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -1
+}
+
+# 用連接器自己的憑證通知 server 撤銷綁定(app 裡該 agent 隨之消失)。0=成功。
+server_unpair() { # $1=cred file
+  local tok id url api
+  tok="$(json_field "$1" connectorToken)"; [ -n "$tok" ] || tok="$(json_field "$1" connector_token)"
+  id="$(json_field "$1" agentLinkId)";     [ -n "$id" ]  || id="$(json_field "$1" agent_link_id)"
+  url="$(json_field "$1" serverUrl)";      [ -n "$url" ] || url="$(json_field "$1" server_url)"
+  [ -n "$url" ] || url="${MACCHIATO_SERVER_URL:-wss://api.macchiato.chat/connector}"
+  { [ -n "$tok" ] && [ -n "$id" ]; } || return 1
+  api="$(printf '%s' "$url" | sed -e 's|^wss://|https://|' -e 's|^ws://|http://|' -e 's|/connector$||')"
+  command curl --disable --silent --fail --max-redirs 0 --connect-timeout 10 --max-time 30 \
+    -X POST "$api/connector/unpair" -H 'content-type: application/json' \
+    --data "{\"agentLinkId\":\"$id\",\"connectorToken\":\"$tok\"}" >/dev/null 2>&1
+}
+
+stop_unit() { # $1=unit-name — 停止+禁用+刪除服務單元(systemd/launchd 皆盡力而為)
+  if have_systemd; then
+    systemctl --user disable --now "$1.service" >/dev/null 2>&1 || true
+    rm -f "$UNIT_DIR/$1.service"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user reset-failed "$1.service" >/dev/null 2>&1 || true
+  fi
+  if have_launchd; then
+    launchctl bootout "gui/$(id -u)/chat.macchiato.$1" >/dev/null 2>&1 || true
+    rm -f "$HOME/Library/LaunchAgents/chat.macchiato.$1.plist"
+  fi
+}
+
+unpair_agent() { # $1=agent key — server 撤銷 → 停服務 → 清憑證(app 代碼保留,重配對很快)
+  local label cred unit
+  label="$(agent_label "$1")"; cred="$(cred_for "$1")"; unit="$(unit_for "$1")"
+  if [ -f "$cred" ]; then
+    if server_unpair "$cred"; then
+      say "$label — unpaired from your Macchiato account ✓"
+    else
+      warn "$label — could not notify the server (offline / already revoked?). If it still shows in the app, remove it there."
+    fi
+  fi
+  stop_unit "$unit"
+  rm -f "$cred" "$cred.revoked" "$cred.tmp"
+  say "$label — service stopped, local credentials removed"
+}
+
+do_unpair() {
+  local installed=() targets=() a t
+  while IFS= read -r a; do [ -n "$a" ] && installed+=("$a"); done < <(installed_agents)
+  [ "${#installed[@]}" -gt 0 ] || { say "No Macchiato connectors installed on this machine — nothing to unpair."; exit 0; }
+  if [ "$REQUESTED" = "all" ]; then
+    targets=("${installed[@]}")
+  elif [ -n "$REQUESTED" ]; then
+    for t in $REQUESTED; do
+      case " ${installed[*]} " in
+        *" $t "*) targets+=("$t") ;;
+        *)        warn "$(agent_label "$t") is not installed here — skipping" ;;
+      esac
+    done
+  elif [ "${#installed[@]}" -eq 1 ] || [ "$ASSUME_YES" = 1 ]; then
+    targets=("${installed[@]}")
+  elif has_tty && stty -g </dev/tty >/dev/null 2>&1; then
+    say "Installed connectors: $(labels_of "${installed[@]}")."
+    pick_agents "${installed[@]}"
+    targets=(${SELECTED[@]+"${SELECTED[@]}"})
+  else
+    fail "Multiple connectors installed ($(labels_of "${installed[@]}")) — pass --agents=<list> or --agents=all."
+  fi
+  [ "${#targets[@]}" -gt 0 ] || fail "Nothing selected — pass --agents=<list> or pick at least one."
+  if [ "${MACCHIATO_SELFTEST:-0}" = 1 ]; then printf 'UNPAIR:%s\n' "$(csv ${targets[@]+"${targets[@]}"})"; exit 0; fi
+  for a in "${targets[@]}"; do unpair_agent "$a"; done
+  say "Done. Pair again anytime by re-running the install command."
+  exit 0
+}
+
+do_uninstall() {
+  local installed=() a
+  while IFS= read -r a; do [ -n "$a" ] && installed+=("$a"); done < <(installed_agents)
+  if [ "${MACCHIATO_SELFTEST:-0}" = 1 ]; then printf 'UNINSTALL:%s\n' "$(csv ${installed[@]+"${installed[@]}"})"; exit 0; fi
+  say "This removes ALL Macchiato connectors from this machine:"
+  say "  services + pairing credentials + connector app files under ~/.macchiato (E2E keys included)."
+  if [ "$ASSUME_YES" != 1 ]; then
+    if has_tty && stty -g </dev/tty >/dev/null 2>&1; then
+      printf '  Continue? [y/N] ' >/dev/tty
+      local k=""
+      IFS= read -rsn1 k </dev/tty 2>/dev/null || k=""
+      printf '%s\n' "$k" >/dev/tty
+      case "$k" in y|Y) ;; *) fail "Cancelled — nothing removed." ;; esac
+    else
+      fail "No terminal to confirm — re-run with -y to uninstall non-interactively."
+    fi
+  fi
+  for a in ${installed[@]+"${installed[@]}"}; do unpair_agent "$a"; done
+  # 只清點名道姓的安裝產物——絕不 rm -rf 整個 ~/.macchiato(裡面可能有用戶自己的文件)。
+  rm -rf "$HOME/.macchiato/app" "$HOME/.macchiato/openclaw-app" "$HOME/.macchiato/claude-code-app" \
+    "$HOME/.macchiato/codex-app" "$HOME/.macchiato/logs" "$HOME/.macchiato/attachments" \
+    "$HOME/.macchiato/cc-attachments" "$HOME/.macchiato/codex-attachments"
+  rm -rf "$HOME/.macchiato"/hermes-*/
+  local f
+  for f in mirror.json sessions.json health.json hermes-projects.json push.sock \
+    claude-code-e2e.json claude-code-mirror.json claude-code-sessions.json cc-projects.json \
+    codex-e2e.json codex-mirror.json codex-projects.json codex-sessions.json \
+    openclaw-e2e.json openclaw-mirror.json openclaw-drive.json openclaw-titled.json openclaw-push.sock; do
+    rm -f "$HOME/.macchiato/$f" "$HOME/.macchiato/$f.bak" "$HOME/.macchiato/$f.tmp"
+  done
+  # gateway 側插件(盡力而為;失敗只提示)
+  if command -v hermes >/dev/null 2>&1; then hermes plugins disable macchiato >/dev/null 2>&1 || true; fi
+  rm -rf "$HOME/.hermes/plugins/macchiato" "$HOME/.hermes/profiles"/*/plugins/macchiato
+  if command -v openclaw >/dev/null 2>&1; then openclaw plugins disable macchiato >/dev/null 2>&1 || true; fi
+  if rmdir "$HOME/.macchiato" 2>/dev/null; then
+    say "Removed ~/.macchiato"
+  elif [ -d "$HOME/.macchiato" ]; then
+    warn "Kept ~/.macchiato — it still contains files this installer didn't create."
+  fi
+  say "Macchiato uninstalled. Agents disappear from the app as each connector unpairs; anything left can be removed in the app."
+  exit 0
+}
+
+# #387 子命令分發:unpair/uninstall 不進安裝選擇/鏡像詢問,亦不需要 verified 工件內容。
+case "$SUBCOMMAND" in
+  unpair)    do_unpair ;;
+  uninstall) do_uninstall ;;
+esac
+
 # ── resolve what to install ─────────────────────────────────────────────────
 if [ "$REQUESTED" = "all" ]; then
   SELECTED=(${DETECTED[@]+"${DETECTED[@]}"})    # may be empty on bash 3.2 → guard the expansion
@@ -713,26 +907,6 @@ if [ "${MACCHIATO_SELFTEST:-0}" = 1 ]; then
   printf 'MIRROR:%s\n' "$MIRROR_MODE"
   exit 0
 fi
-
-# ── per-agent 定位助手(單元名/憑證路徑;與各 install_* 內的路徑推導保持一致) ──
-unit_for() { # $1=canonical agent key → systemd/launchd 單元名
-  case "$1" in
-    hermes)      echo "macchiato-connector" ;;
-    hermes:*)    echo "macchiato-connector-${1#hermes:}" ;;
-    openclaw)    echo "macchiato-openclaw-connector" ;;
-    claude-code) echo "macchiato-claude-code-connector" ;;
-    codex)       echo "macchiato-codex-connector" ;;
-  esac
-}
-cred_for() { # $1=canonical agent key → 配對憑證路徑
-  case "$1" in
-    hermes)      echo "$HOME/.macchiato/connector.json" ;;
-    hermes:*)    echo "$HOME/.macchiato/hermes-${1#hermes:}/connector.json" ;;
-    openclaw)    echo "$HOME/.macchiato/openclaw-connector.json" ;;
-    claude-code) echo "$HOME/.macchiato/claude-code-connector.json" ;;
-    codex)       echo "$HOME/.macchiato/codex-connector.json" ;;
-  esac
-}
 
 # #388 一碼多綁:本次安裝的批次 id(高熵,僅在連接器→server 的 WSS 內傳輸)。
 # 同批第一個配對碼被 claim 後,其餘 agent 在窗口內免碼自動綁定;老 server 忽略,各自出碼。
