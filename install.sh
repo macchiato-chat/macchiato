@@ -401,7 +401,8 @@ MACCHIATO_HERMES_PROFILE=$PROFILE"
     say "Pairing $WHAT connector (enter the code below at macchiato.chat)"
     if [ -n "$PROFILE" ]; then
       # Label carries the profile so the app can tell multiple Hermes agents apart.
-      env "HERMES_HOME=$HH" "MACCHIATO_STATE_DIR=$STATE" "MACCHIATO_LABEL=$(hostname 2>/dev/null || uname -n) ($PROFILE)" \
+      env "HERMES_HOME=$HH" "MACCHIATO_STATE_DIR=$STATE" "MACCHIATO_HERMES_PROFILE=$PROFILE" \
+        "MACCHIATO_LABEL=$(hostname 2>/dev/null || uname -n) ($PROFILE)" \
         "$PY" "$APP/pair.py" || fail "Pairing not completed. Re-run this script to continue."
     else
       "$PY" "$APP/pair.py" || fail "Pairing not completed. Re-run this script to continue."
