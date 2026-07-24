@@ -403,9 +403,11 @@ MACCHIATO_HERMES_PROFILE=$PROFILE"
     if [ -n "$PROFILE" ]; then
       # Label carries the profile so the app can tell multiple Hermes agents apart.
       env "HERMES_HOME=$HH" "MACCHIATO_STATE_DIR=$STATE" "MACCHIATO_HERMES_PROFILE=$PROFILE" \
+        "MACCHIATO_PAIR_BATCH=$PAIR_BATCH" "MACCHIATO_PAIR_BATCH_MANY=$PAIR_BATCH_MANY" \
         "$PY" "$APP/pair.py" || fail "Pairing not completed. Re-run this script to continue."
     else
-      "$PY" "$APP/pair.py" || fail "Pairing not completed. Re-run this script to continue."
+      env "MACCHIATO_PAIR_BATCH=$PAIR_BATCH" "MACCHIATO_PAIR_BATCH_MANY=$PAIR_BATCH_MANY" \
+        "$PY" "$APP/pair.py" || fail "Pairing not completed. Re-run this script to continue."
     fi
   else
     say "$WHAT credentials found, skipping pairing"
@@ -438,7 +440,7 @@ install_openclaw() {
   (cd "$APP" && npm install --omit=dev --silent) || fail "npm install failed in $APP"
   if [ ! -f "$CRED" ]; then
     say "Pairing OpenClaw connector (enter the code below at macchiato.chat)"
-    (cd "$APP" && MACCHIATO_PAIR_ONLY=1 ./node_modules/.bin/tsx src/index.ts) || fail "Pairing not completed. Re-run this script to continue."
+    (cd "$APP" && MACCHIATO_PAIR_ONLY=1 MACCHIATO_PAIR_BATCH="$PAIR_BATCH" MACCHIATO_PAIR_BATCH_MANY="$PAIR_BATCH_MANY" ./node_modules/.bin/tsx src/index.ts) || fail "Pairing not completed. Re-run this script to continue."
   else
     say "OpenClaw credentials found, skipping pairing"
   fi
@@ -478,7 +480,7 @@ install_claude_code() {
   (cd "$APP" && npm install --omit=dev --silent) || fail "npm install failed in $APP"
   if [ ! -f "$CRED" ]; then
     say "Pairing Claude Code connector (enter the code below at macchiato.chat)"
-    (cd "$APP" && MACCHIATO_PAIR_ONLY=1 MACCHIATO_CLAUDE_BIN="$CLAUDE" ./node_modules/.bin/tsx src/index.ts) || fail "Pairing not completed. Re-run this script to continue."
+    (cd "$APP" && MACCHIATO_PAIR_ONLY=1 MACCHIATO_CLAUDE_BIN="$CLAUDE" MACCHIATO_PAIR_BATCH="$PAIR_BATCH" MACCHIATO_PAIR_BATCH_MANY="$PAIR_BATCH_MANY" ./node_modules/.bin/tsx src/index.ts) || fail "Pairing not completed. Re-run this script to continue."
   else
     say "Claude Code credentials found, skipping pairing"
   fi
@@ -513,7 +515,7 @@ install_codex() {
   (cd "$APP" && npm install --omit=dev --silent) || fail "npm install failed in $APP"
   if [ ! -f "$CRED" ]; then
     say "Pairing Codex connector (enter the code below at macchiato.chat)"
-    (cd "$APP" && MACCHIATO_PAIR_ONLY=1 MACCHIATO_CODEX_BIN="$CODEX" ./node_modules/.bin/tsx src/index.ts) || fail "Pairing not completed. Re-run this script to continue."
+    (cd "$APP" && MACCHIATO_PAIR_ONLY=1 MACCHIATO_CODEX_BIN="$CODEX" MACCHIATO_PAIR_BATCH="$PAIR_BATCH" MACCHIATO_PAIR_BATCH_MANY="$PAIR_BATCH_MANY" ./node_modules/.bin/tsx src/index.ts) || fail "Pairing not completed. Re-run this script to continue."
   else
     say "Codex credentials found, skipping pairing"
   fi
@@ -711,6 +713,12 @@ if [ "${MACCHIATO_SELFTEST:-0}" = 1 ]; then
   printf 'MIRROR:%s\n' "$MIRROR_MODE"
   exit 0
 fi
+
+# #388 一碼多綁:本次安裝的批次 id(高熵,僅在連接器→server 的 WSS 內傳輸)。
+# 同批第一個配對碼被 claim 後,其餘 agent 在窗口內免碼自動綁定;老 server 忽略,各自出碼。
+PAIR_BATCH="$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')"
+PAIR_BATCH_MANY=""
+[ "${#SELECTED[@]}" -gt 1 ] && PAIR_BATCH_MANY=1
 
 # ── run the chosen installers ───────────────────────────────────────────────
 for a in "${SELECTED[@]}"; do
