@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import socket
+import subprocess
 import sys
 
 import websockets
@@ -64,6 +65,7 @@ def _save_cred(msg: dict, label: str) -> None:
 # profile 名由 install.sh 經 MACCHIATO_HERMES_PROFILE 傳入(#309;缺省=默認 Hermes)。
 _PAIR_PROFILE = os.environ.get("MACCHIATO_HERMES_PROFILE", "").strip()
 _PAIR_WHO = f"Hermes profile '{_PAIR_PROFILE}'" if _PAIR_PROFILE else "Hermes"
+_PAIR_GROUP = os.environ.get("MACCHIATO_PAIR_GROUP", "").strip() or _PAIR_WHO
 # #388 一碼多綁:安裝器生成的批次 id(僅 WSS 內傳輸);同批第一個被 claim 後本連接器免碼自動綁定
 _PAIR_BATCH = os.environ.get("MACCHIATO_PAIR_BATCH", "").strip()
 
@@ -74,11 +76,18 @@ def _show_code(code: str, fresh: bool) -> None:
     except Exception:
         pass
     print("\n" + "=" * 54)
-    print(f"  Pairing code for {_PAIR_WHO}" + (" (refreshed)" if fresh else "") + ":")
+    print(f"  Pairing code for {_PAIR_GROUP}" + (" (refreshed)" if fresh else "") + ":")
     print(f"        >>>  {code}  <<<")
     print(f"  Sign in at {WEB_URL} → \"Pair connector\" → enter this code.")
     if _PAIR_BATCH and os.environ.get("MACCHIATO_PAIR_BATCH_MANY"):
         print("  Other agents from this install will pair automatically with this code.")
+    # #388 終端 QR(可選增強):qrencode 在則打 ANSI 碼(iOS 掃碼配對直接掃終端);缺失靜默跳過
+    try:
+        qr = subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "2", code], capture_output=True, text=True, timeout=3)
+        if qr.returncode == 0 and qr.stdout:
+            print("\n" + qr.stdout + "  (scan with the Macchiato iOS app)")
+    except Exception:
+        pass
     print("=" * 54 + "\nWaiting for you to claim it…", flush=True)
 
 

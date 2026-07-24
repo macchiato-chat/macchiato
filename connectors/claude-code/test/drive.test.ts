@@ -143,6 +143,7 @@ beforeEach(() => {
   process.env.MACCHIATO_CC_SESSIONS = join(mkdtempSync(join(tmpdir(), "cc-dr-")), "sessions.json");
   delete process.env.MACCHIATO_CC_IDLE_S;
   delete process.env.MACCHIATO_CC_MODEL; // #143 防測試間污染(連接器服務設了它)
+  delete process.env.MACCHIATO_CC_TITLE_MODE; // 同上:個別用例設 off 防偷跑 turnScript,不清會順著污染後面
 });
 
 describe("Drive", () => {
@@ -206,6 +207,28 @@ describe("Drive", () => {
     // SDK 是**整份替換**子進程環境:漏了展開就會丟 PATH/HOME/認證,子進程直接廢掉。
     expect(lastOptions.env.PATH).toBe(process.env.PATH);
     expect(lastOptions.env.HOME).toBe(process.env.HOME);
+  });
+
+  it("#389 通道重建後 env 仍在——改權限/cwd/model 會重建通道,別把身份聲明弄丟", async () => {
+    delete process.env.MACCHIATO_CC_PERMISSION_MODE;
+    process.env.MACCHIATO_CC_TITLE_MODE = "off"; // ULID 首回合會觸發標題,關掉防偷跑 turnScript
+    turnScripts = [
+      [{ type: "system", subtype: "init", session_id: CC_SID }, { type: "result", subtype: "success", result: "1" }],
+      [{ type: "system", subtype: "init", session_id: CC_SID }, { type: "result", subtype: "success", result: "2" }],
+    ];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame("01ULIDSERVERSID000000000AA", "prompt.submit", { text: "first" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOptions.env.CLAUDE_CODE_ENTRYPOINT).toBe("macchiato");
+    // 改權限檔 → 通道參數變 → 下個 prompt 重建通道
+    fire(tuiFrame("01ULIDSERVERSID000000000AA", "session.create", { permissionMode: "plan" }));
+    fire(tuiFrame("01ULIDSERVERSID000000000AA", "prompt.submit", { text: "second" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOptions.permissionMode).toBe("plan"); // 確認通道確實重建了
+    expect(lastOptions.env.CLAUDE_CODE_ENTRYPOINT).toBe("macchiato"); // 重建後聲明仍在
+    d.dispose();
   });
 
   it("#347 E2E 回合在 input.push 前身份快照落盘失败 → poison/fatal，prompt 未交付 SDK", async () => {

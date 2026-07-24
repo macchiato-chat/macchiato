@@ -4,6 +4,7 @@
  * socket 要保活到認領；server code ~8min TTL, 故定期換新碼；斷線則重連換新。照搬 hermes-connector/pair.py。
  */
 import { hostname } from "node:os";
+import { spawnSync } from "node:child_process";
 import WebSocket from "ws";
 import { LINK_B_PROTO } from "./proto";
 import { backoffMs } from "../backoff";
@@ -23,12 +24,20 @@ function showCode(code: string, webUrl: string, fresh: boolean): void {
   const line = "=".repeat(54);
   console.log(`\n${line}`);
   // ⚠️ 回歸契約:scripts/regression/run-regression.mjs 從 install.log 斷言「>>> <碼> <<<」,改動需同步
-  console.log(`  Pairing code for OpenClaw${fresh ? " (refreshed)" : ""}:`);
+  const who = process.env.MACCHIATO_PAIR_GROUP || "OpenClaw";
+  console.log(`  Pairing code for ${who}${fresh ? " (refreshed)" : ""}:`);
   console.log(`        >>>  ${code}  <<<`);
   console.log(`  Sign in at ${webUrl} → \"Pair connector\" → enter this code.`);
   // #388 一碼多綁:同批安裝的其餘 agent 免碼自動綁定(安裝器設 MACCHIATO_PAIR_BATCH_MANY)
   if (process.env.MACCHIATO_PAIR_BATCH && process.env.MACCHIATO_PAIR_BATCH_MANY) {
     console.log("  Other agents from this install will pair automatically with this code.");
+  }
+  // #388 終端 QR(可選增強):qrencode 在則打 ANSI 碼——iOS app 的掃碼配對直接掃終端。
+  try {
+    const qr = spawnSync("qrencode", ["-t", "ANSIUTF8", "-m", "2", code], { encoding: "utf8", timeout: 3000 });
+    if (qr.status === 0 && qr.stdout) console.log(`\n${qr.stdout}  (scan with the Macchiato iOS app)`);
+  } catch {
+    /* 無 qrencode / 失敗:純視覺增強,靜默跳過 */
   }
   console.log(`${line}\nWaiting for you to claim it…`);
 }
