@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { credPath, loadCreds, saveCreds, type Creds } from "../src/linkb/creds";
+import { credPath, loadCreds, quarantineCreds, saveCreds, type Creds } from "../src/linkb/creds";
 
 describe("Link B 憑證 load/save", () => {
   let dir: string;
@@ -54,5 +54,14 @@ describe("Link B 憑證 load/save", () => {
     expect(statSync(credPath()).mode & 0o777).toBe(0o600);
     expect(existsSync(credPath() + ".tmp")).toBe(false);
     expect(loadCreds()?.connectorToken).toBe("b");
+  });
+
+  it("#387 quarantineCreds:改名 .revoked 留痕,loadCreds 回到未配對;無憑證時 no-op", () => {
+    expect(quarantineCreds()).toBeNull(); // 無憑證 no-op
+    saveCreds({ serverUrl: "wss://x", connectorToken: "t", agentLinkId: "al" });
+    expect(quarantineCreds()).toBe(credPath() + ".revoked");
+    expect(existsSync(credPath())).toBe(false);
+    expect(existsSync(credPath() + ".revoked")).toBe(true); // 留痕(重跑安裝時清掉)
+    expect(loadCreds()).toBeNull(); // 服務重啟 → 進等待配對,不再拿死 token 空轉
   });
 });

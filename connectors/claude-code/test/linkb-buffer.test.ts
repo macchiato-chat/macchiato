@@ -449,24 +449,34 @@ describe("#347 per-session runtime 隔离与 socket generation", () => {
 });
 
 describe("#246 auth_error 終端退出(不殭屍)", () => {
-  it("auth_error → onFatal(交 supervisor 退出),不再靜默空轉", async () => {
+  async function authErrorFatalKind(reason: string): Promise<Array<"revoked" | undefined>> {
     const wss = new WebSocketServer({ port: 0 });
     wss.on("connection", (ws) => {
       ws.on("message", (raw) => {
-        if (JSON.parse(String(raw)).t === "hello") ws.send(JSON.stringify({ t: "auth_error", reason: "revoked" }));
+        if (JSON.parse(String(raw)).t === "hello") ws.send(JSON.stringify({ t: "auth_error", reason }));
       });
     });
     const port = (wss.address() as { port: number }).port;
     const c = new LinkBClient({ serverUrl: `ws://127.0.0.1:${port}`, connectorToken: "t", agentLinkId: "al" } as any);
-    let fatal = 0;
-    c.onFatal = () => {
-      fatal++;
+    const kinds: Array<"revoked" | undefined> = [];
+    c.onFatal = (kind) => {
+      kinds.push(kind);
     };
     void c.start().catch(() => {});
     await new Promise((r) => setTimeout(r, 120));
-    expect(fatal).toBe(1); // 退出交 supervisor,不殭屍
     c.close();
     await new Promise((r) => wss.close(r));
+    return kinds;
+  }
+
+  it("auth_error → onFatal(交 supervisor 退出),不再靜默空轉;#387 revoked 標記", async () => {
+    expect(await authErrorFatalKind("revoked")).toEqual(["revoked"]); // kick 帶的吊銷語義
+  });
+  it("#387 重連撞 invalid connector token(踢時離線)→ 同樣按吊銷處理", async () => {
+    expect(await authErrorFatalKind("invalid connector token")).toEqual(["revoked"]);
+  });
+  it("#387 proto mismatch 等其他終端態不誤判為吊銷(不隔離憑證)", async () => {
+    expect(await authErrorFatalKind("proto mismatch, supported 3-4")).toEqual([undefined]);
   });
 });
 

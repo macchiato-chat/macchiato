@@ -79,7 +79,7 @@ LINK_B_PROTO = 4  # 對齊 server（packages/protocol：B=4，#370 E2E 控制認
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.49"
+CONNECTOR_VERSION = "1.5.50"
 E2E_APPROVAL_PLAINTEXT_MAX = 64 * 1024
 # #279 E2E prompt 解密失敗的用戶可見回執(僅提示語,零內容洩漏;四連接器同文案)。
 E2E_DECRYPT_FAIL_WARNING = "無法解密這條消息(設備與連接器的加密密鑰可能失步)——請重試,或重新關閉再開啟本會話的端到端加密。"
@@ -148,6 +148,22 @@ def _default_push_sock() -> str:
     if os.path.realpath(hh) != os.path.realpath(os.path.expanduser("~/.hermes")):
         return os.path.join(hh, "macchiato-push.sock")
     return os.path.expanduser("~/.macchiato/push.sock")
+
+
+def _cred_path() -> str:
+    """配對憑證路徑(pair.py 寫入;_main 回落讀取、#387 解綁隔離同一規則)。"""
+    return os.path.expanduser(os.environ.get("MACCHIATO_CRED") or os.path.join(STATE_DIR, "connector.json"))
+
+
+def _quarantine_creds() -> None:
+    """#387 app 解綁後隔離憑證:改名 .revoked(留痕)。重啟後 _main 見標記退 78,不再空轉;
+    重跑安裝命令即重新配對。盡力而為(env 直供 token 時無檔可隔離)。"""
+    p = _cred_path()
+    try:
+        if os.path.exists(p):
+            os.replace(p, p + ".revoked")
+    except OSError:
+        pass
 
 
 MIRROR_STATE = os.path.join(STATE_DIR, "mirror.json")  # 鏡像水位線持久化
@@ -503,6 +519,7 @@ class Connector:
         self._out_pending: deque = deque(maxlen=500)  # 斷線期間出站幀緩衝(ready 後補發;有界丟最舊)
         self._linkb_ready = False  # #251 收到 t:"ready" 才置真:handshaking 窗口不直發未認證幀、走緩衝
         self._on_fatal = lambda: sys.exit(1)  # #246 auth_error 終端態 → 退出交 supervisor(測試可覆蓋)
+        self._on_fatal_revoked = lambda: sys.exit(78)  # #387 app 解綁:EX_CONFIG,新版 unit 不再拉起(測試可覆蓋)
         self._e2e = E2EKeyStore()  # §19 per-session E2E 密鑰管理（持 K_S、封裝給設備、加解密內容）
         self._e2e_control = E2EControlVerifier(self._e2e)  # #370 设备认证控制 + 持久防重放
         # Hermes gateway 的原生 approval.respond 只有 session FIFO。E2E 下自行赋 request id +
@@ -2479,6 +2496,19 @@ class Connector:
                 f"✗ auth_error: {reason}（憑證吊銷或 Hermes 升級致 proto 不符——需重新配對/升級）",
                 file=sys.stderr,
             )
+            # #387 永久吊銷(app 解綁 kick 帶 "revoked";踢時離線的重連撞 "invalid connector
+            # token")→ 隔離憑證 + exit 78:新版 unit RestartPreventExitStatus=78 不再拉起;
+            # 舊 unit 重啟後因無憑證直接退出,不再拿死 token 打 server。
+            r = str(reason or "")
+            if r == "revoked" or "invalid connector token" in r:
+                _quarantine_creds()
+                print(
+                    "✗ Unpaired from the Macchiato app — local credentials retired. "
+                    "Re-run the install command to pair again.",
+                    file=sys.stderr,
+                )
+                self._on_fatal_revoked()
+                return
             # #246 auth_error 是終端態(非瞬時):此前只記狀態,外層 ≤1s 全速重連狂打 server
             # (收帧重置退避)。改為退出交 supervisor(systemd)——重試/最終 stop,不再殭屍空轉。
             self._on_fatal()
@@ -3032,7 +3062,7 @@ async def _main() -> int:
     agent_link_id = os.environ.get("MACCHIATO_AGENT_LINK_ID")
 
     # 回落到 pair.py 存下的憑證（~/.macchiato/connector.json）。
-    cred_path = os.path.expanduser(os.environ.get("MACCHIATO_CRED") or os.path.join(STATE_DIR, "connector.json"))
+    cred_path = _cred_path()
     if (not token or not agent_link_id) and os.path.exists(cred_path):
         with open(cred_path) as f:
             cred = json.load(f)
@@ -3042,6 +3072,15 @@ async def _main() -> int:
 
     server_url = server_url or "ws://localhost:8080/connector"
     if not token or not agent_link_id:
+        # #387 解綁標記在場 → 這不是配置事故而是用戶在 app 裡解綁了:退 78,
+        # 新版 unit(RestartPreventExitStatus=78)不再拉起。
+        if os.path.exists(cred_path + ".revoked"):
+            print(
+                "Unpaired from the Macchiato app — credentials retired. "
+                "Re-run the install command to pair again.",
+                file=sys.stderr,
+            )
+            return 78
         print(
             "FAIL: 未配對。先跑 pair.py，或設 MACCHIATO_CONNECTOR_TOKEN/MACCHIATO_AGENT_LINK_ID。",
             file=sys.stderr,

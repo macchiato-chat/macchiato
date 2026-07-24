@@ -3,7 +3,7 @@
  *   憑證（未配對則先配對）→ 連 OpenClaw gateway + Macchiato Link B → 啟動鏡像。
  * 跑：pnpm --filter @macchiato/openclaw-connector start
  */
-import { loadCreds } from "./linkb/creds";
+import { loadCreds, quarantineCreds } from "./linkb/creds";
 import { LinkBClient } from "./linkb/client";
 import { runPairing } from "./linkb/pairing";
 import { resolveGatewayConfig } from "./openclaw/config";
@@ -25,7 +25,7 @@ import { join } from "node:path";
 // 四連接器常量(cc/codex/openclaw 各自 src/index.ts + hermes connector.py)+ protocol link.ts 全局。
 // 全局是 server 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」
 // (本機與公開用戶一起亮,重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-const CONNECTOR_VERSION = "1.5.49";
+const CONNECTOR_VERSION = "1.5.50";
 
 /** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
 function runSelfUpdate(): void {
@@ -64,6 +64,19 @@ async function main(): Promise<void> {
     undefined,
     (sid) => e2e.isE2E(sid),
   );
+  // #387 app 解綁(revoked)→ 隔離憑證 + exit 78(EX_CONFIG):新版 unit 憑
+  // RestartPreventExitStatus=78 停止拉起;舊 unit 重啟後無憑證進入等待配對,不再空轉。
+  linkb.onFatal = (kind) => {
+    if (kind === "revoked") {
+      const q = quarantineCreds();
+      console.error(
+        `✗ Unpaired from the Macchiato app — local credentials retired${q ? ` (${q})` : ""}. ` +
+          "Re-run the install command to pair again.",
+      );
+      process.exit(78);
+    }
+    process.exit(1);
+  };
   // #154/#248 首裝採樣:主檔**或 .bak**任一存在都不算首裝——此前只看主檔,兩段 rename 間崩潰
   // (主檔缺、.bak 在)會誤判首裝 → 觸發自動全量導入、重置用戶手改的標題。
   const mirrorMain = process.env.MACCHIATO_OPENCLAW_MIRROR || join(homedir(), ".macchiato/openclaw-mirror.json");

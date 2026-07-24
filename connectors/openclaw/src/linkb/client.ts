@@ -30,8 +30,11 @@ export class LinkBClient {
   private readonly readyOnce: Promise<void>;
 
   /** #246 auth_error(憑證吊銷/proto 不符,非瞬時)= 終端態:退出非零讓 supervisor(systemd)
-   * 接手——重試/最終 stop,消滅「進程活著但不連、不重連、與離線不可區分」的殭屍。測試可覆蓋。 */
-  onFatal: () => void = () => process.exit(1);
+   * 接手——重試/最終 stop,消滅「進程活著但不連、不重連、與離線不可區分」的殭屍。測試可覆蓋。
+   * #387 kind="revoked"(app 解綁/token 已作廢)= 永久終端態:調用方應隔離本地憑證後以
+   * 特殊碼退出(78,新版 unit RestartPreventExitStatus=78 不再拉起;舊 unit 重啟後因無憑證
+   * 進入等待配對,不再用死 token 空轉)。 */
+  onFatal: (kind?: "revoked") => void = () => process.exit(1);
 
   /** #247 半開連接偵測:server 每 30s WS-ping,連續 LIVENESS_MS 無任何入站(含 ping)= 對端已亡
    * (readyState 恒 OPEN、發幀進黑洞)→ terminate 觸發 onClose 重連。收每幀/每 ping 續期。 */
@@ -157,11 +160,16 @@ export class LinkBClient {
         console.log("✓ Link B ready — connected to Macchiato");
         return;
       }
-      case "auth_error":
+      case "auth_error": {
+        // #387 區分「永久吊銷」與其他終端態:server 撤銷綁定時 kick 帶 reason="revoked";
+        // 踢時本機離線的,重連 hello 撞 "invalid connector token"(token hash 已置空)——同義。
+        const reason = typeof msg.reason === "string" ? msg.reason : "";
+        const revoked = reason === "revoked" || reason.includes("invalid connector token");
         console.error(`Link B auth_error: ${msg.reason} — 憑證吊銷或 proto 不符,需重新配對/升級`);
         this.close();
-        this.onFatal(); // #246 退出交 supervisor,不再靜默殭屍空轉
+        this.onFatal(revoked ? "revoked" : undefined); // #246 退出交 supervisor,不再靜默殭屍空轉
         return;
+      }
       case "ping":
         this.send({ t: "pong" });
         return;

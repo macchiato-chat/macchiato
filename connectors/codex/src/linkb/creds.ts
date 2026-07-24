@@ -2,7 +2,7 @@
  * Link B 憑證：配對後拿到的 connector_token + agentLinkId, 存 ~/.macchiato/codex-connector.json。
  * 每個連接器獨立配對,憑證各自分開(hermes/openclaw/claude-code/codex)。
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -37,6 +37,20 @@ export function loadCreds(): Creds | null {
     agentLinkId: c.agentLinkId,
     label: c.label,
   };
+}
+
+/** #387 app 解綁後隔離憑證:改名 .revoked(留痕)。服務被 supervisor 拉起時因無憑證進入
+ * 等待配對,不再拿死 token 空轉;重跑安裝命令即重新配對。返回隔離後路徑(無憑證/失敗 null)。 */
+export function quarantineCreds(): string | null {
+  const p = credPath();
+  if (!existsSync(p)) return null;
+  const q = p + ".revoked";
+  try {
+    renameSync(p, q);
+    return q;
+  } catch {
+    return null;
+  }
 }
 
 /** 寫憑證（0600）。 */

@@ -47,6 +47,20 @@ export function loadCreds(): Creds | null {
   };
 }
 
+/** #387 app 解綁後隔離憑證:改名 .revoked(留痕)。服務被 supervisor 拉起時因無憑證進入
+ * 等待配對,不再拿死 token 空轉;重跑安裝命令即重新配對。返回隔離後路徑(無憑證/失敗 null)。 */
+export function quarantineCreds(): string | null {
+  const p = credPath();
+  if (!existsSync(p)) return null;
+  const q = p + ".revoked";
+  try {
+    renameSync(p, q);
+    return q;
+  } catch {
+    return null;
+  }
+}
+
 /** 寫憑證（0600）。#248/#254:tmp(0600)+chmod+rename 原子寫,不經「先寫 0644 後 chmod」窗口。 */
 export function saveCreds(c: Creds): void {
   const p = credPath();
