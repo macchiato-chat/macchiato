@@ -20,8 +20,13 @@ This repository distributes the **connector** — the small service you run next
 On the machine where your agent (Hermes, OpenClaw, Claude Code or Codex) runs:
 
 ```bash
-Open the Macchiato app or https://macchiato.chat and copy the versioned, SHA-256-verified install command.
+curl -fsSL https://macchiato.chat/install.sh | bash
 ```
+
+The one-liner is served by macchiato.chat itself and is fully verified end to end: it
+downloads a version-pinned bootstrap, checks its SHA-256, and the bootstrap then verifies
+the Ed25519-signed release manifest and every file hash before anything runs. Installer
+flags pass straight through, e.g. `… | bash -s -- --agents=claude-code --no-mirror`.
 
 The installer will:
 
