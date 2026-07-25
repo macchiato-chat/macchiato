@@ -72,7 +72,11 @@ Removing an agent from the web or iOS app works too: the connector notices, reti
 - **Windows (native)** — not supported yet; please run Hermes + connector under **WSL2**.
 - Hermes installed via the **official one-liner, pipx, pip, or uv** are all auto-detected (any layout where `hermes` is on PATH works). Exotic setups: set `HERMES_PYTHON=<path to your Hermes venv's python>`.
 
-> Headless box? Run `loginctl enable-linger $USER` once so the service starts at boot without a login.
+> **Headless box (Pi, VPS, anything you install over SSH)?** The installer enables systemd *lingering* for you.
+> It matters more than it sounds: without it, systemd stops your user's service manager seconds after you log
+> out — killing the connector — so the agent would go offline the moment you close the terminal, and only come
+> back when you SSH in again. If the installer says it couldn't enable it, run `sudo loginctl enable-linger $USER`
+> once. (Lingering also starts the connector at boot without a login.)
 
 ### Manual install
 

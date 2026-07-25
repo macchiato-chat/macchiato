@@ -152,6 +152,35 @@ verify_tree() { # $1=dir under $TMP  $2=repo-relative prefix (e.g. connectors/he
   say "Manifest check ✓ $2 ($n files)"
 }
 
+# ── #430 linger: without it, user services die the moment you log out ───────────
+# systemd user units live under user@<uid>.service, and logind stops that manager
+# UserStopDelaySec (default 10s) after your last session ends — taking every user unit
+# with it. Restart=always cannot help: the manager itself is gone, not the process.
+# On a headless box (Pi/VPS installed over SSH) that reads as "paired fine, replied to
+# my first message, then went offline the moment I closed the terminal".
+# Debian/RPi OS polkit allows set-self-linger without sudo; we still fall back to
+# `sudo -n` and, failing that, warn loudly with the exact command.
+LINGER_STATE=""   # ""=not checked/n-a · "on" · "enabled" (by us) · "failed"
+ensure_linger() {
+  [ -n "$LINGER_STATE" ] && return 0
+  LINGER_STATE="on"   # treat "can't tell" as fine — never block an install over this
+  command -v loginctl >/dev/null 2>&1 || return 0
+  local who; who="$(id -un)"
+  case "$(loginctl show-user "$who" -p Linger 2>/dev/null)" in
+    *=yes) return 0 ;;
+    "")    return 0 ;;   # no logind record (container/CI) — nothing to enable
+  esac
+  if loginctl enable-linger "$who" >/dev/null 2>&1 || sudo -n loginctl enable-linger "$who" >/dev/null 2>&1; then
+    LINGER_STATE="enabled"
+    say "Enabled lingering for $who — connectors keep running after you log out (and start at boot)"
+    return 0
+  fi
+  LINGER_STATE="failed"
+  warn "Could not enable lingering — your connector will STOP when you log out of this machine."
+  warn "Run this once, then re-run the installer:  sudo loginctl enable-linger $who"
+  return 0
+}
+
 install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
   if ! have_systemd; then
     if have_launchd; then
@@ -161,6 +190,7 @@ install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
     warn "No systemd or launchd here — keep this running yourself:  $2"
     return 0
   fi
+  ensure_linger   # #430 must happen before the service matters, once per run
   mkdir -p "$UNIT_DIR"
   {
     echo "[Unit]"
@@ -951,4 +981,10 @@ if [ "${#SKIPPED[@]}" -gt 0 ]; then
 fi
 say "Summary:"
 printf '%s' "$SUMMARY"
+# #430 the one failure mode that silently undoes everything above — repeat it last,
+# where it is still on screen after the install scrolls past.
+if [ "$LINGER_STATE" = "failed" ]; then
+  warn "⚠️  Lingering is OFF for $(id -un): the connector(s) above will be killed when you log out."
+  warn "    Fix it once with:  sudo loginctl enable-linger $(id -un)"
+fi
 say "Done! Open Macchiato — your conversations will start syncing."
