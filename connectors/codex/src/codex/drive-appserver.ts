@@ -151,6 +151,8 @@ interface ActiveTurn {
   threadId: string;
   turnId?: string;
   started: boolean; // message.start 已發
+  /** #393 本回合 prompt 文本(回填 user 消息 srcId 時文本匹配 rollout 的 user_message 行)。 */
+  userText: string;
   agentText: string;
   /** 當前正在流 delta 的 agentMessage itemId + 已流出長度(item/completed 補尾用)。 */
   deltaItem?: string;
@@ -607,9 +609,13 @@ export class AppServerDrive {
           if (!list.length) this.approvals.delete(sid);
           if (!p) return;
           const choice = String(params.choice ?? "deny");
-          const allow = choice === "allow" || choice === "yes" || choice === "always";
-          const all = params.all === true;
-          p.resolve(allow ? (all ? "acceptForSession" : "accept") : "decline");
+          // #359 審批選擇映射(對齊 CC drive.ts):yes/allow/always → 放行;no/deny/未知 → decline
+          // (choice 缺省即 "deny",故未知值 fail-closed 落到 decline)。always 即使 server 未回帶
+          // all(REST 通知快捷入口寫死 all=false、web WS 根本不發 all)也要走會話級授權——靠 choice
+          // 自身判定,不再依賴 all。舊 all=true 路徑保留兼容。
+          const allow = choice === "allow" || choice === "always" || choice === "yes";
+          const always = allow && (params.all === true || choice === "always");
+          p.resolve(allow ? (always ? "acceptForSession" : "accept") : "decline");
           return;
         }
         case "session.interrupt": {
@@ -836,6 +842,7 @@ export class AppServerDrive {
       const turn: ActiveTurn = {
         threadId,
         started: false,
+        userText: firstText,
         agentText: "",
         deltaLen: 0,
         reasoningSeen: new Set(),
@@ -1055,9 +1062,44 @@ export class AppServerDrive {
       this.startMsg(sid, turn);
       this.emit(sid, "message.complete", { text: turn.agentText, status, usage: turn.usage });
     }
+    // #393 回合末把本回合 live 消息回填 srcId(server dedup_key),跨進程重啟後鏡像重投同一 rollout 行
+    // 撞 (session,dedup_key) 唯一索引被吃掉,不再雙份。E2E 走加密批(自帶 srcId)。
+    if (!turn.isE2E) this.backfillLiveSrcIds(sid, turn);
     this.mirror?.fastForward(turn.threadId);
     this.mirror?.unsetDriven(turn.threadId);
     this.projects?.checkTurnEnd(); // #227
+  }
+
+  /**
+   * #393 回合末:把本回合 live 投遞的 user/agent 消息回填 rollout 行 srcId 作 server dedup_key
+   * (message_srcid,#13 同款,Hermes/OpenClaw 驗過的模式)。Codex 無常駐 gateway,live×mirror 收斂
+   * 全靠此:server 的 (session_id,dedup_key) 唯一索引此後對 Codex 生效,跨進程重啟鏡像重投同一 rollout
+   * 行撞索引被 onConflictDoNothing 吃掉,不再雙份。rollout 行無 uuid → srcId 是 srcIdFor 內容指紋,故
+   * 用文本匹配 user_message / 取最後一條 agent_message(= live 的 message.complete 文本所屬行)。
+   * 取捨(見 PR):① rollout 尾行可能晚於 turn/completed 落盤 → 偶爾取不到,留待後續(去重是加固);
+   * ② 帶多條 agent_message 的回合 live 只投一條合併消息,僅最後一條收斂——與 OpenClaw lastAssistant 同限。
+   * 純只讀快照,失敗吞掉(不影響主回合)。
+   */
+  private backfillLiveSrcIds(sid: string, turn: ActiveTurn): void {
+    try {
+      const msgs = this.mirror?.srcIdSnapshot(turn.threadId) ?? [];
+      if (!msgs.length) return;
+      const items: Array<{ role: "user" | "agent"; srcId: string }> = [];
+      // agent:rollout 最後一條 agent_message(= 本回合剛畢的回覆;append-only,尾行即本回合)。
+      const agent = [...msgs].reverse().find((m) => m.role === "agent");
+      if (agent?.srcId) items.push({ role: "agent", srcId: agent.srcId });
+      // user:文本匹配本回合 prompt(對齊 OpenClaw sentTexts 語義)的最後一條 user 行。
+      const want = turn.userText.trim();
+      const user = want
+        ? [...msgs].reverse().find((m) => m.role === "user" && m.text.trim() === want)
+        : undefined;
+      if (user?.srcId) items.push({ role: "user", srcId: user.srcId });
+      if (items.length) {
+        this.linkb.send({ t: "message_srcid", agentLinkId: this.linkb.agentLinkId, sessionId: sid, items });
+      }
+    } catch (e) {
+      console.error(`[#393 Codex srcId 回填失敗 ${sid}] ${(e as Error).message}`);
+    }
   }
 
   // ============================== 審批橋 ==============================
@@ -1101,10 +1143,12 @@ export class AppServerDrive {
     const command =
       kind === "command"
         ? String(request.command ?? "")
-        : `修改文件:${(Array.isArray(request.changes) ? request.changes : []).map((c: any) => String(c?.path ?? "")).filter(Boolean).join(", ").slice(0, 300) || "(見詳情)"}`;
+        : `Modify files: ${(Array.isArray(request.changes) ? request.changes : []).map((c: any) => String(c?.path ?? "")).filter(Boolean).join(", ").slice(0, 300) || "(see details)"}`;
     const reason = request.reason ? String(request.reason) : "";
     const cmd = command.slice(0, 500);
-    const desc = reason || (kind === "command" ? `Codex 想在 ${String(request.cwd ?? "")} 執行命令` : "Codex 想寫入以上文件");
+    // #364 回退文案改英文正典(對齊 CC 的 `Claude Code wants to use X`);不 hardcode 繁中,
+    // 英語界面不再顯示中文。真實 reason(Codex 提供)照原樣透傳,client 按語言本地化見 issue #364。
+    const desc = reason || (kind === "command" ? `Codex wants to run a command in ${String(request.cwd ?? "")}` : "Codex wants to write the files above");
     const patternKey = kind === "command" ? "shell" : "fileChange";
     const requestDigest =
       executionSnapshot

@@ -162,6 +162,65 @@ describe("Drive", () => {
     expect(calls).toEqual(["set:" + CC_SID, "ff:" + CC_SID, "unset:" + CC_SID]);
   });
 
+  it("#393 回合末回填 live 消息 srcId(message_srcid):agent 按 seenMsgIds、user 按文本匹配", async () => {
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "assistant", message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "hello" }] } },
+      { type: "result", subtype: "success", result: "hello" },
+    ];
+    // 只讀快照:transcript 折出的本回合 user + agent(帶 msgId + srcId=行 uuid)。
+    const snapshot = [
+      { role: "user", text: "hi", srcId: "u-uuid-1" },
+      { role: "agent", text: "hello", srcId: "a-uuid-1", msgId: "msg_1" },
+    ];
+    const mirror = {
+      setDriven() {},
+      unsetDriven() {},
+      fastForward() {},
+      markLivePosted() {},
+      markDrivenUuid() {},
+      srcIdSnapshot: () => snapshot,
+    } as any;
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb, mirror);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+    const srcid = sent.find((f: any) => f.t === "message_srcid") as any;
+    expect(srcid).toBeTruthy();
+    expect(srcid.sessionId).toBe(CC_SID);
+    // agent 用 seenMsgIds 精確匹配本回合投遞的組;user 用本回合 prompt 文本匹配。
+    expect(srcid.items).toContainEqual({ role: "agent", srcId: "a-uuid-1" });
+    expect(srcid.items).toContainEqual({ role: "user", srcId: "u-uuid-1" });
+  });
+
+  it("#393 未匹配 seenMsgIds 的 agent 組不回填(避免回填錯行)", async () => {
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "assistant", message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "hello" }] } },
+      { type: "result", subtype: "success", result: "hello" },
+    ];
+    // 快照裡的 agent msgId 與本回合 seenMsgIds(msg_1)不符 → 不回填 agent;user 文本也不符 → 不回填 user。
+    const snapshot = [
+      { role: "user", text: "别的回合", srcId: "u-uuid-x" },
+      { role: "agent", text: "hello", srcId: "a-uuid-x", msgId: "msg_OTHER" },
+    ];
+    const mirror = {
+      setDriven() {},
+      unsetDriven() {},
+      fastForward() {},
+      markLivePosted() {},
+      markDrivenUuid() {},
+      srcIdSnapshot: () => snapshot,
+    } as any;
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb, mirror);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(sent.some((f: any) => f.t === "message_srcid")).toBe(false);
+  });
+
   it("prompt.submit → 流式事件映射成 tui(start/delta/tool/complete),uuid sid 直接 resume", async () => {
     emitScript = [
       { type: "system", subtype: "init", session_id: CC_SID },

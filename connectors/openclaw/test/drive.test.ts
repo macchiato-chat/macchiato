@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Drive, keyForSid, sidForKey } from "../src/openclaw/drive";
 import { MACCHIATO_PREFIX } from "../src/openclaw/mirror";
-import { titlegenKey } from "../src/openclaw/titles";
 import {
   e2eControlKeyId,
   e2eControlMac,
@@ -443,38 +442,36 @@ describe("#60 附件入站", () => {
   });
 });
 
-describe("#113 自動標題(經用戶自己的 agent,隱藏 titlegen 會話)", () => {
-  it("首個 prompt → agent RPC(titlegen key,deliver:false)→ chat final → session.title(清洗過)", async () => {
-    const { linkb, calls, sent } = makeDrive({ titleMode: "summary" });
+describe("#113/#376 自動標題(firstmsg 本地截斷,零 agent RPC)", () => {
+  it("首個 prompt → session.title = 截斷首句;絕不發 agent RPC(未把未可信首句路由進用戶 agent)", async () => {
+    const { linkb, calls, sent } = makeDrive({ titleMode: "firstmsg" });
     await linkb.deliver(tui("prompt.submit", "01TITLESID", { text: "帮我重构支付模块的错误处理" }));
-    await new Promise((r) => setTimeout(r, 40)); // 等 fake final 事件回來
-    const agentCalls = calls.filter((c) => c.method === "agent");
-    expect(agentCalls).toHaveLength(1);
-    expect(agentCalls[0].params.sessionKey).toBe(titlegenKey("01TITLESID")); // macchiato: 前綴 → 鏡像/導入跳過
-    expect(agentCalls[0].params.deliver).toBe(false);
+    await new Promise((r) => setTimeout(r, 40));
+    // #376:標題不再經第二個 agent 回合——一個 agent RPC 都不能有
+    expect(calls.filter((c) => c.method === "agent")).toHaveLength(0);
     const titleEvt = sent.find((m) => m.frame?.params?.type === "session.title");
-    expect(titleEvt?.frame.params.payload.title).toBe("重構支付錯誤處理"); // 引號已清洗
+    expect(titleEvt?.frame.params.payload.title).toBe("帮我重构支付模块的错误处理");
     expect(titleEvt?.sessionId).toBe("01TITLESID");
-    // 同會話再來 prompt → 不重生(titled 持久集)
+    // 同會話再來 prompt → 不重生(titled 持久集,免覆蓋用戶手改)
     await linkb.deliver(tui("prompt.submit", "01TITLESID", { text: "繼續" }));
     await new Promise((r) => setTimeout(r, 20));
-    expect(calls.filter((c) => c.method === "agent")).toHaveLength(1);
+    expect(sent.filter((m) => m.frame?.params?.type === "session.title")).toHaveLength(1);
+  });
+
+  it("#376 summary 環境變量降級 firstmsg:仍只截斷、零 agent RPC", async () => {
+    const { linkb, calls, sent } = makeDrive({ titleMode: "summary" });
+    await linkb.deliver(tui("prompt.submit", "01TITLESID3", { text: "帮我看看这个报错" }));
+    await new Promise((r) => setTimeout(r, 40));
+    expect(calls.filter((c) => c.method === "agent")).toHaveLength(0);
+    const titleEvt = sent.find((m) => m.frame?.params?.type === "session.title");
+    expect(titleEvt?.frame.params.payload.title).toBe("帮我看看这个报错");
   });
 
   it("鏡像來的會話(agent: key)不生成——它有自己的頻道標題", async () => {
-    const { linkb, calls } = makeDrive({ titleMode: "summary" });
+    const { linkb, sent } = makeDrive({ titleMode: "firstmsg" });
     await linkb.deliver(tui("prompt.submit", "agent:main:discord:channel:7", { text: "頻道續聊" }));
     await new Promise((r) => setTimeout(r, 20));
-    expect(calls.filter((c) => c.method === "agent")).toHaveLength(0);
-  });
-
-  it("titlegen 會話的 final 事件不會被 drive 誤翻譯成消息(非 driven → 忽略)", async () => {
-    const { linkb, sent } = makeDrive({ titleMode: "summary" });
-    await linkb.deliver(tui("prompt.submit", "01TITLESID2", { text: "你好" }));
-    await new Promise((r) => setTimeout(r, 40));
-    // titlegen 會話的 chat final 只產生 session.title,不產生 message.* 幀
-    const msgFrames = sent.filter((m) => String(m.frame?.params?.type ?? "").startsWith("message."));
-    expect(msgFrames).toEqual([]);
+    expect(sent.filter((m) => m.frame?.params?.type === "session.title")).toHaveLength(0);
   });
 });
 

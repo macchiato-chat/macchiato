@@ -139,6 +139,8 @@ export function toolCardFor(it: any): { name: string; args: Record<string, unkno
 interface Turn {
   proc: ChildProcess;
   stdoutBuf: string;
+  /** #393 本回合 prompt 文本(回填 user 消息 srcId 時文本匹配 rollout 的 user_message 行)。 */
+  userText: string;
   agentText: string; // 累積 agent 文本(complete 定稿)
   started: boolean;
   completed: boolean;
@@ -632,6 +634,7 @@ export class Drive {
     const turn: Turn = {
       proc,
       stdoutBuf: "",
+      userText: text,
       agentText: "",
       started: false,
       completed: false,
@@ -775,6 +778,9 @@ export class Drive {
     }
     const tid = this.threadFor(sid);
     if (tid) {
+      // #393 回合末把本回合 live 消息回填 srcId(server dedup_key),跨進程重啟後鏡像重投同一 rollout 行
+      // 撞 (session,dedup_key) 唯一索引被吃掉,不再雙份。E2E 走加密批(自帶 srcId)。
+      if (!turn.isE2E) this.backfillLiveSrcIds(sid, tid, turn);
       this.mirror?.fastForward(tid);
       this.projects?.checkTurnEnd(); // #227
       this.mirror?.unsetDriven(tid);
@@ -783,6 +789,32 @@ export class Drive {
     const next = this.queued.get(sid)?.shift();
     if (!this.queued.get(sid)?.length) this.queued.delete(sid);
     if (next !== undefined) this.runTurn(sid, next);
+  }
+
+  /**
+   * #393 回合末:把本回合 live 投遞的 user/agent 消息回填 rollout 行 srcId 作 server dedup_key
+   * (message_srcid,#13 同款,Hermes/OpenClaw 驗過的模式)。exec v1 與 app-server v2 同款——rollout 行
+   * 無 uuid → srcId 是 srcIdFor 內容指紋,用文本匹配 user_message / 取最後一條 agent_message。
+   * 取捨見 PR(尾行落盤時序、多 agent_message 只收斂最後一條)。純只讀快照,失敗吞掉。
+   */
+  private backfillLiveSrcIds(sid: string, tid: string, turn: Turn): void {
+    try {
+      const msgs = this.mirror?.srcIdSnapshot(tid) ?? [];
+      if (!msgs.length) return;
+      const items: Array<{ role: "user" | "agent"; srcId: string }> = [];
+      const agent = [...msgs].reverse().find((m) => m.role === "agent");
+      if (agent?.srcId) items.push({ role: "agent", srcId: agent.srcId });
+      const want = turn.userText.trim();
+      const user = want
+        ? [...msgs].reverse().find((m) => m.role === "user" && m.text.trim() === want)
+        : undefined;
+      if (user?.srcId) items.push({ role: "user", srcId: user.srcId });
+      if (items.length) {
+        this.linkb.send({ t: "message_srcid", agentLinkId: this.linkb.agentLinkId, sessionId: sid, items });
+      }
+    } catch (e) {
+      console.error(`[#393 Codex(exec) srcId 回填失敗 ${sid}] ${(e as Error).message}`);
+    }
   }
 
   private async maybeTitle(sid: string, firstUserText: string): Promise<void> {

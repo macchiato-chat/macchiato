@@ -1,41 +1,39 @@
 /**
- * #113 Macchiato 發起的 OpenClaw 會話自動標題——路由過**用戶自己的 agent**(gateway `agent` RPC,
- * 用其配置的默認模型;零 hardcode provider/model,CLAUDE.md 鐵律)。消除 #94 的「放空」妥協。
+ * #113/#376 Macchiato 發起的 OpenClaw 會話自動標題。
  *
- * 靜默通道(2026-07-11 活測):`agent` RPC + 專用 session key `agent:main:macchiato:titlegen-<sid>`
- * ——落在 MACCHIATO_PREFIX 下,鏡像與深度導入永久跳過,不會像 CC #94 踩過的那樣冒出「幽靈會話」;
- * drive 也從不 markDriven 它,gateway 事件被忽略 → 與用戶對話零污染。
- * 結果取自 chat final **事件**(agent RPC 的直接響應只是 ack,且客戶端 15s 超時可能先拋)。
- * 清理:sessions.delete/reset 需 operator.admin(連接器只有 read/write)→ 不刪。每會話一個
- * 一次性 titlegen 會話(單回合、幾 KB),可接受;OpenClaw 側可見但無害。
+ * #376 安全邊界:未可信首句**絕不**再路由進第二個 agent 回合。舊版經 gateway `agent` RPC 走
+ * 用戶自己的 agent 生成標題——但該 RPC 在連接器側**沒有任何**禁用 tools/hooks/plugins/MCP 的
+ * 參數,整個路由過用戶的完整 agent,連接器**無法證明零工具模式**。按 #376 驗收標準(「若
+ * gateway 無法提供可證明的零工具模式，則不提供 summary」),移除 summary 路徑:只保留本地截斷,
+ * 零 LLM、零 RPC。這也順帶消除舊版每會話留一個 OpenClaw 側 titlegen 會話的副作用。
+ * env `MACCHIATO_OPENCLAW_TITLE_MODE`:firstmsg(默認,截斷)/ off(不生成)。summary 已移除。
  *
- * env `MACCHIATO_OPENCLAW_TITLE_MODE`:summary(默認,經用戶 agent 生成)/ firstmsg(截斷,零 LLM)/ off。
+ * `OpenClawGateway`/`sid` 參數保留以維持 drive.ts 調用簽名穩定,firstmsg 路徑不再使用它們。
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { OpenClawGateway } from "./gateway";
 
-export type TitleMode = "summary" | "firstmsg" | "off";
+export type TitleMode = "firstmsg" | "off";
 
 export function titleMode(): TitleMode {
   const m = process.env.MACCHIATO_OPENCLAW_TITLE_MODE;
   if (m === "firstmsg" || m === "off") return m;
-  if (m && m !== "summary") console.error(`[titles] 忽略非法 MACCHIATO_OPENCLAW_TITLE_MODE=${m}(summary/firstmsg/off)`);
-  return "summary";
+  if (m === "summary")
+    console.error(
+      `[titles] MACCHIATO_OPENCLAW_TITLE_MODE=summary 已因安全原因移除(#376),回退 firstmsg 截斷`,
+    );
+  else if (m) console.error(`[titles] 忽略非法 MACCHIATO_OPENCLAW_TITLE_MODE=${m}(firstmsg/off)`);
+  return "firstmsg"; // #376 安全默認:不把未可信首句路由進另一個 agent 回合
 }
 
-function timeoutMs(): number {
-  const v = Number(process.env.MACCHIATO_OPENCLAW_TITLE_TIMEOUT_MS);
-  return Number.isFinite(v) && v > 0 ? v : 45_000;
-}
-
-/** 首條消息截斷兜底標題(對齊 CC)。 */
+/** 首條消息截斷兜底標題。按碼點截(而非 UTF-16 單元),emoji/增補面字符不被劈成孤代理項。 */
 export function fallbackTitle(firstUserText: string): string {
-  return firstUserText.replace(/\s+/g, " ").trim().slice(0, 56) || "新會話";
+  return [...firstUserText.replace(/\s+/g, " ").trim()].slice(0, 56).join("") || "新會話";
 }
 
-/** 清洗模型輸出:去引號/前綴/多行,截長(對齊 CC)。 */
+/** 清洗輸出:去引號/前綴/多行,截長(保留供未來安全 summary 通道與測試複用)。 */
 export function cleanTitle(raw: string): string {
   return raw
     .split("\n")[0]!
@@ -45,64 +43,17 @@ export function cleanTitle(raw: string): string {
     .trim();
 }
 
-/** titlegen 專用 session key(MACCHIATO_PREFIX 下 → 鏡像/導入天然跳過;OpenClaw 會轉小寫)。 */
-export function titlegenKey(sid: string): string {
-  return `agent:main:macchiato:titlegen-${sid}`.toLowerCase();
-}
-
-function titlePrompt(firstUserText: string): string {
-  return (
-    `Generate a concise title (max 8 words, same language as the message) for a conversation` +
-    ` that starts with this user message:\n"""\n${firstUserText.slice(0, 500)}\n"""\n` +
-    `Reply with ONLY the title — no quotes, no explanations, no tool use.`
-  );
-}
-
 /**
- * 生成標題:summary 經用戶自己的 agent(失敗/超時回退截斷);firstmsg 直接截斷;off 返回空。
- * 先掛 final 事件監聽再發 RPC(免競態);RPC 響應不依賴(只是 ack)。
+ * 生成標題:firstmsg 直接截斷;off 返回空。永不經 gateway RPC 路由未可信首句。
+ * gw/sid 保留簽名,不再使用。
  */
-export async function generateTitle(gw: OpenClawGateway, sid: string, firstUserText: string): Promise<string> {
-  const mode = titleMode();
-  if (mode === "off") return "";
-  const fallback = fallbackTitle(firstUserText);
-  if (mode === "firstmsg") return fallback;
-  const key = titlegenKey(sid);
-  try {
-    const final = new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        off();
-        reject(new Error(`titlegen final 超時 ${timeoutMs()}ms`));
-      }, timeoutMs());
-      const off = gw.onEvent((e) => {
-        const p = (e.payload ?? {}) as Record<string, any>;
-        if (e.event !== "chat" || p.state !== "final") return;
-        if (String(p.sessionKey ?? "").toLowerCase() !== key) return;
-        const text = (Array.isArray(p.message?.content) ? p.message.content : [])
-          .filter((b: any) => b?.type === "text" && typeof b.text === "string")
-          .map((b: any) => b.text)
-          .join("");
-        clearTimeout(timer);
-        off();
-        resolve(text);
-      });
-    });
-    void gw
-      .request("agent", {
-        message: titlePrompt(firstUserText),
-        sessionKey: key,
-        deliver: false,
-        timeout: Math.ceil(timeoutMs() / 1000),
-        idempotencyKey: `titlegen-${sid}-${Date.now()}`,
-      })
-      .catch(() => {
-        /* ack 超時/失敗不致命——final 事件才是結果;真失敗由 final 超時兜底 */
-      });
-    return cleanTitle(await final) || fallback;
-  } catch (e) {
-    console.error(`[openclaw titlegen failed for ${sid}] ${(e as Error).message}`);
-    return fallback;
-  }
+export async function generateTitle(
+  _gw: OpenClawGateway,
+  _sid: string,
+  firstUserText: string,
+): Promise<string> {
+  if (titleMode() === "off") return "";
+  return fallbackTitle(firstUserText);
 }
 
 // ── 已生成標題的 sid 持久集(重啟後不重生,免覆蓋用戶手改)────────────────────────

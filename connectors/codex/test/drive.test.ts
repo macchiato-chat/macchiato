@@ -402,6 +402,46 @@ describe("#153 工具保真 + reasoning 透出", () => {
   });
 });
 
+describe("#393 回合末回填 live srcId(exec v1)", () => {
+  it("agent 取最後一條 agent_message、user 文本匹配 → message_srcid", async () => {
+    const TID = "aaaaaaaa-0000-4000-8000-000000000393";
+    const mirror = {
+      setDriven() {},
+      unsetDriven() {},
+      fastForward() {},
+      srcIdSnapshot: () => [
+        { role: "user", text: "你好", srcId: "sid-user" },
+        { role: "agent", text: "早上好", srcId: "sid-agent" },
+      ],
+    };
+    const { linkb, sent } = makeDrive(undefined, undefined, mirror);
+    await linkb.deliver(tui("prompt.submit", SID, { text: "你好" }));
+    const p = procs[0]!;
+    p.stdout.emit("data", Buffer.from(JSON.stringify({ type: "thread.started", thread_id: TID }) + "\n"));
+    p.stdout.emit("data", Buffer.from(JSON.stringify({ type: "item.completed", item: { id: "m1", type: "agent_message", text: "早上好" } }) + "\n"));
+    p.emit("close", 0);
+    await new Promise((r) => setTimeout(r, 10));
+    const srcid = sent.find((f: any) => f.t === "message_srcid");
+    expect(srcid).toBeTruthy();
+    expect(srcid.sessionId).toBe(SID);
+    expect(srcid.items).toContainEqual({ role: "agent", srcId: "sid-agent" });
+    expect(srcid.items).toContainEqual({ role: "user", srcId: "sid-user" });
+  });
+
+  it("快照無匹配 → 不發 message_srcid", async () => {
+    const TID = "aaaaaaaa-0000-4000-8000-000000000394";
+    const mirror = { setDriven() {}, unsetDriven() {}, fastForward() {}, srcIdSnapshot: () => [] };
+    const { linkb, sent } = makeDrive(undefined, undefined, mirror);
+    await linkb.deliver(tui("prompt.submit", SID, { text: "你好" }));
+    const p = procs[0]!;
+    p.stdout.emit("data", Buffer.from(JSON.stringify({ type: "thread.started", thread_id: TID }) + "\n"));
+    p.stdout.emit("data", Buffer.from(JSON.stringify({ type: "item.completed", item: { id: "m1", type: "agent_message", text: "早上好" } }) + "\n"));
+    p.emit("close", 0);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(sent.some((f: any) => f.t === "message_srcid")).toBe(false);
+  });
+});
+
 describe("#156 覆蓋缺口:排隊續投 + E2E send", () => {
   it("回合中追加 prompt → 排隊;回合結束自動續投(新 proc,帶排隊文本)", async () => {
     const { linkb } = makeDrive();

@@ -150,6 +150,25 @@ describe("Mirror", () => {
     expect(texts).toContain("終端回答");
   });
 
+  it("#393 srcIdSnapshot 折出尾段消息帶 srcId(=行 uuid)+ msgId,與鏡像發的 srcId 收斂同鍵", () => {
+    setupEnv();
+    writeFileSync(file, userLine("問題") + assistantLineWithId("回答", "msg_abc"));
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb);
+    // 鏡像正常投遞,拿到它發給 server 的 srcId(= dedup_key)。
+    (m as any).doPoll();
+    const mirrored = appends(sent).flatMap((f: any) => f.sessions[0].messages);
+    const mirrorUser = mirrored.find((x: any) => x.role === "user");
+    const mirrorAgent = mirrored.find((x: any) => x.role === "agent");
+    // 只讀快照:同一批消息、同一 srcId → live 回填鍵 == 鏡像鍵 → server (session,dedup_key) 唯一索引去重。
+    const snap = m.srcIdSnapshot(SID);
+    const snapUser = snap.find((x) => x.role === "user");
+    const snapAgent = snap.find((x) => x.role === "agent");
+    expect(snapUser?.srcId).toBe(mirrorUser.srcId);
+    expect(snapAgent?.srcId).toBe(mirrorAgent.srcId);
+    expect(snapAgent?.msgId).toBe("msg_abc"); // Drive 據 seenMsgIds(=API message.id)匹配本回合 agent 組
+  });
+
   it("大會話分批發:每帧單會話 ≤ BATCH_MAX 條", () => {
     setupEnv();
     process.env.MACCHIATO_CC_BATCH_MAX = "10";

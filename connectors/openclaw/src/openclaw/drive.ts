@@ -777,7 +777,7 @@ export class Drive {
     }
   }
 
-  /** #113:經用戶自己的 agent 生成標題(titles.generateTitle,隱藏 titlegen 會話)→ session.title。 */
+  /** #113/#376:首條消息本地截斷生成標題(titles.generateTitle,零 LLM、零 RPC)→ session.title。 */
   private async autoTitle(sid: string, firstUserText: string): Promise<void> {
     try {
       const title = await generateTitle(this.gw, sid, firstUserText);

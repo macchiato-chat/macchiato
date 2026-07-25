@@ -292,6 +292,28 @@ export class Mirror {
     this.drivenSids.delete(sid);
   }
 
+  /**
+   * #393 回合末只讀快照:折出該 CC 會話 transcript **尾段**的消息(帶 srcId=行 uuid + msgId=API
+   * message.id),供 Drive 把 live 投遞過的 user/agent 消息回填 srcId 作 server dedup_key。
+   * srcId 是行 uuid(位置無關),故讀尾段窗口即可覆蓋剛結束的回合;窗口起點可能截斷首行(壞 JSON
+   * 跳過)、或截斷某 assistant 組首行(該組 srcId 取窗內首行,不影響「取最後一組」的目標)。
+   * 純只讀:不推水位線、不 emit、不改狀態。E2E 會話由加密批攜 srcId,不走這裡(調用方已隔離)。
+   */
+  srcIdSnapshot(sid: string, windowBytes = 1024 * 1024): CCMessage[] {
+    const f = this.fileForSid(sid);
+    if (!f) return [];
+    try {
+      const size = statSync(f).size;
+      const from = Math.max(0, size - windowBytes);
+      const { entries, endOffset } = readEntries(f, from);
+      if (!entries.length) return [];
+      // now=MAX 強制結算尾部 in-flight 組,回合剛畢的 assistant 組也能取到 srcId。
+      return foldEntries(entries, endOffset, Number.MAX_SAFE_INTEGER).messages;
+    } catch {
+      return [];
+    }
+  }
+
   /** 回合結束：driven 會話水位線快進到文件末（live 已投遞，鏡像別重複）。 */
   fastForward(sid: string): void {
     if (this.hasPendingE2EBackfill(sid)) return;

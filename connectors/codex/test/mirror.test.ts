@@ -63,6 +63,52 @@ describe("#347 identity map fail-closed", () => {
   });
 });
 
+describe("#393 srcId 收斂(live 回填鍵 == 鏡像鍵)", () => {
+  it("srcIdSnapshot 折出 rollout 消息的 srcId 與鏡像 mirror_append 發的同鍵", async () => {
+    const { mkdirSync, mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const root = mkdtempSync(join(tmpdir(), "cx-393-"));
+    const prevSessions = process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+    const prevMirror = process.env.MACCHIATO_CODEX_MIRROR;
+    try {
+      process.env.MACCHIATO_CODEX_SESSIONS_DIR = join(root, "sessions");
+      process.env.MACCHIATO_CODEX_MIRROR = join(root, "mirror.json");
+      const tid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee0393";
+      const dir = join(root, "sessions", "2026", "07", "24");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, `rollout-2026-07-24T00-00-00-${tid}.jsonl`),
+        [
+          JSON.stringify({ type: "session_meta", payload: { cwd: "/x" } }),
+          JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "你好" } }),
+          JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: "早上好" } }),
+        ].join("\n") + "\n",
+      );
+      writeFileSync(process.env.MACCHIATO_CODEX_MIRROR, JSON.stringify({ offsets: {}, ords: {}, seeded: true }));
+      const sent: any[] = [];
+      const mirror = new Mirror({ agentLinkId: "al", isReady: true, send: (f: unknown) => sent.push(f) } as any);
+      (mirror as any).pollOnce();
+      const mirrored = sent
+        .filter((f) => f.t === "mirror_append")
+        .flatMap((f: any) => f.sessions[0].messages);
+      const mUser = mirrored.find((x: any) => x.role === "user");
+      const mAgent = mirrored.find((x: any) => x.role === "agent");
+      // 只讀快照:同一 rollout 行折出的 srcId 必須與鏡像投遞的 dedup_key 完全一致 →
+      // 跨進程重啟鏡像重投時撞 (session,dedup_key) 唯一索引被 onConflictDoNothing 吃掉。
+      const snap = (mirror as any).srcIdSnapshot(tid) as Array<{ role: string; srcId: string }>;
+      expect(snap.find((x) => x.role === "user")!.srcId).toBe(mUser.srcId);
+      expect(snap.find((x) => x.role === "agent")!.srcId).toBe(mAgent.srcId);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      if (prevSessions === undefined) delete process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+      else process.env.MACCHIATO_CODEX_SESSIONS_DIR = prevSessions;
+      if (prevMirror === undefined) delete process.env.MACCHIATO_CODEX_MIRROR;
+      else process.env.MACCHIATO_CODEX_MIRROR = prevMirror;
+    }
+  });
+});
+
 describe("#347 disable backfill ACK 邊界", () => {
   it("發送明文 backfill 後保留 K_S；Mirror 不再自行 remove", async () => {
     const { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } = await import("node:fs");

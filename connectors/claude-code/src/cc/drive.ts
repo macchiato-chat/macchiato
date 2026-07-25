@@ -1994,6 +1994,9 @@ export class Drive {
       // 早於 CLI 寫完 transcript 尾巴)由此精確攔截,不再作為「終端新活動」補投成重複。順序在 fastForward
       // 前登記,確保解除 driven 後恢復鏡像時集合已就位。
       if (turn.seenMsgIds.size) this.mirror?.markLivePosted(cc, turn.seenMsgIds);
+      // #393 回合末把本回合 live 消息回填 srcId(=transcript 行 uuid)作 server dedup_key——
+      // 跨進程重啟後鏡像重投同一行撞 (session,dedup_key) 唯一索引被吃掉,不再雙份。E2E 走加密批(自帶 srcId)。
+      if (!turn.isE2E) this.backfillLiveSrcIds(sid, cc, turn);
       this.mirror?.fastForward(cc); // live 已投遞 → 鏡像水位線快進越過本回合
       this.mirror?.unsetDriven(cc); // 僅回合級跳過：解除後終端側活動恢復鏡像（CC 無 gateway,鏡像是唯一路）
     }
@@ -2019,6 +2022,41 @@ export class Drive {
       return;
     }
     this.scheduleIdleClose(ch);
+  }
+
+  /**
+   * #393 回合末:把本回合 live 投遞的 user/agent 消息回填 transcript 行 uuid 作 server dedup_key
+   * (message_srcid,#13 同款,Hermes/OpenClaw 驗過的模式)。CC 無常駐 gateway,live×mirror 收斂
+   * 全靠此:server 的 (session_id,dedup_key) 唯一索引此後對 CC 生效,跨進程重啟鏡像重投同一 transcript
+   * 行撞索引被 onConflictDoNothing 吃掉,不再雙份。
+   *   - agent:本回合 live 覆蓋的 assistant 組(msgId ∈ seenMsgIds)裡**最後一條**——即 message.complete
+   *     的 finalText 所屬組;它的 srcId(組首行 uuid)正是鏡像重投同組時會帶的 dedup_key。
+   *   - user:文本匹配本回合 prompt(對齊 OpenClaw sentTexts 語義)的最後一條 user 行。
+   * 取捨(見 PR):① SDK result 可能早於 CLI 寫完 transcript 尾巴(#318)→ 偶爾 agent srcId 本回合取不到,
+   * 留待後續(進程內 markLivePosted 仍防雙投,僅跨重啟的該回合 agent 殘留風險)。② 帶工具的回合 transcript
+   * 拆多 assistant 組而 live 只投一條合併消息,僅最後一組能收斂(中間組跨重啟仍可能重投)——與 OpenClaw
+   * 「只回填 lastAssistant」同限。純只讀快照,失敗吞掉(去重是加固,不該影響主回合)。
+   */
+  private backfillLiveSrcIds(sid: string, cc: string, turn: TurnCtx): void {
+    try {
+      const msgs = this.mirror?.srcIdSnapshot(cc) ?? [];
+      if (!msgs.length) return;
+      const items: Array<{ role: "user" | "agent"; srcId: string }> = [];
+      const agent = [...msgs]
+        .reverse()
+        .find((m) => m.role === "agent" && !!m.msgId && turn.seenMsgIds.has(m.msgId));
+      if (agent?.srcId) items.push({ role: "agent", srcId: agent.srcId });
+      const want = contentText(turn.content).trim();
+      const user = want
+        ? [...msgs].reverse().find((m) => m.role === "user" && m.text.trim() === want)
+        : undefined;
+      if (user?.srcId) items.push({ role: "user", srcId: user.srcId });
+      if (items.length) {
+        this.linkb.send({ t: "message_srcid", agentLinkId: this.linkb.agentLinkId, sessionId: sid, items });
+      }
+    } catch (e) {
+      console.error(`[#393 CC srcId 回填失敗 ${sid}] ${(e as Error).message}`);
+    }
   }
 
   /** #118 通道結束(close/crash 後的統一收尾):未完回合定性;送達重投;續投排隊。 */

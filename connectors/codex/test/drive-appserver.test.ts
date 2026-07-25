@@ -185,6 +185,36 @@ describe("#132 v2 回合生命週期", () => {
     expect(done.payload.usage.output_tokens).toBe(5);
   });
 
+  it("#393 回合末回填 live 消息 srcId(message_srcid):user 文本匹配、agent 取最後一條 agent_message", async () => {
+    const { client, linkb, sent, mirror } = make();
+    // 只讀快照:rollout 折出的本回合 user + agent(帶 srcId=srcIdFor 內容指紋)。
+    mirror.srcIdSnapshot = () => [
+      { role: "user", text: "你好", srcId: "sid-user" },
+      { role: "agent", text: "早上好", srcId: "sid-agent" },
+    ];
+    await linkb.deliver(tui("prompt.submit", SID, { text: "你好" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    client.fire("item/completed", { threadId: TID, item: { type: "agentMessage", id: "m1", text: "早上好" } });
+    client.fire("turn/completed", { threadId: TID, turn: { id: "t1", status: "completed" } });
+    await tick();
+    const srcid = sent.find((f: any) => f.t === "message_srcid");
+    expect(srcid).toBeTruthy();
+    expect(srcid.sessionId).toBe(SID);
+    expect(srcid.items).toContainEqual({ role: "agent", srcId: "sid-agent" });
+    expect(srcid.items).toContainEqual({ role: "user", srcId: "sid-user" });
+  });
+
+  it("#393 快照無匹配消息 → 不發 message_srcid(不回填錯行)", async () => {
+    const { client, linkb, sent, mirror } = make();
+    mirror.srcIdSnapshot = () => []; // 尾行尚未落盤等
+    await linkb.deliver(tui("prompt.submit", SID, { text: "你好" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    client.fire("item/completed", { threadId: TID, item: { type: "agentMessage", id: "m1", text: "早上好" } });
+    client.fire("turn/completed", { threadId: TID, turn: { id: "t1", status: "completed" } });
+    await tick();
+    expect(sent.some((f: any) => f.t === "message_srcid")).toBe(false);
+  });
+
   it("多個 agentMessage item(commentary→final)→ 段落分隔;斷流時 completed 補尾", async () => {
     const { client, linkb, sent } = make();
     await linkb.deliver(tui("prompt.submit", SID, { text: "q" }));
@@ -349,6 +379,56 @@ describe("#132 v2 審批橋", () => {
     expect(fcard.payload.description).toBe("需要越權寫");
     await linkb.deliver(tui("approval.respond", SID, { choice: "allow" }));
     expect(await p3).toEqual({ decision: "accept" });
+  });
+
+  it("#359 審批選擇映射:yes/allow/always 放行、no/deny/未知拒絕;always 免 all 也持久", async () => {
+    const { client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "q" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    const h = client.reverse.get("item/commandExecution/requestApproval")!;
+    let n = 0;
+    const ask = async (choice: string, all?: boolean) => {
+      const id = `e${++n}`;
+      const p = h({ threadId: TID, turnId: "t1", itemId: id, command: "cmd", cwd: "/w" });
+      await tick();
+      await linkb.deliver(
+        tui("approval.respond", SID, { choice, request_id: id, ...(all !== undefined ? { all } : {}) }),
+      );
+      return p;
+    };
+    // yes/always/allow 三種放行寫法都不能被當拒絕(#359 核心回歸)
+    expect(await ask("yes")).toEqual({ decision: "accept" });
+    expect(await ask("allow")).toEqual({ decision: "accept" });
+    // always 即使 server 沒回帶 all(web WS 不發、REST 寫死 false)也要走會話級授權
+    expect(await ask("always")).toEqual({ decision: "acceptForSession" });
+    expect(await ask("always", false)).toEqual({ decision: "acceptForSession" });
+    // 顯式 all=true(舊路徑)保留兼容
+    expect(await ask("yes", true)).toEqual({ decision: "acceptForSession" });
+    // no/deny → 拒絕;未知 choice → fail-closed 落 decline
+    expect(await ask("no")).toEqual({ decision: "decline" });
+    expect(await ask("deny")).toEqual({ decision: "decline" });
+    expect(await ask("garbage")).toEqual({ decision: "decline" });
+  });
+
+  it("#364 回退文案為英文正典(無 reason 時不再硬編碼繁中)", async () => {
+    const { client, linkb, sent } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "q" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    const h = client.reverse.get("item/commandExecution/requestApproval")!;
+    const p1 = h({ threadId: TID, turnId: "t1", itemId: "e1", command: "ls", cwd: "/repo" });
+    await tick();
+    const cmdCard = events(sent).findLast((e) => e.type === "approval.request")!;
+    expect(cmdCard.payload.description).toBe("Codex wants to run a command in /repo");
+    await linkb.deliver(tui("approval.respond", SID, { choice: "no", request_id: "e1" }));
+    await p1;
+    const fh = client.reverse.get("item/fileChange/requestApproval")!;
+    const p2 = fh({ threadId: TID, turnId: "t1", itemId: "f1", changes: [{ path: "/a.txt" }] });
+    await tick();
+    const fileCard = events(sent).findLast((e) => e.type === "approval.request")!;
+    expect(fileCard.payload.command).toBe("Modify files: /a.txt");
+    expect(fileCard.payload.description).toBe("Codex wants to write the files above");
+    await linkb.deliver(tui("approval.respond", SID, { choice: "no", request_id: "f1" }));
+    await p2;
   });
 
   it("#245 並行審批:respond 按 request_id 精準配對,不再 FIFO 錯配批錯命令", async () => {

@@ -160,6 +160,24 @@ export class Mirror {
     return [...this.pendingE2EBackfills.values()].some((pending) => pending.localSid === localSid);
   }
 
+  /**
+   * #393 回合末只讀快照:折出該會話 rollout 全量消息並附 srcId(= srcIdFor 內容指紋),供 Drive
+   * 把 live 投遞過的 user/agent 消息回填 srcId 作 server dedup_key。srcId 含**全文行號 ord**,故必須
+   * 從檔頭 ord=0 全量折(不能只讀尾段——ord 會錯,與鏡像發的 srcId 對不上)。純只讀:不推水位、不 emit。
+   * E2E 會話由加密批攜 srcId,不走這裡(調用方已隔離)。
+   */
+  srcIdSnapshot(threadId: string): Array<{ role: "user" | "agent"; text: string; srcId: string }> {
+    const rf = discoverRollouts().rollouts.find((r) => r.threadId === threadId);
+    if (!rf || !existsSync(rf.file)) return [];
+    try {
+      const content = readFileSync(rf.file, "utf8");
+      const { messages } = readNewMessages(content, 0, 0);
+      return messages.map((m) => ({ role: m.role, text: m.text, srcId: srcIdFor(threadId, m) }));
+    } catch {
+      return [];
+    }
+  }
+
   /** 回合結束:driven 會話水位線快進到文件末(live 已投遞,鏡像別重複)。 */
   fastForward(threadId: string): void {
     // backfill 快照尚未 ACK 時，任何旁路都不能越過其暫存水位線。
