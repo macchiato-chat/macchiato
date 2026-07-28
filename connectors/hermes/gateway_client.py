@@ -28,6 +28,8 @@ import os
 import sys
 from typing import Any, Callable, Optional
 
+from safe_log import log_content, redact_upstream_line, safe_err
+
 # 連接器按設計就跑在 Hermes venv 的 python 上（install.sh / systemd 用它啟動）→ spawn
 # tui_gateway 默認用**自己這個解釋器**（sys.executable），任何安裝佈局（one-liner/pipx/pip/uv）
 # 都對。可用 HERMES_PYTHON 環境變量覆蓋。（舊版寫死 pipx 路徑，one-liner 用戶會掛。）
@@ -143,7 +145,7 @@ class GatewayClient:
             except Exception as exc:
                 self.restart_failures += 1
                 print(
-                    f"[gateway restart failed ×{self.restart_failures}: {exc!r}; retry in {backoff:.0f}s]",
+                    f"[gateway restart failed ×{self.restart_failures}: {safe_err(exc)}; retry in {backoff:.0f}s]",
                     file=sys.stderr,
                 )
                 await asyncio.sleep(backoff)
@@ -156,7 +158,7 @@ class GatewayClient:
                 try:
                     self.on_restart()
                 except Exception as exc:
-                    print(f"[on_restart error] {exc!r}", file=sys.stderr)
+                    print(f"[on_restart error] {safe_err(exc)}", file=sys.stderr)
 
     def is_alive(self) -> bool:
         """gateway 子進程是否在運行（健康上報用）。"""
@@ -227,9 +229,11 @@ class GatewayClient:
                 if not raw:
                     break
                 # Surface gateway diagnostics ([gateway-exit], [gateway-signal], …).
+                # #381:默认脱敏——agent 错误/堆栈/路径不得原样进 journald。
                 text = raw.decode("utf-8", "replace").rstrip()
                 if text:
-                    print(f"[gateway stderr] {text}", file=sys.stderr)
+                    print(f"[gateway stderr] {redact_upstream_line(text)}", file=sys.stderr)
+                    log_content("gateway.stderr", text)
         except asyncio.CancelledError:
             return
 
@@ -260,7 +264,7 @@ class GatewayClient:
             if asyncio.iscoroutine(result):
                 asyncio.create_task(result)
         except Exception as exc:  # a bad handler must not kill the reader
-            print(f"[on_event error] {exc!r}", file=sys.stderr)
+            print(f"[on_event error] {safe_err(exc)}", file=sys.stderr)
 
     def _fail_all(self, exc: Exception) -> None:
         for fut in list(self._pending.values()):

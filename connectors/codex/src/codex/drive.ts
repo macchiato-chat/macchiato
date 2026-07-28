@@ -18,9 +18,9 @@
  * 沙箱:非交互驅動需不卡審批。默認 workspace-write(可 env 調);danger-full-access 需顯式開。
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { type CwdResolution, defaultWorkDir, resolveCwd } from "./cwd";
 import { loadDriveState, saveDriveState, codexPermsFor, CODEX_AUTH_ERR_RE } from "./state";
 import { resolveCodexBin } from "./codex-bin";
 import { deriveMeta, discoverRollouts } from "./mirror";
@@ -36,6 +36,7 @@ import {
   type E2EControlKind,
 } from "../e2e/control";
 import type { Mirror } from "./mirror";
+import { logContent, safeErr, shortId, textLen } from "../safe-log";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -72,15 +73,9 @@ const E2E_SENSITIVE_METHODS = new Set([
   "session.retitle",
 ]);
 
+/** 新會話的默認工作目錄:`MACCHIATO_CODEX_WORKDIR` 覆蓋,否則 HOME(見 cwd.ts)。 */
 export function workDir(): string {
-  return process.env.MACCHIATO_CODEX_WORKDIR || homedir();
-}
-function isDir(p: string): boolean {
-  try {
-    return statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
+  return defaultWorkDir();
 }
 /** 沙箱模式:read-only / workspace-write / danger-full-access。默認 workspace-write。 */
 function sandboxMode(): string {
@@ -182,6 +177,11 @@ export class Drive {
   /** 僅主身份快照完整解析，或已把當前完整映射成功雙寫，才可放行非 UUID E2E wire sid。 */
   private identityStateTrusted: boolean;
   private readonly e2eControl?: E2EControlVerifier;
+  private readonly e2eQuiescing = new Map<
+    string,
+    { requestId: string; mode: "enable" | "disable" }
+  >();
+  private readonly contentInflight = new Set<string>();
 
   constructor(
     private readonly linkb: LinkBClient,
@@ -202,6 +202,9 @@ export class Drive {
     this.abandonedTurns = st.pending;
     this.pending = new Set();
     this.e2eControl = e2eControl ?? (e2e ? new E2EControlVerifier(e2e) : undefined);
+    // 影子兜底:啟動時把既有 wire→local 映射的 thread uuid 全灌給鏡像(跨重啟持久),鏡像據此
+    // 永不給這些「被驅動過」的 thread 單獨建明文會話(重啟後內存態丟失也不復發)。
+    for (const localSid of Object.values(this.map)) this.mirror?.markDrivenUuid?.(localSid);
     if (st.pending.length) this.saveMap();
   }
 
@@ -235,7 +238,63 @@ export class Drive {
   }
 
   wire(): void {
-    this.linkb.onFrame((m) => void this.onServerFrame(m));
+    this.linkb.onFrame((m) => {
+      const frame = m.frame as { method?: string; params?: { session_id?: string } } | undefined;
+      const sid = (m.sessionId ?? frame?.params?.session_id) as string | undefined;
+      const content = frame?.method === "prompt.submit" || frame?.method === "command.invoke";
+      if (content && sid && this.e2eQuiescing.has(sid)) {
+        console.error(`[E2E quiesce ${sid}] rejected late ${frame?.method}`);
+        return;
+      }
+      if (content && sid) this.contentInflight.add(sid);
+      void this.onServerFrame(m).finally(() => {
+        if (content && sid) this.contentInflight.delete(sid);
+      });
+    });
+  }
+
+  applyE2EQuiesceState(
+    sessions: Array<{ hermesSessionId: string; pendingOp: "enable" | "disable" | null }>,
+  ): void {
+    const pending = new Map(
+      sessions
+        .filter((session) => session.pendingOp !== null)
+        .map((session) => [session.hermesSessionId, session.pendingOp as "enable" | "disable"]),
+    );
+    for (const sid of this.e2eQuiescing.keys()) if (!pending.has(sid)) this.e2eQuiescing.delete(sid);
+    for (const [sid, mode] of pending) this.e2eQuiescing.set(sid, { requestId: `ready:${mode}`, mode });
+  }
+
+  beginE2ETransition(sid: string, mode: "enable" | "disable"): void {
+    const current = this.e2eQuiescing.get(sid);
+    this.e2eQuiescing.set(sid, { requestId: current?.requestId ?? `resume:${mode}`, mode });
+  }
+
+  releaseE2EQuiesce(sid: string, mode?: "enable" | "disable", requestId?: string): void {
+    const current = this.e2eQuiescing.get(sid);
+    if (!current || (mode && current.mode !== mode) || (requestId && current.requestId !== requestId)) return;
+    this.e2eQuiescing.delete(sid);
+  }
+
+  async quiesceE2E(sid: string, mode: "enable" | "disable", requestId: string): Promise<boolean> {
+    const current = this.e2eQuiescing.get(sid);
+    if (current && current.requestId !== requestId) return false;
+    this.e2eQuiescing.set(sid, { requestId, mode });
+    const configured = Number(process.env.MACCHIATO_E2E_QUIESCE_MS);
+    const deadline = Date.now() + (Number.isFinite(configured) && configured > 0 ? configured : 4 * 60_000);
+    while (
+      this.pending.has(sid) ||
+      this.active.has(sid) ||
+      this.contentInflight.has(sid) ||
+      (this.queued.get(sid)?.length ?? 0) > 0
+    ) {
+      if (Date.now() >= deadline) {
+        this.releaseE2EQuiesce(sid, mode, requestId);
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return this.e2eQuiescing.get(sid)?.requestId === requestId;
   }
 
   dispose(): void {
@@ -335,11 +394,14 @@ export class Drive {
     };
   }
 
+  /** #377 解析+校驗會話工作目錄(realpath/存在性/目錄/可選 allowlist;見 cwd.ts)。 */
+  private resolveSessionCwd(sid: string): CwdResolution {
+    return resolveCwd(this.cwds[sid]);
+  }
+
+  /** ok 時回 realpath 規範路徑,否則回嘗試路徑(供提示/比對)。 */
   private cwdFor(sid: string): string {
-    const c = this.cwds[sid];
-    if (!c) return workDir();
-    if (c === "~") return homedir();
-    return c.startsWith("~/") ? join(homedir(), c.slice(2)) : c;
+    return this.resolveSessionCwd(sid).cwd;
   }
 
   private sendE2EControlResult(
@@ -588,8 +650,9 @@ export class Drive {
             this.persistSessionSetting(this.perms, sid, pm, authenticated, "permissionMode");
           }
           const cwd = typeof params.cwd === "string" ? params.cwd.trim() : "";
-          if (cwd && !this.e2e?.isE2E(sid) && !isDir(this.cwdFor(sid))) {
-            this.emit(sid, "review.summary", { summary: `⚠️ 工作目錄不存在或不是目錄:${this.cwdFor(sid)}(連接器主機上)` });
+          if (cwd && !this.e2e?.isE2E(sid)) {
+            const res = this.resolveSessionCwd(sid);
+            if (!res.ok) this.emit(sid, "review.summary", { summary: `⚠️ ${res.reason}（連接器主機上）` });
           }
           return;
         }
@@ -605,13 +668,15 @@ export class Drive {
 
   private runTurn(sid: string, text: string): void {
     const isE2E = this.e2e?.isE2E(sid) ?? false;
-    const cwd = this.cwdFor(sid);
-    if (!isDir(cwd)) {
-      const err = `⚠️ 工作目錄不存在或不是目錄:${cwd}(連接器主機上)。請修正會話目錄後重發。`;
+    // #377 每回合校驗工作目錄(realpath/allowlist 硬校驗);不通過就回提示、不起回合。
+    const res = this.resolveSessionCwd(sid);
+    if (!res.ok) {
+      const err = `⚠️ ${res.reason}(連接器主機上)。請修正會話目錄後重發。`;
       if (isE2E) this.sendE2ETurn(sid, err);
       else this.emit(sid, "review.summary", { summary: err });
       return;
     }
+    const cwd = res.cwd;
     const resume = this.threadFor(sid);
     const isFirstMacchiatoTurn = !resume && !UUID_RE.test(sid) && !isE2E;
     if (isFirstMacchiatoTurn && !this.titled.has(sid)) void this.maybeTitle(sid, text);
@@ -825,19 +890,19 @@ export class Drive {
       if (!title) return;
       this.genTitle = title;
       this.emit(sid, "session.title", { title });
-      console.log(`· 生成標題「${title}」→ ${sid}`);
+      // #381:标题可能含用户首条消息片段
+      console.log(`· session.title len=${textLen(title)} → ${shortId(sid)}`);
+      logContent("session.title", title);
     } catch (e) {
-      console.error(`[title gen failed for ${sid}] ${(e as Error).message}`);
+      console.error(`[title gen failed for ${shortId(sid)}] ${safeErr(e)}`);
     }
   }
 
   private sendE2ETurn(sid: string, reply: string): void {
-    if (!this.e2e) return;
-    const msgs: Record<string, unknown>[] = (this.pendingUser.get(sid) ?? []).map((t) => ({ role: "user", enc: this.e2e!.encryptContent(sid, { text: t }) }));
+    // #350 E2E driven 回合由 rollout mirror 的 durable outbox 投遞；不能在這裡
+    // fire-and-forget 後 fast-forward，否則 ACK 丟失/進程死亡會永久越過該回合。
     this.pendingUser.delete(sid);
-    if (reply.trim()) msgs.push({ role: "agent", enc: this.e2e.encryptContent(sid, { text: reply }) });
-    if (!msgs.length) return;
-    this.linkb.send({ t: "mirror_append", agentLinkId: this.linkb.agentLinkId, sessions: [{ hermesSessionId: sid, source: "codex", e2e: true, messages: msgs }] });
+    void reply;
   }
 
   private loadState(): ReturnType<typeof loadDriveState> {

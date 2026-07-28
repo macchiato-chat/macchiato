@@ -109,6 +109,147 @@ describe("#393 srcId 收斂(live 回填鍵 == 鏡像鍵)", () => {
   });
 });
 
+describe("#418 ord 記帳與增量路徑對齊(偏移路徑鍵收斂)", () => {
+  /**
+   * #393/#402 的收斂測試用 `{offsets:{},ords:{},seeded:true}` 從 0 起讀,繞開了 ordBase 偏移路徑。
+   * #418:seed / endOrd 若用 split("\n").length,尾 \n 時 ordBase 恒多 1 → 偏移路徑重播的 srcId
+   * ≠ 全量折的 srcId → server 去重失效。本組強制走「水位已在中段」再追加的路徑。
+   */
+  const envLine = (role: "user_message" | "agent_message", text: string) =>
+    JSON.stringify({ type: "event_msg", payload: { type: role, message: text } }) + "\n";
+  const metaLine = JSON.stringify({ type: "session_meta", payload: { cwd: "/x" } }) + "\n";
+
+  async function withWorld(run: (ctx: {
+    tid: string;
+    file: string;
+    Mirror: typeof Mirror;
+    join: (...p: string[]) => string;
+    appendFileSync: typeof import("node:fs").appendFileSync;
+    writeFileSync: typeof import("node:fs").writeFileSync;
+  }) => Promise<void> | void) {
+    const { mkdirSync, mkdtempSync, rmSync, writeFileSync, appendFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const root = mkdtempSync(join(tmpdir(), "cx-418-"));
+    const prevSessions = process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+    const prevMirror = process.env.MACCHIATO_CODEX_MIRROR;
+    try {
+      process.env.MACCHIATO_CODEX_SESSIONS_DIR = join(root, "sessions");
+      process.env.MACCHIATO_CODEX_MIRROR = join(root, "mirror.json");
+      const tid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee0418";
+      const dir = join(root, "sessions", "2026", "07", "25");
+      mkdirSync(dir, { recursive: true });
+      const file = join(dir, `rollout-2026-07-25T00-00-00-${tid}.jsonl`);
+      await run({ tid, file, Mirror, join, appendFileSync, writeFileSync });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      if (prevSessions === undefined) delete process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+      else process.env.MACCHIATO_CODEX_SESSIONS_DIR = prevSessions;
+      if (prevMirror === undefined) delete process.env.MACCHIATO_CODEX_MIRROR;
+      else process.env.MACCHIATO_CODEX_MIRROR = prevMirror;
+    }
+  }
+
+  it("seed 基線後追加:偏移路徑 srcId == 全量 srcIdSnapshot", async () => {
+    await withWorld(async ({ tid, file, Mirror, appendFileSync, writeFileSync }) => {
+      // 存量兩行消息(含尾 \n)——首掃 seed 只基線不投;修前 ords=split 多 1。
+      writeFileSync(file, metaLine + envLine("user_message", "存量 user") + envLine("agent_message", "存量 agent"));
+      const sent: any[] = [];
+      const m: any = new Mirror({ agentLinkId: "al", isReady: true, send: (f: unknown) => sent.push(f) } as any);
+      m.pollOnce(); // seed 存量
+      expect(sent.filter((f) => f.t === "mirror_append")).toHaveLength(0);
+      expect(m.state.seeded).toBe(true);
+      // 正確 nextOrd = 完整行數 3(meta+user+agent);split("\n").length 會是 4。
+      expect(m.state.ords[tid]).toBe(3);
+
+      appendFileSync(file, envLine("user_message", "續聊 user") + envLine("agent_message", "續聊 agent"));
+      m.pollOnce();
+      const pending = m.state.pendingMirrors?.[0];
+      expect(pending).toBeTruthy();
+      const mirrored = pending.frame.sessions[0].messages as Array<{ role: string; text: string; srcId: string }>;
+      expect(mirrored.map((x) => x.text)).toEqual(["續聊 user", "續聊 agent"]);
+
+      const snap = m.srcIdSnapshot(tid) as Array<{ role: string; text: string; srcId: string }>;
+      const snapByText = Object.fromEntries(snap.map((x: any) => [x.text, x.srcId]));
+      for (const msg of mirrored) {
+        expect(msg.srcId).toBe(snapByText[msg.text]);
+      }
+    });
+  });
+
+  it("水位停在中段後追加:ACK 提交的 ordBase 偏移路徑仍與全量鍵收斂", async () => {
+    await withWorld(async ({ tid, file, Mirror, appendFileSync, writeFileSync }) => {
+      // seeded=true 從頭鏡像第一回合 → ACK 提交水位 → 再追加第二回合(真正走偏移 ordBase)。
+      writeFileSync(
+        file,
+        metaLine + envLine("user_message", "第一拍 user") + envLine("agent_message", "第一拍 agent"),
+      );
+      writeFileSync(process.env.MACCHIATO_CODEX_MIRROR!, JSON.stringify({ offsets: {}, ords: {}, seeded: true }));
+      const sent: any[] = [];
+      const m: any = new Mirror({ agentLinkId: "al", isReady: true, send: (f: unknown) => sent.push(f) } as any);
+      m.pollOnce();
+      const first = m.state.pendingMirrors?.[0];
+      expect(first).toBeTruthy();
+      m.handleAck(first.batchId);
+      // 修前若 seed/fastForward 用 split,此處 ords 會是 4;增量 lineCount 路徑應為 3。
+      expect(m.state.ords[tid]).toBe(3);
+
+      appendFileSync(file, envLine("user_message", "第二拍 user") + envLine("agent_message", "第二拍 agent"));
+      m.pollOnce();
+      const second = m.state.pendingMirrors?.[0];
+      expect(second).toBeTruthy();
+      const mirrored = second.frame.sessions[0].messages as Array<{ role: string; text: string; srcId: string }>;
+      expect(mirrored.map((x) => x.text)).toEqual(["第二拍 user", "第二拍 agent"]);
+
+      const snap = m.srcIdSnapshot(tid) as Array<{ text: string; srcId: string }>;
+      const snapByText = Object.fromEntries(snap.map((x) => [x.text, x.srcId]));
+      for (const msg of mirrored) {
+        expect(msg.srcId).toBe(snapByText[msg.text]);
+      }
+      // 顯式對照:ord 必須是全文行號 3/4,不是 split 偏出的 4/5。
+      expect(mirrored[0].srcId).toBe(srcIdFor(tid, { role: "user", text: "第二拍 user", ord: 3 }));
+      expect(mirrored[1].srcId).toBe(srcIdFor(tid, { role: "agent", text: "第二拍 agent", ord: 4 }));
+    });
+  });
+
+  it("E2E backfill endOrd ACK 後續聊:ord 不因尾 \\n 偏移", async () => {
+    await withWorld(async ({ tid, file, Mirror, appendFileSync, writeFileSync }) => {
+      writeFileSync(file, envLine("user_message", "祕密問題") + envLine("agent_message", "祕密回答"));
+      const wireSid = "01K0CODEX418BACKFILLWIRE0001";
+      const sent: any[] = [];
+      const m: any = new Mirror(
+        { agentLinkId: "al", isReady: true, send: (f: unknown) => sent.push(f) } as any,
+        {
+          isE2E: () => false,
+          remove: () => {},
+          disableReceiptForBackfill: () => ({ receipt: "test" }),
+          encryptText: (_s: string, t: string) => t,
+          encryptContent: (_s: string, c: { text: string }) => c,
+        } as any,
+      );
+      await m.backfillE2E(wireSid, tid, "disable");
+      const pendingKey = `disable:${wireSid}`;
+      const pending = m.state.pendingE2EBackfills[pendingKey];
+      expect(pending.endOrd).toBe(2); // 兩完整行;split 會給 3
+      m.handleE2EBackfillResult(wireSid, "disable", pending.batchId, true);
+      expect(m.state.ords[tid]).toBe(2);
+
+      appendFileSync(file, envLine("user_message", "回灌後續聊"));
+      // 清空 pending 後才能進普通 poll
+      m.pollOnce();
+      // seeded 未置且 offsets 已有 → 直接增量
+      // 若 endOrd 多 1,鏡像鍵 ord=3 ≠ 全量折 ord=2。
+      const batch = m.state.pendingMirrors?.[0];
+      expect(batch).toBeTruthy();
+      const msg = batch.frame.sessions[0].messages[0];
+      expect(msg.text).toBe("回灌後續聊");
+      expect(msg.srcId).toBe(srcIdFor(tid, { role: "user", text: "回灌後續聊", ord: 2 }));
+      const snap = m.srcIdSnapshot(tid) as Array<{ text: string; srcId: string }>;
+      expect(msg.srcId).toBe(snap.find((x) => x.text === "回灌後續聊")!.srcId);
+    });
+  });
+});
+
 describe("#347 disable backfill ACK 邊界", () => {
   it("發送明文 backfill 後保留 K_S；Mirror 不再自行 remove", async () => {
     const { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } = await import("node:fs");
@@ -163,20 +304,22 @@ describe("#347 disable backfill ACK 邊界", () => {
       expect(remove).not.toHaveBeenCalled();
       expect((mirror as any).state.offsets[localSid]).toBeUndefined();
       expect((mirror as any).state.offsets[wireSid]).toBeUndefined();
-      expect((mirror as any).pendingE2EBackfills.size).toBe(1);
+      const firstBatchId = sent[0].batchId;
+      expect(Object.keys((mirror as any).state.pendingE2EBackfills)).toHaveLength(1);
       mirror.fastForward(localSid);
       expect((mirror as any).state.offsets[localSid]).toBeUndefined(); // driven 回合旁路也必須服從 pending lock。
 
-      mirror.handleE2EBackfillResult(wireSid, "disable", false);
+      mirror.handleE2EBackfillResult(wireSid, "disable", firstBatchId, false);
       expect((mirror as any).state.offsets[localSid]).toBeUndefined();
-      expect((mirror as any).pendingE2EBackfills.size).toBe(0);
+      expect(Object.keys((mirror as any).state.pendingE2EBackfills)).toHaveLength(0);
       expect(remove).not.toHaveBeenCalled();
 
       await mirror.backfillE2E(wireSid, localSid, "disable");
-      mirror.handleE2EBackfillResult(wireSid, "disable", true);
+      const secondBatchId = sent.at(-1).batchId;
+      mirror.handleE2EBackfillResult(wireSid, "disable", secondBatchId, true);
       expect((mirror as any).state.offsets[localSid]).toBe(statSync(rollout).size);
       expect((mirror as any).state.offsets[wireSid]).toBeUndefined();
-      expect((mirror as any).pendingE2EBackfills.size).toBe(0);
+      expect(Object.keys((mirror as any).state.pendingE2EBackfills)).toHaveLength(0);
       expect(remove).not.toHaveBeenCalled(); // key 刪除只歸 index 的成功 ACK 分支。
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -331,7 +474,7 @@ describe("#236 seeded 基線語義(pollOnce 核心路徑)", () => {
     expect(m.state.seeded).toBe(true);
   });
 
-  it("#268 driven 會話只快進不投遞(live 獨佔)", async () => {
+  it("#350 driven 會話在途不投遞也不提前推進水位", async () => {
     const { Mirror, rollout, appendFileSync, line } = await mkWorld();
     rollout(T1, "存量");
     const sent: any[] = [];
@@ -342,7 +485,7 @@ describe("#236 seeded 基線語義(pollOnce 核心路徑)", () => {
     appendFileSync(f, line("agent_message", "driven 回覆"));
     m.pollOnce();
     expect(sent.filter((x) => x.t === "mirror_append")).toHaveLength(0); // driven → 不鏡像投遞
-    expect(m.state.offsets[T2]).toBeGreaterThan(0); // 只快進水位線
+    expect(m.state.offsets[T2]).toBeUndefined(); // ACK 前不可越過 rollout
   });
 
   it("#349 app-driven E2E unsetDriven 後 terminal 續聊仍回 wire ULID 加密，不建明文 UUID 影子", async () => {
@@ -365,25 +508,160 @@ describe("#236 seeded 基線語義(pollOnce 核心路徑)", () => {
     m.setDriven(T2);
     const f = rollout(T2, "app live user");
     appendFileSync(f, line("agent_message", "app live reply"));
-    m.pollOnce(); // live 路徑獨佔，只快進本地 UUID 水位
+    m.pollOnce(); // live 路徑獨佔，不推本地 UUID 水位
     m.unsetDriven(T2);
     appendFileSync(f, line("user_message", "terminal secret"));
     appendFileSync(f, line("agent_message", "terminal answer"));
-    m.pollOnce();
+    // 每帧只有 server ACK 后才提交候选水位；逐帧 drain，覆盖断线可重放路径。
+    for (let i = 0; i < 8; i++) {
+      m.pollOnce();
+      const pending = m.state.pendingMirrors?.[0];
+      if (!pending) break;
+      expect(m.state.offsets[T2] ?? 0).toBeLessThan(pending.offsets[T2]);
+      m.handleAck(pending.batchId);
+    }
 
     const batches = sent.filter((x) => x.t === "mirror_append");
-    expect(batches).toHaveLength(1);
-    expect(batches[0].sessions).toHaveLength(1);
-    expect(batches[0].sessions[0]).toMatchObject({
-      hermesSessionId: wireSid,
-      e2e: true,
-      messages: [
-        { role: "user", enc: `enc:${wireSid}:terminal secret` },
-        { role: "agent", enc: `enc:${wireSid}:terminal answer` },
-      ],
-    });
-    expect(batches[0].sessions[0].messages.every((message: any) => message.text === undefined)).toBe(true);
+    const sessions = batches.flatMap((batch) => batch.sessions);
+    expect(sessions.every((session) => session.hermesSessionId === wireSid && session.e2e === true)).toBe(true);
+    expect(sessions.flatMap((session) => session.messages).map((message) => message.enc)).toEqual([
+      `enc:${wireSid}:app live user`,
+      `enc:${wireSid}:app live reply`,
+      `enc:${wireSid}:terminal secret`,
+      `enc:${wireSid}:terminal answer`,
+    ]);
+    expect(sessions.flatMap((session) => session.messages).every((message: any) => message.text === undefined)).toBe(true);
     expect(sent.some((frame) => frame.sessions?.some((session: any) => session.hermesSessionId === T2))).toBe(false);
+  });
+
+  it("影子兜底:非 E2E 的 driven thread,unsetDriven 後絕不以本地 threadId 建明文會話", async () => {
+    const { Mirror, rollout, appendFileSync, line } = await mkWorld();
+    rollout(T1, "存量");
+    const sent: any[] = [];
+    const m: any = new Mirror({ agentLinkId: "al", isReady: true, send: (x: any) => sent.push(x), onFrame: () => () => {} } as any);
+    m.pollOnce(); // seeded
+
+    m.setDriven(T2);
+    const f = rollout(T2, "app 發的 prompt");
+    appendFileSync(f, line("agent_message", "app 收到的回覆"));
+    m.unsetDriven(T2); // 內部觸發一次 poll
+    m.pollOnce();
+    m.pollOnce();
+
+    // 2026-07-12 影子會話事故同款:fastForward 不再推水位後,offsets[T2] 未定義 → startOff=0 →
+    // 會把整條 rollout 以 hermesSessionId=T2 全量重發,server createIfMissing 建出第二個明文會話。
+    expect(sent.filter((x) => x.t === "mirror_append")).toHaveLength(0);
+    expect(sent.some((frame) => frame.sessions?.some((s: any) => s.hermesSessionId === T2))).toBe(false);
+    expect(m.counters.mirrorGhostBlocked).toBeGreaterThan(0);
+    expect(m.state.offsets[T2]).toBeUndefined(); // 不推水位:E2E 之後開啟仍能按密文補投
+  });
+
+  it("影子兜底跨重啟:markDrivenUuid 灌入的 thread 同樣不建明文會話", async () => {
+    const { Mirror, rollout } = await mkWorld();
+    rollout(T1, "存量");
+    const sent: any[] = [];
+    const m: any = new Mirror({ agentLinkId: "al", isReady: true, send: (x: any) => sent.push(x), onFrame: () => () => {} } as any);
+    m.pollOnce(); // seeded
+    m.markDrivenUuid(T3); // Drive 啟動時從持久映射灌入
+    rollout(T3, "重啟後終端續聊");
+    m.pollOnce();
+    expect(sent.filter((x) => x.t === "mirror_append")).toHaveLength(0);
+  });
+
+  it("#308 off:unsetDriven 不得全量掃 rollout(終端會話照樣不進 app)", async () => {
+    const { Mirror, rollout } = await mkWorld();
+    rollout(T1, "純終端會話,用戶要求不進 app");
+    process.env.MACCHIATO_MIRROR = "off";
+    try {
+      const sent: any[] = [];
+      const m: any = new Mirror({ agentLinkId: "al", isReady: true, send: (x: any) => sent.push(x), onFrame: () => () => {} } as any);
+      m.setDriven(T2);
+      m.unsetDriven(T2); // 修前:無條件全量 poll → 終端 rollout 被鏡像進 app
+      expect(sent.filter((x) => x.t === "mirror_append")).toHaveLength(0);
+      expect(m.state.offsets[T1]).toBeUndefined();
+    } finally {
+      delete process.env.MACCHIATO_MIRROR;
+    }
+  });
+
+  it("#308 off:E2E driven 回合仍可靠投遞——定向輪詢兜住晚落盤的尾巴", async () => {
+    const { Mirror, rollout, appendFileSync, line } = await mkWorld();
+    rollout(T1, "終端會話,off 下絕不投");
+    process.env.MACCHIATO_MIRROR = "off";
+    try {
+      const wireSid = "01K0CODEXMIRROROFFWIRE00001";
+      const sent: any[] = [];
+      const e2e: any = {
+        isE2E: (sid: string) => sid === wireSid,
+        encryptText: (_s: string, t: string) => `T:${t}`,
+        encryptContent: (_s: string, c: { text: string }) => `E:${c.text}`,
+      };
+      const m: any = new Mirror(
+        { agentLinkId: "al", isReady: true, send: (x: any) => sent.push(x), onFrame: () => () => {} } as any,
+        e2e,
+        (localSid: string) => (localSid === T2 ? wireSid : undefined),
+      );
+      m.setDriven(T2);
+      const f = rollout(T2, "E2E driven 問題");
+      vi.useFakeTimers();
+      m.start(); // off:只裝定向輪詢
+      m.unsetDriven(T2);
+      m.handleAck(sent.filter((x) => x.t === "mirror_append").at(-1).batchId);
+      appendFileSync(f, line("agent_message", "晚落盤的最後一塊")); // 尾巴晚落盤
+      vi.advanceTimersByTime(30_000);
+      vi.useRealTimers();
+
+      const byBatch = new Map<string, any>();
+      for (const frame of sent.filter((x) => x.t === "mirror_append")) byBatch.set(frame.batchId, frame);
+      const msgs = [...byBatch.values()].flatMap((x: any) => x.sessions[0].messages);
+      expect(msgs.map((x: any) => x.enc)).toEqual(["E:E2E driven 問題", "E:晚落盤的最後一塊"]);
+      expect([...byBatch.values()].every((x: any) => x.sessions[0].hermesSessionId === wireSid)).toBe(true);
+      expect(m.state.offsets[T1]).toBeUndefined(); // 終端 rollout 一幀未發、水位未動
+      expect(m.state.seeded).not.toBe(true); // 定向輪詢不得謊稱首掃完成
+    } finally {
+      delete process.env.MACCHIATO_MIRROR;
+    }
+  });
+
+  it("#350 E2E 回合末尾巴在亞秒內追平,不必等滿一個 5s 輪詢周期", async () => {
+    // 取消 fire-and-forget 直發後 E2E 回覆只剩 rollout 檔一條路;回合 result 常早於 Codex
+    // 寫完尾巴 → unsetDriven 那次即時 poll 讀不到最後一塊,舊行為要等下一個 POLL_MS(5s)tick。
+    const { Mirror, rollout, appendFileSync, line } = await mkWorld();
+    rollout(T1, "存量");
+    const wireSid = "01K0CODEXTAILPOLLWIRE000001";
+    const sent: any[] = [];
+    const e2e: any = {
+      isE2E: (sid: string) => sid === wireSid,
+      encryptText: (_s: string, t: string) => `T:${t}`,
+      encryptContent: (_s: string, c: { text: string }) => `E:${c.text}`,
+    };
+    const m: any = new Mirror(
+      { agentLinkId: "al", isReady: true, send: (x: any) => sent.push(x), onFrame: () => () => {} } as any,
+      e2e,
+      (localSid: string) => (localSid === T2 ? wireSid : undefined),
+    );
+    m.pollOnce(); // seeded
+    m.setDriven(T2);
+    const f = rollout(T2, "E2E 問題");
+    vi.useFakeTimers();
+    try {
+      m.start();
+      m.unsetDriven(T2); // 即時 poll:此刻尾巴還沒落盤
+      m.handleAck(sent.filter((x) => x.t === "mirror_append").at(-1).batchId);
+      appendFileSync(f, line("agent_message", "回合末晚落盤的回覆"));
+      // 只推進 1s——遠不到一個 POLL_MS(5s)。修前這裡一幀都不會有。
+      vi.advanceTimersByTime(1_000);
+      const tail = sent.filter((x) => x.t === "mirror_append").at(-1);
+      expect(tail.sessions[0].messages.map((x: any) => x.enc)).toEqual(["E:回合末晚落盤的回覆"]);
+      expect(tail.sessions[0].hermesSessionId).toBe(wireSid);
+      // 排程有界:停掉鏡像後不再有殘留定時器繼續打。
+      m.stop();
+      const before = sent.filter((x) => x.t === "mirror_append").length;
+      vi.advanceTimersByTime(60_000);
+      expect(sent.filter((x) => x.t === "mirror_append")).toHaveLength(before);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("#268 mirror_nack 回退水位線 → 重發同批", async () => {
@@ -400,5 +678,43 @@ describe("#236 seeded 基線語義(pollOnce 核心路徑)", () => {
     m.pollOnce();
     const re = sent.filter((x) => x.t === "mirror_append").at(-1);
     expect(re.sessions[0].messages[0].text).toBe("要被 nack 的消息"); // 重發
+  });
+
+  it("#350 断线重建实例重放同一 batchId，ACK 前水位不动、ACK 后才提交", async () => {
+    const { Mirror, rollout } = await mkWorld();
+    rollout(T1, "存量");
+    const m1: any = new Mirror({
+      agentLinkId: "al",
+      isReady: true,
+      send: () => {},
+      onFrame: () => () => {},
+    } as any);
+    m1.pollOnce();
+    rollout(T2, "必须重放");
+    const first: any[] = [];
+    const live1: any = new Mirror({
+      agentLinkId: "al",
+      isReady: true,
+      send: (frame: any) => first.push(frame),
+      onFrame: () => () => {},
+    } as any);
+    live1.pollOnce();
+    const original = first.find((frame) => frame.t === "mirror_append");
+    expect(live1.state.offsets[T2]).toBeUndefined();
+
+    const replayed: any[] = [];
+    const m2: any = new Mirror({
+      agentLinkId: "al",
+      isReady: true,
+      send: (frame: any) => replayed.push(frame),
+      onFrame: () => () => {},
+    } as any);
+    m2.pollOnce();
+    const replay = replayed.find((frame) => frame.t === "mirror_append");
+    expect(replay.batchId).toBe(original.batchId);
+    expect(replay.sessions).toEqual(original.sessions);
+    expect(m2.state.offsets[T2]).toBeUndefined();
+    m2.handleAck(replay.batchId);
+    expect(m2.state.offsets[T2]).toBeGreaterThan(0);
   });
 });

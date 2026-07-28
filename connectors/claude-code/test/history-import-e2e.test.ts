@@ -11,6 +11,11 @@ const ROTATED_E2E_SID = "33333333-3333-4333-8333-333333333333";
 const E2E_WIRE_SID = "01K0CCHISTORYWIRE0000000001";
 const PLAIN_SID = "22222222-2222-4222-8222-222222222222";
 
+/** #394 起 Drive 在 init/開場會 emit session.localSessionId，fake linkb 必須有 send。 */
+function stubLinkb(): any {
+  return { agentLinkId: "AL0", isReady: true, send: () => {}, onReady: () => () => {} };
+}
+
 describe("#347 history import E2E wire boundary", () => {
   let root: string;
   let previousConfigDir: string | undefined;
@@ -70,7 +75,7 @@ describe("#347 history import E2E wire boundary", () => {
       }),
     );
     const drive = new Drive(
-      { onReady: () => () => {} } as any,
+      stubLinkb(),
       undefined,
       {
         isE2E: (sid: string) => sid === E2E_WIRE_SID,
@@ -120,7 +125,7 @@ describe("#347 history import E2E wire boundary", () => {
     writeFileSync(process.env.MACCHIATO_CC_SESSIONS!, "{broken");
     writeFileSync(`${process.env.MACCHIATO_CC_SESSIONS!}.bak`, "{also-broken");
     const drive = new Drive(
-      { onReady: () => () => {} } as any,
+      stubLinkb(),
       undefined,
       {
         isE2E: (sid: string) => sid === E2E_WIRE_SID,
@@ -158,7 +163,7 @@ describe("#347 history import E2E wire boundary", () => {
       }),
     );
     const drive = new Drive(
-      { onReady: () => () => {} } as any,
+      stubLinkb(),
       undefined,
       {
         isE2E: (sid: string) => sid === E2E_WIRE_SID,
@@ -173,7 +178,7 @@ describe("#347 history import E2E wire boundary", () => {
 
   it("全新安装无 E2E protection floor → 不被缺失身份档永久阻塞", () => {
     const drive = new Drive(
-      { onReady: () => () => {} } as any,
+      stubLinkb(),
       undefined,
       {
         isE2E: () => false,
@@ -215,7 +220,7 @@ describe("#347 history import E2E wire boundary", () => {
     } as any;
     const mirrorCalls: string[] = [];
     const drive = new Drive(
-      { onReady: () => () => {} } as any,
+      stubLinkb(),
       {
         setDriven: (sid: string) => mirrorCalls.push(`set:${sid}`),
         markDrivenUuid: (sid: string) => mirrorCalls.push(`mark:${sid}`),
@@ -279,7 +284,19 @@ describe("#347 history import E2E wire boundary", () => {
     expect(() => restartedDrive.assertE2EIdentitySafe()).not.toThrow();
     (restartedMirror as any).doPoll();
     const mirrorAppends = afterRestart.filter((message) => message.t === "mirror_append");
-    expect(mirrorAppends).toEqual([]);
+    // #348：E2E transcript 可以安全回灌，但必须全为密文 stable batch；ACK 前水位保持 0。
+    expect(mirrorAppends).toHaveLength(2);
+    expect(
+      mirrorAppends.every((message) =>
+        message.sessions.every(
+          (session: any) =>
+            session.e2e === true &&
+            session.messages.every(
+              (entry: any) => typeof entry.enc === "string" && entry.text === undefined,
+            ),
+        ),
+      ),
+    ).toBe(true);
     expect(JSON.stringify(afterRestart)).not.toContain("轮换前绝密");
     expect(JSON.stringify(afterRestart)).not.toContain("轮换后绝密");
     expect((restartedMirror as any).state.offsets[E2E_SID]).toBe(0);
@@ -316,7 +333,7 @@ describe("#347 history import E2E wire boundary", () => {
       setDriven: () => {},
       markDrivenUuid: (sid: string) => marked.push(sid),
     } as any;
-    const drive = new Drive({ onReady: () => () => {} } as any, mirror, e2e);
+    const drive = new Drive(stubLinkb(), mirror, e2e);
 
     (drive as any).handleMessage(
       { sid: E2E_SID, turn: { completed: true }, closing: false },
@@ -344,7 +361,7 @@ describe("#347 history import E2E wire boundary", () => {
 
     const restartedMarked: string[] = [];
     const restarted = new Drive(
-      { onReady: () => () => {} } as any,
+      stubLinkb(),
       {
         markDrivenUuid: (sid: string) => restartedMarked.push(sid),
       } as any,
@@ -407,7 +424,7 @@ describe("#347 history import E2E wire boundary", () => {
       protectedSessionIds: () => [E2E_WIRE_SID],
       hasServerStateSnapshot: () => true,
     } as any;
-    const drive = new Drive({ onReady: () => () => {} } as any, undefined, e2e);
+    const drive = new Drive(stubLinkb(), undefined, e2e);
     expect(drive.localSessionE2EStatus().isE2E(PLAIN_SID)).toBe(true);
     expect(drive.plaintextLocalMirrorAllowed(PLAIN_SID)).toBe(false);
 
@@ -449,7 +466,7 @@ describe("#347 history import E2E wire boundary", () => {
       }),
     );
     const drive = new Drive(
-      { onReady: () => () => {} } as any,
+      stubLinkb(),
       undefined,
       {
         isE2E: (sid: string) => sid === E2E_WIRE_SID,

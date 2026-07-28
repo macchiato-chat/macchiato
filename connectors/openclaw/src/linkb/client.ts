@@ -21,8 +21,18 @@ export class LinkBClient {
   /** 斷線期間的出站幀緩衝(重連 ready 後 flush)——server 部署重啟撞上進行中回合時,
    * 回覆/標題曾被 send() 靜默丟掉(2026-07-12 影子會話實測)。有界:滿了丟最舊。 */
   private readonly pending: string[] = [];
+  /** #380 與 PENDING_MAX 雙限：幀數 + 總字節，防 500 條大幀撐爆內存。 */
+  private pendingBytes = 0;
   private blockedSessionIds = new Set<string>();
-  private static readonly PENDING_MAX = 500;
+  /** #380 對齊 server connectorWss maxPayload（services/server/src/server.ts）。 */
+  static readonly MAX_FRAME_BYTES = 8 * 1024 * 1024;
+  static readonly PENDING_MAX = 500;
+  static readonly PENDING_MAX_BYTES = 16 * 1024 * 1024;
+  private static readonly MAX_TOP_LEVEL_KEYS = 64;
+  private static readonly MAX_JSON_DEPTH = 32;
+  private static readonly MAX_SESSION_ID_LEN = 256;
+  private static readonly MAX_TYPE_LEN = 64;
+  private static readonly MAX_BULK_ARRAY_LEN = 10_000;
   private readonly handlers = new Set<FrameHandler>();
   /** #199 每次 ready(含重連)都觸發——server 重啟丟內存緩存的上報(如 commands 清單)靠它重發。 */
   private readonly readyHandlers = new Set<() => void>();
@@ -44,7 +54,7 @@ export class LinkBClient {
     private readonly creds: Creds,
     private readonly applyE2EState?: E2EStateApplier,
     private readonly socketFactory: (url: string) => WebSocket = (url) =>
-      new WebSocket(url, { handshakeTimeout: 20000 }),
+      new WebSocket(url, { handshakeTimeout: 20000, maxPayload: LinkBClient.MAX_FRAME_BYTES }),
     private readonly isProtected?: E2EProtectionCheck,
   ) {
     this.readyOnce = new Promise((r) => (this.firstReady = r));
@@ -101,6 +111,8 @@ export class LinkBClient {
           proto: LINK_B_PROTO,
           e2eFailClosed: 1,
           e2eControlAuth: 1,
+          e2eKeyVersionBinding: 1,
+          e2eQuiesce: 1,
         }),
       );
     });
@@ -120,10 +132,22 @@ export class LinkBClient {
 
   private handleFrame(raw: WebSocket.RawData): void {
     this.bumpLiveness(); // #247 任何入站幀續期
+    const nbytes = LinkBClient.rawByteLength(raw);
+    if (nbytes > LinkBClient.MAX_FRAME_BYTES) {
+      console.error(`Link B inbound frame dropped: ${nbytes} bytes > maxPayload`);
+      return;
+    }
     let msg: Record<string, unknown>;
     try {
       msg = JSON.parse(raw.toString());
     } catch {
+      console.error("Link B inbound frame dropped: invalid JSON");
+      return;
+    }
+    if (!LinkBClient.isSaneInbound(msg)) {
+      console.error(
+        `Link B inbound frame dropped: schema/size bounds (t=${String((msg as { t?: unknown })?.t)})`,
+      );
       return;
     }
     switch (msg.t) {
@@ -238,7 +262,7 @@ export class LinkBClient {
       kept.push(raw);
     }
     if (dropped) {
-      this.pending.splice(0, this.pending.length, ...kept);
+      this.replacePending(kept);
       console.error(`⚠️ E2E ready 對賬丟棄 ${dropped} 個首連前明文 session payload（請重試相關消息）`);
     }
   }
@@ -251,6 +275,113 @@ export class LinkBClient {
   private sessionIsProtected(sid: unknown): boolean {
     if (typeof sid !== "string" || !sid) return false;
     return this.blockedSessionIds.has(sid) || (this.isProtected?.(sid) ?? false);
+  }
+
+  /** #380 入站 raw 字節長度（ws 可能給 Buffer / ArrayBuffer / Buffer[]）。 */
+  static rawByteLength(raw: WebSocket.RawData): number {
+    // 用 unknown 走這幾道判斷:RawData 的宣告只有 Buffer/ArrayBuffer/Buffer[],逐個排除後
+    // 會窄化成 never,而 ws 實際可能給 TypedArray/DataView,分支必須留著。
+    const r: unknown = raw;
+    if (Buffer.isBuffer(r)) return r.length;
+    if (Array.isArray(r)) return r.reduce((n: number, b: Buffer) => n + b.length, 0);
+    if (r instanceof ArrayBuffer) return r.byteLength;
+    if (ArrayBuffer.isView(r)) return r.byteLength;
+    return Buffer.byteLength(String(r), "utf8");
+  }
+
+  private static jsonDepthOk(value: unknown, maxDepth: number, depth = 0): boolean {
+    if (depth > maxDepth) return false;
+    if (value === null || typeof value !== "object") return true;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (!LinkBClient.jsonDepthOk(item, maxDepth, depth + 1)) return false;
+      }
+      return true;
+    }
+    for (const v of Object.values(value as Record<string, unknown>)) {
+      if (!LinkBClient.jsonDepthOk(v, maxDepth, depth + 1)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * #380 入站基本邊界：type / 頂層鍵數 / 嵌套深度 / 關鍵 id 長度 / 批次數組長度。
+   * 未知 t 放行但受頂層約束（完整 zod 分型留後續）。
+   */
+  static isSaneInbound(msg: unknown): msg is Record<string, unknown> {
+    if (msg === null || typeof msg !== "object" || Array.isArray(msg)) return false;
+    const obj = msg as Record<string, unknown>;
+    if (Object.keys(obj).length > LinkBClient.MAX_TOP_LEVEL_KEYS) return false;
+    if (typeof obj.t !== "string" || !obj.t || obj.t.length > LinkBClient.MAX_TYPE_LEN) return false;
+    if (!LinkBClient.jsonDepthOk(obj, LinkBClient.MAX_JSON_DEPTH)) return false;
+    for (const key of ["sessionId", "hermesSessionId", "chatId", "agentLinkId"] as const) {
+      const v = obj[key];
+      if (v !== undefined && (typeof v !== "string" || v.length > LinkBClient.MAX_SESSION_ID_LEN)) {
+        return false;
+      }
+    }
+    const frame = obj.frame;
+    if (frame !== undefined) {
+      if (frame === null || typeof frame !== "object" || Array.isArray(frame)) return false;
+      const params = (frame as { params?: unknown }).params;
+      if (params !== undefined) {
+        if (params === null || typeof params !== "object" || Array.isArray(params)) return false;
+        const sid = (params as { session_id?: unknown }).session_id;
+        if (
+          sid !== undefined &&
+          (typeof sid !== "string" || sid.length > LinkBClient.MAX_SESSION_ID_LEN)
+        ) {
+          return false;
+        }
+      }
+    }
+    for (const key of ["sessions", "items", "messages", "disabledReceipts"] as const) {
+      const v = obj[key];
+      if (Array.isArray(v) && v.length > LinkBClient.MAX_BULK_ARRAY_LEN) return false;
+    }
+    const e2e = obj.e2eState;
+    if (e2e !== null && e2e !== undefined) {
+      if (typeof e2e !== "object" || Array.isArray(e2e)) return false;
+      const sessions = (e2e as { sessions?: unknown }).sessions;
+      const receipts = (e2e as { disabledReceipts?: unknown }).disabledReceipts;
+      if (Array.isArray(sessions) && sessions.length > LinkBClient.MAX_BULK_ARRAY_LEN) return false;
+      if (Array.isArray(receipts) && receipts.length > LinkBClient.MAX_BULK_ARRAY_LEN) return false;
+    }
+    return true;
+  }
+
+  private replacePending(frames: string[]): void {
+    this.pending.splice(0, this.pending.length, ...frames);
+    this.pendingBytes = frames.reduce((n, f) => n + Buffer.byteLength(f, "utf8"), 0);
+  }
+
+  private enqueuePending(raw: string): void {
+    const nbytes = Buffer.byteLength(raw, "utf8");
+    if (nbytes > LinkBClient.MAX_FRAME_BYTES) {
+      console.error(`Link B outbound frame dropped: ${nbytes} bytes > maxPayload`);
+      return;
+    }
+    let dropped = 0;
+    while (
+      this.pending.length > 0 &&
+      (this.pending.length >= LinkBClient.PENDING_MAX ||
+        this.pendingBytes + nbytes > LinkBClient.PENDING_MAX_BYTES)
+    ) {
+      const old = this.pending.shift()!;
+      this.pendingBytes -= Buffer.byteLength(old, "utf8");
+      dropped++;
+    }
+    if (this.pendingBytes + nbytes > LinkBClient.PENDING_MAX_BYTES) {
+      console.error(
+        `Link B pending drop: frame ${nbytes} bytes exceeds remaining byte budget`,
+      );
+      return;
+    }
+    if (dropped) {
+      console.error(`⚠️ Link B pending backpressure: dropped ${dropped} oldest frame(s)`);
+    }
+    this.pending.push(raw);
+    this.pendingBytes += nbytes;
   }
 
   private static onlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
@@ -450,8 +581,7 @@ export class LinkBClient {
       const hasE2E = msg.t === "mirror_append" && Array.isArray(sessions) && sessions.some((s) => s?.e2e === true);
       if (!hasE2E) return;
     }
-    if (this.pending.length >= LinkBClient.PENDING_MAX) this.pending.shift(); // 有界:丟最舊
-    this.pending.push(JSON.stringify(msg));
+    this.enqueuePending(JSON.stringify(msg));
   }
 
   /** ready 後把斷線期間積壓的幀按序補發。 */
@@ -460,7 +590,9 @@ export class LinkBClient {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     console.log(`· Link B 重連 → 補發斷線期間積壓的 ${this.pending.length} 幀`);
-    for (const pending of this.pending.splice(0)) {
+    const queued = this.pending.splice(0);
+    this.pendingBytes = 0;
+    for (const pending of queued) {
       try {
         const filtered = this.filterBlockedOutbound(JSON.parse(pending));
         if (filtered) ws.send(JSON.stringify(filtered));

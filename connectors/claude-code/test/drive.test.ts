@@ -130,6 +130,17 @@ function tuiFrame(sid: string, method: string, params: Record<string, unknown> =
 
 const CC_SID = "6966afc5-2dca-477d-a987-848421d25124";
 
+/**
+ * #427 假時鐘下沖刷 drive 的 frameChain → openChannel → consume → yieldScript 微任務鏈,
+ * 直到腳本掛上第一個 setTimeout(__wait) 或跑完同步事件。不推進真實時間。
+ */
+async function flushDriveTimers(maxTicks = 30): Promise<void> {
+  for (let i = 0; i < maxTicks; i++) {
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+  }
+}
+
 beforeEach(() => {
   emitScript = [];
   turnScripts = [];
@@ -144,6 +155,7 @@ beforeEach(() => {
   delete process.env.MACCHIATO_CC_IDLE_S;
   delete process.env.MACCHIATO_CC_MODEL; // #143 防測試間污染(連接器服務設了它)
   delete process.env.MACCHIATO_CC_TITLE_MODE; // 同上:個別用例設 off 防偷跑 turnScript,不清會順著污染後面
+  vi.useRealTimers(); // #427 防上一用例假時鐘洩漏
 });
 
 describe("Drive", () => {
@@ -234,9 +246,14 @@ describe("Drive", () => {
     fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
     await new Promise((r) => setTimeout(r, 20));
     expect(lastOptions.resume).toBe(CC_SID); // 鏡像會話:sid 即 CC id
-    const types = sent.map((f: any) => f.frame?.params?.type);
+    // #394 開場/init 會夾帶 session.localSessionId；訊息流仍是 start→delta→complete。
+    const types = sent
+      .map((f: any) => f.frame?.params?.type)
+      .filter((t: string) => t !== "session.localSessionId");
     expect(types).toEqual(["message.start", "message.delta", "message.delta", "message.complete"]);
     expect((sent.at(-1) as any).frame.params.payload.text).toBe("hello");
+    const resumeEvt = sent.find((f: any) => f.frame?.params?.type === "session.localSessionId") as any;
+    expect(resumeEvt?.frame?.params?.payload?.localSessionId).toBe(CC_SID);
   });
 
   it("Macchiato 新會話(ULID sid):init 的 session_id 持久映射,下回合 resume 用它", async () => {
@@ -254,6 +271,38 @@ describe("Drive", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(lastOptions.resume).toBe(CC_SID); // 續聊走映射
     expect(d.localSessionIdFor("01ULIDSERVERSID000000000AA")).toBe(CC_SID);
+  });
+
+  it("#394 ULID 會話:init 後上報 session.localSessionId；續聊開場再補報", async () => {
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    const wireSid = "01ULIDSERVERSID000000000AA";
+    fire(tuiFrame(wireSid, "prompt.submit", { text: "first" }));
+    await new Promise((r) => setTimeout(r, 20));
+    const firstReport = sent.filter(
+      (f: any) => f.frame?.params?.type === "session.localSessionId",
+    ) as any[];
+    expect(firstReport.length).toBeGreaterThanOrEqual(1);
+    expect(firstReport[0].frame.params.payload).toEqual({ localSessionId: CC_SID });
+    expect(firstReport[0].frame.params.session_id).toBe(wireSid);
+    // 第二回合：開場已知 map → 再補報一次（server 冪等）
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const before = sent.length;
+    fire(tuiFrame(wireSid, "prompt.submit", { text: "second" }));
+    await new Promise((r) => setTimeout(r, 20));
+    const secondBatch = sent
+      .slice(before)
+      .filter((f: any) => f.frame?.params?.type === "session.localSessionId") as any[];
+    expect(secondBatch.length).toBeGreaterThanOrEqual(1);
+    expect(secondBatch[0].frame.params.payload.localSessionId).toBe(CC_SID);
   });
 
   it("#389 通道帶 env:聲明 entrypoint=macchiato(終端 /resume 可見)且展開了 process.env", async () => {
@@ -287,6 +336,46 @@ describe("Drive", () => {
     await new Promise((r) => setTimeout(r, 30));
     expect(lastOptions.permissionMode).toBe("plan"); // 確認通道確實重建了
     expect(lastOptions.env.CLAUDE_CODE_ENTRYPOINT).toBe("macchiato"); // 重建後聲明仍在
+    d.dispose();
+  });
+
+  it("#392 不存在/越界的 cwd → 阻斷投遞並回提示,不開通道(prompt 不交付 SDK)", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "off";
+    const sid = "01ULIDCWDBLOCK0000000000AA";
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(sid, "session.create", { cwd: "/nonexistent/definitely/not/here" }));
+    fire(tuiFrame(sid, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(queryCalls).toBe(0); // 未開通道
+    const warn = sent.find(
+      (f: any) => f.frame?.params?.type === "review.summary" && String(f.frame.params.payload.summary).includes("工作目錄"),
+    );
+    expect(warn).toBeTruthy();
+    d.dispose();
+  });
+
+  it("#105 回合進行中改 cwd → 照常記下(回合末重建通道生效),不拒絕、不打斷", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "off";
+    const good1 = mkdtempSync(join(tmpdir(), "cc-cwdA-"));
+    const good2 = mkdtempSync(join(tmpdir(), "cc-cwdB-"));
+    const sid = "01ULIDMIDTURN00000000000AA";
+    turnScripts = [[{ __wait: 200 }, { type: "system", subtype: "init", session_id: CC_SID }, { type: "result", subtype: "success", result: "1" }]];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(sid, "session.create", { cwd: good1 }));
+    fire(tuiFrame(sid, "prompt.submit", { text: "go" }));
+    await new Promise((r) => setTimeout(r, 25)); // 回合已起、仍在 __wait 中
+    fire(tuiFrame(sid, "session.create", { cwd: good2 })); // 回合進行中改 cwd
+    await new Promise((r) => setTimeout(r, 10));
+    expect((d as any).cwds[sid]).toBe(good2); // 立刻落庫,下回合按新 cwd 重建通道
+    const warn = sent.find(
+      (f: any) => f.frame?.params?.type === "review.summary" && String(f.frame.params.payload.summary).includes("工作目錄"),
+    );
+    expect(warn).toBeFalsy(); // 合法目錄 → 不回任何告警
+    await new Promise((r) => setTimeout(r, 220)); // 等回合結束再 dispose
     d.dispose();
   });
 
@@ -363,6 +452,31 @@ describe("Drive", () => {
     await new Promise((r) => setTimeout(r, 10));
     expect((d as any).queued.get(CC_SID)).toEqual(["/verify"]);
     expect(interrupted).toBe(1);
+  });
+
+  it("#381 command.invoke 默认日志不含 canary args", async () => {
+    const canary = "CANARY-SKILL-ARG-sk-live-CC-/Users/private/repo";
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const logs: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((...a) => {
+      logs.push(a.map(String).join(" "));
+    });
+    try {
+      const { linkb, fire } = fakeLinkb();
+      const d = new Drive(linkb);
+      d.wire();
+      fire(tuiFrame(CC_SID, "command.invoke", { command: "deep-research", args: canary }));
+      await new Promise((r) => setTimeout(r, 20));
+      const joined = logs.join("\n");
+      expect(joined).toMatch(/command\.invoke/);
+      expect(joined).toMatch(/argsLen=/);
+      expect(joined).not.toContain(canary);
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it("#199 system/commands_changed → 整份替換轉給 CommandsReporter", async () => {
@@ -865,8 +979,10 @@ describe("#102 消息面補齊", () => {
     new Drive(linkb).wire();
     fire(tuiFrame(CC_SID, "prompt.submit", { text: "go" }));
     await new Promise((r) => setTimeout(r, 20));
-    const types = sent.map((f: any) => f.frame?.params?.type);
-    expect(types).toEqual(["message.start", "message.complete"]); // 未知類型無幀外洩
+    const types = sent
+      .map((f: any) => f.frame?.params?.type)
+      .filter((t: string) => t !== "session.localSessionId");
+    expect(types).toEqual(["message.start", "message.complete"]); // 未知類型無幀外洩（#394 resume 上報另計）
     const unknownLogs = log.mock.calls.filter((c) => String(c[0]).includes("未處理的 SDK 消息"));
     expect(unknownLogs).toHaveLength(2); // thinking_tokens 一次 + tool_use_summary 一次
     log.mockRestore();
@@ -1052,46 +1168,69 @@ describe("#118 streaming-input 長活通道", () => {
   });
 
   it("閒置回收:超時關通道回收;下個 prompt 新通道 resume 續上", async () => {
-    process.env.MACCHIATO_CC_IDLE_S = "1"; // 最小檔:1s
-    turnScripts = [[init, { type: "result", subtype: "success", result: "one" }]];
-    const { linkb, fire } = fakeLinkb();
-    const d = new Drive(linkb);
-    d.wire();
-    fire(tuiFrame(CC_SID, "prompt.submit", { text: "t1" }));
-    await new Promise((r) => setTimeout(r, 30));
-    expect((d as any).channels.size).toBe(1);
-    await new Promise((r) => setTimeout(r, 1200)); // 越過 idle 窗
-    expect((d as any).channels.size).toBe(0); // 已回收
-    turnScripts = [[init, { type: "result", subtype: "success", result: "two" }]];
-    fire(tuiFrame(CC_SID, "prompt.submit", { text: "t2" }));
-    await new Promise((r) => setTimeout(r, 30));
-    expect(queryCalls).toBe(2); // 新通道
-    expect(lastOptions.resume).toBe(CC_SID); // resume 續上下文
-    d.dispose();
+    // #427 假時鐘:不依賴真實 1s 窗（整包並行時 wall-clock 會被擠）
+    vi.useFakeTimers();
+    try {
+      process.env.MACCHIATO_CC_IDLE_S = "1"; // 1s idle
+      turnScripts = [[init, { type: "result", subtype: "success", result: "one" }]];
+      const { linkb, fire } = fakeLinkb();
+      const d = new Drive(linkb);
+      d.wire();
+      fire(tuiFrame(CC_SID, "prompt.submit", { text: "t1" }));
+      await flushDriveTimers();
+      expect((d as any).channels.size).toBe(1);
+      await vi.advanceTimersByTimeAsync(1000); // 恰好 idle 窗
+      expect((d as any).channels.size).toBe(0); // 已回收
+      turnScripts = [[init, { type: "result", subtype: "success", result: "two" }]];
+      fire(tuiFrame(CC_SID, "prompt.submit", { text: "t2" }));
+      await flushDriveTimers();
+      expect(queryCalls).toBe(2); // 新通道
+      expect(lastOptions.resume).toBe(CC_SID); // resume 續上下文
+      d.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("#212 回合結束時已有後台任務 → 越過 idle 窗仍保留，任務完成後才回收", async () => {
-    process.env.MACCHIATO_CC_IDLE_S = "0.05";
-    turnScripts = [[
-      init,
-      { type: "system", subtype: "task_started", task_id: "bg-long", description: "長任務" },
-      { type: "result", subtype: "success", result: "已放到後台" },
-      { __wait: 150 },
-      { type: "system", subtype: "task_notification", task_id: "bg-long", status: "completed" },
-    ]];
-    const { linkb, fire } = fakeLinkb();
-    const d = new Drive(linkb);
-    d.wire();
-    fire(tuiFrame(CC_SID, "prompt.submit", { text: "run in background" }));
+    // #427 假時鐘:原 wall-clock 100ms/120ms 窗在並行負載下偶發紅
+    vi.useFakeTimers();
+    try {
+      const IDLE_MS = 50;
+      const TASK_MS = 150;
+      process.env.MACCHIATO_CC_IDLE_S = String(IDLE_MS / 1000);
+      turnScripts = [[
+        init,
+        { type: "system", subtype: "task_started", task_id: "bg-long", description: "長任務" },
+        { type: "result", subtype: "success", result: "已放到後台" },
+        { __wait: TASK_MS },
+        { type: "system", subtype: "task_notification", task_id: "bg-long", status: "completed" },
+      ]];
+      const { linkb, fire } = fakeLinkb();
+      const d = new Drive(linkb);
+      d.wire();
+      fire(tuiFrame(CC_SID, "prompt.submit", { text: "run in background" }));
+      await flushDriveTimers();
+      expect((d as any).sessionTasks.get(CC_SID)?.has("bg-long")).toBe(true);
+      expect((d as any).channels.size).toBe(1);
 
-    await new Promise((r) => setTimeout(r, 100)); // 已越過 50ms idle 窗，task 尚在跑
-    expect((d as any).channels.size).toBe(1);
-    expect((d as any).sessionTasks.get(CC_SID)?.has("bg-long")).toBe(true);
+      // 越過完整 idle 窗，task 尚在跑 → 通道必須保留
+      await vi.advanceTimersByTimeAsync(IDLE_MS + 1);
+      expect((d as any).channels.size).toBe(1);
+      expect((d as any).sessionTasks.get(CC_SID)?.has("bg-long")).toBe(true);
 
-    await new Promise((r) => setTimeout(r, 120)); // task 150ms 完成，再過完整 50ms idle 窗
-    expect((d as any).sessionTasks.has(CC_SID)).toBe(false);
-    expect((d as any).channels.size).toBe(0);
-    d.dispose();
+      // 走完 task wait 剩餘 → notification → 重新 schedule idle
+      await vi.advanceTimersByTimeAsync(TASK_MS - IDLE_MS - 1);
+      expect((d as any).sessionTasks.has(CC_SID)).toBe(false);
+      expect((d as any).channels.size).toBe(1);
+
+      // 任務結束後的完整 idle 窗才回收
+      await vi.advanceTimersByTimeAsync(IDLE_MS);
+      expect((d as any).channels.size).toBe(0);
+      d.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("#253 回合卡死(有事件無 result)→ 看門狗強制收尾 error + 回收通道 + 清 pending", async () => {
@@ -1137,28 +1276,40 @@ describe("#118 streaming-input 長活通道", () => {
   });
 
   it("#212 result 後才收到 task_started → 撤銷既有 idle timer，不競態誤殺", async () => {
-    process.env.MACCHIATO_CC_IDLE_S = "0.05";
-    turnScripts = [[
-      init,
-      { type: "result", subtype: "success", result: "done" },
-      { __wait: 20 },
-      { type: "system", subtype: "task_started", task_id: "bg-late", description: "晚到任務" },
-      { __wait: 130 },
-      { type: "system", subtype: "task_notification", task_id: "bg-late", status: "completed" },
-    ]];
-    const { linkb, fire } = fakeLinkb();
-    const d = new Drive(linkb);
-    d.wire();
-    fire(tuiFrame(CC_SID, "prompt.submit", { text: "late background event" }));
+    // #427 假時鐘:同組 wall-clock 競態窗
+    vi.useFakeTimers();
+    try {
+      const IDLE_MS = 50;
+      process.env.MACCHIATO_CC_IDLE_S = String(IDLE_MS / 1000);
+      turnScripts = [[
+        init,
+        { type: "result", subtype: "success", result: "done" },
+        { __wait: 20 },
+        { type: "system", subtype: "task_started", task_id: "bg-late", description: "晚到任務" },
+        { __wait: 130 },
+        { type: "system", subtype: "task_notification", task_id: "bg-late", status: "completed" },
+      ]];
+      const { linkb, fire } = fakeLinkb();
+      const d = new Drive(linkb);
+      d.wire();
+      fire(tuiFrame(CC_SID, "prompt.submit", { text: "late background event" }));
+      await flushDriveTimers();
 
-    await new Promise((r) => setTimeout(r, 100)); // 原 idle timer 應在 50ms 關閉；task_started 已將它撤銷
-    expect((d as any).channels.size).toBe(1);
-    expect((d as any).sessionTasks.get(CC_SID)?.has("bg-late")).toBe(true);
+      // t=20: late task_started 撤銷 result 後掛上的 idle；再推進遠超原 idle 窗仍保留
+      await vi.advanceTimersByTimeAsync(20 + IDLE_MS + 1); // 71ms：原 50ms idle 已過
+      expect((d as any).channels.size).toBe(1);
+      expect((d as any).sessionTasks.get(CC_SID)?.has("bg-late")).toBe(true);
 
-    await new Promise((r) => setTimeout(r, 120));
-    expect((d as any).sessionTasks.has(CC_SID)).toBe(false);
-    expect((d as any).channels.size).toBe(0);
-    d.dispose();
+      // t=150: task 完成 → 重新 schedule idle；再 +IDLE_MS 回收
+      await vi.advanceTimersByTimeAsync(130 - IDLE_MS - 1); // 到 task_notification
+      expect((d as any).sessionTasks.has(CC_SID)).toBe(false);
+      expect((d as any).channels.size).toBe(1);
+      await vi.advanceTimersByTimeAsync(IDLE_MS);
+      expect((d as any).channels.size).toBe(0);
+      d.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("送達確認:push 後未見任何事件即死 → 自動重投一次(新通道)", async () => {
@@ -1196,7 +1347,7 @@ describe("#118 streaming-input 長活通道", () => {
     d.dispose();
   });
 
-  it("#266 E2E 通道崩潰 → 加密批定稿 + 清 pendingUser(不滯留串到下回合)", async () => {
+  it("#266 E2E 通道崩潰 → 不旁路 durable mirror outbox，且清 pendingUser", async () => {
     turnScripts = [[init, { __throw: true }]]; // init 已見(seen)→ 不重投,走定稿
     const { linkb, sent, fire } = fakeLinkb();
     const e2e = {
@@ -1208,12 +1359,37 @@ describe("#118 streaming-input 長活通道", () => {
     d.wire();
     fire(tuiFrame(CC_SID, "prompt.submit", { text: "CIPHER" }));
     await new Promise((r) => setTimeout(r, 50));
-    // 不發明文 message.complete;走加密批(mirror_append e2e)定稿
+    // 不發明文 message.complete；transcript Mirror 會以 stable batch 定稿，drive 不直發。
     expect(sent.some((f: any) => f.frame?.params?.type === "message.complete")).toBe(false);
-    const mf = sent.find((f: any) => f.t === "mirror_append") as any;
-    expect(mf?.sessions[0].e2e).toBe(true);
-    expect(mf.sessions[0].messages.some((m: any) => m.role === "user")).toBe(true); // 用戶消息定稿進批
+    expect(sent.some((f: any) => f.t === "mirror_append")).toBe(false);
     expect((d as any).pendingUser.has(CC_SID)).toBe(false); // 清空,不滯留
+    d.dispose();
+  });
+
+  it("#348 E2E 成功回合不把 assistant id 標成 live 已投，保留 transcript durable mirror 唯一正文", async () => {
+    turnScripts = [[
+      init,
+      { type: "assistant", message: { id: "msg-e2e-1", content: [], usage: {} } },
+      { type: "result", subtype: "success", result: "加密回覆" },
+    ]];
+    const { linkb, fire } = fakeLinkb();
+    const mirror = {
+      setDriven: vi.fn(),
+      unsetDriven: vi.fn(),
+      fastForward: vi.fn(),
+      markLivePosted: vi.fn(),
+    } as any;
+    const e2e = {
+      isE2E: (id: string) => id === CC_SID,
+      decryptText: (_s: string, ct: string) => (ct === "CIPHER" ? "明文問題" : ct),
+    } as any;
+    const d = new Drive(linkb, mirror, e2e);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "CIPHER" }));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(mirror.markLivePosted).not.toHaveBeenCalled();
+    expect(mirror.fastForward).toHaveBeenCalledWith(CC_SID);
+    expect(mirror.unsetDriven).toHaveBeenCalledWith(CC_SID);
     d.dispose();
   });
 

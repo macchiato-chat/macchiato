@@ -31,22 +31,25 @@
  */
 import {
   query,
+  forkSession,
   renameSession,
   type PermissionResult,
   type PermissionUpdate,
   type Query,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { imageBlockFor, materializeAttachment } from "./attachments";
+import { type CwdResolution, defaultWorkDir, resolveCwd } from "./cwd";
 import { claudeBinIsAbsolute, resolveClaudeBin } from "./claude-bin";
 import { sdkEnv } from "./sdk-env";
 import type { CommandsReporter } from "./commands";
 import { generateTitle } from "./titles";
 import type { LinkBClient } from "../linkb/client";
 import type { E2EKeyStore } from "../e2e/keys";
+import { formatCommandInvokeLog, logContent, safeErr, shortId, textLen } from "../safe-log";
 import {
   canonicalE2EApprovalDisplay,
   dispatchForE2EControl,
@@ -92,6 +95,8 @@ const E2E_SENSITIVE_METHODS = new Set([
   "session.rename",
   "session.archive",
   "session.retitle",
+  // #473 rewind 會**改寫本機 transcript**,E2E 下更不能認 server 的裸帧(server 側 v1 也直接拒 E2E)。
+  "session.rewind",
 ]);
 
 function mapPath(): string {
@@ -237,22 +242,15 @@ function parseDriveState(raw: string, identityStateTrusted: boolean): PersistedD
   };
 }
 
+/** 新會話的默認工作目錄:`MACCHIATO_CC_WORKDIR` 覆蓋,否則 HOME(見 cwd.ts)。 */
 export function workDir(): string {
-  return process.env.MACCHIATO_CC_WORKDIR || homedir();
+  return defaultWorkDir();
 }
 
 /** #118 閒置回收:回合結束後這麼久無新 prompt → close 通道回收 CLI 進程(resume 重建零丟失)。 */
 function idleMs(): number {
   const s = Number(process.env.MACCHIATO_CC_IDLE_S || "600");
   return (Number.isFinite(s) && s > 0 ? s : 600) * 1000;
-}
-
-function isDir(p: string): boolean {
-  try {
-    return statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
 }
 
 /** SDK PermissionMode 合法值(對齊 @anthropic-ai/claude-agent-sdk)。 */
@@ -530,7 +528,7 @@ export class Drive {
     // 影子兜底:啟動時把既有 ULID→CLI 映射的 CLI uuid 全灌給鏡像(跨重啟持久),鏡像據此永不給
     // 這些「被驅動過」的 CLI 會話單獨建會話(防重啟後污染態丟失又復發)。
     for (const localSids of Object.values(this.aliases)) {
-      for (const localSid of localSids) this.mirror?.markDrivenUuid(localSid);
+      for (const localSid of localSids) this.mirror?.markDrivenUuid?.(localSid);
     }
     // #200 上個進程死時盤上還留著的在途回合 = 被殺掉的回合。撈出待 flush(ready 後告知),當即清盤
     // (新回合從空集重記,不與舊的混)。
@@ -638,6 +636,76 @@ export class Drive {
   /** #266 sid → 內容型幀(prompt.submit/command.invoke)的串行鏈。附件下載(await materialize)慢時,
    * 後到的純文本此前會超車 startTurn、附件幀反被 steer 打斷 → 順序反轉。串行保序。 */
   private readonly frameChain = new Map<string, Promise<void>>();
+  /** #368 wire sid → 当前 E2E 模式切换 barrier；存在时新回合不得启动。 */
+  private readonly e2eQuiescing = new Map<
+    string,
+    { requestId: string; mode: "enable" | "disable" }
+  >();
+
+  applyE2EQuiesceState(
+    sessions: Array<{ hermesSessionId: string; pendingOp: "enable" | "disable" | null }>,
+  ): void {
+    const pending = new Map(
+      sessions
+        .filter((session) => session.pendingOp !== null)
+        .map((session) => [
+          session.hermesSessionId,
+          session.pendingOp as "enable" | "disable",
+        ]),
+    );
+    for (const sid of this.e2eQuiescing.keys()) {
+      if (!pending.has(sid)) this.e2eQuiescing.delete(sid);
+    }
+    for (const [sid, mode] of pending) {
+      this.e2eQuiescing.set(sid, { requestId: `ready:${mode}`, mode });
+    }
+  }
+
+  beginE2ETransition(sid: string, mode: "enable" | "disable"): void {
+    const current = this.e2eQuiescing.get(sid);
+    this.e2eQuiescing.set(sid, {
+      requestId: current?.requestId ?? `resume:${mode}`,
+      mode,
+    });
+  }
+
+  releaseE2EQuiesce(
+    sid: string,
+    mode?: "enable" | "disable",
+    requestId?: string,
+  ): void {
+    const current = this.e2eQuiescing.get(sid);
+    if (!current) return;
+    if (mode && current.mode !== mode) return;
+    if (requestId && current.requestId !== requestId) return;
+    this.e2eQuiescing.delete(sid);
+  }
+
+  async quiesceE2E(
+    sid: string,
+    mode: "enable" | "disable",
+    requestId: string,
+  ): Promise<boolean> {
+    const current = this.e2eQuiescing.get(sid);
+    if (current && current.requestId !== requestId) return false;
+    this.e2eQuiescing.set(sid, { requestId, mode });
+    const configured = Number(process.env.MACCHIATO_E2E_QUIESCE_MS);
+    const timeoutMs =
+      Number.isFinite(configured) && configured > 0 ? configured : 4 * 60_000;
+    const deadline = Date.now() + timeoutMs;
+    while (
+      this.pending.has(sid) ||
+      this.frameChain.has(sid) ||
+      (this.queued.get(sid)?.length ?? 0) > 0
+    ) {
+      if (Date.now() >= deadline) {
+        this.releaseE2EQuiesce(sid, mode, requestId);
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return this.e2eQuiescing.get(sid)?.requestId === requestId;
+  }
 
   wire(): void {
     this.linkb.onFrame((m) => this.routeFrame(m));
@@ -649,6 +717,10 @@ export class Drive {
     const method = frame.method;
     const sid = (msg.sessionId ?? frame.params?.session_id) as string | undefined;
     if (sid && (method === "prompt.submit" || method === "command.invoke")) {
+      if (this.e2eQuiescing.has(sid)) {
+        console.error(`[E2E quiesce ${sid}] rejected late ${method}`);
+        return;
+      }
       const prev = this.frameChain.get(sid) ?? Promise.resolve();
       const next = prev.then(() => this.onServerFrame(msg)).catch((e) => console.error(`[frame ${method} ${sid}] ${(e as Error).message}`));
       this.frameChain.set(sid, next);
@@ -1218,9 +1290,16 @@ export class Drive {
             arr.push(text);
             this.pendingUser.set(sid, arr);
           }
-          const logText =
-            authenticated && args ? `/${name} [encrypted args]` : text;
-          console.log(`· command.invoke ${logText} → ${sid}`);
+          // #381:默认日志只记命令名 + args 长度 + 截断 id,绝不写 args/prompt 正文
+          console.log(
+            formatCommandInvokeLog({
+              name,
+              argsLen: args.length,
+              sid,
+              e2e: authenticated !== undefined,
+            }),
+          );
+          logContent("command.invoke", text);
           await this.dispatchContent(sid, text, authenticated !== undefined);
           return;
         }
@@ -1256,7 +1335,9 @@ export class Drive {
           const cwd = typeof params.cwd === "string" ? params.cwd.trim() : "";
           if (!partial || Object.hasOwn(params, "cwd")) {
             if (this.persistSessionSetting(this.cwds, sid, cwd, authenticated, "cwd")) {
-              console.log(`· session.create ${sid} cwd=${cwd || "(default)"}`);
+              // #381:cwd 是本机绝对路径,默认不落盘;只记是否设置
+              console.log(`· session.create ${shortId(sid)} cwdSet=${cwd ? 1 : 0}`);
+              logContent("session.create.cwd", cwd || "(default)");
             }
           }
           // #98 權限檔(upsert;隨時可改,不像 cwd)。空/非法 = 清回 env 默認。
@@ -1308,14 +1389,12 @@ export class Drive {
           ) {
             this.closeChannel(ch);
           }
-          // 急校驗：壞目錄立刻回一行 system 提示（system 行不鎖 cwd，草稿仍可改），
+          // 急校驗：壞/越界目錄立刻回一行 system 提示（system 行不鎖 cwd，草稿仍可改），
           // 別等首條 prompt 才炸。E2E 跳過（不發明文行；startTurn 走加密回覆兜底）。
           if (cwd && !this.e2e?.isE2E(sid)) {
-            const resolved = this.cwdFor(sid);
-            if (!isDir(resolved)) {
-              this.emit(sid, "review.summary", {
-                summary: `⚠️ 工作目錄不存在或不是目錄：${resolved}（連接器主機上）`,
-              });
+            const res = this.resolveSessionCwd(sid);
+            if (!res.ok) {
+              this.emit(sid, "review.summary", { summary: `⚠️ ${res.reason}（連接器主機上）` });
             }
           }
           return;
@@ -1327,6 +1406,16 @@ export class Drive {
           // 不該能燒掉主機的歷史)。server 側行已刪,這裡防「刪了又冒回來」。
           const cc = this.ccSidFor(sid) ?? (CC_UUID_RE.test(sid) ? sid : undefined);
           if (cc) this.mirror?.tombstone(cc);
+          return;
+        }
+        case "session.rewind": {
+          // #473 回退到某條用戶消息之前。server 在等 ACK——**它只有收到 ok 才刪自己的行**,
+          // 所以無論成敗都必須回一幀,否則它超時判失敗、用戶白等。
+          const requestId = typeof params.request_id === "string" ? params.request_id : "";
+          const targetUuid = typeof params.target_src_id === "string" ? params.target_src_id : "";
+          void this.rewindSession(sid, targetUuid)
+            .catch(() => ({ ok: false as const, error: "failed" as const }))
+            .then((r) => this.onRewindResult?.({ hermesSessionId: sid, requestId, ...r }));
           return;
         }
         case "session.rename": {
@@ -1467,12 +1556,14 @@ export class Drive {
     }
   }
 
-  /** #105 會話工作目錄：per-session 下發值（~ 由此處展開）優先，回退 env/home 默認。 */
+  /** #392 解析+校驗會話工作目錄(realpath/存在性/目錄/可選 allowlist;見 cwd.ts)。 */
+  private resolveSessionCwd(sid: string): CwdResolution {
+    return resolveCwd(this.cwds[sid]);
+  }
+
+  /** #105 會話工作目錄：ok 時回 realpath 規範路徑,否則回嘗試路徑(供提示/比對)。 */
   private cwdFor(sid: string): string {
-    const c = this.cwds[sid];
-    if (!c) return workDir();
-    if (c === "~") return homedir();
-    return c.startsWith("~/") ? join(homedir(), c.slice(2)) : c;
+    return this.resolveSessionCwd(sid).cwd;
   }
 
   /**
@@ -1485,17 +1576,18 @@ export class Drive {
     opts?: { retriedDelivery?: boolean; requireDelivery?: boolean },
   ): void {
     const isE2E = this.e2e?.isE2E(sid) ?? false;
-    // #105 每回合校驗工作目錄(用戶手輸的可能有 typo,也可能事後被刪):不存在就回提示、不起回合——
-    // CC 在壞 cwd 下的報錯難懂。提示走 system 行(review.summary),agent 沒有回覆過 → server 側
-    // cwd 仍可改,用戶修正路徑後重發即可;E2E 走加密回覆(不發明文行)。
-    const cwd = this.cwdFor(sid);
-    if (!isDir(cwd)) {
-      const errText = `⚠️ 工作目錄不存在或不是目錄：${cwd}（連接器主機上）。請修正會話目錄後重發。`;
+    // #105/#392 每回合校驗工作目錄(用戶手輸的可能有 typo/事後被刪;#392 加 realpath/allowlist 硬校驗):
+    // 不通過就回提示、不起回合——CC 在壞 cwd 下的報錯難懂。提示走 system 行(review.summary),agent
+    // 沒有回覆過 → server 側 cwd 仍可改,用戶修正路徑後重發即可;E2E 走加密回覆(不發明文行)。
+    const res = this.resolveSessionCwd(sid);
+    if (!res.ok) {
+      const errText = `⚠️ ${res.reason}(連接器主機上)。請修正會話目錄後重發。`;
       if (isE2E) this.sendE2ETurn(sid, errText);
       else this.emit(sid, "review.summary", { summary: errText });
       if (opts?.requireDelivery) throw new E2EControlError(errText);
       return;
     }
+    const cwd = res.cwd;
     let ch = this.channels.get(sid);
     // #98/#143 cwd/權限檔/model 變了 → 通道創建參數失效,重建(閒置通道立即,回合中的留到回合末)。
     if (
@@ -1514,6 +1606,14 @@ export class Drive {
     if (ch.idleTimer) {
       clearTimeout(ch.idleTimer);
       ch.idleTimer = undefined;
+    }
+    // #394：已有映射（續聊 / 鏡像 sid 即 uuid）時每回合開場補報——server 重啟或舊連接器升級後
+    // 可在下一回合補齊 localSessionId，不必等 init 事件（首回合新會話仍靠 init 上報）。
+    {
+      const known = this.ccSidFor(sid);
+      if (known && CC_UUID_RE.test(known)) {
+        this.emit(sid, "session.localSessionId", { localSessionId: known });
+      }
     }
     // #94：Macchiato 發起的會話(非 uuid)首回合(無映射)= 新對話 → **立即**用首條 user 文本生成
     // 標題(不等回合結束,越早越好——用戶剛發第一句、AI 還在想,標題就出來)。重啟安全(映射持久→
@@ -1757,8 +1857,13 @@ export class Drive {
             "（CLI fork/resume?）——已切換當前映射並持久保留兩個 alias]",
         );
       }
+      // #394：把 cc transcript uuid 上報 server，app 才能給「複製 claude --resume / 在終端繼續」。
+      // 每回合 init 都冪等上報（含 uuid 輪換後的新值；舊 server 忽略未知 tui type）。
+      if (CC_UUID_RE.test(m.session_id)) {
+        this.emit(sid, "session.localSessionId", { localSessionId: m.session_id });
+      }
       this.mirror?.setDriven(m.session_id); // 本回合 live 獨佔(per-turn)
-      this.mirror?.markDrivenUuid(m.session_id); // 影子兜底:永久登記此 CLI uuid 為「被驅動過」
+      this.mirror?.markDrivenUuid?.(m.session_id); // 影子兜底:永久登記此 CLI uuid 為「被驅動過」
       // #201 每回合一個 init。若此刻無 active turn(上個回合已 done、通道閒置)——說明這是子任務完成後
       // SDK 自動喚醒 agent 的續寫回合(無 prompt.submit)。建合成 turn 接住,否則後續內容被 !turn 丟棄。
       // 正常回合:startTurn 已同步建好 ch.turn(見其註),故此處 !ch.turn 為假、不觸發。
@@ -1894,7 +1999,16 @@ export class Drive {
     const key = `${m.type}/${m.subtype ?? ""}`;
     if (!this.loggedUnknown.has(key)) {
       this.loggedUnknown.add(key);
-      console.log(`[drive] 未處理的 SDK 消息 ${key}(首次,已忽略): ${JSON.stringify(m).slice(0, 400)}`);
+      // #381:SDK 消息可能含 prompt/工具结果/路径;默认只记 type 键 + 字节数
+      const sample = (() => {
+        try {
+          return JSON.stringify(m);
+        } catch {
+          return "";
+        }
+      })();
+      console.log(`[drive] 未處理的 SDK 消息 ${key}(首次,已忽略): bytes=${sample.length}`);
+      logContent("sdk-unknown", sample.slice(0, 400));
     }
   }
 
@@ -1993,11 +2107,15 @@ export class Drive {
       // #318 把本回合 live 覆蓋的 message.id 交給 mirror:fastForward 吞不掉的晚落盤殘片(SDK result
       // 早於 CLI 寫完 transcript 尾巴)由此精確攔截,不再作為「終端新活動」補投成重複。順序在 fastForward
       // 前登記,確保解除 driven 後恢復鏡像時集合已就位。
-      if (turn.seenMsgIds.size) this.mirror?.markLivePosted(cc, turn.seenMsgIds);
+      // E2E live 路徑不投正文，transcript mirror 是唯一可靠内容源；不得把 assistant id
+      // 登记成“已 live 投递”后从 durable 批里删掉。明文仍用精确 id 吞掉晚落盘残片。
+      if (!turn.isE2E && turn.seenMsgIds.size) {
+        this.mirror?.markLivePosted(cc, turn.seenMsgIds);
+      }
       // #393 回合末把本回合 live 消息回填 srcId(=transcript 行 uuid)作 server dedup_key——
       // 跨進程重啟後鏡像重投同一行撞 (session,dedup_key) 唯一索引被吃掉,不再雙份。E2E 走加密批(自帶 srcId)。
       if (!turn.isE2E) this.backfillLiveSrcIds(sid, cc, turn);
-      this.mirror?.fastForward(cc); // live 已投遞 → 鏡像水位線快進越過本回合
+      this.mirror?.fastForward(cc); // #200/#348 仅保留兼容调用，未 ACK 不推进
       this.mirror?.unsetDriven(cc); // 僅回合級跳過：解除後終端側活動恢復鏡像（CC 無 gateway,鏡像是唯一路）
     }
     // #94：標題已在回合開頭立即生成(見 startTurn),此處不重複。回合末補寫回 transcript
@@ -2117,6 +2235,69 @@ export class Drive {
   }
 
   /** #118 關通道:回收 CLI 進程(閒置/變更 cwd/dispose)。consume 循環隨後自然結束。 */
+  /**
+   * #473 rewind ACK 出口（index.ts 注入）：走 Link B **頂層幀** `rewind_result`，不是 tui 事件。
+   */
+  onRewindResult?: (r: {
+    hermesSessionId: string;
+    requestId: string;
+    ok: boolean;
+    dropped?: number;
+    error?: "unsupported" | "not_found" | "busy" | "failed";
+  }) => void;
+
+  /**
+   * #473 把該會話回退到 `targetUuid` 這條用戶消息之前。
+   *
+   * 走 SDK 的 `forkSession({ upToMessageId })`：它把 transcript 複製進一個**新**會話檔、重映射
+   * 整條 uuid 鏈，**原檔一個字節都不動**（原會話因此天然就是存檔，也不會和「用戶同時在終端
+   * resume 同一會話」打架）。隨後把 wire sid 重指到新 uuid——drive 本來就支持一個 wire sid 對應
+   * 多個本地 transcript uuid（resume/fork 換 uuid 是既有語義）。
+   *
+   * 三個順序不能亂：
+   *  1. 先關通道——上下文在 CLI 進程記憶體裡，不關的話回合末它會把舊那份續寫回去；
+   *  2. fork 完**立刻**讓鏡像認領新檔並把水位坐到 EOF，否則下一輪 poll（5s）會把 fork 複製過去
+   *     的整段歷史當成新消息再灌一遍；
+   *  3. 最後才落 map/alias，讓下個 prompt resume 到新會話。
+   *
+   * 目標就是首行時沒有任何內容可保留：`upToMessageId` 省略等於全量複製，正好相反——這種情況
+   * 直接丟掉映射，下個 prompt 自然開一個全新會話。
+   */
+  private async rewindSession(
+    sid: string,
+    targetUuid: string,
+  ): Promise<{ ok: boolean; dropped?: number; error?: "unsupported" | "not_found" | "busy" | "failed" }> {
+    const cc = this.ccSidFor(sid) ?? (CC_UUID_RE.test(sid) ? sid : undefined);
+    if (!cc || !targetUuid) return { ok: false, error: "not_found" };
+    const ch = this.channels.get(sid);
+    // 回合進行中不回退:CLI 正在往 transcript 追寫(server 側也已擋一道)。
+    if (ch?.turn) return { ok: false, error: "busy" };
+    const plan = this.mirror?.rewindPlan(cc, targetUuid) ?? null;
+    if (!plan) return { ok: false, error: "not_found" };
+    if (ch) this.closeChannel(ch);
+
+    if (plan.keepUpToUuid === null) {
+      delete this.map[sid]; // 整段都不要了 → 下個 prompt 開新會話
+      this.saveMap();
+      console.log(`· session.rewind ${cc} → 目標即首條,丟掉映射(下個 prompt 開新會話)`);
+      return { ok: true, dropped: plan.dropped };
+    }
+    let forked: string;
+    try {
+      forked = String((await forkSession(cc, { upToMessageId: plan.keepUpToUuid }))?.sessionId ?? "");
+    } catch (error) {
+      console.error(`[session.rewind ${cc} fork 失敗] ${String(error)}`);
+      return { ok: false, error: "failed" };
+    }
+    if (!forked) return { ok: false, error: "failed" };
+    this.mirror?.adoptForked?.(forked); // ⚠️ 必須先於 map 落盤:防歷史被重灌
+    this.map[sid] = forked;
+    this.rememberLocalSessionId(sid, forked);
+    this.saveMap();
+    console.log(`· session.rewind ${cc} → fork ${forked}(丟 ${plan.dropped} 行;原會話保持不動)`);
+    return { ok: true, dropped: plan.dropped };
+  }
+
   private closeChannel(ch: Channel): void {
     ch.closing = true;
     if (ch.idleTimer) {
@@ -2150,9 +2331,11 @@ export class Drive {
           /* 寫回 transcript 失敗不致命(session.title 已發給 server) */
         }
       }
-      console.log(`· 生成標題「${title}」→ ${sid}`);
+      // #381:标题可能含用户首条消息片段
+      console.log(`· session.title len=${textLen(title)} → ${shortId(sid)}`);
+      logContent("session.title", title);
     } catch (e) {
-      console.error(`[title gen failed for ${sid}] ${(e as Error).message}`);
+      console.error(`[title gen failed for ${shortId(sid)}] ${safeErr(e)}`);
     }
   }
 
@@ -2167,7 +2350,7 @@ export class Drive {
       if (!cc) return;
       const file = discoverSessions().find((s) => s.sid === cc)?.file;
       if (!file) {
-        console.error(`[retitle] 找不到 ${cc} 的 transcript`);
+        console.error(`[retitle] 找不到 ${shortId(cc)} 的 transcript`);
         return;
       }
       const { entries, endOffset } = readEntries(file, 0);
@@ -2182,9 +2365,10 @@ export class Drive {
       } catch {
         /* 寫回 transcript 失敗不致命 */
       }
-      console.log(`· AI 重新命名「${title}」→ ${sid}`);
+      console.log(`· session.retitle len=${textLen(title)} → ${shortId(sid)}`);
+      logContent("session.retitle", title);
     } catch (e) {
-      console.error(`[retitle failed for ${sid}] ${(e as Error).message}`);
+      console.error(`[retitle failed for ${shortId(sid)}] ${safeErr(e)}`);
     }
   }
 
@@ -2371,20 +2555,9 @@ export class Drive {
 
   /** §19：E2E 回合結束 → 用戶消息 + 回覆加密成 mirror_append 批（方案 A，同 OpenClaw）。 */
   private sendE2ETurn(sid: string, reply: string): void {
-    if (!this.e2e) return;
-    const msgs: Record<string, unknown>[] = (this.pendingUser.get(sid) ?? []).map((t) => ({
-      role: "user",
-      enc: this.e2e!.encryptContent(sid, { text: t }),
-    }));
+    // #348 transcript mirror 先 WAL、经 mirror_ack 才推进水位；这里不再 fire-and-forget。
     this.pendingUser.delete(sid);
-    if (reply.trim()) msgs.push({ role: "agent", enc: this.e2e.encryptContent(sid, { text: reply }) });
-    if (!msgs.length) return;
-    this.linkb.send({
-      t: "mirror_append",
-      agentLinkId: this.linkb.agentLinkId,
-      sessions: [{ hermesSessionId: sid, source: "claude-code", e2e: true, messages: msgs }],
-    });
-    console.log(`· E2E turn → encrypted mirror batch (${sid}, ${msgs.length} messages)`);
+    void reply;
   }
 
   private safeArgs(s: string): Record<string, unknown> {

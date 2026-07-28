@@ -350,6 +350,29 @@ describe("#317 command.invoke → SkillUserInput", () => {
     });
     expect(client.requests.filter((r) => r.method === "turn/start")).toHaveLength(1); // 未起新回合
   });
+
+  it("#381 command.invoke 默认日志不含 canary args", async () => {
+    const canary = "CANARY-SKILL-ARG-sk-live-CODEX-/Users/private/repo";
+    const logs: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((...a) => {
+      logs.push(a.map(String).join(" "));
+    });
+    try {
+      const { client, linkb } = make(idx);
+      await linkb.deliver(tui("command.invoke", SID, { command: "/imagegen", args: canary }));
+      await tick();
+      expect(client.requests.find((r) => r.method === "turn/start")!.params.input).toEqual([
+        { type: "skill", name: "imagegen", path: SKILL_PATH },
+        { type: "text", text: canary },
+      ]);
+      const joined = logs.join("\n");
+      expect(joined).toMatch(/command\.invoke/);
+      expect(joined).toMatch(/argsLen=/);
+      expect(joined).not.toContain(canary);
+    } finally {
+      log.mockRestore();
+    }
+  });
 });
 
 describe("#132 v2 審批橋", () => {
@@ -520,7 +543,7 @@ describe("#132 v2 附件/resume/重啟", () => {
     expect(client.requests.filter((r) => r.method === "thread/resume")).toHaveLength(1);
   });
 
-  it("E2E 回合:user+reply 加密成 mirror_append,不走明文 tui", async () => {
+  it("E2E 回合不走明文 tui，也不旁路 durable mirror outbox 直發", async () => {
     const { client, sent } = make();
     const e2e: any = { isE2E: () => true, decryptText: (_s: string, t: string) => t, encryptContent: (_s: string, o: any) => "enc:" + JSON.stringify(o) };
     const d2sent: any[] = [];
@@ -537,9 +560,8 @@ describe("#132 v2 附件/resume/重啟", () => {
     c2.fire("turn/completed", { threadId: TID, turn: { status: "completed" } });
     await tick();
     expect(d2sent.filter((f) => f.t === "tui" && JSON.stringify(f).includes("答案"))).toHaveLength(0);
-    const mf = d2sent.find((f) => f.t === "mirror_append");
-    expect(mf.sessions[0].e2e).toBe(true);
-    expect(mf.sessions[0].messages.map((m: any) => m.role)).toEqual(["user", "agent"]);
+    // #350：由 rollout Mirror 的持久 outbox 读取 user+reply 并等待 ACK；drive 不直发。
+    expect(d2sent.filter((f) => f.t === "mirror_append")).toHaveLength(0);
     void sent;
     void client;
   });
@@ -844,5 +866,42 @@ describe("#224 codex 改名雙向", () => {
     await tick();
     expect(sent.filter((f) => f.frame?.params?.type === "session.title")).toHaveLength(0);
     void d;
+  });
+});
+
+describe("#377 cwd 限定與校驗(fail closed)", () => {
+  it("不存在/越界的 cwd → 阻斷投遞(不發 thread/start)並回提示", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    process.env.MACCHIATO_CODEX_WORKDIR = mkdtempSync(join(tmpdir(), "cx-ws-")); // 默認目錄重定向,不碰真 HOME
+    const { linkb, client, sent } = make();
+    await linkb.deliver(tui("session.create", SID, { cwd: "/nonexistent/definitely/not/here" }));
+    await linkb.deliver(tui("prompt.submit", SID, { text: "hi" }));
+    await tick();
+    expect(client.requests.map((r) => r.method)).not.toContain("thread/start"); // 未起回合
+    const warn = events(sent).find((p) => p.type === "review.summary" && String(p.payload.summary).includes("工作目錄"));
+    expect(warn).toBeTruthy();
+    delete process.env.MACCHIATO_CODEX_WORKDIR;
+  });
+
+  it("回合進行中改 cwd → 照常記下(下回合生效),不拒絕、不打斷", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    process.env.MACCHIATO_CODEX_WORKDIR = mkdtempSync(join(tmpdir(), "cx-wsL-"));
+    const good1 = mkdtempSync(join(tmpdir(), "cx-good1-"));
+    const good2 = mkdtempSync(join(tmpdir(), "cx-good2-"));
+    const { d, client, linkb, sent } = make();
+    await linkb.deliver(tui("session.create", SID, { cwd: good1 }));
+    await linkb.deliver(tui("prompt.submit", SID, { text: "go" }));
+    await tick(); // thread/start + turn/start 已發,active 有 SID
+    await linkb.deliver(tui("session.create", SID, { cwd: good2 })); // 回合中改 cwd
+    await tick();
+    expect((d as any).cwds[SID]).toBe(good2); // 立刻落庫,下回合按新 cwd 起
+    const warn = events(sent).find((p) => p.type === "review.summary" && String(p.payload.summary).includes("工作目錄"));
+    expect(warn).toBeFalsy(); // 合法目錄 → 不回任何告警
+    client.fire("turn/completed", { threadId: TID, turn: { status: "completed" } }); // 收尾
+    delete process.env.MACCHIATO_CODEX_WORKDIR;
   });
 });

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { E2EKeyStore, E2EKeyStoreStateError } from "../src/e2e/keys";
+import { E2EKeyStore, E2EKeyStoreStateError, deviceKeyFingerprint } from "../src/e2e/keys";
 import * as ec from "../src/e2e/crypto";
 import { handleE2EControlFrame } from "../src/index";
 import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/e2e/control";
@@ -80,7 +80,7 @@ describe("#347 E2E 控制 roundtrip", () => {
           t: "e2e_wrap_request",
           hermesSessionId: sid,
           backfill: true,
-          devices: [{ deviceId: "phone", pubKey: device.pubB64 }],
+          devices: [{ deviceId: "phone", pubKey: device.pubB64, keyFingerprint: deviceKeyFingerprint(device.pubB64) }],
         },
         linkb,
         e2e,
@@ -137,7 +137,7 @@ describe("#347 E2E 控制 roundtrip", () => {
         t: "e2e_wrap_request",
         hermesSessionId: sid,
         backfill: false,
-        devices: [{ deviceId: "tablet", pubKey: secondDevice.pubB64 }],
+        devices: [{ deviceId: "tablet", pubKey: secondDevice.pubB64, keyFingerprint: deviceKeyFingerprint(secondDevice.pubB64) }],
       },
       linkb,
       e2e,
@@ -266,7 +266,7 @@ describe("#347 E2E 控制 roundtrip", () => {
       {
         t: "e2e_wrap_request",
         hermesSessionId: sid,
-        devices: [{ deviceId: "new-phone", pubKey: device.pubB64 }],
+        devices: [{ deviceId: "new-phone", pubKey: device.pubB64, keyFingerprint: deviceKeyFingerprint(device.pubB64) }],
       },
       linkb,
       e2e,
@@ -281,6 +281,10 @@ describe("#347 E2E 控制 roundtrip", () => {
       disabledReceipts: [],
       sessions: [{ hermesSessionId: "missing", pendingOp: "enable" }],
     });
+    // 缺鑰 = 軟拒絕該幀:不回 e2e_key、不生成 K₂,但**絕不上拋**——上拋會落到外層
+    // linkb.close() + onFatal() → process.exit(1),而 server 重連後會重發同一幀,
+    // 等於一幀請求即可讓 Codex 連接器永久起不來。
+    const before = sent.length;
     expect(() =>
       handleE2EControlFrame(
         { t: "e2e_wrap_request", hermesSessionId: "missing", devices: [] },
@@ -289,8 +293,82 @@ describe("#347 E2E 控制 roundtrip", () => {
         mirror,
         sessions,
       ),
-    ).toThrow(E2EKeyStoreStateError);
+    ).not.toThrow();
+    expect(sent.length).toBe(before);
     expect(missing.hasKey("missing")).toBe(false);
     expect(missing.isE2E("missing")).toBe(true);
+  });
+
+  it("#366 畸形 devices 幀被軟拒絕:不上拋(不觸發 onFatal)、不回 e2e_key、既有 K_S 不動", () => {
+    const sid = "dos";
+    const e2e = new E2EKeyStore(path);
+    const original = e2e.createForEnable(sid);
+    e2e.applyServerState({
+      version: 1,
+      disabledReceipts: [],
+      sessions: [{ hermesSessionId: sid, pendingOp: null }],
+    });
+    const sent: Record<string, any>[] = [];
+    const linkb = { agentLinkId: "al", send: (msg: Record<string, unknown>) => sent.push(msg) };
+    const mirror = { backfillE2E: async () => {}, handleE2EBackfillResult: () => {} };
+    const sessions = { localSessionIdFor: (wireSid: string) => wireSid };
+    const device = ec.genDeviceKeypair();
+    const fp = deviceKeyFingerprint(device.pubB64);
+
+    // 惡意/畸形 server 幀:同一 deviceId 出現兩次。
+    expect(
+      handleE2EControlFrame(
+        {
+          t: "e2e_wrap_request",
+          hermesSessionId: sid,
+          devices: [
+            { deviceId: "phone", pubKey: device.pubB64, keyFingerprint: fp },
+            { deviceId: "phone", pubKey: device.pubB64, keyFingerprint: fp },
+          ],
+        },
+        linkb,
+        e2e,
+        mirror,
+        sessions,
+      ),
+    ).toBe(true);
+    expect(sent).toEqual([]); // 該幀被拒,不回包
+    expect(e2e.requireKey(sid).equals(original)).toBe(true); // 既有 K_S 不受影響
+
+    // 進程仍然可用:下一幀正常設備照封。
+    handleE2EControlFrame(
+      {
+        t: "e2e_wrap_request",
+        hermesSessionId: sid,
+        devices: [{ deviceId: "phone", pubKey: device.pubB64, keyFingerprint: fp }],
+      },
+      linkb,
+      e2e,
+      mirror,
+      sessions,
+    );
+    expect(sent.at(-1)!.t).toBe("e2e_key");
+    expect(ec.unwrapKey(sent.at(-1)!.wrapped[0].sealed, device.priv).equals(original)).toBe(true);
+
+    // 單台壞公鑰混在其中:只跳過那台,其餘照封。
+    const good = ec.genDeviceKeypair();
+    handleE2EControlFrame(
+      {
+        t: "e2e_wrap_request",
+        hermesSessionId: sid,
+        devices: [
+          { deviceId: "broken", pubKey: "!!bad", keyFingerprint: "x".repeat(43) },
+          { deviceId: "tablet", pubKey: good.pubB64, keyFingerprint: deviceKeyFingerprint(good.pubB64) },
+        ],
+      },
+      linkb,
+      e2e,
+      mirror,
+      sessions,
+    );
+    const last = sent.at(-1)!;
+    expect(last.t).toBe("e2e_key");
+    expect(last.wrapped.map((w: { deviceId: string }) => w.deviceId)).toEqual(["tablet"]);
+    expect(ec.unwrapKey(last.wrapped[0].sealed, good.priv).equals(original)).toBe(true);
   });
 });

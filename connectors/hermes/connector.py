@@ -22,17 +22,22 @@ Env:
   MACCHIATO_CONNECTOR_TOKEN required
   MACCHIATO_AGENT_LINK_ID   required
   HERMES_PYTHON             gateway python (default: hermes-agent venv)
+  #379 本地 dev-disk 附件下載（生產默認拒 loopback）:
+  MACCHIATO_ATTACH_ALLOW_LOCALHOST=1  才放行 http→localhost/127.0.0.1/::1
+  MACCHIATO_ATTACH_LOCAL_PORT         可選，默認 8080（對齊 PUBLIC_SERVER_URL）
+  MACCHIATO_ATTACH_LOCAL_PATH_PREFIX  可選，默認 /attachments
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
+import errno
 import importlib
 import json
 import mimetypes
 import os
 import re
+import stat
 import http.client
 import ipaddress
 import socket
@@ -51,6 +56,17 @@ import websockets
 import hashlib
 
 from gateway_client import GatewayClient, GatewayDied, GatewayError
+
+# #380 Link B 傳輸邊界——對齊 server connectorWss maxPayload=8MiB（server.ts）。
+LINKB_MAX_FRAME_BYTES = 8 * 1024 * 1024
+LINKB_PENDING_MAX = 500
+LINKB_PENDING_MAX_BYTES = 16 * 1024 * 1024
+LINKB_MAX_TOP_LEVEL_KEYS = 64
+LINKB_MAX_JSON_DEPTH = 32
+LINKB_MAX_SESSION_ID_LEN = 256
+LINKB_MAX_TYPE_LEN = 64
+LINKB_MAX_BULK_ARRAY_LEN = 10_000
+PUSH_MAX_LINE_BYTES = 1 * 1024 * 1024
 from e2e_keys import E2EKeyStore
 from e2e_control import (
     E2EControlError,
@@ -73,13 +89,28 @@ from backfill import (
     cron_feed_target,
     session_snapshot,
 )
+from cwd import resolve_cwd
+from media import (
+    MEDIA_MAX,  # noqa: F401 - 見下方 re-export 註釋:測試讀 connector.MEDIA_MAX
+    extract_media_files as _media_extract,
+    read_media_file as _media_read,
+    resolve_media_allow_roots as _media_allow_roots,
+)
+from safe_log import (
+    format_command_invoke_log,
+    log_content,
+    safe_err,
+    short_id,
+    text_len,
+)
 
-LINK_B_PROTO = 4  # 對齊 server（packages/protocol：B=4，#370 E2E 控制認證；嚴格校驗）
+LINK_B_PROTO = 5  # 對齊 server（packages/protocol：B=5，#369 設備公鑰版本綁定；嚴格校驗）
+LINK_B_PROTO = 5  # 對齊 server（packages/protocol：B=5，#348/#368 可靠 ACK + quiesce；嚴格校驗）
 # §update 連接器發布版本:對齊 packages/protocol CONNECTOR_VERSION。⚠️ 發版必須**五處同步 bump**:
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.51"
+CONNECTOR_VERSION = "1.5.56"
 E2E_APPROVAL_PLAINTEXT_MAX = 64 * 1024
 # #279 E2E prompt 解密失敗的用戶可見回執(僅提示語,零內容洩漏;四連接器同文案)。
 E2E_DECRYPT_FAIL_WARNING = "無法解密這條消息(設備與連接器的加密密鑰可能失步)——請重試,或重新關閉再開啟本會話的端到端加密。"
@@ -177,6 +208,171 @@ def _projects_reg_path() -> str:
 
 def _mem_hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+
+# ── #378 抗 symlink / TOCTOU 的「具名文件」讀寫原語（Projects 的 AGENTS.md/CLAUDE.md 專用）─────
+# 威脅：mem 只允許具名 AGENTS.md/CLAUDE.md，但舊實現讀跟隨 symlink（可讀 ~/.ssh/id_rsa）、寫用固定
+# `<file>.tmp`（跟隨預置 symlink 再 rename 覆寫任意文件）、目錄可在備案後被換成 symlink（TOCTOU）。
+# 對策：目錄 realpath+dev/ino 釘身份、每次操作前重驗；**符號連結不一律拒,而是「安全解析 + 包含性檢查」**
+# （2026-07-25 人類 review 定調:用 dotfiles symlink 管 CLAUDE.md 的用戶必須能正常用）——realpath 解析後
+# 斷言目標仍在備案目錄樹內,越界則拒；對解析後的真實路徑 O_NOFOLLOW 打開 + fstat 校驗（常規文件、非硬
+# 連結、dev/ino 與解析時一致）；讀先量後配限尺寸；寫**寫穿到解析後的真實路徑**（保住 symlink 不被替換）,
+# 走隨機臨時名 O_EXCL|O_NOFOLLOW+0600、replace 前重驗目錄身份。與 TS 側 safe-fs.ts 逐條對齊。
+# 侷限（如實記錄）：Python 無便捷 openat/dirfd,項目樹內部的中間路徑段仍有殘留 TOCTOU 窗口（收窄而非
+# 消滅）；硬連結靠 nlink==1 擋讀,但 nlink 恰為 1（原文件已刪）時與普通文件無異——擋不住就是擋不住。
+def _proj_dir_identity(path: str) -> dict:
+    canon = os.path.realpath(os.path.expanduser(path))
+    st = os.stat(canon)
+    if not stat.S_ISDIR(st.st_mode):
+        raise ValueError(f"不是目錄:{canon}")
+    return {"canon": canon, "dev": st.st_dev, "ino": st.st_ino}
+
+
+def _proj_assert_dir(identity: dict) -> None:
+    ls = os.lstat(identity["canon"])
+    if stat.S_ISLNK(ls.st_mode):
+        raise ValueError(f"拒絕:可信目錄被換成符號連結({identity['canon']})")
+    st = os.stat(identity["canon"])
+    if not stat.S_ISDIR(st.st_mode) or st.st_dev != identity["dev"] or st.st_ino != identity["ino"]:
+        raise ValueError(f"拒絕:可信目錄身份已變({identity['canon']})")
+
+
+def _proj_within_dir(root: str, target: str) -> bool:
+    """target 是否在 root **之內**(邊界安全:防 /a/bc 誤判在 /a/b 內;root 自身不算內)。"""
+    return target.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _proj_resolve_named(identity: dict, name: str):
+    """安全解析備案目錄下的具名項:不存在 → None;符號連結 → realpath 解析並**斷言目標仍在備案目錄樹內**
+    (越界 / 斷鏈拋錯)。回 dict(path/via_symlink/is_file/dev/ino),path 之末段在解析那一刻確定非符號連結。"""
+    _proj_assert_dir(identity)
+    entry = os.path.join(identity["canon"], name)
+    try:
+        ls = os.lstat(entry)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISLNK(ls.st_mode):
+        return {"path": entry, "via_symlink": False, "is_file": stat.S_ISREG(ls.st_mode),
+                "dev": ls.st_dev, "ino": ls.st_ino}
+    target = os.path.realpath(entry)
+    if not os.path.exists(target):
+        raise ValueError(f"拒絕:{name} 是斷開的符號連結(目標不可解析)")
+    # 包含性檢查:目標必須仍在**本 project 備案目錄樹內**——項目內的軟連結照用,指到項目外
+    # (~/.ssh/id_rsa、別人的倉庫…)就是真越界,拒。
+    if not _proj_within_dir(identity["canon"], target):
+        raise ValueError(f"拒絕:{name} 的符號連結目標在項目目錄外({target})")
+    ts = os.lstat(target)  # realpath 之後末段必非 symlink;取指紋供 open 後比對
+    return {"path": target, "via_symlink": True, "is_file": stat.S_ISREG(ts.st_mode),
+            "dev": ts.st_dev, "ino": ts.st_ino}
+
+
+def _proj_open_verified(r: dict, name: str):
+    """按解析結果打開並校驗:O_NOFOLLOW(末段被換成 symlink → ELOOP)+ fstat(常規文件、非硬連結、
+    dev/ino 與解析時一致)。解析後文件被刪 → None。"""
+    try:
+        fd = os.open(r["path"], os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        if e.errno in (errno.ELOOP, getattr(errno, "EMLINK", -1)):
+            raise ValueError(f"拒絕讀取:{name} 在校驗與打開之間被換成符號連結")
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"拒絕讀取:{name} 不是常規文件")
+        if st.st_nlink != 1:
+            raise ValueError(f"拒絕讀取:{name} 是硬連結(nlink={st.st_nlink})")
+        if st.st_dev != r["dev"] or st.st_ino != r["ino"]:
+            raise ValueError(f"拒絕讀取:{name} 在校驗與打開之間被替換")
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _proj_read_named(identity: dict, name: str, max_bytes: int):
+    r = _proj_resolve_named(identity, name)
+    if r is None:
+        return None
+    fd = _proj_open_verified(r, name)
+    if fd is None:
+        return None
+    try:
+        size = min(os.fstat(fd).st_size, max_bytes)  # #378 先量後配
+        data = b""
+        while len(data) < size:
+            chunk = os.read(fd, size - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data.decode("utf-8", errors="replace")
+    finally:
+        os.close(fd)
+
+
+def _proj_named_size(identity: dict, name: str):
+    """具名文件的字節大小(同讀路徑的安全性);不存在 → None。
+    用途:「超限就整體拒絕」的場景——絕不能先讀出**截斷版**再落盤(遷移場景會把超出部分永久丟)。"""
+    r = _proj_resolve_named(identity, name)
+    if r is None:
+        return None
+    fd = _proj_open_verified(r, name)
+    if fd is None:
+        return None
+    try:
+        return os.fstat(fd).st_size
+    finally:
+        os.close(fd)
+
+
+def _proj_named_kind(identity: dict, name: str) -> str:
+    """具名項的可用形態(符號連結安全解析後判定):absent / file / other。越界 symlink 拋錯。"""
+    r = _proj_resolve_named(identity, name)
+    if r is None:
+        return "absent"
+    return "file" if r["is_file"] else "other"
+
+
+def _proj_write_named(identity: dict, name: str, content: str) -> None:
+    """原子寫:**寫穿到解析後的真實路徑**(項目內的 symlink 因此保留,dotfiles 照用),
+    走該目錄下的隨機臨時名 + O_EXCL|O_NOFOLLOW + 0600,replace 前再驗目錄身份。"""
+    r = _proj_resolve_named(identity, name)  # 內含 _proj_assert_dir;越界 symlink 在此就拒
+    if r is not None and not r["is_file"]:
+        raise ValueError(f"拒絕寫入:{name} 不是常規文件")
+    target = r["path"] if r is not None else os.path.join(identity["canon"], name)
+    base = os.path.basename(target)
+    parent_path = os.path.dirname(target)
+    # 目標所在目錄同樣釘身份:replace 前重驗,擋「解析後把中間目錄換掉」的 TOCTOU。
+    parent = identity if parent_path == identity["canon"] else _proj_dir_identity(parent_path)
+    if parent is not identity and not _proj_within_dir(identity["canon"], parent["canon"]):
+        raise ValueError(f"拒絕寫入({name}):目標目錄在項目目錄外({parent['canon']})")
+    tmp = os.path.join(parent["canon"], f".{base}.{os.urandom(9).hex()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    renamed = False
+    try:
+        try:
+            data = content.encode("utf-8")
+            off = 0
+            while off < len(data):
+                off += os.write(fd, data[off:])
+        finally:
+            os.close(fd)
+        _proj_assert_dir(identity)
+        if parent is not identity:
+            _proj_assert_dir(parent)
+        os.replace(tmp, os.path.join(parent["canon"], base))
+        renamed = True
+    finally:
+        # 寫失敗(盤滿 / IO 錯)也要清臨時文件——否則備案目錄裡越積越多 `.AGENTS.md.<rand>.tmp`
+        # 殘骸。對齊 TS 側 safe-fs.ts 的 finally 清理。
+        if not renamed:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 MIRROR_PRUNE_S = float(os.environ.get("MACCHIATO_MIRROR_PRUNE_S", str(30 * 24 * 3600)))  # #9 水位線閒置多久可裁
 # 自驅會話 id 映射持久化：server sid（ULID）→ state.db 會話 id（gateway session_key）。
 # Hermes 0.18+ 的 create_session 返回 stored_session_id = state.db 行 id ≠ 運行時句柄；
@@ -188,6 +384,9 @@ PUSH_SOCK = os.path.expanduser(os.environ.get("MACCHIATO_PUSH_SOCK") or _default
 HEALTH_INTERVAL_S = float(os.environ.get("MACCHIATO_HEALTH_S", "30"))
 ATTACH_TTL_S = float(os.environ.get("MACCHIATO_ATTACH_TTL_S", str(6 * 3600)))  # 入站附件保留 6h 後 GC
 MIRROR_STUCK_S = float(os.environ.get("MACCHIATO_MIRROR_STUCK_S", "60"))  # 鏡像輪詢時延超此→判卡死、重啟
+# §19 quiesce 自旋上限。必須**小於** server 的等待上限(默認 300s),否則 server 先超時、連接器還
+# 攥著屏障不放 → 兩側狀態機錯位。對齊 OpenClaw 的 4 分鐘。
+QUIESCE_TIMEOUT_S = float(os.environ.get("MACCHIATO_QUIESCE_TIMEOUT_S", "240"))
 
 
 def _sanitize_filename(name: str) -> str:
@@ -197,21 +396,121 @@ def _sanitize_filename(name: str) -> str:
 
 
 DOWNLOAD_MAX = 100 * 1024 * 1024  # 入站附件下載封頂（100MB），超出即中止（防無界寫盤）
+# #383 全局 attach root 總字節配額(默認 2 GiB)+並發下載上限(默認 3)
+ATTACH_QUOTA_BYTES = int(os.environ.get("MACCHIATO_ATTACH_QUOTA_BYTES", str(2 * 1024 * 1024 * 1024)))
+ATTACH_MAX_INFLIGHT = int(os.environ.get("MACCHIATO_ATTACH_MAX_INFLIGHT", "3"))
+_PART_STALE_S = 15 * 60  # 崩潰殘留 .part 超過此時長才由 GC 清(須 > 下載超時)
+_ATTACH_INFLIGHT = 0
+_ATTACH_INFLIGHT_LOCK = threading.Lock()
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _ensure_private_dir(path: str) -> None:
+    """attachment 目錄 0700(exist_ok + chmod 兜底)。"""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def _du_attach_root(root: str | None = None) -> int:
+    """統計 attach root 佔用(lstat,不跟隨 symlink;只計常規文件)。"""
+    root = root if root is not None else ATTACH_DIR
+    total = 0
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return 0
+    for id_name in entries:
+        d = os.path.join(root, id_name)
+        try:
+            st = os.lstat(d)
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            continue
+        if stat.S_ISREG(st.st_mode):
+            total += st.st_size
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            continue
+        try:
+            files = os.listdir(d)
+        except OSError:
+            continue
+        for f in files:
+            p = os.path.join(d, f)
+            try:
+                fs = os.lstat(p)
+                if stat.S_ISREG(fs.st_mode):
+                    total += fs.st_size
+            except OSError:
+                pass
+    return total
+
+
+def _is_allowed_local_http(p) -> bool:
+    """#379:僅顯式 dev 開關才放行 http→loopback（對齊 server dev-disk 的 /attachments/raw@8080）。
+
+    env:
+      MACCHIATO_ATTACH_ALLOW_LOCALHOST=1  必填，否則一律拒 loopback
+      MACCHIATO_ATTACH_LOCAL_PORT         可選，默認 8080
+      MACCHIATO_ATTACH_LOCAL_PATH_PREFIX  可選，默認 /attachments；空字串=不限 path
+    """
+    if os.environ.get("MACCHIATO_ATTACH_ALLOW_LOCALHOST") != "1":
+        return False
+    if p.scheme != "http":
+        return False
+    host = (p.hostname or "").lower()
+    if host not in _LOCAL_HOSTS:
+        return False
+    # userinfo 混淆（http://evil@127.0.0.1/…）一律拒
+    if p.username is not None or p.password is not None:
+        return False
+    port_raw = os.environ.get("MACCHIATO_ATTACH_LOCAL_PORT")
+    if port_raw is None or port_raw == "":
+        want_port = 8080
+    else:
+        try:
+            want_port = int(port_raw)
+        except ValueError:
+            return False
+    if not (1 <= want_port <= 65535):
+        return False
+    got_port = p.port if p.port is not None else 80  # http 默認 80；dev-disk 是 8080
+    if got_port != want_port:
+        return False
+    if "MACCHIATO_ATTACH_LOCAL_PATH_PREFIX" in os.environ:
+        prefix = os.environ["MACCHIATO_ATTACH_LOCAL_PATH_PREFIX"]
+    else:
+        prefix = "/attachments"
+    if prefix:
+        path = p.path or "/"
+        if path != prefix and not path.startswith(prefix if prefix.endswith("/") else prefix + "/"):
+            return False
+    return True
 
 
 def _validate_download_url(url: str) -> None:
-    """SSRF / 本地文件防護（審計 #12）：server 下發的 url 直喂 urllib 會被 file:// 讀本機密鑰、
-    或指向內網/雲元數據做 SSRF（萬一 server 被攻破 / 明文 MITM）。只允許 https（或 http+localhost 的
-    dev-disk 服務）；拒 file/ftp/data/gopher；https 目標解析後不得落在私網/環回/link-local/保留段。"""
+    """SSRF / 本地文件防護（審計 #12；#379 收緊）：server 下發的 url 直喂 urllib 會被 file://
+    讀本機密鑰、或指向內網/雲元數據做 SSRF（萬一 server 被攻破 / 明文 MITM）。只允許 https；
+    生產默認**拒** loopback。本地 dev-disk 須顯式 MACCHIATO_ATTACH_ALLOW_LOCALHOST=1 才放行
+    http→loopback；拒 file/ftp/data/gopher；https 目標解析後不得落在私網/環回/link-local/保留段。"""
     p = urlparse(url)
-    host = (p.hostname or "").lower()
-    if p.scheme == "http" and host in _LOCAL_HOSTS:
-        return  # 本地 dev-disk 服務（生產走 https）
+    if _is_allowed_local_http(p):
+        return  # #379 顯式 dev 才放行
     if p.scheme != "https":
-        raise ValueError(f"不允許的 url scheme：{p.scheme!r}（只允許 https）")
+        raise ValueError(
+            f"不允許的 url scheme：{p.scheme!r}（只允許 https；"
+            "本地 dev-disk 需 MACCHIATO_ATTACH_ALLOW_LOCALHOST=1）"
+        )
+    host = (p.hostname or "").lower()
     if not host:
         raise ValueError("url 缺主機名")
+    if p.username is not None or p.password is not None:
+        raise ValueError("url 不得含 userinfo（防混淆）")
     try:
         infos = socket.getaddrinfo(host, p.port or 443, proto=socket.IPPROTO_TCP)
     except OSError as exc:
@@ -233,15 +532,20 @@ def _open_validated_download(url: str, timeout: float = 30.0):
     if p.query:
         path += "?" + p.query
     headers = {"User-Agent": "macchiato-connector"}
-    if p.scheme == "http" and host in _LOCAL_HOSTS:
+    if _is_allowed_local_http(p):
         conn = http.client.HTTPConnection(host, p.port or 80, timeout=timeout)
         conn.request("GET", path, headers=headers)
         resp = conn.getresponse()
     else:
         if p.scheme != "https":
-            raise ValueError(f"不允許的 scheme：{p.scheme!r}（只允許 https）")
+            raise ValueError(
+                f"不允許的 scheme：{p.scheme!r}（只允許 https；"
+                "本地 dev-disk 需 MACCHIATO_ATTACH_ALLOW_LOCALHOST=1）"
+            )
         if not host:
             raise ValueError("url 缺主機名")
+        if p.username is not None or p.password is not None:
+            raise ValueError("url 不得含 userinfo（防混淆）")
         port = p.port or 443
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
         ip = None
@@ -270,26 +574,79 @@ def _open_validated_download(url: str, timeout: float = 30.0):
 
 
 def _materialize_attachment(ref: dict) -> str:
-    """下載 presigned GET url 到本地文件（連接器與 gateway 同機，落盤即可讓 gateway 讀）。"""
+    """下載 presigned GET url 到本地文件（連接器與 gateway 同機，落盤即可讓 gateway 讀）。
+    #383:0700/0600;O_EXCL|O_NOFOLLOW 臨時寫 + 原子 replace;Content-Length 早拒;
+    全局配額 + 並發上限;失敗 finally unlink partial。"""
+    global _ATTACH_INFLIGHT
     _validate_download_url(str(ref.get("url") or ""))  # 審計 #12：下載前早拒（file:// / 字面私網）
+
+    with _ATTACH_INFLIGHT_LOCK:
+        if _ATTACH_INFLIGHT >= ATTACH_MAX_INFLIGHT:
+            raise ValueError(f"附件並發下載達上限 {ATTACH_MAX_INFLIGHT}")
+        _ATTACH_INFLIGHT += 1
+
     name = _sanitize_filename(ref.get("name") or "")
     if "." not in name:
         ext = mimetypes.guess_extension((ref.get("mime") or "").split(";")[0].strip()) or ""
         name += ext
     d = os.path.join(ATTACH_DIR, re.sub(r"[^\w\-]+", "_", str(ref.get("id") or "att")))
-    os.makedirs(d, exist_ok=True)
     path = os.path.join(d, name)
-    written = 0
-    with _open_validated_download(str(ref["url"])) as r, open(path, "wb") as f:  # #249 pin-IP + 拒重定向
-        while True:
-            chunk = r.read(1 << 16)
-            if not chunk:
-                break
-            written += len(chunk)
-            if written > DOWNLOAD_MAX:
-                raise ValueError(f"下載超過上限 {DOWNLOAD_MAX} 字節，已中止")
-            f.write(chunk)
-    return path
+    tmp = os.path.join(d, f".{name}.{os.urandom(8).hex()}.part")
+    published = False
+    try:
+        _ensure_private_dir(ATTACH_DIR)
+        _ensure_private_dir(d)
+
+        used = _du_attach_root(ATTACH_DIR)
+        if used >= ATTACH_QUOTA_BYTES:
+            raise ValueError(f"附件磁盤配額已滿 {used}/{ATTACH_QUOTA_BYTES} 字節")
+
+        # #249 pin-IP + 拒重定向
+        with _open_validated_download(str(ref["url"])) as r:
+            # Content-Length 早拒:帶頭且超 DOWNLOAD_MAX / 配額 → 不寫盤
+            cl_raw = r.getheader("Content-Length")
+            if cl_raw is not None and cl_raw != "":
+                try:
+                    cl = int(cl_raw)
+                except ValueError:
+                    cl = -1
+                if cl >= 0:
+                    if cl > DOWNLOAD_MAX:
+                        raise ValueError(f"Content-Length {cl} 超過上限 {DOWNLOAD_MAX}")
+                    if used + cl > ATTACH_QUOTA_BYTES:
+                        raise ValueError(f"附件將超過磁盤配額 {used}+{cl}/{ATTACH_QUOTA_BYTES}")
+
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW, 0o600)
+            written = 0
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    fd = -1  # 所有權交給 fdopen
+                    while True:
+                        chunk = r.read(1 << 16)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > DOWNLOAD_MAX:
+                            raise ValueError(f"下載超過上限 {DOWNLOAD_MAX} 字節，已中止")
+                        f.write(chunk)
+            except Exception:
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                raise
+        os.replace(tmp, path)
+        published = True
+        return path
+    finally:
+        with _ATTACH_INFLIGHT_LOCK:
+            _ATTACH_INFLIGHT = max(0, _ATTACH_INFLIGHT - 1)
+        if not published:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 _STT_AVAILABLE = None  # 惰性探測緩存（進程生命週期內不變）
@@ -333,67 +690,99 @@ def _transcribe_attachment(ref: dict) -> dict:
     return {"text": (result.get("transcript") or "").strip()}
 
 
-MEDIA_MAX = 12 * 1024 * 1024  # 出站附件 base64 內聯上限（12MB），超出跳過
+# #372 出站附件 capability-bound 路徑校驗(見 media.py);MEDIA_MAX 自 media re-export 給測試。
 
 
-def _extract_media_files(text: str) -> list:
-    """復用 Hermes 平台適配器的 MEDIA:/裸路徑解析（與 Discord/Telegram 投遞同一套）。"""
-    from gateway.platforms.base import BasePlatformAdapter as B
-
-    media, cleaned = B.extract_media(text)
-    media = B.filter_media_delivery_paths(media)  # [(path, is_voice)]，校驗存在
-    local, _ = B.extract_local_files(cleaned)
-    local = B.filter_local_delivery_paths(local)
-    out, seen = [], set()
-    for path, _v in list(media) + [(p, False) for p in local]:
-        if path not in seen:
-            seen.add(path)
-            out.append(path)
-    return out
+def _extract_media_files(text: str, allowed_roots: list | None = None) -> list:
+    """#158/#372:僅 MEDIA: 標記 + 允許根內路徑(不再合併裸絕對路徑自動上傳)。"""
+    roots = allowed_roots if allowed_roots is not None else _media_allow_roots(
+        state_dir=STATE_DIR, attach_dir=ATTACH_DIR
+    )
+    return _media_extract(text, roots)
 
 
-def _read_media_file(path: str) -> dict | None:
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        return None
-    if size <= 0 or size > MEDIA_MAX:
-        if size > MEDIA_MAX:
-            print(f"[media too big, skip] {path} {size}B", file=sys.stderr)
-        return None
-    with open(path, "rb") as f:
-        data = f.read()
-    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
-    return {
-        "kind": "image" if mime.startswith("image/") else "document",
-        "name": os.path.basename(path),
-        "mime": mime,
-        "size": size,
-        "data_b64": base64.b64encode(data).decode("ascii"),
-    }
+def _read_media_file(path: str, allowed_roots: list | None = None) -> dict | None:
+    """#158/#372:讀文件成 media.attach payload;根外/超限/非常規 → None。"""
+    roots = allowed_roots if allowed_roots is not None else _media_allow_roots(
+        state_dir=STATE_DIR, attach_dir=ATTACH_DIR
+    )
+    return _media_read(path, roots)
 
 
 def _gc_attachments() -> int:
-    """刪除 ATTACH_DIR 下超過 ATTACH_TTL_S 的入站附件（prompt 早已消費，無需長留）。"""
+    """刪除 ATTACH_DIR 下超過 ATTACH_TTL_S 的入站附件（prompt 早已消費，無需長留）。
+    #383:lstat 不跟隨 symlink;清 symlink/未知/過期 `.part` 殘留;目錄保持 0700。"""
+    import shutil
+
     now = time.time()
     removed = 0
     try:
-        for root, _dirs, files in os.walk(ATTACH_DIR, topdown=False):
-            for name in files:
-                p = os.path.join(root, name)
-                try:
-                    if now - os.path.getmtime(p) > ATTACH_TTL_S:
-                        os.remove(p)
-                        removed += 1
-                except OSError:
-                    pass
-            if root != ATTACH_DIR:
-                try:
-                    os.rmdir(root)  # 只刪空目錄
-                except OSError:
-                    pass
-    except FileNotFoundError:
+        os.chmod(ATTACH_DIR, 0o700)
+    except OSError:
         pass
+    try:
+        top = os.listdir(ATTACH_DIR)
+    except (FileNotFoundError, OSError):
+        return 0
+    for id_name in top:
+        d = os.path.join(ATTACH_DIR, id_name)
+        try:
+            st = os.lstat(d)
+        except OSError:
+            continue
+        # 根下 symlink / 非目錄雜物:不跟隨,直接清
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                os.unlink(d)
+                removed += 1
+            except OSError:
+                pass
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            try:
+                os.unlink(d)
+                removed += 1
+            except OSError:
+                pass
+            continue
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+        try:
+            files = os.listdir(d)
+        except OSError:
+            continue
+        for name in files:
+            p = os.path.join(d, name)
+            try:
+                fs = os.lstat(p)
+            except OSError:
+                continue
+            try:
+                if stat.S_ISLNK(fs.st_mode):
+                    os.unlink(p)
+                    removed += 1
+                    continue
+                if not stat.S_ISREG(fs.st_mode):
+                    if stat.S_ISDIR(fs.st_mode):
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        os.unlink(p)
+                    removed += 1
+                    continue
+                is_part = name.startswith(".") and name.endswith(".part")
+                age = now - fs.st_mtime
+                if (is_part and age > _PART_STALE_S) or (not is_part and age > ATTACH_TTL_S):
+                    os.unlink(p)
+                    removed += 1
+            except OSError:
+                pass
+        try:
+            if not os.listdir(d):
+                os.rmdir(d)
+        except OSError:
+            pass
     return removed
 
 
@@ -516,7 +905,9 @@ class Connector:
         self._projects_load()
         self._mirror_batch_id = 0
         self._mirror_rewind = deque(maxlen=64)  # (batchId, {sid: 舊floor})，供 nack 回退
-        self._out_pending: deque = deque(maxlen=500)  # 斷線期間出站幀緩衝(ready 後補發;有界丟最舊)
+        # #380 斷線出站緩衝：幀數 + 總字節雙限（不再只靠 maxlen=500）。
+        self._out_pending: deque[str] = deque()
+        self._out_pending_bytes = 0
         self._linkb_ready = False  # #251 收到 t:"ready" 才置真:handshaking 窗口不直發未認證幀、走緩衝
         self._on_fatal = lambda: sys.exit(1)  # #246 auth_error 終端態 → 退出交 supervisor(測試可覆蓋)
         self._on_fatal_revoked = lambda: sys.exit(78)  # #387 app 解綁:EX_CONFIG,新版 unit 不再拉起(測試可覆蓋)
@@ -525,6 +916,12 @@ class Connector:
         # Hermes gateway 的原生 approval.respond 只有 session FIFO。E2E 下自行赋 request id +
         # digest，并严格只允许签封响应消费队首，绝不把“第二张卡的批准”错批给第一张。
         self._e2e_approvals: dict[str, deque] = {}
+        # #368 server 發出 E2E 切換前先要求 quiesce。只要 sid 在此表，新的 prompt.submit /
+        # command.invoke 一律拒絕（審批/澄清/密鑰響應**不攔**——那是讓在途回合走完的幀）；
+        # 既有 session chain/live/retry 收斂後才回 ACK，避免回覆跨越明密文邊界。
+        self._e2e_quiescing: dict[str, tuple[str, str | None]] = {}
+        # quiesce 自旋跑在後台任務裡（接收循環絕不 inline await）；持強引用防被 GC 提前回收。
+        self._quiesce_tasks: set = set()
         self._mirror_lock = None  # 鏡像輪詢 ↔ E2E 歷史回灌互斥（防舊 floor 追加與整段替換競態）
         # 自驅會話持久映射（server sid ↔ state.db id）。跨進程/gateway 重啟保留——E2E 鏡像投遞、
         # resume 帶上下文、歸檔回寫都靠它。
@@ -621,6 +1018,10 @@ class Connector:
                 "proto": LINK_B_PROTO,
                 "e2eFailClosed": 1,
                 "e2eControlAuth": 1,
+                "e2eKeyVersionBinding": 1,
+                "e2eQuiesce": 1,
+                "mirrorDurable": 1,
+                "rewind": 1,  # #473 SessionDB.rewind_to_message(軟刪 active=0,原生能力)
             }
         )
         # 保活心跳 + 自動重連：Fly 邊緣會掐閒置 WS；gateway 與 session 映射跨重連保留。
@@ -633,10 +1034,13 @@ class Connector:
                         # 半開(進程亡但 TCP 未 FIN)時永遠檢測不到、幀發進黑洞。改有限值:每 20s WS-ping,
                         # 無 pong 超時即斷 → 外層重連。取 45s(寬容家用上行推大 import 批時 pong 遲到,
                         # 又能在一分鐘內揪出死連接);env 可調。
+                        # #380 max_size 對齊 server connectorWss（8MiB）；websockets 默認 1MiB 會
+                        # 誤殺合法大鏡像/導入批，100MiB 級默認則過寬。
                         self.server_url,
                         ping_interval=20,
                         ping_timeout=float(os.environ.get("MACCHIATO_LINKB_PING_TIMEOUT", "45")),
                         close_timeout=10,
+                        max_size=LINKB_MAX_FRAME_BYTES,
                     ) as ws:
                         self.ws = ws
                         self._linkb_ready = False  # #251 新連接:ready 前不直發(見 _send)
@@ -822,11 +1226,49 @@ class Connector:
         )
         return None
 
+    def _set_out_pending(self, frames: deque[str] | list[str]) -> None:
+        """#380 整表替換 pending 時重算字節計數。"""
+        self._out_pending = deque(frames)
+        self._out_pending_bytes = sum(len(f.encode("utf-8")) for f in self._out_pending)
+
+    def _enqueue_out_pending(self, data: str) -> None:
+        """#380 出站緩衝：幀數 + 總字節雙限，超限丟最舊。"""
+        # 測試/旁路若直接賦值 _out_pending，字節計數可能失步——入隊前重算。
+        self._out_pending_bytes = sum(len(f.encode("utf-8")) for f in self._out_pending)
+        nbytes = len(data.encode("utf-8"))
+        if nbytes > LINKB_MAX_FRAME_BYTES:
+            print(
+                f"[Link B outbound dropped] {nbytes} bytes > max frame",
+                file=sys.stderr,
+            )
+            return
+        dropped = 0
+        while self._out_pending and (
+            len(self._out_pending) >= LINKB_PENDING_MAX
+            or self._out_pending_bytes + nbytes > LINKB_PENDING_MAX_BYTES
+        ):
+            old = self._out_pending.popleft()
+            self._out_pending_bytes -= len(old.encode("utf-8"))
+            dropped += 1
+        if self._out_pending_bytes + nbytes > LINKB_PENDING_MAX_BYTES:
+            print(
+                f"[Link B pending drop] frame {nbytes} bytes exceeds remaining byte budget",
+                file=sys.stderr,
+            )
+            return
+        if dropped:
+            print(
+                f"⚠️ Link B pending backpressure: dropped {dropped} oldest frame(s)",
+                file=sys.stderr,
+            )
+        self._out_pending.append(data)
+        self._out_pending_bytes += nbytes
+
     def _drop_queued_for_protected(self, protected: set[str]) -> None:
         """ready floor 提升时丢弃此前按 plaintext 状态积压的整帧/批内 session。"""
         if not protected or not self._out_pending:
             return
-        kept: deque = deque(maxlen=self._out_pending.maxlen)
+        kept: list[str] = []
         dropped_frames = 0
         dropped_sessions = 0
         for raw in self._out_pending:
@@ -860,7 +1302,7 @@ class Connector:
                 dropped_frames += 1
                 continue
             kept.append(json.dumps(msg, ensure_ascii=False))
-        self._out_pending = kept
+        self._set_out_pending(kept)
         if dropped_frames or dropped_sessions:
             print(
                 "⚠️ E2E ready 对账清除首连前明文："
@@ -963,6 +1405,46 @@ class Connector:
             self._sdb = SessionDB()  # 默認 ~/.hermes/state.db；check_same_thread=False，可跨線程
         return self._sdb
 
+    async def _rewind_hermes(self, server_sid: str, target_src_id: str) -> tuple[bool, int, str | None]:
+        """#473 把 state.db 會話回退到 target_src_id 這條用戶消息之前。
+
+        Hermes 原生就有這個能力（`/undo` 走同一個 SessionDB API）：軟刪 id ≥ target 的行
+        （`active=0`，留檔可審計），要求 target 是 user 行。我們的 srcId 恰好就是 state.db
+        行 id，故不需要任何映射。
+
+        回 (ok, rewound_count, error_code)。
+        """
+        real = self._stored.get(server_sid) or self._fwd.get(server_sid, server_sid)
+        try:
+            target_id = int(str(target_src_id).strip())
+        except (TypeError, ValueError):
+            return False, 0, "not_found"  # 非 state.db 行 id（導入/舊會話）→ 定位不到
+
+        def _do():
+            db = self._session_db()
+            sid = db.resolve_session_id(real) or real
+            return sid, db.rewind_to_message(sid, target_id)
+
+        try:
+            sid, res = await asyncio.to_thread(_do)
+        except ValueError:
+            # rewind_to_message 對「行不存在 / 不屬該會話 / 非 user 角色」拋 ValueError。
+            return False, 0, "not_found"
+        except Exception as exc:
+            print(f"[rewind failed] {exc!r}", file=sys.stderr)
+            return False, 0, "failed"
+        rewound = int(res.get("rewound_count") or 0)
+        # 運行時句柄必須丟掉:gateway 進程裡那份 conversation_history 是**記憶體態**,
+        # 底下的行軟刪了它也不知道。清映射 → 下個 prompt 走 session.resume 重讀 state.db,
+        # 拿到的才是截斷後的上下文。
+        real_ids = {real, sid}
+        self._fwd.pop(server_sid, None)
+        for rid in list(self._rev):
+            if rid in real_ids or self._rev.get(rid) == server_sid:
+                self._rev.pop(rid, None)
+        print(f"· session.rewind {sid} → 軟刪 {rewound} 行(active=0),運行時句柄已丟")
+        return True, rewound, None
+
     async def _set_hermes_title(self, server_sid: str, title: str) -> None:
         # #161 手動改名回寫(archive 同款路徑):自驅會話用持久映射的 state.db id;導入會話用原值。
         real = self._stored.get(server_sid) or self._fwd.get(server_sid, server_sid)
@@ -973,7 +1455,9 @@ class Connector:
             return sid, db.set_session_title(sid, title)
 
         sid, ok = await asyncio.to_thread(_do)
-        print(f"· session.rename {sid} → {title!r}({'ok' if ok else 'no-op'})")
+        # #381:标题正文不进默认日志
+        print(f"· session.rename {short_id(sid)} len={text_len(title)} ({'ok' if ok else 'no-op'})")
+        log_content("session.rename", title)
 
     async def _set_hermes_archived(self, server_sid: str, archived: bool) -> None:
         # session.archive 是 server 造的合成方法、tui_gateway 沒有 → 連接器自己寫 state.db。
@@ -993,7 +1477,9 @@ class Connector:
         path = await asyncio.to_thread(_materialize_attachment, ref)
         method = "image.attach" if ref.get("kind") == "image" else "file.attach"
         await self.gw.request(method, {"session_id": real_sid, "path": path})
-        print(f"· 附件 {method} {ref.get('name')!r} → {real_sid}")
+        # #381:附件名/URL 不落默认日志
+        print(f"· 附件 {method} nameLen={text_len(ref.get('name'))} → {short_id(real_sid)}")
+        log_content("attach", str(ref.get("name") or ""))
 
     async def _send_voice_transcript(
         self, server_sid: str, attachment_id, text: str, error: str | None = None
@@ -1027,9 +1513,13 @@ class Connector:
                 server_sid,
                 {"jsonrpc": "2.0", "method": "event", "params": {"type": "session.title", "session_id": server_sid, "payload": {"title": title}}},
             )
-            print(f"· 自動生成標題「{title}」→ {server_sid}", file=sys.stderr)
+            print(
+                f"· session.title len={text_len(title)} → {short_id(server_sid)}",
+                file=sys.stderr,
+            )
+            log_content("session.title", title)
         except Exception as exc:
-            print(f"[auto_title failed for {server_sid}] {exc!r}", file=sys.stderr)
+            print(f"[auto_title failed for {short_id(server_sid)}] {safe_err(exc)}", file=sys.stderr)
 
     @staticmethod
     def _has_title(state_sid: str) -> bool:
@@ -1154,17 +1644,27 @@ class Connector:
         }
 
     async def _emit_media_from_text(self, server_sid: str, text: str) -> None:
-        # 出站附件：agent 在正文用 MEDIA:/裸路徑標的文件 → 讀取 → media.attach 事件上送。
+        # #158/#372 出站附件:僅 MEDIA: + 允許根內(session cwd / ATTACH_DIR / STATE_DIR /
+        # MACCHIATO_MEDIA_ALLOW_ROOTS);裸路徑與根外(/etc、~/.ssh…)一律不讀不傳。
+        roots = _media_allow_roots(
+            session_cwd=self._cwds.get(server_sid),
+            state_dir=STATE_DIR,
+            attach_dir=ATTACH_DIR,
+        )
         try:
-            paths = await asyncio.to_thread(_extract_media_files, text)
+            paths = await asyncio.to_thread(_extract_media_files, text, roots)
         except Exception as exc:
             print(f"[extract_media failed] {exc!r}", file=sys.stderr)
             return
         for path in paths:
             try:
-                payload = await asyncio.to_thread(_read_media_file, path)
+                payload = await asyncio.to_thread(_read_media_file, path, roots)
             except Exception as exc:
-                print(f"[read media {path} failed] {exc!r}", file=sys.stderr)
+                # #381/#372:不落完整路徑(可能敏感);只記 path_len + 錯型
+                print(
+                    f"[read media failed] path_len={len(path)} err={type(exc).__name__}",
+                    file=sys.stderr,
+                )
                 continue
             if payload is None:
                 continue
@@ -1174,7 +1674,9 @@ class Connector:
                 "params": {"type": "media.attach", "session_id": server_sid, "payload": payload},
             }
             await self._to_server(server_sid, frame)
-            print(f"· media.attach {payload['name']}（{payload['size']}B）→ {server_sid}")
+            # #381:文件名可能含客户路径,默认只记 size
+            print(f"· media.attach size={payload['size']}B → {short_id(server_sid)}")
+            log_content("media.attach", str(payload.get("name") or ""))
 
     def _load_stored(self) -> dict:
         # #248 主檔壞/缺 → 試 .bak(此前無備份:sessions.json 損壞即自驅會話 server↔state.db
@@ -1249,6 +1751,23 @@ class Connector:
                     return owner
         return None
 
+    async def _emit_cwd_reject(self, server_sid: str, reason: str) -> None:
+        """#423 顯式 cwd 校驗失敗 → 與 TS 兩家同形的 review.summary 提示(fail closed)。"""
+        err = f"⚠️ {reason}(連接器主機上)。請修正會話目錄後重發。"
+        print(f"[#423 cwd 拒絕 {server_sid}] {reason}", file=sys.stderr)
+        await self._to_server(
+            server_sid,
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "review.summary",
+                    "session_id": server_sid,
+                    "payload": {"summary": err},
+                },
+            },
+        )
+
     async def _ensure_session(self, server_sid: str) -> str:
         real = self._fwd.get(server_sid)
         if real:
@@ -1276,8 +1795,23 @@ class Connector:
             except GatewayError:
                 continue
         if real is None:
-            cwd = self._cwds.get(server_sid)
-            res = await self.gw.create_session(**({"cwd": cwd} if cwd else {}))  # #227 per-session cwd
+            # #227/#423 per-session cwd:只把校驗過的路徑交給 gateway(防 _cwds 殘留壞值透傳)
+            cwd_raw = self._cwds.get(server_sid)
+            cwd = None
+            if cwd_raw:
+                cres = resolve_cwd(cwd_raw)
+                if cres.ok and cres.cwd:
+                    cwd = cres.cwd
+                    if cwd != cwd_raw:
+                        self._cwds[server_sid] = cwd  # 規範化 realpath
+                else:
+                    # 存過但現在壞了(目錄被刪/allowlist 收緊)→ 不透傳;清掉以免反覆踩
+                    self._cwds.pop(server_sid, None)
+                    print(
+                        f"[#423] create 前 cwd 失效,改不帶 cwd 建會話:{getattr(cres, 'reason', cwd_raw)}",
+                        file=sys.stderr,
+                    )
+            res = await self.gw.create_session(**({"cwd": cwd} if cwd else {}))
             real = res.get("session_id")
             stored = (res or {}).get("stored_session_id")
             self._record_stored(server_sid, stored)
@@ -1390,7 +1924,7 @@ class Connector:
                 print(f"[send failed → 緩衝] {exc!r}", file=sys.stderr)
         if msg.get("t") in ("mirror_append", "connector_health", "pong"):
             return False
-        self._out_pending.append(data)
+        self._enqueue_out_pending(data)
         return False
 
     async def _start_push_socket(self) -> None:
@@ -1402,7 +1936,12 @@ class Connector:
         except OSError:
             pass
         try:
-            self._push_server = await asyncio.start_unix_server(self._push_handler, path=PUSH_SOCK)
+            # #380 limit=換行前硬字節上限（StreamReader 默認僅 64KiB，放寬到 1MiB 並硬頂）。
+            self._push_server = await asyncio.start_unix_server(
+                self._push_handler,
+                path=PUSH_SOCK,
+                limit=PUSH_MAX_LINE_BYTES,
+            )
             os.chmod(PUSH_SOCK, 0o600)  # 僅本用戶可投遞（本機 IPC）
             print(f"· 主動投遞 socket 已啟（{PUSH_SOCK}）")
         except Exception as exc:
@@ -1413,37 +1952,40 @@ class Connector:
         ack: dict = {"ok": False, "error": "unknown"}
         try:
             line = await asyncio.wait_for(reader.readline(), timeout=10)
-            req = json.loads(line.decode("utf-8")) if line else {}
-            chat_id = str(req.get("chatId") or "")
-            # #160 deliver-to-origin:chatId 若是本地 state.db 會話 id → 翻譯成 server sid
-            # (server 按 hermesSessionId 歸位原會話;翻不出原樣傳,home/自定義名照舊落收件箱)。
-            chat_id = self._stored_rev.get(chat_id, chat_id)
-            text = req.get("text") or ""
-            if not chat_id or not text:
-                ack = {"ok": False, "error": "missing chatId/text"}
-            elif self._e2e.is_protected(chat_id) or self._e2e.is_protected(f"macchiato:{chat_id}"):
-                # connector_push 的 wire shape 只有明文 text。目的會話（含 server 的
-                # inbox fallback sid）受 E2E 保護時必須在本機拒絕，不能先把正文交給 server。
-                ack = {"ok": False, "error": "E2E push unsupported"}
-            elif self.ws is None:
-                ack = {"ok": False, "error": "link B down", "retryable": True}
+            if len(line) > PUSH_MAX_LINE_BYTES:
+                ack = {"ok": False, "error": "line too large"}
             else:
-                self._push_seq += 1
-                pid = self._push_seq
-                msg = {
-                    "t": "connector_push",
-                    "agentLinkId": self.agent_link_id,
-                    "chatId": chat_id,
-                    "text": text,
-                    "pushId": pid,
-                }
-                if req.get("replyTo"):
-                    msg["replyTo"] = req["replyTo"]
-                if req.get("metadata"):
-                    msg["metadata"] = req["metadata"]
-                await self._send(msg)
-                print(f"· 主動投遞 → server（chat={chat_id[:24]}, push {pid}, {len(text)} 字）")
-                ack = {"ok": True, "messageId": f"push:{pid}"}
+                req = json.loads(line.decode("utf-8")) if line else {}
+                chat_id = str(req.get("chatId") or "")
+                # #160 deliver-to-origin:chatId 若是本地 state.db 會話 id → 翻譯成 server sid
+                # (server 按 hermesSessionId 歸位原會話;翻不出原樣傳,home/自定義名照舊落收件箱)。
+                chat_id = self._stored_rev.get(chat_id, chat_id)
+                text = req.get("text") or ""
+                if not chat_id or not text:
+                    ack = {"ok": False, "error": "missing chatId/text"}
+                elif self._e2e.is_protected(chat_id) or self._e2e.is_protected(f"macchiato:{chat_id}"):
+                    # connector_push 的 wire shape 只有明文 text。目的會話（含 server 的
+                    # inbox fallback sid）受 E2E 保護時必須在本機拒絕，不能先把正文交給 server。
+                    ack = {"ok": False, "error": "E2E push unsupported"}
+                elif self.ws is None:
+                    ack = {"ok": False, "error": "link B down", "retryable": True}
+                else:
+                    self._push_seq += 1
+                    pid = self._push_seq
+                    msg = {
+                        "t": "connector_push",
+                        "agentLinkId": self.agent_link_id,
+                        "chatId": chat_id,
+                        "text": text,
+                        "pushId": pid,
+                    }
+                    if req.get("replyTo"):
+                        msg["replyTo"] = req["replyTo"]
+                    if req.get("metadata"):
+                        msg["metadata"] = req["metadata"]
+                    await self._send(msg)
+                    print(f"· 主動投遞 → server（chat={chat_id[:24]}, push {pid}, {len(text)} 字）")
+                    ack = {"ok": True, "messageId": f"push:{pid}"}
         except asyncio.TimeoutError:
             ack = {"ok": False, "error": "read timeout"}
         except Exception as exc:
@@ -1522,6 +2064,7 @@ class Connector:
                     st = json.load(f)
                 st.setdefault("sessions", {})
                 st.setdefault("tombstones", [])  # #161 墓碑:app 刪過的會話,鏡像永不再撈
+                st.setdefault("pendingE2EBackfills", {})
                 if is_bak:
                     print(
                         f"⚠️ mirror.json 損壞/丟失 → 已從 .bak 恢復水位線（{path}）。"
@@ -1533,9 +2076,9 @@ class Connector:
                 if not isinstance(exc, FileNotFoundError):
                     print(f"[mirror state 損壞 {path}] {exc!r}", file=sys.stderr)
                 continue
-        return {"baseline": None, "sessions": {}}
+        return {"baseline": None, "sessions": {}, "pendingE2EBackfills": {}}
 
-    def _save_mirror_state(self, st: dict) -> None:
+    def _save_mirror_state(self, st: dict, *, strict: bool = False) -> None:
         try:
             # #262 dirty 判斷:與上次落盤相同 → 跳過(鏡像每 2s 輪詢,無條件雙寫傷 SD 卡;Pi 前科)。
             data = json.dumps(st, sort_keys=True)
@@ -1552,6 +2095,8 @@ class Connector:
             self._mirror_last_saved = data
         except Exception as exc:
             print(f"[mirror state save failed] {exc!r}", file=sys.stderr)
+            if strict:
+                raise
 
     # ── 健康自檢 / 上報（#1 兼容自檢 + #2 健康上報）─────────────────────────
 
@@ -1976,24 +2521,124 @@ class Connector:
                 return snap, cand
         return None, None
 
+    def _begin_e2e_transition(
+        self, server_sid: str, mode: str, request_id: str | None = None
+    ) -> None:
+        if not hasattr(self, "_e2e_quiescing"):
+            self._e2e_quiescing = {}
+        self._e2e_quiescing[server_sid] = (mode, request_id)
+
+    def _release_e2e_quiesce(
+        self, server_sid: str, mode: str | None = None, request_id: str | None = None
+    ) -> None:
+        active = getattr(self, "_e2e_quiescing", {}).get(server_sid)
+        if active is None:
+            return
+        if mode is not None and active[0] != mode:
+            return
+        if request_id is not None and active[1] not in (None, request_id):
+            return
+        self._e2e_quiescing.pop(server_sid, None)
+
+    def _spawn_quiesce_task(self, server_sid: str, mode: str, request_id: str) -> None:
+        """把 quiesce 自旋丟到後台任務並在其完成時回 result;接收循環不阻塞(見調用點註釋)。
+        屏障在**這裡同步**先立起來(而不是等任務被調度),否則 server 發完 e2e_quiesce 立刻放行的
+        新回合會從屏障底下溜過去。"""
+        self._begin_e2e_transition(server_sid, mode, request_id)
+
+        async def run() -> None:
+            try:
+                ok = await self._quiesce_e2e(server_sid, mode, request_id)
+                error = None if ok else "busy_timeout"
+            except Exception as exc:  # 任務內崩了也必須回 result,否則 server pendingOp 永遠掛著
+                print(f"[E2E quiesce 失敗 {server_sid}] {exc!r}", file=sys.stderr)
+                self._release_e2e_quiesce(server_sid, mode, request_id)
+                ok, error = False, "quiesce_failed"
+            try:
+                await self._send(
+                    {
+                        "t": "e2e_quiesce_result",
+                        "agentLinkId": self.agent_link_id,
+                        "hermesSessionId": server_sid,
+                        "mode": mode,
+                        "requestId": request_id,
+                        "ok": ok,
+                        **({} if ok else {"error": error}),
+                    }
+                )
+            except Exception as exc:
+                print(f"[E2E quiesce result 發送失敗 {server_sid}] {exc!r}", file=sys.stderr)
+
+        task = asyncio.ensure_future(run())
+        tasks = getattr(self, "_quiesce_tasks", None)
+        if tasks is None:
+            tasks = self._quiesce_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _quiesce_e2e(
+        self, server_sid: str, mode: str, request_id: str
+    ) -> bool:
+        self._begin_e2e_transition(server_sid, mode, request_id)
+        deadline = asyncio.get_running_loop().time() + QUIESCE_TIMEOUT_S
+        while (
+            server_sid in self._live_inflight
+            or server_sid in self._session_chains
+            or server_sid in self._retry_tasks
+        ):
+            if asyncio.get_running_loop().time() >= deadline:
+                self._release_e2e_quiesce(server_sid, mode, request_id)
+                return False
+            await asyncio.sleep(0.02)
+        return True
+
+    async def _resend_pending_e2e_backfills(self) -> None:
+        st = getattr(self, "_mirror_st", None) or self._load_mirror_state()
+        self._mirror_st = st
+        for pending in list(st.setdefault("pendingE2EBackfills", {}).values()):
+            frame = pending.get("frame") if isinstance(pending, dict) else None
+            if isinstance(frame, dict):
+                await self._send(frame)
+
     async def _e2e_backfill_history(self, server_sid: str, mode: str = "enable") -> None:
         """§19 D2 / 關閉：state.db 全量歷史回灌 `e2e_backfill`，server 事務內原地替換。
         mode="enable"（新開啟）：K_S 重加密回灌，清 KEK 可解的舊明文 payload。
         mode="disable"（關閉）：**明文**回灌（server 恢復可讀+投影）、成功後刪本地 K_S。
         找不到 state.db 會話（自驅 tui 會話 id 未解析，見 E2E-5）→ found:false：enable 時
         server 歷史不替換（僅新消息加密）；disable 時關閉失敗、K_S 保留、會話保持加密。
-        持 _mirror_lock 與鏡像輪詢互斥，並把該會話水位線推到快照覆蓋位——回灌已含全歷史，
-        鏡像不得再按舊 floor 追加（重複投遞）。"""
+        持 _mirror_lock 與鏡像輪詢互斥。候選水位線與完整 wire frame 先持久化；只有收到
+        server 對同一 batchId 的提交 ACK 後才推水位。斷線/進程重啟只重發同一批，不會
+        因「已發出但未提交」跳過歷史。"""
         async with self._get_mirror_lock():
+            st = self._mirror_st or self._load_mirror_state()
+            self._mirror_st = st
+            pending_all = st.setdefault("pendingE2EBackfills", {})
+            existing = pending_all.get(server_sid)
+            if isinstance(existing, dict) and existing.get("mode") == mode:
+                frame = existing.get("frame")
+                if isinstance(frame, dict):
+                    await self._send(frame)
+                    return
             snap, state_sid = await self._e2e_snapshot(server_sid)
             if snap is None or not snap["messages"]:
-                await self._send({
+                batch_id = str(uuid.uuid4())
+                frame = {
                     "t": "e2e_backfill",
                     "agentLinkId": self.agent_link_id,
                     "hermesSessionId": server_sid,
                     "mode": mode,
                     "found": False,
-                })
+                    "batchId": batch_id,
+                }
+                pending_all[server_sid] = {
+                    "batchId": batch_id,
+                    "mode": mode,
+                    "frame": frame,
+                    "stateSid": None,
+                    "cover": None,
+                }
+                self._save_mirror_state(st, strict=True)
+                await self._send(frame)
                 tail = "關閉失敗、K_S 保留" if mode == "disable" else "server 歷史未替換"
                 print(
                     f"· E2E 回灌({mode})：state.db 無會話 {server_sid}（或無已結算消息）"
@@ -2012,6 +2657,7 @@ class Connector:
                 "mode": mode,
                 "found": True,
                 "session": entry,
+                "batchId": str(uuid.uuid4()),
             }
             if mode == "disable":
                 # 关闭回灌会把 plaintext 交给不可信 server。先为设备签名 intent 生成
@@ -2036,15 +2682,19 @@ class Connector:
                         expected_intent=pending["intent"],
                     )
                 backfill["disableReceipt"] = receipt
+            pending_all[server_sid] = {
+                "batchId": backfill["batchId"],
+                "mode": mode,
+                "frame": backfill,
+                "stateSid": state_sid,
+                "cover": snap["cover"],
+            }
+            # #367 WAL：先以原子 replace 持久化 outbox/candidate，再允許 frame 離機。
+            self._save_mirror_state(st, strict=True)
             await self._send(backfill)
-            st = self._mirror_st or self._load_mirror_state()
-            wm = st["sessions"]
-            if snap["cover"] > wm.get(state_sid, 0):
-                wm[state_sid] = snap["cover"]
-                self._save_mirror_state(st)
             print(
                 f"· E2E 回灌({mode})：{server_sid} 全歷史 {len(snap['messages'])} 條已回傳"
-                f"（水位線→{snap['cover']}）"
+                f"（候選水位線 {snap['cover']}，等待 ACK）"
             )
 
     async def _submit_final(self, server_sid: str, real: str, final_text: str, retry_refs: list) -> None:
@@ -2109,11 +2759,9 @@ class Connector:
 
     # ── #227 Projects:備案目錄 project_op + 回合末惰性版本化 ─────────────────
     # 安全紀律(docs/projects.md):mem 操作只服務本地註冊表裡的路徑(server 被攻破也指不動);
-    # 只碰 AGENTS.md 一個文件;原子寫;CLAUDE.md 墊片只在不存在時補(不踩用戶配置)。
-
-    @staticmethod
-    def _proj_canon(server_path: str) -> str:
-        return os.path.realpath(os.path.expanduser(server_path))
+    # 只碰 AGENTS.md 一個文件;#378 文件原語抗 symlink/TOCTOU(見上方 _proj_read_named/_proj_write_named:
+    # 目錄 realpath+dev/ino 釘身份、目標 O_NOFOLLOW+fstat、寫走同目錄隨機臨時名 O_EXCL);
+    # CLAUDE.md 墊片只在不存在時補(不踩用戶配置)。self._projects 值為可信目錄身份 dict。
 
     def _projects_load(self) -> None:
         try:
@@ -2121,7 +2769,7 @@ class Connector:
                 data = json.load(f)
             for sp in data.get("paths", []):
                 try:
-                    self._projects[sp] = self._proj_canon(sp)
+                    self._projects[sp] = _proj_dir_identity(sp)  # #378 realpath+dev/ino;不存在/非目錄跳過
                 except Exception:
                     pass
         except (FileNotFoundError, ValueError):
@@ -2137,13 +2785,6 @@ class Connector:
             os.replace(tmp, path)
         except Exception as exc:
             print(f"[#227 projects registry save failed] {exc!r}", file=sys.stderr)
-
-    @staticmethod
-    def _proj_atomic_write(file: str, content: str) -> None:
-        tmp = file + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(content)
-        os.replace(tmp, file)
 
     async def _project_op(self, msg: dict) -> None:
         req_id = msg.get("reqId")
@@ -2167,7 +2808,7 @@ class Connector:
                 self._projects = {}
                 for sp in paths:
                     try:
-                        self._projects[sp] = self._proj_canon(sp)
+                        self._projects[sp] = _proj_dir_identity(sp)  # #378 realpath+dev/ino;壞路徑跳過
                     except Exception:
                         pass
                 self._projects_save()
@@ -2180,50 +2821,59 @@ class Connector:
     def _proj_register(self, server_path: str, mkdir: bool, agents_md) -> dict:
         if not server_path:
             return {"ok": False, "error": "缺 path"}
-        canon = self._proj_canon(server_path)
-        existed = os.path.exists(canon)
+        canon_raw = os.path.realpath(os.path.expanduser(server_path))
+        existed = os.path.exists(canon_raw)
         if not existed:
             if not mkdir:
-                return {"ok": False, "error": f"目錄不存在:{canon}(可勾選「自動創建」)"}
-            os.makedirs(canon, exist_ok=True)
-        if not os.path.isdir(canon):
-            return {"ok": False, "error": f"不是目錄:{canon}"}
+                return {"ok": False, "error": f"目錄不存在:{canon_raw}(可勾選「自動創建」)"}
+            os.makedirs(canon_raw, exist_ok=True)
+        # #378 realpath + dev/ino 釘身份(擋目錄 symlink);非目錄 → 統一回不是目錄。
+        try:
+            ident = _proj_dir_identity(server_path)
+        except Exception:
+            return {"ok": False, "error": f"不是目錄:{canon_raw}"}
+        canon = ident["canon"]
         if not os.access(canon, os.W_OK):
             return {"ok": False, "error": f"目錄不可寫:{canon}"}
-        # 三態(同 TS): (A) 有 AGENTS.md 沿用; (B) 只有 CLAUDE.md 無 AGENTS.md → 遷移(改名+重建墊片);
+        # #378 符號連結:解析到項目樹內的真實文件 → 當常規文件照常用(dotfiles 用 symlink 管 CLAUDE.md
+        # 的用戶不受影響);指到項目目錄外(或斷鏈)→ _proj_named_kind 拋錯,由 _project_op 統一回錯。
+        a_kind = _proj_named_kind(ident, "AGENTS.md")
+        c_kind = _proj_named_kind(ident, "CLAUDE.md")
+        # 三態(同 TS): (A) 有 AGENTS.md 沿用; (B) 只有 CLAUDE.md 無 AGENTS.md → 遷移(內容落 AGENTS.md+重建墊片),
+        # 超過 PROJ_MEM_MAX 則整體拒絕備案(寧可不備案,也不能截斷丟用戶內容);
         # (C) 都無/CLAUDE.md 已是純墊片 → 帶初始內容則寫 AGENTS.md,缺墊片補。
-        ap = os.path.join(canon, "AGENTS.md")
-        cp = os.path.join(canon, "CLAUDE.md")
-        has_a = os.path.exists(ap)
-        has_c = os.path.exists(cp)
-        c_content = ""
-        if has_c:
-            with open(cp, encoding="utf-8", errors="replace") as f:
-                c_content = f.read()
         existing = None
         wrote_shim = False
         migrated = False
-        if has_a:
-            with open(ap, encoding="utf-8", errors="replace") as f:
-                existing = f.read()[:PROJ_MEM_MAX]
-            if not has_c:
-                self._proj_atomic_write(cp, PROJ_SHIM)
+        if a_kind == "file":
+            existing = _proj_read_named(ident, "AGENTS.md", PROJ_MEM_MAX)
+            if c_kind == "absent":
+                _proj_write_named(ident, "CLAUDE.md", PROJ_SHIM)
                 wrote_shim = True
-        elif has_c and c_content.strip() != "@AGENTS.md":
-            os.rename(cp, ap)  # (B) 遷移:內容落到 AGENTS.md
-            self._proj_atomic_write(cp, PROJ_SHIM)  # 重建一行墊片
-            with open(ap, encoding="utf-8", errors="replace") as f:
-                existing = f.read()[:PROJ_MEM_MAX]
-            wrote_shim = True
-            migrated = True
+        elif c_kind == "file":
+            # 超限的 CLAUDE.md 絕不能遷移:照讀會拿到**截斷版**,落進 AGENTS.md 後原文件被覆蓋成一行墊片,
+            # 超出 PROJ_MEM_MAX 的部分永久丟。故先量大小,超限 → 拒絕備案,磁盤一個字節都不動。
+            c_size = _proj_named_size(ident, "CLAUDE.md") or 0
+            if c_size > PROJ_MEM_MAX:
+                return {"ok": False,
+                        "error": f"CLAUDE.md 超過 {PROJ_MEM_MAX // 1024}KB 記憶上限({c_size} 字節),"
+                                 f"為避免截斷丟失內容已拒絕遷移;請先精簡 CLAUDE.md 再備案"}
+            c_content = _proj_read_named(ident, "CLAUDE.md", PROJ_MEM_MAX) or ""
+            if c_content.strip() != "@AGENTS.md":
+                _proj_write_named(ident, "AGENTS.md", c_content)  # (B) 內容落 AGENTS.md
+                _proj_write_named(ident, "CLAUDE.md", PROJ_SHIM)  # 重建一行墊片
+                existing = c_content
+                wrote_shim = True
+                migrated = True
+            elif agents_md is not None:
+                _proj_write_named(ident, "AGENTS.md", agents_md)  # CLAUDE.md 已是純墊片
         else:
             if agents_md is not None:
-                self._proj_atomic_write(ap, agents_md)
-            if not has_c:
-                self._proj_atomic_write(cp, PROJ_SHIM)
-                wrote_shim = True
+                _proj_write_named(ident, "AGENTS.md", agents_md)
+            _proj_write_named(ident, "CLAUDE.md", PROJ_SHIM)
+            wrote_shim = True
         content = existing if existing is not None else (agents_md or "")
-        self._projects[server_path] = canon
+        self._projects[server_path] = ident
         self._proj_last_hash[canon] = _mem_hash(content)
         self._projects_save()
         tag = "(CLAUDE.md→AGENTS.md 遷移)" if migrated else ("(+CLAUDE.md 墊片)" if wrote_shim else "")
@@ -2231,11 +2881,11 @@ class Connector:
         return {"ok": True, "existed": existed, "agentsMd": existing, "hash": _mem_hash(content),
                 "wroteShim": wrote_shim, "migratedClaudeToAgents": migrated}
 
-    def _proj_require(self, server_path: str) -> str:
-        canon = self._projects.get(server_path)
-        if not canon:
+    def _proj_require(self, server_path: str) -> dict:
+        ident = self._projects.get(server_path)
+        if not ident:
             raise ValueError("路徑未備案(本地註冊表硬校驗)")
-        return canon
+        return ident
 
     @staticmethod
     def _proj_file_for(file) -> str:
@@ -2247,40 +2897,34 @@ class Connector:
         raise ValueError(f"文件不在白名單:{file}")
 
     def _proj_mem_read(self, server_path: str, file=None) -> dict:
-        canon = self._proj_require(server_path)
+        ident = self._proj_require(server_path)
         name = self._proj_file_for(file)
-        ap = os.path.join(canon, name)
-        content = ""
-        if os.path.exists(ap):
-            with open(ap, encoding="utf-8", errors="replace") as f:
-                content = f.read()[:PROJ_MEM_MAX]
+        content = _proj_read_named(ident, name, PROJ_MEM_MAX) or ""  # #378 O_NOFOLLOW+fstat
         if name == "AGENTS.md":
-            self._proj_last_hash[canon] = _mem_hash(content)
+            self._proj_last_hash[ident["canon"]] = _mem_hash(content)
         return {"ok": True, "agentsMd": content, "hash": _mem_hash(content)}
 
     def _proj_mem_write(self, server_path: str, content, file=None) -> dict:
-        canon = self._proj_require(server_path)
+        ident = self._proj_require(server_path)
         name = self._proj_file_for(file)
-        if content is None or len(content) > PROJ_MEM_MAX:
+        # 上限一律按**字節**量:讀路徑按字節截,寫路徑若按字符數擋,非 ASCII 內容會出現
+        # 「寫得進、讀回是截斷版、回合末 hash 一變就用截斷版覆蓋 server」的丟數據循環。
+        if content is None or len(content.encode("utf-8")) > PROJ_MEM_MAX:
             return {"ok": False, "error": "內容缺失或超限"}
-        self._proj_atomic_write(os.path.join(canon, name), content)
+        _proj_write_named(ident, name, content)  # #378 同目錄隨機臨時名 O_EXCL+rename
         if name == "AGENTS.md":
-            self._proj_last_hash[canon] = _mem_hash(content)
+            self._proj_last_hash[ident["canon"]] = _mem_hash(content)
         return {"ok": True, "hash": _mem_hash(content)}
 
     def _projects_check_turn_end(self) -> None:
         """#227 回合末惰性版本化:掃備案目錄(極少)的 AGENTS.md,hash 變了 → 推 project_mem_changed。
         未定基線(重啟後首回合)只定不推——重啟間隙的變化由面板打開時的穿透讀對賬兜住。"""
-        for server_path, canon in list(self._projects.items()):
+        for server_path, ident in list(self._projects.items()):
             try:
-                ap = os.path.join(canon, "AGENTS.md")
-                content = ""
-                if os.path.exists(ap):
-                    with open(ap, encoding="utf-8", errors="replace") as f:
-                        content = f.read()[:PROJ_MEM_MAX]
+                content = _proj_read_named(ident, "AGENTS.md", PROJ_MEM_MAX) or ""
                 h = _mem_hash(content)
-                prev = self._proj_last_hash.get(canon)
-                self._proj_last_hash[canon] = h
+                prev = self._proj_last_hash.get(ident["canon"])
+                self._proj_last_hash[ident["canon"]] = h
                 if prev is not None and prev != h:
                     asyncio.get_running_loop().create_task(self._send({
                         "t": "project_mem_changed", "agentLinkId": self.agent_link_id,
@@ -2323,10 +2967,84 @@ class Connector:
         task.add_done_callback(_cleanup)
         return task
 
+    @staticmethod
+    def _json_depth_ok(value, max_depth: int, depth: int = 0) -> bool:
+        if depth > max_depth:
+            return False
+        if value is None or not isinstance(value, (dict, list)):
+            return True
+        if isinstance(value, list):
+            return all(Connector._json_depth_ok(item, max_depth, depth + 1) for item in value)
+        return all(Connector._json_depth_ok(v, max_depth, depth + 1) for v in value.values())
+
+    @staticmethod
+    def _is_sane_inbound(msg) -> bool:
+        """#380 入站基本邊界：type/鍵數/深度/關鍵 id/批次數組。未知 t 放行但受頂層約束。"""
+        if not isinstance(msg, dict):
+            return False
+        if len(msg) > LINKB_MAX_TOP_LEVEL_KEYS:
+            return False
+        t = msg.get("t")
+        if not isinstance(t, str) or not t or len(t) > LINKB_MAX_TYPE_LEN:
+            return False
+        if not Connector._json_depth_ok(msg, LINKB_MAX_JSON_DEPTH):
+            return False
+        for key in ("sessionId", "hermesSessionId", "chatId", "agentLinkId"):
+            v = msg.get(key)
+            if v is not None and (not isinstance(v, str) or len(v) > LINKB_MAX_SESSION_ID_LEN):
+                return False
+        frame = msg.get("frame")
+        if frame is not None:
+            if not isinstance(frame, dict):
+                return False
+            params = frame.get("params")
+            if params is not None:
+                if not isinstance(params, dict):
+                    return False
+                sid = params.get("session_id")
+                if sid is not None and (
+                    not isinstance(sid, str) or len(sid) > LINKB_MAX_SESSION_ID_LEN
+                ):
+                    return False
+        for key in ("sessions", "items", "messages", "disabledReceipts"):
+            v = msg.get(key)
+            if isinstance(v, list) and len(v) > LINKB_MAX_BULK_ARRAY_LEN:
+                return False
+        e2e = msg.get("e2eState")
+        if e2e is not None:
+            if not isinstance(e2e, dict):
+                return False
+            sessions = e2e.get("sessions")
+            receipts = e2e.get("disabledReceipts")
+            if isinstance(sessions, list) and len(sessions) > LINKB_MAX_BULK_ARRAY_LEN:
+                return False
+            if isinstance(receipts, list) and len(receipts) > LINKB_MAX_BULK_ARRAY_LEN:
+                return False
+        return True
+
     async def _on_server_msg(self, raw) -> None:
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            nbytes = len(raw)
+        elif isinstance(raw, str):
+            nbytes = len(raw.encode("utf-8"))
+        else:
+            nbytes = len(str(raw).encode("utf-8"))
+        if nbytes > LINKB_MAX_FRAME_BYTES:
+            print(
+                f"[Link B inbound dropped] {nbytes} bytes > maxPayload",
+                file=sys.stderr,
+            )
+            return
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
+            print("[Link B inbound dropped] invalid JSON", file=sys.stderr)
+            return
+        if not self._is_sane_inbound(msg):
+            print(
+                f"[Link B inbound dropped] schema/size bounds (t={msg.get('t')!r})",
+                file=sys.stderr,
+            )
             return
         t = msg.get("t")
         if not self._linkb_ready and t not in ("ready", "auth_error", "ping"):
@@ -2357,6 +3075,11 @@ class Connector:
                     ):
                         raise ValueError("invalid/duplicate e2eState session")
                     server_e2e[row["hermesSessionId"]] = row["pendingOp"]
+                self._e2e_quiescing = {
+                    sid: (op, None)
+                    for sid, op in server_e2e.items()
+                    if op in ("enable", "disable")
+                }
                 receipts = state.get("disabledReceipts")
                 if not isinstance(receipts, list):
                     raise ValueError("invalid e2eState disabledReceipts")
@@ -2437,7 +3160,7 @@ class Connector:
                 if completed:
                     # 这些旧 epoch 已由 server 提交；断线期间缓存的旧密文/回灌帧不能再补发。
                     # re-enable 会话仍由 retained protection floor 保持隔离，直到生成 K2。
-                    kept = deque()
+                    kept: list[str] = []
                     for pending_raw in self._out_pending:
                         try:
                             pending_msg = json.loads(pending_raw)
@@ -2456,9 +3179,41 @@ class Connector:
                         )
                         if not touches_completed:
                             kept.append(pending_raw)
-                    self._out_pending = kept
+                    self._set_out_pending(kept)
+                    # ⚠️ ready 對賬已按認證 receipt 結算這些會話 → 它們的 durable disable
+                    # backfill **也已經提交**。必須同步從 pendingE2EBackfills 摘掉，否則下面的
+                    # `_resend_pending_e2e_backfills` 會把**完整明文快照 + receipt 再發一次**；
+                    # 而 `e2e_backfill_result` 回來時本地 pending_disable 已是 None → raise →
+                    # 被 `_on_server_msg` 的兜底 except 吞掉 → 結尾的 pop/save 永遠到不了 →
+                    # 每次重連原樣重演，明文快照每次過線（#367 的「ACK 丟失可自動收斂」驗收項
+                    # 反而變成永久錯誤迴圈）。
+                    bst = getattr(self, "_mirror_st", None) or self._load_mirror_state()
+                    self._mirror_st = bst
+                    pending_backfills = bst.setdefault("pendingE2EBackfills", {})
+                    settled_backfills = 0
+                    for sid in completed:
+                        entry = pending_backfills.get(sid)
+                        if not isinstance(entry, dict) or entry.get("mode") != "disable":
+                            continue
+                        # 與正常 ACK 路徑一致：提交後推該會話的鏡像水位，別讓已回灌的段重投。
+                        state_sid = entry.get("stateSid")
+                        cover = entry.get("cover")
+                        if isinstance(state_sid, str) and isinstance(cover, int):
+                            wm = bst.setdefault("sessions", {})
+                            if cover > wm.get(state_sid, 0):
+                                wm[state_sid] = cover
+                        pending_backfills.pop(sid, None)
+                        self._release_e2e_quiesce(sid, "disable")
+                        settled_backfills += 1
+                    if settled_backfills:
+                        self._save_mirror_state(bst, strict=True)
                     print(
                         f"· E2E disable ACK 丢失恢复：已按认证 receipt 结算 {len(completed)} 个会话"
+                        + (
+                            f"（同步摘除 {settled_backfills} 份已提交的待确认回灌，不再重发明文快照）"
+                            if settled_backfills
+                            else ""
+                        )
                     )
             except Exception as exc:
                 self._linkb_state = "e2e_state_error"
@@ -2478,12 +3233,16 @@ class Connector:
                     # #251:先 peek 再 popleft——send 失敗時該幀不丟(此前 popleft 後 send 拋即丟一幀)。
                     while self._out_pending:
                         await self.ws.send(self._out_pending[0])
-                        self._out_pending.popleft()
+                        old = self._out_pending.popleft()
+                        self._out_pending_bytes = max(
+                            0, self._out_pending_bytes - len(old.encode("utf-8"))
+                        )
                     print(f"· 重連 → 補發斷線期間積壓的 {n} 幀")
                 except Exception as exc:
                     print(f"[積壓補發失敗,剩 {len(self._out_pending)}] {exc!r}", file=sys.stderr)
             # #251:補發完成後才置 ready——補發期間並發的 _send 走緩衝、由上面循環按序帶出,不亂序。
             self._linkb_ready = True
+            await self._resend_pending_e2e_backfills()
             await self._advertise_import()
             await self._report_commands()  # #199 每次 ready 重發(server 重啟丟內存緩存)
             await self._maybe_auto_import()  # #154 首裝自動全量導入(不請示)
@@ -2526,28 +3285,62 @@ class Connector:
         if t == "self_update":
             self._self_update()
             return
+        if (
+            t == "e2e_quiesce"
+            and isinstance(msg.get("hermesSessionId"), str)
+            and msg.get("mode") in ("enable", "disable")
+            and isinstance(msg.get("requestId"), str)
+        ):
+            sid = msg["hermesSessionId"]
+            mode = msg["mode"]
+            request_id = msg["requestId"]
+            # ⚠️ 絕不 inline await:_quiesce_e2e 會自旋到在途回合收尾(上限 QUIESCE_TIMEOUT_S)。
+            # 本函數跑在**單消費者接收循環**裡——inline await 期間該 agent link 上所有會話的
+            # tui / mirror_nack / self_update、乃至 server 用來解鎖的 e2e_quiesce_release 全堵在
+            # socket buffer 裡收不到,而 WS ping/pong 由庫的獨立任務答 → server 與 App 全程顯示
+            # 連接器健康,實際整條 Link B 凍結數分鐘。對齊 OpenClaw(index.ts 的 void ...then())
+            # 改成後台任務,接收循環立刻回去收下一幀。
+            self._spawn_quiesce_task(sid, mode, request_id)
+            return
+        if (
+            t == "e2e_quiesce_release"
+            and isinstance(msg.get("hermesSessionId"), str)
+            and msg.get("mode") in ("enable", "disable")
+        ):
+            self._release_e2e_quiesce(
+                msg["hermesSessionId"], msg["mode"], msg.get("requestId")
+            )
+            return
         if t == "e2e_wrap_request":
             # §19：iOS 開啟某會話 E2E / 新設備加入 → 生成或取出 K_S，封裝給各設備公鑰、回傳。
             sid = msg.get("hermesSessionId")
             if sid:
-                pending = self._e2e.pending_disable(sid)
-                if pending is not None:
-                    # disable 已提交但 ACK 丢失时，server 可能在同一连接上立刻收到用户
-                    # re-enable，来不及经过下一次 ready 对账。此时绝不能 createForEnable
-                    # 复用 K1；live 请求也必须携带并通过本地 K1 验证 R1，先原子退休旧
-                    # epoch、保留 protection floor，随后才可生成 K2。
-                    receipt = msg.get("disableReceipt")
-                    if receipt != pending.get("receipt") or receipt is None:
-                        raise E2EControlError(
-                            "pending re-enable has no matching authenticated disable receipt"
+                # 顯式拒絕 + 明確日誌，與 cc / codex / openclaw 的內層 catch 對稱
+                # （#366 驗收項）。此前狀態級錯誤只會被主循環的通用 catch 吞成
+                # 「_on_server_msg 分支異常」，運維無從分辨是畸形幀還是真故障。
+                try:
+                    pending = self._e2e.pending_disable(sid)
+                    if pending is not None:
+                        # disable 已提交但 ACK 丢失时，server 可能在同一连接上立刻收到用户
+                        # re-enable，来不及经过下一次 ready 对账。此时绝不能 createForEnable
+                        # 复用 K1；live 请求也必须携带并通过本地 K1 验证 R1，先原子退休旧
+                        # epoch、保留 protection floor，随后才可生成 K2。
+                        receipt = msg.get("disableReceipt")
+                        if receipt != pending.get("receipt") or receipt is None:
+                            raise E2EControlError(
+                                "pending re-enable has no matching authenticated disable receipt"
+                            )
+                        verify_disable_receipt(
+                            self._e2e.require_key(sid),
+                            receipt,
+                            expected_intent=pending["intent"],
                         )
-                    verify_disable_receipt(
-                        self._e2e.require_key(sid),
-                        receipt,
-                        expected_intent=pending["intent"],
-                    )
-                    self._e2e.complete_disable_for_reenable(sid, receipt)
-                wrapped = self._e2e.wrap_for_devices(sid, msg.get("devices") or [])
+                        self._e2e.complete_disable_for_reenable(sid, receipt)
+                    wrapped = self._e2e.wrap_for_devices(sid, msg.get("devices") or [])
+                except (ValueError, E2EControlError) as exc:
+                    # 軟拒絕該幀:不回 e2e_key、不動本地狀態、連接照常。
+                    print(f"[E2E wrap rejected {sid}] {exc}", file=sys.stderr)
+                    return
                 await self._send({
                     "t": "e2e_key",
                     "agentLinkId": self.agent_link_id,
@@ -2556,6 +3349,7 @@ class Connector:
                 })
                 print(f"· E2E：會話 {sid} 封裝 K_S 給 {len(wrapped)} 台設備")
                 if msg.get("backfill"):
+                    self._begin_e2e_transition(sid, "enable")
                     # §19 D2 新開啟：把該會話全量歷史重加密回灌，server 原地替換明文。
                     asyncio.create_task(self._e2e_backfill_history(sid))
             return
@@ -2564,6 +3358,7 @@ class Connector:
             # 并在本地持久化 pending marker。server 单方面发裸帧绝不能触发明文回灌。
             sid = msg.get("hermesSessionId")
             if sid and self._e2e.has_pending_disable(sid):
+                self._begin_e2e_transition(sid, "disable")
                 asyncio.create_task(self._e2e_backfill_history(sid, mode="disable"))
             elif sid:
                 print(
@@ -2579,16 +3374,49 @@ class Connector:
                         "hermesSessionId": sid,
                         "mode": "disable",
                         "found": False,
+                        "batchId": str(uuid.uuid4()),
                     }
                 )
             return
         if t == "e2e_backfill_result":
             sid = msg.get("hermesSessionId")
             mode = msg.get("mode")
+            st = getattr(self, "_mirror_st", None) or self._load_mirror_state()
+            self._mirror_st = st
+            pending_all = st.setdefault("pendingE2EBackfills", {})
+            pending_backfill = pending_all.get(sid) if isinstance(sid, str) else None
+            if (
+                not isinstance(pending_backfill, dict)
+                or pending_backfill.get("mode") != mode
+                or pending_backfill.get("batchId") != msg.get("batchId")
+            ):
+                print(
+                    f"[E2E stale backfill ACK ignored {sid}] "
+                    f"mode={mode} batch={msg.get('batchId')}",
+                    file=sys.stderr,
+                )
+                return
+            committed = msg.get("ok") is True and (
+                (mode == "enable" and msg.get("e2e") is True)
+                or (mode == "disable" and msg.get("e2e") is False)
+            )
             if mode == "disable" and isinstance(sid, str) and sid:
                 try:
-                    if msg.get("ok") is True and msg.get("e2e") is False:
+                    if committed:
                         pending = self._e2e.pending_disable(sid)
+                        if pending is None and not self._e2e.is_e2e(sid):
+                            # 該 disable 已在別處結算過（典型：ready 對賬按認證 receipt 先結
+                            # 算，隨後遲到/重放的 result 才到）。K_S 早已刪除、本地無 pending，
+                            # 這是**冪等成功**而非錯誤：絕不能 raise —— 一 raise 就被
+                            # `_on_server_msg` 兜底吞掉，函數尾部的 pop/save 到不了，待確認
+                            # 回灌永遠留在盤上、每次重連再把明文快照發一遍。
+                            print(
+                                f"· E2E disable result {sid}：本地已结算过，幂等接受并清理待确认回灌"
+                            )
+                            pending_all.pop(sid, None)
+                            self._save_mirror_state(st, strict=True)
+                            self._release_e2e_quiesce(sid, mode)
+                            return
                         if pending is None or pending["receipt"] is None:
                             raise E2EControlError(
                                 "disable result has no matching local release"
@@ -2623,6 +3451,17 @@ class Connector:
                     # 持久状态无法安全结算时保持进程 fail noisy；不能吞掉后继续猜测明文态。
                     print(f"[E2E disable settle failed {sid}] {exc!r}", file=sys.stderr)
                     raise
+            if committed:
+                state_sid = pending_backfill.get("stateSid")
+                cover = pending_backfill.get("cover")
+                if isinstance(state_sid, str) and isinstance(cover, int):
+                    wm = st["sessions"]
+                    if cover > wm.get(state_sid, 0):
+                        wm[state_sid] = cover
+            if committed or msg.get("ok") is False:
+                pending_all.pop(sid, None)
+                self._save_mirror_state(st, strict=True)
+                self._release_e2e_quiesce(sid, mode)
             return
         if t == "project_op":
             await self._project_op(msg)
@@ -2647,6 +3486,20 @@ class Connector:
             return
         server_sid = params_sid or outer_sid
         if not isinstance(server_sid, str) or not server_sid:
+            return
+        # 屏障只攔「開新回合」的兩個方法(對齊 OpenClaw drive.ts 的 content 判定)。
+        # ⚠️ 絕不能連 approval/clarification/secret.respond 一起攔:quiesce 是「先立屏障、再等
+        # 在途回合收尾」,而回合可能正**停在審批卡等用戶點同意**——把 respond 丟掉,回合就永遠
+        # 完不成 → 自旋必然跑滿超時 → 回合永久掛起、E2E 開關必失敗。這三個是「讓在途回合往前
+        # 走完」的幀,恰恰是 quiesce 要等的東西。
+        if server_sid in getattr(self, "_e2e_quiescing", {}) and method in (
+            "prompt.submit",
+            "command.invoke",
+        ):
+            print(
+                f"[E2E quiesce rejected {method} {server_sid}] transition in progress",
+                file=sys.stderr,
+            )
             return
         try:
             alias_owner = self._protected_inbound_alias_owner(server_sid)
@@ -2786,6 +3639,9 @@ class Connector:
             "session.rename",
             "session.archive",
             "session.retitle",
+            # #473 rewind 是**真正的破壞性寫**(軟刪 state.db 行 + 丟運行時句柄),E2E 下更不能
+            # 認 server 的裸帧。server 側 v1 也直接拒 E2E 會話,這裡是第二道。
+            "session.rewind",
         }
         if self._e2e.is_protected(server_sid) and method in sensitive_methods and not authenticated_control:
             print(f"[E2E legacy control rejected {server_sid}] {method}", file=sys.stderr)
@@ -2883,9 +3739,21 @@ class Connector:
                     if not text:
                         # dispatch 沒展開(未知/被禁命令)→ 原文提交兜底,agent 至少看得見用戶意圖
                         text = f"/{name} {arg}".strip()
-                        print(f"· #199 dispatch 未展開 /{name},原文提交兜底", file=sys.stderr)
+                        print(
+                            f"· #199 dispatch 未展開 name={name},原文提交兜底",
+                            file=sys.stderr,
+                        )
                     await self._submit_final(server_sid, real, text, [])
-                    print(f"· #199 command.invoke /{name} → {server_sid}(展開 {len(text)} 字)")
+                    # #381:绝不写 args / 展开正文
+                    print(
+                        format_command_invoke_log(
+                            name=name,
+                            args_len=len(arg),
+                            sid=server_sid,
+                            expanded_len=len(text),
+                        )
+                    )
+                    log_content("command.invoke", text)
                 invoke_task = self._dispatch_session(
                     server_sid, _do_invoke, propagate=authenticated_control
                 )
@@ -2982,33 +3850,50 @@ class Connector:
                 asyncio.create_task(self._e2e_backfill_history(server_sid, mode="disable"))
                 control_accepted = True
             elif method == "session.create":
-                # #227 cwd:草稿期傳來的工作目錄。未建會話 → 存起來,create 時帶上;已建 → session.cwd.set
-                # 中途改(gateway 支持;session busy=agent 回覆過返 4009,Macchiato 側本就鎖 cwd、不該發)。
-                cwd = str(params.get("cwd") or "").strip()
-                # cwd 存儲同步(_do_prompt 的 _ensure_session 讀 self._cwds)——先於下面的建會話派發。
-                if cwd:
-                    self._cwds[server_sid] = cwd
+                # #227/#423 cwd:草稿期傳來的工作目錄。
+                #  - 空 = 清回無 per-session 覆寫(默認不動,不注入專用工作區);
+                #  - 顯式下發 → realpath + 存在 + 是目錄 + 可選 allowlist,fail closed:
+                #    不過則不寫 `_cwds`、不傳 gateway,回 review.summary(與 TS 兩家同文案);
+                #  - 合法路徑:未建 → 存起來 create 帶上;已建 → session.cwd.set。
+                #    回合進行中改 cwd 仍照常記下(busy=4009 既有邏輯吞),**不** mid-turn reject。
+                cwd_raw = str(params.get("cwd") or "").strip()
+                cwd = ""
+                cwd_rejected = False
+                if cwd_raw:
+                    cres = resolve_cwd(cwd_raw)
+                    if not cres.ok:
+                        await self._emit_cwd_reject(
+                            server_sid, cres.reason or f"工作目錄無效:{cwd_raw}"
+                        )
+                        cwd_rejected = True
+                    else:
+                        cwd = cres.cwd
+                        # cwd 存儲同步(_do_prompt 的 _ensure_session 讀 self._cwds)——先於建會話派發。
+                        self._cwds[server_sid] = cwd
                 else:
                     self._cwds.pop(server_sid, None)
 
                 # #251(#4):建會話/改 cwd 的 gateway 調用掛進 per-session 串行鏈,不再在讀循環內聯
-                # 與 _do_prompt 的 _ensure_session 併發雙 create。
-                async def _do_create(server_sid=server_sid, cwd=cwd):
-                    real = self._fwd.get(server_sid)
-                    if real is None:
-                        await self._ensure_session(server_sid)
-                    elif cwd:
-                        try:
-                            await self.gw.request("session.cwd.set", {"session_id": real, "cwd": cwd})
-                            print(f"· #227 session.cwd.set {real} → {cwd}")
-                        except GatewayError as exc:
-                            if exc.code != 4009:  # 4009=busy(已鎖),其餘上拋
-                                raise
-                create_task = self._dispatch_session(
-                    server_sid, _do_create, propagate=authenticated_control
-                )
-                if authenticated_control:
-                    await create_task
+                # 與 _do_prompt 的 _ensure_session 併發雙 create。非法 cwd 已拒 → 不派發 gateway。
+                if not cwd_rejected:
+                    async def _do_create(server_sid=server_sid, cwd=cwd):
+                        real = self._fwd.get(server_sid)
+                        if real is None:
+                            await self._ensure_session(server_sid)
+                        elif cwd:
+                            try:
+                                await self.gw.request(
+                                    "session.cwd.set", {"session_id": real, "cwd": cwd}
+                                )
+                                print(f"· #227 session.cwd.set {real} → {cwd}")
+                            except GatewayError as exc:
+                                if exc.code != 4009:  # 4009=busy(已鎖),其餘上拋
+                                    raise
+                    create_task = self._dispatch_session(
+                        server_sid, _do_create, propagate=authenticated_control
+                    )
+                    if authenticated_control:
+                        await create_task
                 control_accepted = authenticated_control
             elif method == "session.archive":
                 await self._set_hermes_archived(server_sid, bool(params.get("archived", True)))
@@ -3023,6 +3908,29 @@ class Connector:
                             tombs.append(t_id)
                     self._save_mirror_state(self._mirror_st)
                     print(f"· session.delete {server_sid} → 墓碑(鏡像永不再撈)")
+            elif method == "session.rewind":
+                # #473 回退到某條用戶消息之前。server 在等這條 ACK——**它只有收到 ok 才刪自己的
+                # 行**,所以無論成敗、無論拋不拋,都必須回一幀,否則它 30s 超時後判失敗、用戶白等。
+                request_id = str(params.get("request_id") or "")
+                target_src_id = str(params.get("target_src_id") or "")
+                ok, rewound, err = False, 0, "failed"
+                try:
+                    ok, rewound, err = await self._rewind_hermes(server_sid, target_src_id)
+                except Exception as exc:
+                    print(f"[session.rewind {server_sid} failed] {exc!r}", file=sys.stderr)
+                try:
+                    await self._send(
+                        {
+                            "t": "rewind_result",
+                            "agentLinkId": self.agent_link_id,
+                            "hermesSessionId": server_sid,
+                            "requestId": request_id,
+                            "ok": ok,
+                            **({"rewound": rewound} if ok else {"error": err or "failed"}),
+                        }
+                    )
+                except Exception as exc:
+                    print(f"[rewind result 發送失敗 {server_sid}] {exc!r}", file=sys.stderr)
             elif method == "session.rename":
                 # #161 手動改名回寫:app 改標題 → 寫回 state.db,Hermes TUI 兩邊一致。
                 title = str(params.get("title") or "").strip()

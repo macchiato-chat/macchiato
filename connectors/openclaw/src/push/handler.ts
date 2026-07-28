@@ -18,6 +18,8 @@ export function pushSockPath(): string {
 export class PushHandler {
   private server: Server | null = null;
   private pushSeq = 0;
+  /** #380 換行前硬字節上限——失陷/惡意本地客戶端不得無限累積。 */
+  static readonly MAX_LINE_BYTES = 1 * 1024 * 1024;
 
   constructor(
     private readonly linkb: LinkBClient,
@@ -60,19 +62,27 @@ export class PushHandler {
   }
 
   private handle(sock: Socket): void {
-    let buf = "";
+    let buf = Buffer.alloc(0);
+    let settled = false;
     const reply = (ack: Record<string, unknown>): void => {
+      if (settled) return;
+      settled = true;
       sock.write(JSON.stringify(ack) + "\n");
       sock.end();
     };
     sock.setTimeout(10000, () => reply({ ok: false, error: "timeout" }));
     sock.on("data", (d) => {
-      buf += d.toString("utf8");
-      const nl = buf.indexOf("\n");
+      if (settled) return;
+      const chunk = Buffer.isBuffer(d) ? d : Buffer.from(d);
+      if (buf.length + chunk.length > PushHandler.MAX_LINE_BYTES) {
+        return reply({ ok: false, error: "line too large" });
+      }
+      buf = Buffer.concat([buf, chunk]);
+      const nl = buf.indexOf(0x0a);
       if (nl < 0) return;
       let req: Record<string, unknown>;
       try {
-        req = JSON.parse(buf.slice(0, nl));
+        req = JSON.parse(buf.subarray(0, nl).toString("utf8"));
       } catch {
         return reply({ ok: false, error: "bad json" });
       }

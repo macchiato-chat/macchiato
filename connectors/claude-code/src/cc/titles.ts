@@ -22,9 +22,9 @@ export function titleMode(): TitleMode {
   return "firstmsg"; // #346 安全默認:不把未可信首條消息送進另一個 agent 回合
 }
 
-/** 首條消息截斷兜底標題。 */
+/** 首條消息截斷兜底標題。按碼點截(而非 UTF-16 單元),emoji/增補面字符不被劈成孤代理項。 */
 function fallbackTitle(firstUserText: string): string {
-  return firstUserText.replace(/\s+/g, " ").trim().slice(0, 56) || "新會話";
+  return [...firstUserText.replace(/\s+/g, " ").trim()].slice(0, 56).join("") || "新會話";
 }
 
 /** 清洗模型輸出:去引號/前綴/多行,截長。 */

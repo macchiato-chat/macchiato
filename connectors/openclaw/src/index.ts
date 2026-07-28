@@ -25,7 +25,7 @@ import { join } from "node:path";
 // 四連接器常量(cc/codex/openclaw 各自 src/index.ts + hermes connector.py)+ protocol link.ts 全局。
 // 全局是 server 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」
 // (本機與公開用戶一起亮,重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-const CONNECTOR_VERSION = "1.5.51";
+const CONNECTOR_VERSION = "1.5.56";
 
 /** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
 function runSelfUpdate(): void {
@@ -105,6 +105,50 @@ async function main(): Promise<void> {
   void drive.subscribeSessionEvents();
   new CommandsReporter(gw, linkb).start(); // #199 skill 清單上報(/菜單數據源;失敗只缺菜單)
   linkb.onFrame((msg) => {
+    if (
+      msg.t === "e2e_quiesce" &&
+      typeof msg.hermesSessionId === "string" &&
+      (msg.mode === "enable" || msg.mode === "disable") &&
+      typeof msg.requestId === "string"
+    ) {
+      void drive
+        .quiesceE2E(msg.hermesSessionId, msg.mode, msg.requestId)
+        .then((ok) =>
+          linkb.send({
+            t: "e2e_quiesce_result",
+            agentLinkId: linkb.agentLinkId,
+            hermesSessionId: msg.hermesSessionId,
+            mode: msg.mode,
+            requestId: msg.requestId,
+            ok,
+            ...(!ok ? { error: "busy_timeout" as const } : {}),
+          }),
+        )
+        .catch((error) => {
+          linkb.send({
+            t: "e2e_quiesce_result",
+            agentLinkId: linkb.agentLinkId,
+            hermesSessionId: msg.hermesSessionId,
+            mode: msg.mode,
+            requestId: msg.requestId,
+            ok: false,
+            error: "quiesce_failed",
+          });
+        });
+      return;
+    }
+    if (
+      msg.t === "e2e_quiesce_release" &&
+      typeof msg.hermesSessionId === "string" &&
+      (msg.mode === "enable" || msg.mode === "disable")
+    ) {
+      drive.releaseE2EQuiesce(
+        msg.hermesSessionId,
+        msg.mode,
+        typeof msg.requestId === "string" ? msg.requestId : undefined,
+      );
+      return;
+    }
     try {
     if (msg.t === "mirror_nack" && typeof msg.batchId === "number") mirror.handleNack(msg.batchId);
     else if (msg.t === "import_start") void runIdentitySafeImport(); // web「re-import」→ 身份對賬後回灌全量歷史
@@ -114,6 +158,7 @@ async function main(): Promise<void> {
       try {
         // 首次 enable 才可生成 K_S；新設備補封缺 key 必須失敗，不能偷偷换成无法解旧历史的 K₂。
         if (msg.backfill) {
+          drive.beginE2ETransition(sid, "enable");
           e2e.beginEnable(sid, msg.disableReceipt);
           drive.assertE2EIdentitySafe();
         }
@@ -143,6 +188,7 @@ async function main(): Promise<void> {
           );
           return;
         }
+        drive.beginE2ETransition(msg.hermesSessionId, "disable");
         e2e.markServerE2E(msg.hermesSessionId, "disable");
         drive.assertE2EIdentitySafe();
         mirror.assertE2EIdentitySafe();
@@ -179,6 +225,7 @@ async function main(): Promise<void> {
       }
       // 只有 store 确认 ACK 仍对应当前转换后，水位线才可提交；迟到 ACK 按失败解锁旧 pending。
       mirror.handleE2EBackfillResult(msg.hermesSessionId, msg.mode, accepted);
+      drive.releaseE2EQuiesce(msg.hermesSessionId, msg.mode);
       if (!accepted) {
         console.error(
           `· E2E backfill rejected/inconsistent: ${msg.hermesSessionId} mode=${msg.mode} ` +

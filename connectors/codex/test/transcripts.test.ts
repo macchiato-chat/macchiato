@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { readNewMessages } from "../src/codex/transcripts";
+import { nextOrdAtEof, readNewMessages } from "../src/codex/transcripts";
 
 const meta = (cwd: string) => JSON.stringify({ type: "session_meta", payload: { cwd, session_id: "x" } });
 const userMsg = (t: string) => JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: t } });
@@ -33,5 +33,16 @@ describe("codex rollout 解析", () => {
     const content = [userMsg("  "), "не json", agentMsg("ok")].join("\n") + "\n";
     const { messages } = readNewMessages(content, 0, 0);
     expect(messages.map((m) => m.text)).toEqual(["ok"]);
+  });
+
+  it("#418 nextOrdAtEof 與 readNewMessages.lineCount 一致(含尾 \\n;split 恒多 1)", () => {
+    const withTrail = [meta("/tmp"), userMsg("a"), agentMsg("b")].join("\n") + "\n";
+    const noTrail = [meta("/tmp"), userMsg("a"), agentMsg("b")].join("\n"); // 末行未閉合 → 增量不計
+    expect(nextOrdAtEof(withTrail)).toBe(readNewMessages(withTrail, 0, 0).lineCount);
+    expect(nextOrdAtEof(noTrail)).toBe(readNewMessages(noTrail, 0, 0).lineCount);
+    // 回歸:split("\n").length 在尾 \n 時多出空串 → 恒多 1
+    expect(withTrail.split("\n").length).toBe(nextOrdAtEof(withTrail) + 1);
+    expect(nextOrdAtEof("")).toBe(0);
+    expect(nextOrdAtEof("no-nl")).toBe(0);
   });
 });

@@ -13,6 +13,7 @@ import os
 import stat
 import sys
 import threading
+import time
 import uuid
 from copy import deepcopy
 
@@ -46,6 +47,26 @@ _DISABLE_RECEIPT_KEYS = {
     "receiptId",
     "mac",
 }
+_PROCESS_LOCK_TIMEOUT_S = 5.0
+_PROCESS_LOCK_POLL_S = 0.01
+#: CAS 衝突重試次數；每次都重讀磁盤權威快照。耗盡後只失敗本次操作，不 poison 實例。
+_CAS_MAX_ATTEMPTS = 3
+
+
+class E2EKeyStoreLockTimeout(RuntimeError):
+    """另一個進程持鎖超過 ``_PROCESS_LOCK_TIMEOUT_S``。
+
+    語義是「現在拿不到鎖」，**不是**「本進程的 keystore 不可信」——當成持久化失敗去
+    poison 整個實例，會讓該進程所有 E2E 會話 fail closed 直到重啟。
+    """
+
+
+class E2EKeyStoreConflict(RuntimeError):
+    """同一 logical session 的三方 CAS 衝突：磁盤權威狀態既非我的 base 也非 desired。
+
+    語義是「我的內存快照過期了」，同樣不是持久化故障，不得 poison 實例；未涉及的其它
+    session 完全不受影響。
+    """
 
 
 def _canonical_json(value: object) -> bytes:
@@ -140,6 +161,113 @@ def _pending_disable_state(key: str) -> dict:
     return state
 
 
+def _decode_snapshot(raw: bytes) -> tuple[dict[str, bytes], dict[str, dict], set[str]]:
+    """严格解码一个 keystore snapshot；供启动恢复与锁内三方合并共用。"""
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("E2E store root must be an object")
+    keys: dict[str, bytes] = {}
+    pending_disable: dict[str, dict] = {}
+    protected: set[str] = set()
+    for stored_sid, encoded in data.items():
+        if not isinstance(stored_sid, str) or not isinstance(encoded, str):
+            raise ValueError("E2E store entry must be string:string")
+        value = base64.b64decode(encoded, validate=True)
+        if stored_sid.startswith(_PROTECTED_PREFIX):
+            sid = _protected_sid(stored_sid)
+            if value != _PROTECTED_MARKER or sid in protected:
+                raise ValueError("invalid or duplicate protected metadata")
+            protected.add(sid)
+            continue
+        if stored_sid.startswith(_PENDING_DISABLE_PREFIX):
+            state = _pending_disable_state(stored_sid)
+            sid = state["intent"]["hermesSessionId"]
+            if value != _PENDING_DISABLE_MARKER or sid in pending_disable:
+                raise ValueError("invalid or duplicate pending-disable metadata")
+            pending_disable[sid] = state
+            continue
+        if not stored_sid or len(value) != 32:
+            raise ValueError(f"bad K_S entry for {stored_sid!r}: {len(value)} bytes")
+        keys[stored_sid] = value
+    if not set(pending_disable).issubset(keys):
+        raise ValueError("pending-disable metadata has no corresponding K_S")
+    for sid, state in pending_disable.items():
+        expected_key_id = base64.urlsafe_b64encode(
+            hashlib.sha256(keys[sid]).digest()
+        ).decode("ascii").rstrip("=")
+        if state["intent"]["keyId"] != expected_key_id:
+            raise ValueError("pending-disable metadata key id mismatch")
+    return keys, pending_disable, protected
+
+
+def _logical_session_id(stored_sid: str) -> str:
+    if stored_sid.startswith(_PROTECTED_PREFIX):
+        return _protected_sid(stored_sid)
+    if stored_sid.startswith(_PENDING_DISABLE_PREFIX):
+        return _pending_disable_state(stored_sid)["intent"]["hermesSessionId"]
+    return stored_sid
+
+
+def _snapshot_record(raw: bytes) -> dict[str, str]:
+    # 先走完整状态校验，避免把磁盘坏档当成可合并的普通 JSON。
+    _decode_snapshot(raw)
+    value = json.loads(raw)
+    return dict(value)
+
+
+def _merge_snapshots(base_raw: bytes, desired_raw: bytes, disk_raw: bytes) -> bytes:
+    """按 logical session 做三方 CAS；保留其他进程刚提交的 unrelated sessions。"""
+    base = _snapshot_record(base_raw)
+    desired = _snapshot_record(desired_raw)
+    disk = _snapshot_record(disk_raw)
+
+    def grouped(record: dict[str, str]) -> dict[str, dict[str, str]]:
+        out: dict[str, dict[str, str]] = {}
+        for stored_sid, value in record.items():
+            out.setdefault(_logical_session_id(stored_sid), {})[stored_sid] = value
+        return out
+
+    base_groups = grouped(base)
+    desired_groups = grouped(desired)
+    disk_groups = grouped(disk)
+    for sid in set(base_groups).union(desired_groups):
+        before = base_groups.get(sid, {})
+        after = desired_groups.get(sid, {})
+        if before == after:
+            continue
+        current = disk_groups.get(sid, {})
+        if current != before and current != after:
+            raise E2EKeyStoreConflict(
+                f"E2E keystore concurrent state conflict for session {sid!r}"
+            )
+        disk = {
+            stored_sid: value
+            for stored_sid, value in disk.items()
+            if _logical_session_id(stored_sid) != sid
+        }
+        disk.update(after)
+
+    return json.dumps(
+        disk,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def device_key_fingerprint(pub_key: str) -> str:
+    """base64url-no-pad(SHA-256(raw X25519 public key))，跨 server/TS/iOS 一致。"""
+    if not isinstance(pub_key, str):
+        raise ValueError("device public key must be canonical base64")
+    try:
+        raw = base64.b64decode(pub_key, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("device public key must be canonical base64") from exc
+    if len(raw) != 32 or base64.b64encode(raw).decode("ascii") != pub_key:
+        raise ValueError("device public key must be canonical 32-byte base64")
+    return base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).decode("ascii").rstrip("=")
+
+
 class E2EKeyStore:
     def __init__(self, path: str = E2E_STORE):
         self._path = path
@@ -149,7 +277,7 @@ class E2EKeyStore:
         # server 的 e2e:true 只能把会话加入保护域，绝不能靠后续 e2e:false/omission 删除。
         # 即使 K_S 丢失也要持续 quarantine，避免把密文/控制误走 legacy 明文路径。
         self._protected: set[str] = set()
-        self._disk_digest: bytes | None = None
+        self._disk_snapshot = b"{}"
         self._poisoned = False
         self._load()
 
@@ -169,40 +297,7 @@ class E2EKeyStore:
             try:
                 with open(path, "rb") as f:
                     raw = f.read()
-                d = json.loads(raw)
-                if not isinstance(d, dict):
-                    raise ValueError("E2E store root must be an object")
-                keys: dict[str, bytes] = {}
-                pending_disable: dict[str, dict] = {}
-                protected: set[str] = set()
-                for stored_sid, encoded in d.items():
-                    if not isinstance(stored_sid, str) or not isinstance(encoded, str):
-                        raise ValueError("E2E store entry must be string:string")
-                    value = base64.b64decode(encoded, validate=True)
-                    if stored_sid.startswith(_PROTECTED_PREFIX):
-                        sid = _protected_sid(stored_sid)
-                        if value != _PROTECTED_MARKER or sid in protected:
-                            raise ValueError("invalid or duplicate protected metadata")
-                        protected.add(sid)
-                        continue
-                    if stored_sid.startswith(_PENDING_DISABLE_PREFIX):
-                        state = _pending_disable_state(stored_sid)
-                        sid = state["intent"]["hermesSessionId"]
-                        if value != _PENDING_DISABLE_MARKER or sid in pending_disable:
-                            raise ValueError("invalid or duplicate pending-disable metadata")
-                        pending_disable[sid] = state
-                        continue
-                    if not stored_sid or len(value) != 32:
-                        raise ValueError(f"bad K_S entry for {stored_sid!r}: {len(value)} bytes")
-                    keys[stored_sid] = value
-                if not set(pending_disable).issubset(keys):
-                    raise ValueError("pending-disable metadata has no corresponding K_S")
-                for sid, state in pending_disable.items():
-                    expected_key_id = base64.urlsafe_b64encode(
-                        hashlib.sha256(keys[sid]).digest()
-                    ).decode("ascii").rstrip("=")
-                    if state["intent"]["keyId"] != expected_key_id:
-                        raise ValueError("pending-disable metadata key id mismatch")
+                keys, pending_disable, protected = _decode_snapshot(raw)
                 self._keys = keys
                 self._pending_disable = pending_disable
                 self._protected = protected
@@ -220,7 +315,7 @@ class E2EKeyStore:
                     # protection floor，甚至把会话重新走明文。构造时已持有跨进程锁，故把
                     # 当前 primary 解析出的权威状态 canonical 地同步到两份；写失败则拒启。
                     self._write_snapshot_pair(repaired)
-                self._disk_digest = hashlib.sha256(repaired).digest()
+                self._disk_snapshot = repaired
                 return
             except FileNotFoundError:
                 continue
@@ -236,7 +331,7 @@ class E2EKeyStore:
         self._keys = {}  # 全新安裝
         self._pending_disable = {}
         self._protected = set()
-        self._disk_digest = None
+        self._disk_snapshot = b"{}"
 
     def _serialized_snapshot(self) -> bytes:
         serialized = {
@@ -266,21 +361,67 @@ class E2EKeyStore:
         self._atomic_write(self._path + ".bak", raw)
 
     def _save(self) -> None:
+        """提交當前內存狀態。
+
+        錯誤分三類（四家連接器對稱）：
+
+        - **CAS 衝突**：內存快照過期 → 重讀磁盤權威快照重試，有限次；耗盡也只失敗本次
+          操作，**不 poison**（poison = 該進程所有 E2E 會話 fail closed 直到重啟）。
+        - **鎖等待超時**：現在拿不到鎖 → 只失敗本次操作，**不 poison**。
+        - **真的持久化不確定**（寫入/快照解析失敗等）→ 照舊 poison。
+        """
         self._assert_usable()
-        raw = self._serialized_snapshot()
+        last_conflict: E2EKeyStoreConflict | None = None
+        for _attempt in range(_CAS_MAX_ATTEMPTS):
+            try:
+                self._save_once()
+                return
+            except E2EKeyStoreConflict as exc:
+                last_conflict = exc
+            except E2EKeyStoreLockTimeout:
+                raise
+        raise E2EKeyStoreConflict(
+            f"E2E keystore 併發衝突，{_CAS_MAX_ATTEMPTS} 次重讀後仍未收斂，"
+            f"本次操作未提交（實例仍可用）：{last_conflict}"
+        ) from last_conflict
+
+    def _save_once(self) -> None:
+        desired_raw = self._serialized_snapshot()
         process_lock = self._acquire_process_lock()
         try:
-            try:
-                with open(self._path, "rb") as f:
-                    current_digest = hashlib.sha256(f.read()).digest()
-            except FileNotFoundError:
-                current_digest = None
-            if current_digest != self._disk_digest:
-                raise RuntimeError(
-                    "E2E keystore changed in another process; refusing stale snapshot overwrite"
-                )
-            self._write_snapshot_pair(raw)
-            self._disk_digest = hashlib.sha256(raw).digest()
+            disk_raw = None
+            failures = []
+            for candidate in (self._path, self._path + ".bak"):
+                try:
+                    with open(candidate, "rb") as f:
+                        candidate_raw = f.read()
+                    _decode_snapshot(candidate_raw)
+                    disk_raw = candidate_raw
+                    break
+                except FileNotFoundError:
+                    continue
+                except (ValueError, binascii.Error, json.JSONDecodeError) as exc:
+                    failures.append(exc)
+            if disk_raw is None:
+                if failures or os.path.exists(self._path) or os.path.exists(self._path + ".bak"):
+                    raise RuntimeError("E2E keystore has no valid snapshot during locked commit")
+                disk_raw = b"{}"
+            merged_raw = _merge_snapshots(
+                self._disk_snapshot,
+                desired_raw,
+                disk_raw,
+            )
+            merged_keys, merged_pending, merged_protected = _decode_snapshot(merged_raw)
+            self._write_snapshot_pair(merged_raw)
+            # 合并可能吸收另一进程的 unrelated session；当前内存也必须发布同一 committed generation。
+            self._keys = merged_keys
+            self._pending_disable = merged_pending
+            self._protected = merged_protected
+            self._disk_snapshot = merged_raw
+        except (E2EKeyStoreConflict, E2EKeyStoreLockTimeout):
+            # 這兩類不是持久化故障：內存過期 / 拿不到鎖。實例照舊可用，交由 _save 重試或
+            # 只失敗本次操作，絕不 poison（見 _save 的 docstring）。
+            raise
         except Exception:
             # 全量快照的提交结果一旦不确定，本进程不能再凭 stale 内存判断某会话是明文。
             self._poisoned = True
@@ -303,8 +444,18 @@ class E2EKeyStore:
                 or stat.S_IMODE(st.st_mode) & 0o077
             ):
                 raise RuntimeError("unsafe E2E keystore process lock")
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            return fd
+            deadline = time.monotonic() + _PROCESS_LOCK_TIMEOUT_S
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return fd
+                except BlockingIOError as exc:
+                    if time.monotonic() >= deadline:
+                        raise E2EKeyStoreLockTimeout(
+                            "E2E keystore process lock remained held for "
+                            f"{_PROCESS_LOCK_TIMEOUT_S:.0f}s"
+                        ) from exc
+                    time.sleep(_PROCESS_LOCK_POLL_S)
         except Exception:
             os.close(fd)
             raise
@@ -559,18 +710,54 @@ class E2EKeyStore:
                 raise
 
     # ── 密鑰分發 ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _assert_wrap_targets_well_formed(devices: list) -> None:
+        """幀級校驗；四家連接器對稱（#366 驗收項）。
+
+        兩種失敗語義刻意分層：
+
+        - **畸形幀**（本函數）：同一批 ``devices`` 出現重複 ``deviceId``，或條目連
+          ``deviceId`` 都沒有。無法歸因到某一台設備（同一 deviceId 的兩個 pubKey，
+          哪個才是權威版本？）→ 整幀拒絕。調用方必須**顯式接住並記錄**，絕不能讓它
+          殺掉連接器 —— server 重連後的 bootstrapE2E 會重發同一幀。
+        - **單台壞公鑰**（``wrap_for_devices`` 迴圈內）：某條目缺 ``pubKey``、非
+          canonical、server 已宣告的指紋對不上、或封裝本身失敗 → 只跳過這一台並告警，
+          其餘照封。一台設備有問題不該讓所有設備都拿不到 K_S。
+        """
+        seen = set()
+        for d in devices or []:
+            dev_id = d.get("deviceId") if isinstance(d, dict) else None
+            if not dev_id or not isinstance(dev_id, str) or dev_id in seen:
+                raise ValueError("invalid or duplicate device wrap target")
+            seen.add(dev_id)
+
     def wrap_for_devices(self, sid: str, devices: list) -> list:
-        """把 K_S 封裝給每台設備公鑰 → [{deviceId, sealed}]。壞公鑰跳過。"""
+        """把 K_S 封裝給已绑定 fingerprint 的設備。
+
+        畸形幀整批拒絕（且不生成 K_S）；單台壞公鑰只跳過該台、其餘照封。
+        """
+        self._assert_wrap_targets_well_formed(devices)  # 畸形幀不得觸發 K_S 生成
         k_s = self.get_or_create_key(sid)
         out = []
         for d in devices or []:
             dev_id, pub = d.get("deviceId"), d.get("pubKey")
-            if not dev_id or not pub:
-                continue
+            fingerprint = d.get("keyFingerprint")
             try:
-                out.append({"deviceId": dev_id, "sealed": ec.wrap_key(k_s, pub)})
-            except Exception:
-                pass  # 公鑰格式壞 → 跳過該設備
+                if not pub:
+                    raise ValueError("missing device public key")
+                computed = device_key_fingerprint(pub)  # 非 canonical 公鑰在此拋
+                # 能力自適應：舊 server（或回滾後的 server）不帶 ``keyFingerprint``——按公鑰
+                # 自算即可，絕不因對端沒宣告版本就跳過該設備。帶了就必須對得上。
+                if fingerprint and computed != fingerprint:
+                    raise ValueError("device public key fingerprint mismatch")
+                out.append({
+                    "deviceId": dev_id,
+                    "keyFingerprint": computed,
+                    "sealed": ec.wrap_key(k_s, pub),
+                })
+            except Exception as exc:
+                # 單台壞公鑰：跳過並響亮記錄，其餘設備照封（絕不 all-or-nothing）。
+                print(f"[E2E wrap skipped device {dev_id}] {exc}", file=sys.stderr)
         return out
 
     # ── 內容加解密（供 mirror/tui/prompt 接線用）──────────────────────────

@@ -1,13 +1,35 @@
 /**
- * #158 出站附件(對齊 Hermes connector.py 的 _extract_media_files/_read_media_file):
- * agent 回覆正文裡 `MEDIA:<路徑>` 標記或裸絕對路徑 → 讀文件(12MB 上限)→ media.attach 事件
- * (base64 內聯,server 落存儲+渲染 media block,ingest 對任意連接器通吃)。
- * 保守解析防誤報:MEDIA: 標記顯式優先;裸路徑必須「絕對路徑 + 常見副檔名 + 磁盤上真實存在的文件」。
+ * #158 出站附件 + #372 capability-bound 路徑校驗:
+ * agent 回覆正文裡 `MEDIA:<路徑>` 標記 → 讀文件(12MB 上限)→ media.attach 事件
+ * (base64 內聯,server 落存儲+渲染 media block)。
+ *
+ * 威脅:模型正文不是可信授權邊界;prompt injection 可誘導打印 `/etc/hosts`、
+ * `~/.ssh/*` 等,舊實現只要文件存在就上傳。
+ *
+ * 對策(#372 務實落地):
+ *  - **只認 `MEDIA:` 標記**(禁用裸絕對路徑自動上傳,降低誤報與注入面);
+ *  - 路徑必須落在「會話允許根」內:session cwd / macchiato 管理目錄 / 附件目錄 /
+ *    `MACCHIATO_MEDIA_ALLOW_ROOTS`(冒號分隔額外根,測試與本機擴展用);
+ *  - `realpath` 解析 symlink 後做包含性檢查(逃逸根外 → 拒);
+ *  - `O_NOFOLLOW` 打開 + `fstat` 確認常規文件 + size 上限(縮 TOCTOU)。
+ * 失敗只記 reason / path_len,不 dump 路徑正文或文件內容(#381 對齊)。
  */
-import { readFileSync, statSync } from "node:fs";
-import { basename, extname } from "node:path";
+import {
+  openSync,
+  readSync,
+  fstatSync,
+  closeSync,
+  lstatSync,
+  realpathSync,
+  statSync,
+  constants,
+} from "node:fs";
+import { basename, extname, join, sep } from "node:path";
+import { homedir } from "node:os";
 
 export const MEDIA_MAX = 12 * 1024 * 1024;
+/** 冒號分隔的額外允許根(測試 / 本機 agent 輸出目錄白名單)。 */
+export const MEDIA_ALLOW_ROOTS_ENV = "MACCHIATO_MEDIA_ALLOW_ROOTS";
 
 const MIME: Record<string, string> = {
   ".png": "image/png",
@@ -30,31 +52,116 @@ const MIME: Record<string, string> = {
   ".mov": "video/quicktime",
 };
 
-/** MEDIA: 標記(整行,顯式意圖)。 */
+/** MEDIA: 標記(整行,顯式意圖)。裸絕對路徑不再自動上傳(#372)。 */
 const MEDIA_RE = /^MEDIA:\s*(\S.*?)\s*$/gm;
-/** 裸絕對路徑:以 / 或 ~/ 開頭、帶已知副檔名的 token(空白/引號/反引號邊界)。 */
-const BARE_RE = /(?:^|[\s"'`(])((?:\/|~\/)[\w.\-\/]+\.(?:png|jpe?g|gif|webp|svg|pdf|txt|md|csv|json|html|zip|mp3|m4a|wav|mp4|mov))(?=$|[\s"'`).,;:!?])/gim;
+
+const OPEN_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
 
 function expand(p: string): string {
-  return p.startsWith("~/") ? p.replace("~", process.env.HOME ?? "~") : p;
+  if (p === "~") return homedir();
+  if (p.startsWith("~/")) return join(homedir(), p.slice(2));
+  return p;
 }
 
-/** 從回覆正文提取待投遞的本地文件路徑(去重、存在性校驗)。 */
-export function extractMediaPaths(text: string): string[] {
+/** target 是否在 root 之內(邊界安全:同路徑或以 root+sep 為前綴,防 /a/bc 誤判在 /a/b 內)。 */
+export function withinRoot(root: string, target: string): boolean {
+  if (target === root) return true;
+  const prefix = root.endsWith(sep) ? root : root + sep;
+  return target.startsWith(prefix);
+}
+
+/**
+ * 彙總當前會話的允許根(realpath 後的目錄;不存在/不可解析的跳過)。
+ * 空列表 = fail closed(任何路徑都拒)。
+ */
+export function resolveMediaAllowRoots(opts?: {
+  sessionCwd?: string | null;
+  extraRoots?: readonly string[];
+}): string[] {
+  const candidates: string[] = [];
+  const cwd = opts?.sessionCwd?.trim();
+  if (cwd) candidates.push(expand(cwd));
+
+  const state =
+    (process.env.MACCHIATO_STATE_DIR || "").trim() || join(homedir(), ".macchiato");
+  candidates.push(state);
+  candidates.push(join(state, "attachments"));
+
+  const raw = (process.env[MEDIA_ALLOW_ROOTS_ENV] || "").trim();
+  if (raw) {
+    for (const part of raw.split(":")) {
+      const p = part.trim();
+      if (p) candidates.push(expand(p));
+    }
+  }
+  if (opts?.extraRoots) {
+    for (const r of opts.extraRoots) {
+      const p = r?.trim();
+      if (p) candidates.push(expand(p));
+    }
+  }
+
   const out: string[] = [];
   const seen = new Set<string>();
-  const push = (raw: string) => {
-    const p = expand(raw.trim());
-    if (seen.has(p)) return;
-    seen.add(p);
+  for (const c of candidates) {
     try {
-      if (statSync(p).isFile()) out.push(p);
+      const canon = realpathSync(c);
+      if (!statSync(canon).isDirectory()) continue;
+      if (seen.has(canon)) continue;
+      seen.add(canon);
+      out.push(canon);
     } catch {
-      /* 不存在/不可讀 → 不是要投遞的文件 */
+      /* 不存在 / 不可解析 → 跳過該根 */
     }
-  };
-  for (const m of text.matchAll(MEDIA_RE)) push(m[1]!);
-  for (const m of text.matchAll(BARE_RE)) push(m[1]!);
+  }
+  return out;
+}
+
+/**
+ * 將候選路徑規範化並校驗是否落在允許根內且為常規文件。
+ * 成功 → realpath;失敗 → null(不拋,由調用方記 reason)。
+ */
+export function resolveAllowedMediaPath(
+  rawPath: string,
+  roots: readonly string[],
+): string | null {
+  if (!roots.length) return null;
+  const expanded = expand(rawPath.trim());
+  if (!expanded) return null;
+  let canon: string;
+  try {
+    canon = realpathSync(expanded);
+  } catch {
+    return null;
+  }
+  if (!roots.some((r) => withinRoot(r, canon))) return null;
+  try {
+    // realpath 之後末段必非 symlink;再 lstat 確認是常規文件(拒目錄/裝置/socket)。
+    const ls = lstatSync(canon);
+    if (!ls.isFile()) return null;
+  } catch {
+    return null;
+  }
+  return canon;
+}
+
+function logDenied(reason: string, pathLen: number): void {
+  console.error(`[media denied] reason=${reason} path_len=${pathLen}`);
+}
+
+/** 從回覆正文提取待投遞的本地文件路徑(僅 MEDIA: ;去重;必須落在允許根內)。 */
+export function extractMediaPaths(text: string, roots: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  if (!roots.length) return out;
+  for (const m of text.matchAll(MEDIA_RE)) {
+    const raw = (m[1] ?? "").trim();
+    if (!raw) continue;
+    const canon = resolveAllowedMediaPath(raw, roots);
+    if (!canon || seen.has(canon)) continue;
+    seen.add(canon);
+    out.push(canon);
+  }
   return out;
 }
 
@@ -66,30 +173,63 @@ export interface MediaPayload {
   data_b64: string;
 }
 
-/** 讀文件成 media.attach payload(Hermes 同款形狀);超限/空/讀失敗 → null。 */
-export function readMediaFile(path: string): MediaPayload | null {
-  let size: number;
+/** 讀文件成 media.attach payload;根外/超限/非常規/讀失敗 → null。 */
+export function readMediaFile(path: string, roots: readonly string[]): MediaPayload | null {
+  const pathLen = path.length;
+  const canon = resolveAllowedMediaPath(path, roots);
+  if (!canon) {
+    logDenied("outside_roots_or_missing", pathLen);
+    return null;
+  }
+
+  let fd: number;
   try {
-    size = statSync(path).size;
-  } catch {
+    fd = openSync(canon, OPEN_FLAGS);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ELOOP") logDenied("symlink_race", pathLen);
+    else logDenied("open_failed", pathLen);
     return null;
   }
-  if (size <= 0 || size > MEDIA_MAX) {
-    if (size > MEDIA_MAX) console.error(`[media too big, skip] ${path} ${size}B`);
-    return null;
-  }
-  let data: Buffer;
+
   try {
-    data = readFileSync(path);
+    const st = fstatSync(fd);
+    if (!st.isFile()) {
+      logDenied("not_regular_file", pathLen);
+      return null;
+    }
+    const size = Number(st.size);
+    if (size <= 0) {
+      logDenied("empty", pathLen);
+      return null;
+    }
+    if (size > MEDIA_MAX) {
+      console.error(`[media too big] size=${size}B path_len=${pathLen}`);
+      return null;
+    }
+    const buf = Buffer.allocUnsafe(size);
+    let off = 0;
+    while (off < size) {
+      const n = readSync(fd, buf, off, size - off, off);
+      if (n <= 0) break;
+      off += n;
+    }
+    if (off !== size) {
+      logDenied("short_read", pathLen);
+      return null;
+    }
+    const mime = MIME[extname(canon).toLowerCase()] ?? "application/octet-stream";
+    return {
+      kind: mime.startsWith("image/") ? "image" : "document",
+      name: basename(canon),
+      mime,
+      size,
+      data_b64: buf.toString("base64"),
+    };
   } catch {
+    logDenied("read_failed", pathLen);
     return null;
+  } finally {
+    closeSync(fd);
   }
-  const mime = MIME[extname(path).toLowerCase()] ?? "application/octet-stream";
-  return {
-    kind: mime.startsWith("image/") ? "image" : "document",
-    name: basename(path),
-    mime,
-    size,
-    data_b64: data.toString("base64"),
-  };
 }

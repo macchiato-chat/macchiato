@@ -365,6 +365,8 @@ export class Mirror {
   private readonly drivenSidByKey = new Map<string, string>();
   private driveIdentityResolver?: (identity: string) => string | undefined;
   private plaintextLocalAllowed?: () => boolean;
+  /** #432 live 已投工具的原地補全鉤子(未接線時退化為舊行為:全部 append)。 */
+  private liveToolEnricher?: (sid: string, tool: MirrorTool) => boolean;
   /** identity state 寫失敗後保持 poison；任何內容路徑須等同一完整快照重試成功才可繼續。 */
   private identityPersistenceDirty = false;
   /** 每次 history import 前須先以 gateway 當前 key→sessionId 對賬，防離線 rotation 新 UUID 漏保護。 */
@@ -411,6 +413,13 @@ export class Mirror {
   ): void {
     this.driveIdentityResolver = resolver;
     this.plaintextLocalAllowed = plaintextLocalAllowed;
+  }
+
+  /** #432 打撈時判別「live 已投過的工具」並原地補內容(見 Drive.enrichLiveTool)。 */
+  setLiveToolEnricher(
+    enrich: (sid: string, tool: MirrorTool) => boolean,
+  ): void {
+    this.liveToolEnricher = enrich;
   }
 
   /**
@@ -666,14 +675,22 @@ export class Mirror {
     this.state.offsets[key] = newOffset;
     const salvaged = messages
       .filter((m) => m.role === "agent" && (m.reasoning || m.tools?.length))
-      .map((m) => ({
-        role: m.role,
-        createdAt: m.createdAt,
-        srcId: srcIdFor(m), // 指紋按原始內容算(重發冪等)
-        text: "", // 正文 live 已投——只補 tool/thinking
-        ...(m.reasoning ? { reasoning: m.reasoning } : {}),
-        ...(m.tools ? { tools: m.tools } : {}),
-      }));
+      .map((m) => {
+        // #432 #261 之後 live 已經實時投過工具卡了(只是內容單薄:gateway 的 result 無輸出正文)。
+        // live 投過的 → 補發同 tool_id 的 tool.complete 帶真輸出,原地填空,**不再進 append 批**;
+        // 沒投過的(老 gateway/live 漏收)照舊 append 保真。此前一律 append = 同批工具投兩次。
+        const tools = (m.tools ?? []).filter((t) => !this.liveToolEnricher?.(sid, t));
+        return {
+          role: m.role,
+          createdAt: m.createdAt,
+          srcId: srcIdFor(m), // 指紋按原始內容算(重發冪等)
+          text: "", // 正文 live 已投——只補 tool/thinking
+          ...(m.reasoning ? { reasoning: m.reasoning } : {}),
+          ...(tools.length ? { tools } : {}),
+        };
+      })
+      // 工具全被 live 認領且無 reasoning → 整條沒內容可補,別發空殼消息
+      .filter((m) => m.reasoning || (m as { tools?: MirrorTool[] }).tools?.length);
     if (!salvaged.length) return null;
     return { hermesSessionId: sid, source: "openclaw", messages: salvaged };
   }

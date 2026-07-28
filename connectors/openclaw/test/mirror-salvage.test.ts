@@ -139,3 +139,65 @@ describe("#161 墓碑", () => {
     expect(appends(sent).length).toBe(before); // 不再撈
   });
 });
+
+/**
+ * #432 #261 之後 live 已實時投工具卡(內容單薄:gateway result 只有 exit/status),
+ * 打撈若照舊 append = 同一批工具在正文前後各出現一次(前空後滿)。
+ * 現在:live 投過的 → 補發同 tool_id 的 tool.complete 原地填內容,不進 append 批。
+ */
+describe("#432 live 已投工具不再重複 append", () => {
+  const tuis = (sent: any[]) => sent.filter((f) => f.t === "tui").map((f) => f.frame.params);
+
+  it("live 投過該 callId → 走 tool.complete 補內容,append 批裡不再有它", async () => {
+    const { mirror, file, sent } = setup();
+    const enriched: Array<{ sid: string; callId: string }> = [];
+    mirror.setLiveToolEnricher((sid, tool) => {
+      enriched.push({ sid, callId: tool.callId });
+      // 真實現(Drive.enrichLiveTool)在此發 tui tool.complete;測試裡模擬同樣的副作用
+      (mirror as any).linkb.send({
+        t: "tui",
+        frame: { params: { type: "tool.complete", session_id: sid, payload: { tool_id: tool.callId, result_text: tool.output } } },
+      });
+      return true;
+    });
+    writeFileSync(file, toolMsg("帶工具的回覆", 2000));
+    await (mirror as any).pollOnce();
+
+    expect(enriched).toEqual([{ sid: SID, callId: "t1" }]);
+    const complete = tuis(sent).filter((p) => p.type === "tool.complete");
+    expect(complete).toHaveLength(1);
+    expect(complete[0].payload).toMatchObject({ tool_id: "t1", result_text: "file1\nfile2" }); // 真輸出補上
+    // reasoning 仍要補(live 不投思考),但 tools 已被 live 認領 → 不重複
+    const msgs = appends(sent).flatMap((e: any) => e.messages);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].reasoning).toBe("想一想");
+    expect(msgs[0].tools).toBeUndefined();
+  });
+
+  it("live 沒投過(老 gateway/漏收)→ 照舊 append,保真不丟", async () => {
+    const { mirror, file, sent } = setup();
+    mirror.setLiveToolEnricher(() => false);
+    writeFileSync(file, toolMsg("帶工具的回覆", 2000));
+    await (mirror as any).pollOnce();
+    const msgs = appends(sent).flatMap((e: any) => e.messages);
+    expect(msgs[0].tools[0]).toMatchObject({ name: "exec", output: "file1\nfile2" });
+  });
+
+  it("工具全被 live 認領且無 reasoning → 整條不發(不留空殼消息)", async () => {
+    const { mirror, file, sent } = setup();
+    mirror.setLiveToolEnricher(() => true);
+    writeFileSync(
+      file,
+      line({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "回覆" }, { type: "toolCall", id: "t9", name: "exec", arguments: {} }],
+          timestamp: 4000,
+        },
+      }),
+    );
+    await (mirror as any).pollOnce();
+    expect(appends(sent)).toHaveLength(0);
+  });
+});

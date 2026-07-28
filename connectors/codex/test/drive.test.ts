@@ -456,7 +456,7 @@ describe("#156 覆蓋缺口:排隊續投 + E2E send", () => {
     expect(spawnArgs[1]![spawnArgs[1]!.length - 1]).toBe("第二條(排隊)");
   });
 
-  it("E2E 會話:回合結束把 user+reply 加密成 mirror_append(不走明文 tui)", async () => {
+  it("E2E 會話:回合結束不走明文 tui，也不旁路 durable mirror outbox 直發", async () => {
     const { linkb, sent } = makeDrive();
     // 最小可逆「加密」樁:isE2E=true、encrypt/decrypt 直傳
     const d2sent: any[] = [];
@@ -477,11 +477,9 @@ describe("#156 覆蓋缺口:排隊續投 + E2E send", () => {
     await new Promise((r) => setTimeout(r, 10));
     // 明文 tui 事件不許有
     expect(d2sent.filter((f) => f.t === "tui" && JSON.stringify(f).includes("秘密"))).toHaveLength(0);
-    const mf = d2sent.find((f) => f.t === "mirror_append");
-    expect(mf.sessions[0].e2e).toBe(true);
-    const roles = mf.sessions[0].messages.map((m: any) => m.role);
-    expect(roles).toEqual(["user", "agent"]);
-    expect(mf.sessions[0].messages[1].enc).toContain("秘密回答");
+    // #350：rollout 落盤後由 Mirror 統一生成 stable batch，ACK 前保持 driven 水位；
+    // drive 直發會形成第二套不可重放的 fire-and-forget 狀態機。
+    expect(d2sent.filter((f) => f.t === "mirror_append")).toHaveLength(0);
   });
 });
 

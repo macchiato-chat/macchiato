@@ -97,6 +97,17 @@ describe("generateTitle", () => {
     expect(sdk.calls).toHaveLength(0);
   });
 
+  it("fallback 按碼點截斷:emoji 跨在 56 邊界不產生孤代理項", async () => {
+    const { generateTitle } = await fresh();
+    const input = "a".repeat(55) + "😀😀"; // 第 56 個碼點是增補面 emoji(2 個 UTF-16 單元)
+    const title = await generateTitle(input);
+    expect(title).toBe("a".repeat(55) + "😀"); // 整個 emoji 保留,而非半個代理對
+    expect([...title]).toHaveLength(56);
+    // 無孤代理項:高位不缺低位、低位不缺高位
+    expect(title).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+    expect(sdk.calls).toHaveLength(0);
+  });
+
   it("off 返回空且不調模型", async () => {
     process.env.MACCHIATO_CC_TITLE_MODE = "off";
     const { generateTitle } = await fresh();

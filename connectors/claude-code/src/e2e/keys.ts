@@ -3,7 +3,7 @@
  * K_S 存 ~/.macchiato/claude-code-e2e.json（0600, fsync + 原子寫；與 Hermes 的 e2e.json 分開）。
  * **某 hermesSessionId 在 store 里 = 該會話已開 E2E。** 鍵 = server 的 hermesSessionId（原始大小寫）。
  */
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -26,6 +26,8 @@ import {
   type E2EDisableReceiptV1,
 } from "./control";
 import {
+  E2EKeyStoreConflictError,
+  E2EKeyStoreLockTimeoutError,
   mergeE2EKeyStoreSnapshots,
   withE2EKeyStoreLock,
 } from "./file-lock";
@@ -37,6 +39,14 @@ export function e2eStorePath(): string {
 export interface DevicePub {
   deviceId: string;
   pubKey: string;
+  /** 可選：舊 / 回滾後的 server 不帶；連接器按 `pubKey` 自算，帶了才核對。 */
+  keyFingerprint?: string;
+}
+
+export interface WrappedDeviceKey {
+  deviceId: string;
+  keyFingerprint: string;
+  sealed: string;
 }
 
 export interface ServerE2EStateV1 {
@@ -58,11 +68,25 @@ interface StoreState {
   protected: Map<string, "enable" | "disable" | null>;
 }
 
+/** CAS 衝突重試次數：每次都在鎖內重讀磁盤權威快照，耗盡後只失敗本次操作、不 poison。 */
+const CAS_MAX_ATTEMPTS = 3;
 const PENDING_DISABLE_PREFIX = "\u0000macchiato:pending-disable:";
 const PENDING_DISABLE_MARKER = Buffer.alloc(32, 0xa5);
 const DISABLE_INTENT_PREFIX = "\u0000macchiato:disable-intent:";
 const DISABLE_RECEIPT_PREFIX = "\u0000macchiato:disable-receipt:";
 const PROTECTED_PREFIX = "\u0000macchiato:protected:";
+const DEVICE_PUBLIC_KEY_B64 = /^[A-Za-z0-9+/]{43}=$/;
+
+export function deviceKeyFingerprint(pubKey: string): string {
+  if (!DEVICE_PUBLIC_KEY_B64.test(pubKey)) {
+    throw new E2EKeyStoreStateError("device public key is not canonical 32-byte base64");
+  }
+  const raw = Buffer.from(pubKey, "base64");
+  if (raw.length !== 32 || raw.toString("base64") !== pubKey) {
+    throw new E2EKeyStoreStateError("device public key is not canonical 32-byte base64");
+  }
+  return createHash("sha256").update(raw).digest("base64url");
+}
 
 function pendingDisableMetaSid(sid: string): string {
   return PENDING_DISABLE_PREFIX + Buffer.from(sid, "utf8").toString("base64url");
@@ -507,29 +531,56 @@ export class E2EKeyStore {
       disableReceipts: nextDisableReceipts,
       protected: nextProtected,
     };
-    let committed: StoreState;
-    try {
-      committed = withE2EKeyStoreLock(this.path, () => {
-        const disk = authoritativeStoreState(this.path);
-        const snapshot = mergeE2EKeyStoreSnapshots(
-          snapshotJson(baseState),
-          snapshotJson(desiredState),
-          snapshotJson(disk),
-          logicalSessionId,
+    // CAS 衝突有限重試：每次都在鎖內重讀磁盤權威快照，另一個進程的寫序列收斂後即可提交。
+    let committed: StoreState | undefined;
+    let lastConflict: E2EKeyStoreConflictError | undefined;
+    for (let attempt = 1; attempt <= CAS_MAX_ATTEMPTS && !committed; attempt++) {
+      try {
+        committed = withE2EKeyStoreLock(this.path, () => {
+          const disk = authoritativeStoreState(this.path);
+          const snapshot = mergeE2EKeyStoreSnapshots(
+            snapshotJson(baseState),
+            snapshotJson(desiredState),
+            snapshotJson(disk),
+            logicalSessionId,
+          );
+          const merged = parseSnapshot(snapshot);
+          // Keep both files at the latest snapshot. A previous-generation backup can resurrect
+          // receipt-deleted keys or lose another process's newly committed protection floor.
+          atomicWrite(this.path, snapshot);
+          atomicWrite(this.path + ".bak", snapshot);
+          return merged;
+        });
+      } catch (cause) {
+        // ⚠️ 只有**真的持久化不確定**才 poison 整個實例（poison = 該進程所有 E2E 會話
+        // fail closed 直到重啟，代價極大）。下面兩類都不是：
+        if (cause instanceof E2EKeyStoreConflictError) {
+          // 「我的內存過期了」：重讀磁盤重試；重試耗盡也只讓本次操作失敗（見迴圈外）。
+          lastConflict = cause;
+          continue;
+        }
+        if (cause instanceof E2EKeyStoreLockTimeoutError) {
+          // 「現在拿不到鎖」：本次操作失敗，實例照舊可用，其它 session 不受影響。
+          throw new E2EKeyStoreStateError(
+            `E2E keystore 進程鎖等待超時，本次操作未提交（實例仍可用）：${cause.message}`,
+            { cause: cause },
+          );
+        }
+        this.poisoned = new Error(
+          `[e2e] keystore persistence failed; this instance is poisoned and must restart before handling any session`,
+          { cause },
         );
-        const merged = parseSnapshot(snapshot);
-        // Keep both files at the latest snapshot. A previous-generation backup can resurrect
-        // receipt-deleted keys or lose another process's newly committed protection floor.
-        atomicWrite(this.path, snapshot);
-        atomicWrite(this.path + ".bak", snapshot);
-        return merged;
-      });
-    } catch (cause) {
-      this.poisoned = new Error(
-        `[e2e] keystore persistence failed; this instance is poisoned and must restart before handling any session`,
-        { cause },
+        throw this.poisoned;
+      }
+    }
+    if (!committed) {
+      // 只隔離本次操作/本 session：調用方按狀態級拒絕處理（軟拒絕該幀），
+      // 下一次 ready 對賬會用權威快照重新收斂。
+      throw new E2EKeyStoreStateError(
+        `E2E keystore 併發衝突，${CAS_MAX_ATTEMPTS} 次重讀後仍未收斂，本次操作未提交` +
+          `（實例仍可用）：${lastConflict?.message ?? "unknown"}`,
+        { cause: lastConflict },
       );
-      throw this.poisoned;
     }
     // Copy-on-write: memory changes only after the complete two-file snapshot reached disk.
     this.keys = committed.keys;
@@ -982,31 +1033,70 @@ export class E2EKeyStore {
     return this.createForEnable(sid);
   }
 
-  private wrapKeyForDevices(k: Buffer, devices: DevicePub[]): { deviceId: string; sealed: string }[] {
-    const out: { deviceId: string; sealed: string }[] = [];
+  /**
+   * 幀級校驗：`devices` 這個列表本身是否自洽。四家連接器對稱（#366 驗收項）。
+   *
+   * 兩種失敗語義刻意分層，別再混為一談：
+   * - **畸形幀**（本函數）：同一批 `devices` 出現重複 `deviceId`，或條目連 `deviceId`
+   *   都沒有。這種錯無法歸因到某一台設備（同一 deviceId 的兩個 pubKey，哪個才是權威
+   *   版本？），也說明請求方本身有問題 → 整幀拒絕，拋 `E2EKeyStoreStateError`。
+   *   調用方**必須在內層接住只打日誌**：server 會在重連後的 bootstrapE2E 重發同一幀，
+   *   讓它冒泡到 onFatal 等於「一幀畸形請求 = 連接器永久起不來」的 DoS。
+   * - **單台壞公鑰**（`wrapKeyForDevices`）：某條目缺 `pubKey`、非 canonical base64、
+   *   server 已宣告的指紋對不上、或封裝本身失敗 → 只跳過這一台並告警，其餘照封。
+   *   一台設備有問題不該讓多設備用戶的**所有**設備都拿不到 K_S。
+   */
+  private assertWrapTargetsWellFormed(devices: DevicePub[]): void {
+    const seen = new Set<string>();
     for (const d of devices ?? []) {
-      if (!d?.deviceId || !d?.pubKey) continue;
+      const id = typeof d?.deviceId === "string" ? d.deviceId : "";
+      if (!id || seen.has(id)) {
+        throw new E2EKeyStoreStateError("invalid or duplicate device wrap target");
+      }
+      seen.add(id);
+    }
+  }
+
+  private wrapKeyForDevices(k: Buffer, devices: DevicePub[]): WrappedDeviceKey[] {
+    const out: WrappedDeviceKey[] = [];
+    for (const d of devices ?? []) {
       try {
-        out.push({ deviceId: d.deviceId, sealed: ec.wrapKey(k, d.pubKey) });
-      } catch {
-        /* 公鑰格式壞 → 跳過該設備 */
+        if (!d.pubKey) {
+          throw new E2EKeyStoreStateError("missing device public key");
+        }
+        const fingerprint = deviceKeyFingerprint(d.pubKey); // 非 canonical 公鑰在此拋
+        // 能力自適應：舊 server（或回滾後的 server）不帶 `keyFingerprint`——按公鑰自算即可，
+        // 絕不因為對端沒宣告版本就跳過該設備、讓用戶拿不到 K_S。帶了就必須對得上。
+        if (d.keyFingerprint && fingerprint !== d.keyFingerprint) {
+          throw new E2EKeyStoreStateError("device public key fingerprint mismatch");
+        }
+        out.push({
+          deviceId: d.deviceId,
+          keyFingerprint: fingerprint,
+          sealed: ec.wrapKey(k, d.pubKey),
+        });
+      } catch (error) {
+        // 單台壞公鑰：跳過並響亮記錄，其餘設備照封（絕不 all-or-nothing）。
+        console.error(`[E2E wrap skipped device ${d?.deviceId}] ${(error as Error).message}`);
       }
     }
     return out;
   }
 
   /** 首次 enable：必要时生成 K_S，再封装给设备。 */
-  wrapForEnable(sid: string, devices: DevicePub[]): { deviceId: string; sealed: string }[] {
+  wrapForEnable(sid: string, devices: DevicePub[]): WrappedDeviceKey[] {
+    this.assertWrapTargetsWellFormed(devices); // 畸形幀不得觸發 K_S 生成
     return this.wrapKeyForDevices(this.createForEnable(sid), devices);
   }
 
   /** 新设备补封：必须沿用既有 K_S；缺 key 时拒绝，绝不生成不兼容的 K₂。 */
-  wrapExistingForDevices(sid: string, devices: DevicePub[]): { deviceId: string; sealed: string }[] {
+  wrapExistingForDevices(sid: string, devices: DevicePub[]): WrappedDeviceKey[] {
+    this.assertWrapTargetsWellFormed(devices);
     return this.wrapKeyForDevices(this.requireKey(sid), devices);
   }
 
   /** @deprecated 兼容旧调用，语义等同首次 enable；index 会依据 backfill 显式选路。 */
-  wrapForDevices(sid: string, devices: DevicePub[]): { deviceId: string; sealed: string }[] {
+  wrapForDevices(sid: string, devices: DevicePub[]): WrappedDeviceKey[] {
     return this.wrapForEnable(sid, devices);
   }
 

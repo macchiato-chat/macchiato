@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -108,5 +108,29 @@ describe("#199 command.invoke → /skill 文本", () => {
     expect(calls.filter((c) => c.method === "chat.send")).toHaveLength(0);
     await linkb.deliver({ t: "tui", sessionId: sid, frame: { method: "command.invoke", params: { session_id: sid, command: "weather" } } });
     expect(calls.find((c) => c.method === "chat.send")?.params.message).toBe("/skill weather");
+  });
+
+  it("#381 command.invoke 默认日志不含 canary args", async () => {
+    const canary = "CANARY-SKILL-ARG-sk-live-OPENCLAW-/Users/private/repo";
+    const logs: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((...a) => {
+      logs.push(a.map(String).join(" "));
+    });
+    try {
+      const { linkb, calls } = makeDrive();
+      const sid = "01OCCMDLOGCANARY0000000000";
+      await linkb.deliver({
+        t: "tui",
+        sessionId: sid,
+        frame: { method: "command.invoke", params: { session_id: sid, command: "canvas", args: canary } },
+      });
+      expect(calls.find((c) => c.method === "chat.send")?.params.message).toBe(`/skill canvas ${canary}`);
+      const joined = logs.join("\n");
+      expect(joined).toMatch(/command\.invoke/);
+      expect(joined).toMatch(/argsLen=/);
+      expect(joined).not.toContain(canary);
+    } finally {
+      log.mockRestore();
+    }
   });
 });

@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { spawn } from "node:child_process";
 import {
   chmodSync,
+  existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -14,10 +17,12 @@ import {
   E2EKeyStore,
   E2EKeyStoreError,
   E2EKeyStoreStateError,
+  deviceKeyFingerprint,
   settleE2EBackfillAck,
 } from "../src/e2e/keys";
 import * as ec from "../src/e2e/crypto";
 import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/e2e/control";
+import { withE2EKeyStoreLock } from "../src/e2e/file-lock";
 
 function disableIntent(sid: string, key: Buffer): E2EControlEnvelopeV1 {
   return {
@@ -66,19 +71,42 @@ describe("E2EKeyStore（持鑰/封裝/加解密/持久化）", () => {
     expect(s.getOrCreateKey("d1").equals(k)).toBe(true);
   });
 
-  it("封裝給兩台設備 → 各自解出同一把 K_S；壞公鑰跳過", () => {
+  it("#369 封裝结果绑定设备 fingerprint；错版本整批 fail closed", () => {
     const s = new E2EKeyStore(path);
     const a = ec.genDeviceKeypair();
     const b = ec.genDeviceKeypair();
     const wrapped = s.wrapForDevices("d1", [
-      { deviceId: "A", pubKey: a.pubB64 },
-      { deviceId: "B", pubKey: b.pubB64 },
-      { deviceId: "C", pubKey: "!!bad" },
+      { deviceId: "A", pubKey: a.pubB64, keyFingerprint: deviceKeyFingerprint(a.pubB64) },
+      { deviceId: "B", pubKey: b.pubB64, keyFingerprint: deviceKeyFingerprint(b.pubB64) },
     ]);
     expect(wrapped.map((w) => w.deviceId)).toEqual(["A", "B"]);
     const k = s.getOrCreateKey("d1");
     expect(ec.unwrapKey(wrapped[0].sealed, a.priv).equals(k)).toBe(true);
     expect(ec.unwrapKey(wrapped[1].sealed, b.priv).equals(k)).toBe(true);
+    // 单台坏公钥/错指纹：跳过该台，绝不 all-or-nothing。
+    expect(
+      s.wrapExistingForDevices("d1", [
+        { deviceId: "A", pubKey: a.pubB64, keyFingerprint: deviceKeyFingerprint(b.pubB64) },
+      ]),
+    ).toEqual([]);
+    const mixed = s.wrapExistingForDevices("d1", [
+      { deviceId: "bad", pubKey: "!!bad", keyFingerprint: "x".repeat(43) },
+      { deviceId: "B", pubKey: b.pubB64, keyFingerprint: deviceKeyFingerprint(b.pubB64) },
+    ]);
+    expect(mixed.map((w) => w.deviceId)).toEqual(["B"]);
+    expect(ec.unwrapKey(mixed[0].sealed, b.priv).equals(k)).toBe(true);
+  });
+
+  it("#366 畸形 devices（重複 deviceId）整幀拒絕，且不生成 K_S", () => {
+    const s = new E2EKeyStore(path);
+    const a = ec.genDeviceKeypair();
+    const dup = [
+      { deviceId: "A", pubKey: a.pubB64, keyFingerprint: deviceKeyFingerprint(a.pubB64) },
+      { deviceId: "A", pubKey: a.pubB64, keyFingerprint: deviceKeyFingerprint(a.pubB64) },
+    ];
+    expect(() => s.wrapForEnable("newSid", dup)).toThrow(/invalid or duplicate/);
+    expect(s.hasKey("newSid")).toBe(false); // 畸形帧不得触发 K_S 生成
+    expect(() => s.wrapExistingForDevices("newSid", dup)).toThrow(/invalid or duplicate/);
   });
 
   it("內容/文本往返 + 無鑰報錯", () => {
@@ -385,6 +413,108 @@ describe("E2EKeyStore（持鑰/封裝/加解密/持久化）", () => {
     expect(final.hasKey("a")).toBe(true);
     expect(final.isE2E("b")).toBe(true);
     expect(final.requireKey("b").equals(k2)).toBe(true);
+  });
+
+  it("#366 交错删除与 pending-disable 写入按 session 合并，不复活旧 K_S 或丢 intent", () => {
+    const seed = new E2EKeyStore(path);
+    seed.createForEnable("delete-me");
+    const pendingKey = seed.createForEnable("pending");
+    const deleter = new E2EKeyStore(path);
+    const pendingWriter = new E2EKeyStore(path);
+
+    pendingWriter.markServerE2E("pending", "disable");
+    pendingWriter.beginDisable("pending", disableIntent("pending", pendingKey));
+    completeDisableWithReceipt(deleter, "delete-me");
+
+    const final = new E2EKeyStore(path);
+    expect(final.hasKey("delete-me")).toBe(false);
+    expect(final.hasPendingDisable("pending")).toBe(true);
+    expect(final.requireKey("pending").equals(pendingKey)).toBe(true);
+  });
+
+  it("#366 同 session CAS 衝突只失敗本次操作，絕不 poison 整個實例", () => {
+    // CAS 衝突的語義只是「我的內存快照過期了」，不是持久化故障。此前它走 poison 分支 →
+    // 該進程**所有** E2E 會話 fail closed 直到重啟。
+    const first = new E2EKeyStore(path);
+    const second = new E2EKeyStore(path);
+    const winner = second.createForEnable("same"); // 另一个实例先提交
+
+    expect(() => first.createForEnable("same")).toThrow(E2EKeyStoreStateError);
+    // 再来一次仍然是「状态级」错误，不是 poisoned —— 证明实例没被毒化。
+    expect(() => first.createForEnable("same")).toThrow(E2EKeyStoreStateError);
+
+    // 实例仍然可用：unrelated session 照常提交并落盘。
+    const other = first.createForEnable("unrelated");
+    expect(first.hasKey("unrelated")).toBe(true);
+    const restarted = new E2EKeyStore(path);
+    expect(restarted.requireKey("unrelated").equals(other)).toBe(true);
+    expect(restarted.requireKey("same").equals(winner)).toBe(true);
+  });
+
+  it("#366 两个真实进程从同一旧快照并发新增 K_S，最终主备包含双方提交", async () => {
+    const go = join(dir, "go");
+    const readyA = join(dir, "ready-a");
+    const readyB = join(dir, "ready-b");
+    const tsx = new URL("../node_modules/.bin/tsx", import.meta.url).pathname;
+    const keysModule = new URL("../src/e2e/keys.ts", import.meta.url).href;
+    const run = (sid: string, ready: string) =>
+      new Promise<void>((resolve, reject) => {
+        const script = [
+          `import { existsSync, writeFileSync } from "node:fs";`,
+          `import { E2EKeyStore } from ${JSON.stringify(keysModule)};`,
+          `const store = new E2EKeyStore(${JSON.stringify(path)});`,
+          `writeFileSync(${JSON.stringify(ready)}, "ready");`,
+          `const waitCell = new Int32Array(new SharedArrayBuffer(4));`,
+          `while (!existsSync(${JSON.stringify(go)})) Atomics.wait(waitCell, 0, 0, 5);`,
+          `store.createForEnable(${JSON.stringify(sid)});`,
+        ].join("\n");
+        const child = spawn(tsx, ["--eval", script], { stdio: ["ignore", "ignore", "pipe"] });
+        let stderr = "";
+        child.stderr.setEncoding("utf8");
+        child.stderr.on("data", (chunk) => { stderr += chunk; });
+        child.once("error", reject);
+        child.once("exit", (code) =>
+          code === 0 ? resolve() : reject(new Error(`child ${sid} failed (${code}): ${stderr}`)),
+        );
+      });
+    const a = run("process-a", readyA);
+    const b = run("process-b", readyB);
+    const children = Promise.all([a, b]);
+    void children.catch(() => {});
+    for (let attempt = 0; attempt < 4_000 && (!existsSync(readyA) || !existsSync(readyB)); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const bothReady = existsSync(readyA) && existsSync(readyB);
+    writeFileSync(go, "go");
+    await children;
+    expect(bothReady).toBe(true);
+
+    const final = new E2EKeyStore(path);
+    expect(final.hasKey("process-a")).toBe(true);
+    expect(final.hasKey("process-b")).toBe(true);
+    expect(readFileSync(path, "utf8")).toBe(readFileSync(`${path}.bak`, "utf8"));
+  }, 30_000);
+
+  it("#366 崩溃 owner / PID 复用锁可恢复；无法证明 ownership 的坏锁 fail closed", () => {
+    const lockDir = `${path}.lock`;
+    mkdirSync(lockDir, { mode: 0o700 });
+    writeFileSync(
+      join(lockDir, "owner.json"),
+      JSON.stringify({
+        v: 1,
+        pid: process.pid,
+        token: "a".repeat(48),
+        createdAtMs: Date.now(),
+        processStart: "reused-pid-from-an-older-process",
+      }),
+      { mode: 0o600 },
+    );
+    expect(withE2EKeyStoreLock(path, () => "recovered")).toBe("recovered");
+    expect(existsSync(lockDir)).toBe(false);
+
+    mkdirSync(lockDir, { mode: 0o700 });
+    writeFileSync(join(lockDir, "owner.json"), "{broken", { mode: 0o600 });
+    expect(() => withE2EKeyStoreLock(path, () => undefined)).toThrow(/invalid JSON/);
   });
 
 });

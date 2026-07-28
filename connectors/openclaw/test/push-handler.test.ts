@@ -100,4 +100,30 @@ describe("push handler（unix socket → connector_push）", () => {
     expect(ack).toEqual({ ok: false, error: "E2E push unsupported" });
     expect(sent).toEqual([]);
   });
+
+  it("#380 換行前超 MAX_LINE_BYTES → line too large，不發", async () => {
+    const sockPath = process.env.MACCHIATO_OPENCLAW_PUSH_SOCK!;
+    const ack = await new Promise<any>((resolve, reject) => {
+      const s = connect(sockPath);
+      let buf = "";
+      // 不帶換行先灌超過 1MiB，應被拒
+      const payload = Buffer.alloc(PushHandler.MAX_LINE_BYTES + 64, 0x61);
+      s.on("connect", () => {
+        s.write(payload);
+        // 再寫換行觸發處理（即便已超限也應在累積時拒）
+        s.write("\n");
+      });
+      s.on("data", (d) => {
+        buf += d.toString();
+        const nl = buf.indexOf("\n");
+        if (nl >= 0) {
+          resolve(JSON.parse(buf.slice(0, nl)));
+          s.end();
+        }
+      });
+      s.on("error", reject);
+    });
+    expect(ack).toEqual({ ok: false, error: "line too large" });
+    expect(sent).toEqual([]);
+  });
 });

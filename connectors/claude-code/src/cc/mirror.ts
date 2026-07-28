@@ -3,11 +3,28 @@
  *  - 發現：掃 projects/ 下全部 <uuid>.jsonl（agent-*.jsonl = 子 agent 轉錄，跳過）。
  *  - 未知會話從 0 全量鏡像完整歷史（自動看到所有會話 = 相對官方 remote control 的核心賣點,
  *    不依賴手動 import）；分批發（batchMax 條/帧，單帧單會話）防超 server maxPayload。
- *  - 字節偏移水位線 + in-flight 保留（見 transcripts.foldEntries）+ mirror_nack 回退。
- *  - driven 會話（本進程經 SDK 驅動）：live 路徑獨佔投遞，鏡像只快進水位線（防雙投，Hermes 教訓）。
+ *  - 字節偏移水位線 + in-flight 保留（見 transcripts.foldEntries）。durable outbox（#348）：幀落盤
+ *    後才發，只有 `mirror_ack` 才提交水位；`mirror_nack` 默認保留原批重發，終態 `code`
+ *    （`e2e_direction` 方向翻轉 / `malformed` 畸形毒批）則丟批——見 `handleNack`。
+ *  - driven 會話（本進程經 SDK 驅動）：live 路徑獨佔投遞；回合末**不再快進水位**（#200/#348：未經
+ *    server ACK 絕不推進），明文靠 #393 的 srcId 去重、E2E 靠 durable outbox 補投；`drivenUuids`
+ *    守衛保證鏡像永不為被驅動過的 CLI 會話另建影子會話。
  *  - §9：消息帶 srcId（transcript 行 uuid），server 端崩潰重發去重。
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, renameSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join, basename } from "node:path";
 import type { LinkBClient } from "../linkb/client";
@@ -15,13 +32,58 @@ import type { E2EKeyStore } from "../e2e/keys";
 import type { E2EDisableReceiptV1 } from "../e2e/control";
 import { foldEntries, projectsDir, readEntries, type CCMessage } from "./transcripts";
 
+/**
+ * 鏡像狀態檔的耐久寫（0600 + fsync + 原子 rename + 目錄 fsync）。
+ *
+ * 為什麼要這麼嚴：這個檔案自 durable outbox 起裝的是**完整消息正文**——待確認批的整個 wire
+ * frame 都落在裡面，disable 回灌時更是「整個曾加密會話的明文快照」。同倉 `e2e/keys.ts` 對 K_S
+ * 就是 0600 + fsync，這裡沒有理由更鬆（原先是默認 0644，多用戶主機上別的用戶可讀）。
+ * 而 fsync 也不是可選項：#200 的動機就是掉電，沒有 fsync 的「先落盤再發送」對掉電根本不成立。
+ */
+function durableWrite(target: string, contents: string): void {
+  const dir = dirname(target);
+  mkdirSync(dir, { recursive: true });
+  const temp = join(dir, `.${basename(target)}.${process.pid}.${randomUUID()}.tmp`);
+  const fd = openSync(temp, "wx", 0o600);
+  let open = true;
+  try {
+    writeFileSync(fd, contents, "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    open = false;
+    renameSync(temp, target);
+  } catch (error) {
+    if (open) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* 保留原始寫入錯誤 */
+      }
+    }
+    try {
+      unlinkSync(temp);
+    } catch {
+      /* temp 可能未建成或已 rename 走 */
+    }
+    throw error;
+  }
+  // rename 本身也要落盤，否則掉電後可能只剩舊檔/半個目錄項。
+  const dirFd = openSync(dir, "r");
+  try {
+    fsyncSync(dirFd);
+  } finally {
+    closeSync(dirFd);
+  }
+}
+
+
 const POLL_MS = Number(process.env.MACCHIATO_CC_POLL_MS) || 5000;
-const REWIND_KEEP = 256; // 首輪全量一個大會話可連發多批，rewind 要留夠深供 nack 回退
+const MAX_WIRE_BYTES = Number(process.env.MACCHIATO_MIRROR_FRAME_BYTES) || 2 * 1024 * 1024;
+/** E2E 回灌分片上限（server 側 parseE2EBackfillFrame 同值硬校驗）。 */
+const MAX_BACKFILL_CHUNKS = 512;
 /** #9:轉錄文件消失多久後裁掉水位線/標題(默認 7 天;CC 清理舊轉錄後 uuid 不復用,不會回歸)。 */
 const PRUNE_MS = Number(process.env.MACCHIATO_MIRROR_PRUNE_MS) || 7 * 24 * 3600 * 1000;
-/** 單批最多消息數（防單帧超 server maxPayload）。運行時讀 env,便於測試覆蓋。 */
 const batchMax = (): number => Number(process.env.MACCHIATO_CC_BATCH_MAX) || 150;
-
 /** 公開 connector 不依賴私有 protocol package；此處鏡像 packages/protocol 的導入 wire shape。 */
 interface ImportToolCall {
   callId: string;
@@ -54,6 +116,9 @@ interface E2EBackfillBase {
   agentLinkId: string;
   hermesSessionId: string;
   mode?: "enable" | "disable";
+  batchId: string;
+  chunkIndex?: number;
+  chunkCount?: number;
 }
 
 type ConnectorE2EBackfill =
@@ -139,16 +204,33 @@ interface State {
   tombstones?: string[];
   /** #154 首掃基線已建(true 之後新發現的會話才 from-zero)。舊安裝(offsets 非空)載入時視為已建。 */
   seeded?: boolean;
+  pendingMirrors?: Array<{
+    batchId: string;
+    frame: Record<string, unknown>;
+    sid: string;
+    endOffset: number;
+    title?: string;
+    /** ACK 可乱序到达；只有同 sid 的前序批全 ACK 后才允许连续提交水位。 */
+    acked?: boolean;
+  }>;
+  pendingE2EBackfills?: Record<
+    string,
+    {
+      batchId: string;
+      wireSid: string;
+      localSid?: string;
+      mode: "enable" | "disable";
+      frames: Array<Record<string, unknown>>;
+      endOffset?: number;
+    }
+  >;
 }
 
 export class Mirror {
   private state: State;
   private timer: ReturnType<typeof setInterval> | null = null;
-  private batchId = 0;
-  // #266 rewind 除 offset 也記發批前的 title——nack 回退時一起還原,否則「無真人消息不建會話」
-  // 守衛(!titles[sid])在重發時失效(offset 回退了但 titles[sid] 已被 set,守衛判假)。
-  private readonly rewind: Array<{ id: number; prev: Record<string, number>; prevTitle: Record<string, string | undefined> }> = [];
   private readonly drivenSids = new Set<string>();
+  private readonly sentBatchAt = new Map<string, number>();
   /**
    * 影子 session 兜底(第二道防護,2026-07-13):**曾被 Macchiato 驅動過**的 CLI 會話 uuid(持久,
    * 由 Drive 從 ULID→CLI 映射灌入,跨重啟)。driven 會話的正文由 live 在 ULID 下獨佔投遞,鏡像
@@ -164,6 +246,17 @@ export class Mirror {
    * 常態下多數 id 被 fastForward 先吃、永不匹配,故必須靠淘汰防洩漏。
    */
   private readonly livePosted = new Map<string, Set<string>>();
+  /**
+   * #308 `MACCHIATO_MIRROR=off` 下仍需**定向**輪詢的會話：app 建的、受 E2E 保護的 driven 會話。
+   * 它們的正文只有鏡像一條投遞路（live 路徑對 E2E 不投正文），而 off 下沒有全量輪詢定時器。
+   * 只裝這一小撮 sid——終端會話一個都不掃，`MIRROR=off` 的契約不破。
+   */
+  private readonly drivenE2EWatch = new Set<string>();
+  /**
+   * #268 自適應縮批：sid → 連續 NACK 次數。每次 NACK 把該會話的每批條數上限對半砍（下限 1），
+   * ACK 後歸零。server 端的失敗常見於「這批太大」，原樣重發同一批只會一直撞同一堵牆。
+   */
+  private readonly nackShrink = new Map<string, number>();
   /**
    * 內部 fork 檔（subagent / 後台任務）：CC 會把它們寫成獨立 <uuid>.jsonl（繼承父會話標題
    * 元數據、**無任何真人消息**）。首次鏡像（水位線 0）折不出 user 消息 → 判內部檔，跳過且
@@ -183,6 +276,14 @@ export class Mirror {
   private readonly quietPolls = new Map<string, number>();
   lastPollAt = Date.now();
   lastError: string | null = null;
+  /**
+   * #348 lastError 的「未結清」標記。poll 成功返回**不等於**問題解決——NACK 後批次仍留在
+   * durable outbox 重試、水位就是不動的。此前 poll 正常返回即無條件清空 lastError，而
+   * health.ts 是 lastError 唯一的用戶可見出口 → #348 要求的「明確報錯」實際落成「靜默凍結」：
+   * 會話停更、UI 什麼也不說。故錯誤一旦記下就黏住，直到**真有一批被 server 提交**（ACK）
+   * 才算恢復正常、允許下一輪 poll 清掉。
+   */
+  private errorSticky = false;
   /** #10:累計計數(進程生命週期),健康上報帶出。 */
   readonly counters: Record<string, number> = {
     mirrorBatches: 0,
@@ -190,14 +291,10 @@ export class Mirror {
     mirrorNacks: 0,
     mirrorErrors: 0,
     mirrorGhostBlocked: 0, // 影子 session 兜底:攔下的「為 driven CLI 會話憑空建會話」次數(正常應恆 0)
+    mirrorDirectionRewinds: 0, // E2E 方向翻轉導致丟棄凍結批、回退重編的次數
+    mirrorDropped: 0, // server 判畸形/毒批而丟棄跳過的批次數(非 0 = 有內容沒進 app)
   };
   private polling = false;
-  /**
-   * #347 send 只代表提交请求；server ACK 前既不能删 K_S，也不能推进/另行消费 transcript 水位线。
-   * key 用 wire sid 接 server ACK；value 保留本地 CC uuid，供 poll/fastForward 锁定和 ACK 提交水位。
-   */
-  private readonly pendingE2EBackfills = new Map<string, { localSid: string; endOffset: number }>();
-
   /** #308 MACCHIATO_MIRROR=off:停鏡像輪詢(終端側活動不進 app)。⚠️ 只停這一樣——
    * fastForward/墓碑/markLivePosted/E2E backfill 是 driven 會話衛生,必須照常跑,
    * 多關任何一個 = 影子會話/雙投全家回歸(#161/#318)。副作用:終端側忙碌指示(#56)一併失去。 */
@@ -218,6 +315,11 @@ export class Mirror {
     if (this.disabled) {
       // ⚠️ 回歸契約:scripts/localchain/scenarios-mirror-off.mjs 斷言此串,改文案需同步
       console.log("· Mirror disabled (MACCHIATO_MIRROR=off) — terminal sessions stay out of the app; app-driven sessions unaffected");
+      // #308 契約的後半句「app-driven sessions unaffected」也要兌現:E2E driven 回合的正文
+      // **只有鏡像這一條路**(live 路徑不投密文正文)。故 off 下仍裝一個**定向**輪詢——只掃
+      // drivenE2EWatch 裡的會話(app 建的、受 E2E 保護的),外加待確認批重發;終端會話一個都不掃,
+      // 契約不破。缺這條時:尾巴晚落盤的最後一塊、任何需重試的批**永遠不會再發**。
+      this.timer = setInterval(() => void this.poll(this.drivenE2EWatch), POLL_MS);
       return;
     }
     void this.poll();
@@ -226,6 +328,7 @@ export class Mirror {
   }
   stop(): void {
     if (this.timer) clearInterval(this.timer);
+    for (const sid of [...this.tailPollTimers.keys()]) this.cancelTailPolls(sid);
   }
   restart(): void {
     this.stop();
@@ -235,6 +338,8 @@ export class Mirror {
 
   setDriven(sid: string): void {
     this.drivenSids.add(sid);
+    if (this.disabled && this.isE2ESession(sid)) this.watchDrivenE2E(sid);
+    this.drivenUuids.add(sid);
   }
 
   /** #161 墓碑:永不再鏡像此 CLI 會話(持久;transcript 不動)。 */
@@ -242,6 +347,9 @@ export class Mirror {
     const t = (this.state.tombstones ??= []);
     if (!t.includes(sid)) {
       t.push(sid);
+      this.state.pendingMirrors = (this.state.pendingMirrors ?? []).filter(
+        (pending) => pending.sid !== sid,
+      );
       this.save();
       console.log(`· 墓碑 ${sid}(鏡像永不再撈)`);
     }
@@ -290,6 +398,60 @@ export class Mirror {
    */
   unsetDriven(sid: string): void {
     this.drivenSids.delete(sid);
+    // #350 回合末尾巴的**定向**追讀。E2E driven 回合的正文只有 transcript 這一條路（live
+    // 不投密文），而 SDK 的 result 常常早於 CLI 把 transcript 尾巴寫完 → 下面這次即時 poll
+    // 讀不到最後一塊，就要等滿一個 POLL_MS（5s）的常規 tick，用戶側表現為「回覆延遲 0–5s、
+    // 且常被拆成兩段到達」。這裡在回合末補幾次**短間隔定向** poll（只掃這一個 sid），把尾巴
+    // 追平壓到亞秒級。純屬調度：內容源仍然只有 transcript，不新增任何投遞路徑。
+    if (this.isE2ESession(sid)) this.scheduleTailPolls(sid);
+    if (this.disabled) {
+      // #308 MIRROR=off:**絕不**在這裡做全量 poll——那會把用戶明確要求不進 app 的終端會話
+      // 全掃一遍鏡像進去(契約反向破裂)。只對「受 E2E 保護的 app-driven 會話」做定向投遞,
+      // 並登記進 watch 讓 start() 的定向輪詢持續兜住晚落盤的尾巴/需重試的批。
+      if (this.isE2ESession(sid)) {
+        this.watchDrivenE2E(sid);
+        void this.poll(new Set([sid]));
+      }
+      return;
+    }
+    void this.poll();
+  }
+
+  /**
+   * #350 回合末尾巴追讀的排程（每 sid 一組，重入即取代——新回合結束時舊排程已無意義）。
+   * 間隔刻意前密後疏：常見情況第一兩次就追平，最後一次兜住寫得特別慢的尾巴；全部落在
+   * 一個 POLL_MS 之內，超出的部分本來就由常規 tick 接手，故不會與它疊加成重複輪詢。
+   */
+  private readonly tailPollTimers = new Map<string, ReturnType<typeof setTimeout>[]>();
+  private static readonly TAIL_POLL_DELAYS_MS = [250, 700, 1500, 3000];
+
+  private scheduleTailPolls(sid: string): void {
+    this.cancelTailPolls(sid);
+    const scope = new Set([sid]);
+    const timers = Mirror.TAIL_POLL_DELAYS_MS.map((delay) => {
+      const timer = setTimeout(() => void this.poll(scope), delay);
+      timer.unref?.(); // 純加速用，絕不因此拖住進程退出
+      return timer;
+    });
+    this.tailPollTimers.set(sid, timers);
+  }
+
+  private cancelTailPolls(sid: string): void {
+    for (const timer of this.tailPollTimers.get(sid) ?? []) clearTimeout(timer);
+    this.tailPollTimers.delete(sid);
+  }
+
+  /** 該本地會話當前是否受 E2E 保護（有 wire 映射或本地直接持鑰）。 */
+  private isE2ESession(sid: string): boolean {
+    return !!this.e2eWireSidForLocal?.(sid) || this.e2e?.isE2E(sid) === true;
+  }
+
+  /** MIRROR=off 下仍需定向輪詢的 app-driven E2E 會話（有界 FIFO，防無限增長）。 */
+  private watchDrivenE2E(sid: string): void {
+    this.drivenE2EWatch.add(sid);
+    while (this.drivenE2EWatch.size > 64) {
+      this.drivenE2EWatch.delete(this.drivenE2EWatch.values().next().value!);
+    }
   }
 
   /**
@@ -314,17 +476,78 @@ export class Mirror {
     }
   }
 
-  /** 回合結束：driven 會話水位線快進到文件末（live 已投遞，鏡像別重複）。 */
+  /** #200/#348：回合結束不再未經 ACK 快進；plaintext live 靠 srcId 去重(#393)，E2E 交 durable mirror。 */
   fastForward(sid: string): void {
-    if (this.hasPendingE2EBackfill(sid)) return;
-    const f = this.fileForSid(sid);
-    if (!f) return;
+    void sid;
+  }
+
+  /**
+   * #473 rewind 的**只讀**勘察：在 sid 的 transcript 裡找 `targetUuid`，回「最後一條要保留的
+   * 行 uuid」與會被丟掉的行數。
+   *
+   * 為什麼只讀:回退本身交給 SDK 的 `forkSession({ upToMessageId })`——它把 transcript 複製進
+   * 一個**新**會話檔並重映射 uuid 鏈,原檔一個字節都不動。我們自己改檔案的舊做法有三個毛病:
+   * 繞開 SDK、進程死在覆寫中途會留半行、以及和「用戶同時在終端 resume 同一會話」打架。
+   *
+   * `upToMessageId` 是 **inclusive**,所以要丟掉目標那條,傳的必須是它**前一條**的 uuid。
+   * `keepUpToUuid = null` 表示目標就是首行 → 沒有任何內容可保留,調用方應改為「丟掉映射、
+   * 下個 prompt 重開新會話」,而不是 fork(省略 upToMessageId 是全量複製,正好相反)。
+   */
+  rewindPlan(sid: string, targetUuid: string): { keepUpToUuid: string | null; dropped: number } | null {
+    if (!sid || !targetUuid) return null;
+    const file = this.fileForSid(sid);
+    if (!file) return null;
+    let content: string;
     try {
-      this.state.offsets[sid] = statSync(f).size;
-      this.save();
+      content = readFileSync(file, "utf8");
     } catch {
-      /* 下輪 poll 兜底 */
+      return null;
     }
+    let keepUpToUuid: string | null = null;
+    let hit = false;
+    let dropped = 0;
+    for (const line of content.split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      let uuid = "";
+      try {
+        uuid = String((JSON.parse(t) as { uuid?: unknown }).uuid ?? "");
+      } catch {
+        continue; // 壞行跳過（與 foldEntries 同款容錯）
+      }
+      if (hit) {
+        dropped += 1;
+        continue;
+      }
+      if (uuid === targetUuid) {
+        hit = true;
+        dropped = 1;
+        continue;
+      }
+      if (uuid) keepUpToUuid = uuid;
+    }
+    return hit ? { keepUpToUuid, dropped } : null;
+  }
+
+  /**
+   * #473 認領 fork 出來的新 transcript：登記為 driven，並把水位線**直接坐到該檔當前 EOF**。
+   *
+   * ⚠️ 這一步漏了就是本功能最壞的 bug：fork 複製過去的整段歷史會被下一輪 poll（5s）當成新消息
+   * 再灌一遍進同一個會話。必須在 fork 返回後**立刻**做，不能等 CLI 下個回合的 `init` 來報。
+   */
+  adoptForked(sid: string): boolean {
+    if (!sid) return false;
+    this.markDrivenUuid(sid);
+    const file = this.fileForSid(sid);
+    let size = 0;
+    try {
+      if (file) size = statSync(file).size;
+    } catch {
+      /* 檔還沒落盤 → 水位 0；下輪 poll 從頭讀,但 driven 守衛已擋住明文落地 */
+    }
+    this.state.offsets[sid] = size;
+    this.save(true);
+    return true;
   }
 
   private fileForSid(sid: string): string | null {
@@ -332,49 +555,162 @@ export class Mirror {
     return null;
   }
 
-  handleNack(batchId: number): void {
-    const e = this.rewind.find((r) => r.id === batchId);
-    if (!e) return;
+  /**
+   * mirror_nack。默認語義是「保留 durable 批、按同 batchId 重發」——但幀是在**發送時**凍結進
+   * outbox 的，會話事後轉 E2E（或關 E2E）後,凍結的舊方向批被 server 的方向校驗**永遠**拒絕：
+   * 水位永久凍結,且每 15 秒把開啟 E2E 前的明文正文重發一次給 server。故終態 code 必須丟批:
+   *  - `e2e_direction`:丟掉**該 sid 的全部**待確認批(後續批同樣是舊方向),水位停在最後一次
+   *    ACK 的位置 → 下輪 poll 從那裡重讀、按當前方向重新編碼,恢復舊實現的自愈路徑。
+   *    已 ACK 未提交的批一併丟棄:重讀會再發一次,server 端按 srcId 冪等去重。
+   *  - `malformed`:批畸形/毒批,重試永遠不會好 → 丟批並**跳過**這段(推水位),否則該會話從此
+   *    永不再前進;lastError 留給 health 讓用戶看見丟了東西。
+   */
+  handleNack(batchId: string | number, error?: string, code?: string): void {
+    const target = (this.state.pendingMirrors ?? []).find(
+      (pending) => pending.batchId === String(batchId),
+    );
+    if (!target) return;
     this.counters.mirrorNacks += 1; // #10
-    for (const [k, off] of Object.entries(e.prev)) this.state.offsets[k] = off;
-    // #266 title 也回退:發批前無標題的會話,nack 後恢復「無標題」→ 守衛在重發時照常生效。
-    for (const [k, t] of Object.entries(e.prevTitle)) {
-      if (t === undefined) delete this.state.titles[k];
-      else this.state.titles[k] = t;
+    this.lastError = error ?? `mirror_nack batch ${batchId}`;
+    this.errorSticky = true; // 直到真有一批被 server 提交才清（見字段註釋）
+    this.sentBatchAt.delete(String(batchId));
+    this.nackShrink.set(target.sid, Math.min((this.nackShrink.get(target.sid) ?? 0) + 1, 8));
+    if (code === "e2e_direction") {
+      const sid = target.sid;
+      const dropped = (this.state.pendingMirrors ?? []).filter((pending) => pending.sid === sid);
+      for (const pending of dropped) this.sentBatchAt.delete(pending.batchId);
+      this.state.pendingMirrors = (this.state.pendingMirrors ?? []).filter(
+        (pending) => pending.sid !== sid,
+      );
+      this.counters.mirrorDirectionRewinds += 1;
+      this.save(true);
+      console.warn(
+        `· mirror_nack(e2e_direction) ${sid} → 丟棄 ${dropped.length} 個舊方向凍結批,回退到水位 ${this.state.offsets[sid] ?? 0} 重讀重編`,
+      );
+      return;
     }
-    this.save();
-    console.warn(`· mirror_nack batch ${batchId} → rewinding watermark for resend`);
+    if (code === "malformed") {
+      this.state.offsets[target.sid] = Math.max(
+        this.state.offsets[target.sid] ?? 0,
+        target.endOffset,
+      );
+      if (target.title) this.state.titles[target.sid] = target.title;
+      this.state.pendingMirrors = (this.state.pendingMirrors ?? []).filter(
+        (pending) => pending.batchId !== target.batchId,
+      );
+      this.counters.mirrorDropped += 1;
+      this.save(true);
+      console.error(
+        `· mirror_nack(malformed) batch ${batchId} → 丟棄該批並跳過(server 判畸形/毒批):${this.lastError}`,
+      );
+      return;
+    }
+    console.warn(`· mirror_nack batch ${batchId} → durable outbox retained for resend`);
   }
 
-  /** server 的 backfill 事务结果：只有成功 ACK 才提交对应快照水位线。 */
+  handleAck(batchId: string | number): void {
+    const pending = (this.state.pendingMirrors ?? []).find(
+      (candidate) => candidate.batchId === String(batchId),
+    );
+    if (!pending) return;
+    pending.acked = true;
+    // 同一 sid 可按字节连续发多批，但 ACK/NACK 可能乱序。只从该 sid 队首连续消费已 ACK
+    // 前缀；后批先 ACK 时保留 durable marker，绝不能越过仍在重试的前批水位。
+    while (true) {
+      const head = (this.state.pendingMirrors ?? []).find(
+        (candidate) => candidate.sid === pending.sid,
+      );
+      if (!head?.acked) break;
+      this.state.offsets[head.sid] = Math.max(
+        this.state.offsets[head.sid] ?? 0,
+        head.endOffset,
+      );
+      if (head.title) this.state.titles[head.sid] = head.title;
+      this.nackShrink.delete(head.sid); // 這批過了 → 恢復正常批大小
+      this.state.pendingMirrors = this.state.pendingMirrors!.filter(
+        (candidate) => candidate.batchId !== head.batchId,
+      );
+      this.sentBatchAt.delete(head.batchId);
+    }
+    this.sentBatchAt.delete(String(batchId));
+    this.errorSticky = false; // 有批真被 server 提交 → 錯誤結清，下輪 poll 可清 lastError
+    this.save(true);
+  }
+
+  acceptsE2EBackfillResult(
+    wireSid: string,
+    mode: "enable" | "disable",
+    batchId: unknown,
+  ): boolean {
+    const pending = this.state.pendingE2EBackfills?.[`${mode}:${wireSid}`];
+    return !!pending && typeof batchId === "string" && pending.batchId === batchId;
+  }
+
   handleE2EBackfillResult(
     wireSid: string,
     mode: "enable" | "disable",
-    committed: boolean,
+    batchIdOrCommitted: unknown,
+    committedMaybe?: boolean,
   ): void {
     const pendingKey = `${mode}:${wireSid}`;
-    const pending = this.pendingE2EBackfills.get(pendingKey);
-    this.pendingE2EBackfills.delete(pendingKey);
-    if (!committed || !pending) return;
-    this.state.offsets[pending.localSid] = Math.max(this.state.offsets[pending.localSid] ?? 0, pending.endOffset);
-    this.save();
+    const pending = this.state.pendingE2EBackfills?.[pendingKey];
+    const batchId = committedMaybe === undefined ? pending?.batchId : batchIdOrCommitted;
+    const committed =
+      committedMaybe === undefined ? batchIdOrCommitted === true : committedMaybe;
+    if (!pending || pending.batchId !== batchId) return;
+    delete this.state.pendingE2EBackfills![pendingKey];
+    this.sentBatchAt.delete(pending.batchId);
+    if (!committed) {
+      this.save(true);
+      return;
+    }
+    if (pending.localSid && pending.endOffset !== undefined) {
+      this.state.offsets[pending.localSid] = Math.max(
+        this.state.offsets[pending.localSid] ?? 0,
+        pending.endOffset,
+      );
+    }
+    this.save(true);
     console.log(
       `· E2E backfill ACK(${mode}): ${wireSid} (local ${pending.localSid}; watermark → ${pending.endOffset})`,
     );
   }
 
   private hasPendingE2EBackfill(localSid: string): boolean {
-    return [...this.pendingE2EBackfills.values()].some((pending) => pending.localSid === localSid);
+    return Object.values(this.state.pendingE2EBackfills ?? {}).some(
+      (pending) => pending.localSid === localSid,
+    );
   }
 
-  private async poll(): Promise<void> {
+  private pendingOffset(sid: string): number {
+    let offset = this.state.offsets[sid] ?? 0;
+    for (const pending of this.state.pendingMirrors ?? []) {
+      if (pending.sid === sid) offset = Math.max(offset, pending.endOffset);
+    }
+    return offset;
+  }
+
+  private pendingTitle(sid: string): string | undefined {
+    let title = this.state.titles[sid];
+    for (const pending of this.state.pendingMirrors ?? []) {
+      if (pending.sid === sid && pending.title) title = pending.title;
+    }
+    return title;
+  }
+
+  private async poll(scope?: Set<string>): Promise<void> {
     if (this.polling) return;
     this.polling = true;
     try {
-      this.doPoll();
-      this.lastError = null;
+      this.doPoll(scope);
+      // ⚠️ 只有「本輪成功 **且** 沒有仍在重試的待確認批」才算恢復正常。無條件清空會把 NACK/
+      // 方向不符/毒批留下的錯誤在下一輪 poll(5s 後)抹掉——而 health.ts 是 lastError 唯一的
+      // 用戶可見出口,#348 要求的「明確報錯」就會落成「靜默凍結」:水位不動、UI 什麼也不說。
+      // 只有沒有未結清錯誤時才算恢復正常（見 errorSticky）。
+      if (!this.errorSticky) this.lastError = null;
     } catch (e) {
       this.lastError = (e as Error).message;
+      this.errorSticky = true;
       this.counters.mirrorErrors += 1; // #10
       console.error("[mirror poll]", this.lastError);
     } finally {
@@ -383,13 +719,33 @@ export class Mirror {
     }
   }
 
-  private doPoll(): void {
+  /**
+   * @param scope 給定時只處理這批 sid（定向輪詢，見 `drivenE2EWatch`）：不掃其餘 transcript、
+   *   不做 prune / busy 活動上報、不置 `seeded`（置了會讓日後開啟鏡像時把全部存量會話當「新
+   *   會話」從 0 灌一遍），且水位缺失時按 from-zero 處理（這些會話的內容本就該進 app）。
+   */
+  private doPoll(scope?: Set<string>): void {
     if (!this.linkb.isReady) return;
+    const pendingMirrors = this.state.pendingMirrors ?? [];
+    const pendingBackfills = Object.values(this.state.pendingE2EBackfills ?? {});
+    for (const pending of pendingMirrors) {
+      if (Date.now() - (this.sentBatchAt.get(pending.batchId) ?? 0) >= 15_000) {
+        this.linkb.send(pending.frame as any);
+        this.sentBatchAt.set(pending.batchId, Date.now());
+      }
+    }
+    for (const pending of pendingBackfills) {
+      if (Date.now() - (this.sentBatchAt.get(pending.batchId) ?? 0) >= 15_000) {
+        for (const frame of pending.frames) this.linkb.send(frame as any);
+        this.sentBatchAt.set(pending.batchId, Date.now());
+      }
+    }
 
     const now = Date.now();
     const activity: Array<{ hermesSessionId: string; busy: boolean }> = [];
-    const found = discoverSessions();
-    this.prune(new Set(found.map((s) => s.sid)), now);
+    const all = discoverSessions();
+    const found = scope ? all.filter((s) => scope.has(s.sid)) : all;
+    if (!scope) this.prune(new Set(all.map((s) => s.sid)), now);
     for (const { sid, file } of found) {
       if (this.state.tombstones?.includes(sid)) continue; // #161 app 刪過 → 永不再撈
       let size: number;
@@ -408,10 +764,14 @@ export class Mirror {
       // #154 基線策略(拍板翻轉,對齊 codex):**首掃**把既有 transcript 基線到文件末——裝上連接器
       // 不再把全部舊會話不請自來灌進側欄,歷史改走「導入」提示(全量/按 project/不導,app 端三選)。
       // 首掃之後新發現的會話 = 連接器運行期間新建 → 照舊從 0 全量鏡像(終端新會話實時可見不變)。
-      if (!(sid in this.state.offsets)) this.state.offsets[sid] = this.state.seeded ? 0 : size;
+      if (!(sid in this.state.offsets)) {
+        // 定向輪詢的目標是 app 自己建的 driven 會話 → 一律 from-zero（`seeded` 在 MIRROR=off
+        // 下可能從未置過，按它走會把本會話誤基線到檔末、正文永遠不投）。
+        this.state.offsets[sid] = scope || this.state.seeded ? 0 : size;
+      }
 
       if (this.drivenSids.has(sid)) {
-        this.state.offsets[sid] = size; // live 獨佔投遞：只快進
+        // #200/#348 回合在途只让路；发送成功不代表 server 提交，绝不能预推水位。
         // driven 回合的工作態由 live 路徑權威投遞——鏡像側靜默讓路（不發 false 防踩 live 的 true）。
         this.busySids.delete(sid);
         this.quietPolls.delete(sid);
@@ -424,11 +784,29 @@ export class Mirror {
       // 追平：單會話分批發（每批 ≤ BATCH_MAX 條），單帧只裝一條會話 → 防超 server maxPayload(8MiB)。
       let guard = 0;
       while (guard++ < 2000) {
-        const off = this.state.offsets[sid] ?? 0;
+        const off = this.pendingOffset(sid);
         if (size <= off) break;
         const { entries, endOffset } = readEntries(file, off);
         if (!entries.length) break;
-        const folded = foldEntries(entries, endOffset, Date.now(), batchMax());
+        // 自適應縮批(#268 二期):同一 sid 連續被 NACK 就對半縮條數上限(下限 1)。server 端的
+        // 失敗常見於「這一批太大」(聚合條數/總字節撞限額),原樣重發同一批只會一直撞同一堵牆;
+        // 縮到能過為止,ACK 後由 successShrink 逐步恢復。
+        const shrink = this.nackShrink.get(sid) ?? 0;
+        const effectiveMax = Math.max(1, Math.floor(batchMax() / 2 ** Math.min(shrink, 8)));
+        const initialFold = foldEntries(entries, endOffset, Date.now(), effectiveMax);
+        let byteBudget = 0;
+        let messageLimit = 0;
+        for (const message of initialFold.messages) {
+          // 密文 base64/nonce/tag 也要留余量；最终 frame 仍由 sendOne 按实际 JSON 严格校验。
+          const estimate = Buffer.byteLength(JSON.stringify(toImportMessage(message)), "utf8") * 2 + 512;
+          if (messageLimit > 0 && byteBudget + estimate > MAX_WIRE_BYTES) break;
+          byteBudget += estimate;
+          messageLimit += 1;
+        }
+        const folded =
+          initialFold.messages.length > Math.max(1, messageLimit)
+            ? foldEntries(entries, endOffset, Date.now(), Math.max(1, messageLimit))
+            : initialFold;
         const { consumedUpTo, title } = folded;
         // #318 先濾掉 live 已投的殘片(回合末晚落盤、逃過 fastForward)——防重複最後一塊。濾空的批次
         // 照常推進水位線(下方 consumedUpTo),只是不 emit;不影響「無 user 不建會話」等既有守衛。
@@ -444,7 +822,13 @@ export class Mirror {
         // 真會話首批必含首條 user prompt,故不受影響;殘片會話後續出現真 user 即恢復全量鏡像。
         // 第二道(2026-07-13):`drivenUuids.has(sid)` —— 曾被 Macchiato 驅動的 CLI 會話**永不**單獨建
         // 鏡像會話(其正文由 live 在 ULID 下獨佔投遞),連「有 user 的終端續問」也不建(極少見,取捨)。
-        if (!this.state.titles[sid] && (this.drivenUuids.has(sid) || !messages.some((m) => m.role === "user"))) {
+        const mappedWireSid = this.e2eWireSidForLocal?.(sid);
+        const knownTitle = this.pendingTitle(sid);
+        if (
+          !knownTitle &&
+          ((!mappedWireSid && this.drivenUuids.has(sid)) ||
+            !messages.some((m) => m.role === "user"))
+        ) {
           this.internalAt.set(sid, size);
           break;
         }
@@ -452,10 +836,9 @@ export class Mirror {
         // 標題優先級：流裡 custom-title > 已記標題 > 首條 user 截斷（分批時首批可能沒讀到 custom-title,
         // 先用 fallback，後續批讀到 custom-title 再更新）。
         const firstUser = messages.find((m) => m.role === "user")?.text.slice(0, 60);
-        const candidate = title ?? (this.state.titles[sid] ? undefined : firstUser);
-        const newTitle = candidate && candidate !== this.state.titles[sid] ? candidate : undefined;
+        const candidate = title ?? (knownTitle ? undefined : firstUser);
+        const newTitle = candidate && candidate !== knownTitle ? candidate : undefined;
         if (messages.length || newTitle) {
-          const mappedWireSid = this.e2eWireSidForLocal?.(sid);
           const directE2ESid = this.e2e?.isE2E(sid) ? sid : undefined;
           const targetSid = mappedWireSid ?? directE2ESid ?? sid;
           if (!mappedWireSid && !directE2ESid && this.plaintextLocalAllowed?.(sid) === false) {
@@ -467,26 +850,32 @@ export class Mirror {
           // 兜底自檢(2026-07-13):若竟為 driven CLI 會話走到「首次 emit(=建會話)」,說明上面兩道守衛
           // 有洞——這正是影子 session。阻止落地 + 記 mirrorGhostBlocked(健康上報帶出;正常恆 0,非 0=有洞
           // 當場可見)+ 錯誤日誌。正常路徑上這永遠不觸發(主守衛已攔)——它是防未來回歸的絆線。
-          if (!this.state.titles[sid] && this.drivenUuids.has(sid)) {
+          if (!mappedWireSid && !knownTitle && this.drivenUuids.has(sid)) {
             this.counters.mirrorGhostBlocked += 1;
             console.error(
               `[mirror] ⚠️ 影子 session 兜底觸發:阻止為 driven CLI 會話 ${sid} 憑空建鏡像會話(守衛有洞?mirrorGhostBlocked=${this.counters.mirrorGhostBlocked})`,
             );
           } else {
-            this.sendOne(
+            const sent = this.sendOne(
               sid,
-              this.entry(targetSid, newTitle ?? this.state.titles[sid] ?? "Claude Code", messages),
-              off,
+              this.entry(targetSid, newTitle ?? knownTitle ?? "Claude Code", messages),
+              consumedUpTo,
+              newTitle,
             );
-            if (newTitle) this.state.titles[sid] = newTitle;
+            if (sent) {
+              if (!scope) this.state.seeded = true; // 定向輪詢沒掃存量,不得謊稱首掃完成
+              continue;
+            }
+            break;
           }
         }
         if (consumedUpTo <= off) break; // 無進展（尾部全 in-flight）→ 下輪 poll
-        this.state.offsets[sid] = consumedUpTo;
+        // 只有没产生 wire mutation（例如 livePosted 已由实时路径确认覆盖）的行可本地消费。
+        if (!messages.length && !newTitle) this.state.offsets[sid] = consumedUpTo;
       }
 
-      // #56 工作態結算（內部 fork 檔不算——它們不是 server 端的真會話）。
-      if (!this.internalAt.has(sid)) {
+      // #56 工作態結算（內部 fork 檔不算——它們不是 server 端的真會話）。定向輪詢不上報活動。
+      if (!scope && !this.internalAt.has(sid)) {
         const inFlight = (this.state.offsets[sid] ?? 0) < size;
         const recentGrowth = now - (this.lastGrowthAt.get(sid) ?? 0) < 90_000;
         if (grew || (inFlight && recentGrowth)) {
@@ -507,24 +896,39 @@ export class Mirror {
     if (activity.length) {
       this.linkb.send({ t: "mirror_activity", agentLinkId: this.linkb.agentLinkId, sessions: activity });
     }
-    this.state.seeded = true; // #154 首掃完成:此後新發現的會話才 from-zero
+    // ⚠️ 定向輪詢**不得**置 seeded:它沒掃過存量會話,置了等於謊稱「首掃完成」,日後開啟鏡像時
+    // 全部存量會話會被當「新會話」從 0 全量灌一遍(#154 明確不要的行為)。
+    if (!scope) this.state.seeded = true; // #154 首掃完成:此後新發現的會話才 from-zero
     this.save();
   }
 
-  /** 發一條會話的一批（單帧單會話）；記 rewind 供 nack 回退。 */
-  private sendOne(sid: string, entry: Record<string, unknown>, prevOff: number): void {
-    this.batchId += 1;
-    // #266 記發批前的 title(此刻尚未 set 新標題,見調用點 302→303 順序)供 nack 一起回退。
-    this.rewind.push({ id: this.batchId, prev: { [sid]: prevOff }, prevTitle: { [sid]: this.state.titles[sid] } });
-    if (this.rewind.length > REWIND_KEEP) this.rewind.shift();
-    this.linkb.send({
+  /** 單帧先按实际 JSON 字节校验并 WAL 落盘；mirror_ack 才提交 offset/title。 */
+  private sendOne(
+    sid: string,
+    entry: Record<string, unknown>,
+    endOffset: number,
+    title?: string,
+  ): boolean {
+    const batchId = randomUUID();
+    const frame = {
       t: "mirror_append",
       agentLinkId: this.linkb.agentLinkId,
       sessions: [entry],
-      batchId: this.batchId,
-    });
+      batchId,
+    };
+    if (Buffer.byteLength(JSON.stringify(frame), "utf8") > MAX_WIRE_BYTES) {
+      this.lastError = `single mirror message exceeds ${MAX_WIRE_BYTES} byte frame budget (${sid})`;
+      this.errorSticky = true;
+      console.error(`[mirror] ${this.lastError}; watermark retained`);
+      return false;
+    }
+    (this.state.pendingMirrors ??= []).push({ batchId, frame, sid, endOffset, title });
+    this.save(true);
+    this.linkb.send(frame);
+    this.sentBatchAt.set(batchId, Date.now());
     this.counters.mirrorBatches += 1; // #10
     this.counters.mirrorMessages += Array.isArray((entry as any).messages) ? (entry as any).messages.length : 0;
+    return true;
   }
 
   /** 構造批次條目；E2E 會話走加密（標題+內容盲存，srcId 是元數據保留）。 */
@@ -555,22 +959,65 @@ export class Mirror {
   ): Promise<void> {
     const e2e = this.e2e;
     if (!e2e) return;
+    const pendingKey = `${mode}:${wireSid}`;
+    const existing = this.state.pendingE2EBackfills?.[pendingKey];
+    if (existing) {
+      for (const frame of existing.frames) this.linkb.send(frame as any);
+      this.sentBatchAt.set(existing.batchId, Date.now());
+      return;
+    }
     const file = localSid ? this.fileForSid(localSid) : null;
+    const batchId = randomUUID();
     const base = {
       t: "e2e_backfill" as const,
       agentLinkId: this.linkb.agentLinkId,
       hermesSessionId: wireSid,
       mode,
+      batchId,
     };
     const notFound = (): void => {
       const frame = { ...base, found: false } satisfies ConnectorE2EBackfill;
+      (this.state.pendingE2EBackfills ??= {})[pendingKey] = {
+        batchId,
+        wireSid,
+        localSid,
+        mode,
+        frames: [frame],
+      };
+      this.save(true);
       this.linkb.send(frame);
+      this.sentBatchAt.set(batchId, Date.now());
       console.warn(
         `· E2E backfill(${mode}): no settled transcript for ${wireSid}` +
           (localSid ? ` (local ${localSid})` : " (no local session mapping)") +
           " → found:false" +
           (mode === "disable" ? " (disable failed, K_S kept)" : " (server history NOT replaced)"),
       );
+    };
+    /**
+     * 本地歷史存在、但**編不出合法 wire 幀**（單條超幀預算 / 分片數超 512）。
+     * ⚠️ 這裡絕不能 throw：唯一調用點是 `void ....catch(console.error)`，拋出等於一幀不發 →
+     * server 的 pendingOp 永遠掛著、兩側 barrier 永不解除、該會話所有 prompt 靜默丟棄，**重啟
+     * 也不救**。必須回一幀讓 server 出終態：`found:false` 是協議裡唯一的「連接器交不出回灌」
+     * 信號，server 收到後回 `ok:false` + 釋放 quiesce barrier（disable 另清 pending、會話保持
+     * 加密；enable 保持 pending 不誤報成功——那是 server 既有的安全設計）。錯誤同時掛 lastError
+     * 上健康,用戶看得見。
+     */
+    const unrepresentable = (reason: string): void => {
+      this.lastError = `E2E backfill(${mode}) ${wireSid}: ${reason}`;
+      this.errorSticky = true;
+      console.error(`[mirror] ${this.lastError} → 回 found:false 讓 server 出終態(不再靜默掛死)`);
+      const frame = { ...base, found: false } satisfies ConnectorE2EBackfill;
+      (this.state.pendingE2EBackfills ??= {})[pendingKey] = {
+        batchId,
+        wireSid,
+        localSid,
+        mode,
+        frames: [frame],
+      };
+      this.save(true);
+      this.linkb.send(frame);
+      this.sentBatchAt.set(batchId, Date.now());
     };
     if (!localSid || !file) return notFound();
     const { entries, endOffset } = readEntries(file, 0);
@@ -605,10 +1052,63 @@ export class Mirror {
       session,
       ...(disableReceipt ? { disableReceipt } : {}),
     } satisfies ConnectorE2EBackfill;
-    this.linkb.send(frame);
-    this.pendingE2EBackfills.set(`${mode}:${wireSid}`, { localSid, endOffset });
+    const messageChunks: ImportMessage[][] = [];
+    let current: ImportMessage[] = [];
+    for (const message of session.messages) {
+      const candidate = [...current, message];
+      // 探測用**最壞情況**分片元數據:真幀是 `chunkIndex:<n>, chunkCount:<m>`,比 0/1 多幾個
+      // 字節。用 0/1 探測會讓臨界批在真發時超預算(只能靠下面的兜底校驗發現,整次轉換就廢了)。
+      const probe = {
+        ...frame,
+        session: { ...session, messages: candidate },
+        chunkIndex: MAX_BACKFILL_CHUNKS - 1,
+        chunkCount: MAX_BACKFILL_CHUNKS,
+      };
+      if (Buffer.byteLength(JSON.stringify(probe), "utf8") > MAX_WIRE_BYTES) {
+        if (!current.length) {
+          return unrepresentable(
+            `single E2E backfill message exceeds ${MAX_WIRE_BYTES} byte frame budget`,
+          );
+        }
+        messageChunks.push(current);
+        current = [message];
+      } else {
+        current = candidate;
+      }
+    }
+    if (current.length) messageChunks.push(current);
+    if (messageChunks.length > MAX_BACKFILL_CHUNKS) {
+      return unrepresentable(`E2E backfill requires more than ${MAX_BACKFILL_CHUNKS} chunks`);
+    }
+    const frames = messageChunks.map((chunk, chunkIndex) => ({
+      ...frame,
+      session: { ...session, messages: chunk },
+      chunkIndex,
+      chunkCount: messageChunks.length,
+    }));
+    if (
+      frames.some(
+        (chunk) => Buffer.byteLength(JSON.stringify(chunk), "utf8") > MAX_WIRE_BYTES,
+      )
+    ) {
+      // 走到這裡說明上面的最壞情況探測仍不夠保守(不該發生)——照樣回終態,不靜默掛死。
+      return unrepresentable(
+        `single E2E backfill message exceeds ${MAX_WIRE_BYTES} byte frame budget`,
+      );
+    }
+    (this.state.pendingE2EBackfills ??= {})[pendingKey] = {
+      batchId,
+      wireSid,
+      localSid,
+      mode,
+      frames,
+      endOffset,
+    };
+    this.save(true);
+    for (const chunk of frames) this.linkb.send(chunk);
+    this.sentBatchAt.set(batchId, Date.now());
     console.log(
-      `· E2E backfill(${mode}) submitted for ${wireSid} (local ${localSid}; ${msgs.length} messages; waiting for server ACK)`,
+      `· E2E backfill(${mode}) submitted for ${wireSid} (local ${localSid}; ${msgs.length} messages / ${frames.length} chunks; waiting for server ACK)`,
     );
   }
 
@@ -648,28 +1148,37 @@ export class Mirror {
           tombstones: s.tombstones ?? [], // #161
           // #154:舊安裝(有水位線,歷史已全量鏡過)視為已 seeded;白名單漏字段的教訓——顯式帶上。
           seeded: s.seeded ?? Object.keys(s.offsets ?? {}).length > 0,
+          pendingMirrors: Array.isArray(s.pendingMirrors) ? s.pendingMirrors : [],
+          pendingE2EBackfills:
+            s.pendingE2EBackfills && typeof s.pendingE2EBackfills === "object"
+              ? s.pendingE2EBackfills
+              : {},
         };
       } catch {
         /* 下一個候選 */
       }
     }
-    return { offsets: {}, titles: {}, missingAt: {} };
+    return {
+      offsets: {},
+      titles: {},
+      missingAt: {},
+      pendingMirrors: [],
+      pendingE2EBackfills: {},
+    };
   }
   private lastSaved = "";
-  private save(): void {
+  private save(strict = false): void {
     try {
       // #262 dirty 判斷:序列化與上次落盤相同 → 跳過(每 5s 無條件寫盤兩份=主+.bak,≈3.4 萬次/天
       // 傷 SD 卡)。JSON.stringify 遠比兩次 write+rename 便宜。
       const json = JSON.stringify(this.state);
       if (json === this.lastSaved) return;
-      mkdirSync(dirname(statePath()), { recursive: true });
-      const tmp = `${statePath()}.tmp`;
-      writeFileSync(tmp, json);
-      if (existsSync(statePath())) renameSync(statePath(), `${statePath()}.bak`); // #6:上一版留作 .bak
-      renameSync(tmp, statePath()); // 原子寫（審計 #6 的教訓：別半截損壞）
+      // #6:上一版留作 .bak（同樣 0600——它裝的是上一版的完整正文）。
+      if (existsSync(statePath())) durableWrite(`${statePath()}.bak`, this.lastSaved || json);
+      durableWrite(statePath(), json); // 原子寫（審計 #6 的教訓：別半截損壞）
       this.lastSaved = json;
-    } catch {
-      /* 持久化失敗不致命 */
+    } catch (error) {
+      if (strict) throw error;
     }
   }
 }

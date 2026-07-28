@@ -1,9 +1,23 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { createServer } from "node:http";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { IMAGE_BLOCK_MAX, imageBlockFor, isPrivateIp, materializeAttachment, pinnedLookup, validateDownloadUrl } from "../src/cc/attachments";
+
+const LOCAL_ENV_KEYS = [
+  "MACCHIATO_ATTACH_ALLOW_LOCALHOST",
+  "MACCHIATO_ATTACH_LOCAL_PORT",
+  "MACCHIATO_ATTACH_LOCAL_PATH_PREFIX",
+] as const;
+
+function clearLocalAttachEnv() {
+  for (const k of LOCAL_ENV_KEYS) delete process.env[k];
+}
+
+afterEach(() => {
+  clearLocalAttachEnv();
+});
 
 describe("imageBlockFor (#118 原生圖片入站)", () => {
   it("支持類型且 ≤3.5MB → image block;非圖/超限/讀失敗 → null(回退路徑注入)", () => {
@@ -33,30 +47,81 @@ describe("isPrivateIp", () => {
   });
 });
 
-describe("validateDownloadUrl", () => {
-  it("拒 file/ftp/data、http 非 localhost、私網/雲元數據 https;放行 http+localhost", async () => {
-    for (const bad of ["file:///etc/passwd", "ftp://x/y", "data:text/plain,hi", "http://evil.com/x", "https://169.254.169.254/x", "https://127.0.0.1/x", "https://10.0.0.5/x"])
+describe("validateDownloadUrl (#379 生產拒 localhost)", () => {
+  it("生產默認拒 file/ftp/data/http/loopback、私網 https", async () => {
+    clearLocalAttachEnv();
+    for (const bad of [
+      "file:///etc/passwd",
+      "ftp://x/y",
+      "data:text/plain,hi",
+      "http://evil.com/x",
+      "http://localhost:8080/attachments/x",
+      "http://127.0.0.1:8080/attachments/x",
+      "http://[::1]:8080/attachments/x",
+      "http://0.0.0.0:8080/attachments/x",
+      "https://169.254.169.254/x",
+      "https://127.0.0.1/x",
+      "https://10.0.0.5/x",
+    ])
       await expect(validateDownloadUrl(bad), bad).rejects.toThrow();
-    await expect(validateDownloadUrl("http://localhost:8080/x")).resolves.toBeUndefined();
-    await expect(validateDownloadUrl("http://127.0.0.1:9/x")).resolves.toBeUndefined();
+  });
+
+  it("dev env 下放行 http→loopback（host/port/path 對齊）；錯 port/path/userinfo 仍拒", async () => {
+    process.env.MACCHIATO_ATTACH_ALLOW_LOCALHOST = "1";
+    // 默認 port 8080 + path /attachments
+    for (const ok of [
+      "http://localhost:8080/attachments/raw?k=1",
+      "http://127.0.0.1:8080/attachments/x",
+      "http://[::1]:8080/attachments",
+    ])
+      await expect(validateDownloadUrl(ok), ok).resolves.toBeUndefined();
+
+    for (const bad of [
+      "http://localhost/attachments/x", // 缺端口 → 80 ≠ 8080
+      "http://localhost:9/attachments/x", // 錯端口
+      "http://localhost:8080/other/x", // 錯 path
+      "http://evil@127.0.0.1:8080/attachments/x", // userinfo
+      "http://0.0.0.0:8080/attachments/x", // 非 loopback 字面
+      "https://localhost:8080/attachments/x", // https→loopback 仍走 isPrivateIp 拒
+    ])
+      await expect(validateDownloadUrl(bad), bad).rejects.toThrow();
+
+    process.env.MACCHIATO_ATTACH_LOCAL_PORT = "9999";
+    process.env.MACCHIATO_ATTACH_LOCAL_PATH_PREFIX = "/media";
+    await expect(validateDownloadUrl("http://127.0.0.1:9999/media/a")).resolves.toBeUndefined();
+    await expect(validateDownloadUrl("http://127.0.0.1:8080/media/a")).rejects.toThrow();
+    await expect(validateDownloadUrl("http://127.0.0.1:9999/attachments/a")).rejects.toThrow();
   });
 });
 
 describe("materializeAttachment", () => {
-  it("http+localhost 真下載落盤,內容正確", async () => {
+  it("dev env 下 http+loopback 真下載落盤,內容正確", async () => {
     const payload = Buffer.from("\x89PNG-attachment-body");
     const srv = createServer((_q, res) => res.end(payload));
     await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
     const port = (srv.address() as { port: number }).port;
     const dir = mkdtempSync(join(tmpdir(), "cc-att-"));
     process.env.MACCHIATO_CC_ATTACH_DIR = dir;
+    process.env.MACCHIATO_ATTACH_ALLOW_LOCALHOST = "1";
+    process.env.MACCHIATO_ATTACH_LOCAL_PORT = String(port);
+    process.env.MACCHIATO_ATTACH_LOCAL_PATH_PREFIX = "/attachments";
     try {
-      const p = await materializeAttachment({ id: "a1", name: "pic.png", url: `http://127.0.0.1:${port}/pic.png` });
+      const p = await materializeAttachment({
+        id: "a1",
+        name: "pic.png",
+        url: `http://127.0.0.1:${port}/attachments/pic.png`,
+      });
       expect(readFileSync(p)).toEqual(payload);
       expect(p).toContain("pic.png");
     } finally {
       srv.close();
     }
+  });
+  it("生產默認拒絕 localhost 下載", async () => {
+    clearLocalAttachEnv();
+    await expect(
+      materializeAttachment({ id: "b", name: "n", url: "http://127.0.0.1:8080/attachments/x" }),
+    ).rejects.toThrow();
   });
   it("拒絕 file:// url(不落盤)", async () => {
     await expect(materializeAttachment({ id: "b", name: "n", url: "file:///etc/passwd" })).rejects.toThrow();

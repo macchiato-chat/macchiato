@@ -45,7 +45,8 @@ function showCode(code: string, webUrl: string, fresh: boolean): void {
 /** 一次配對嘗試：paired → resolve(Creds)；auth_error → reject("PAIR_REJECTED")；斷線 → reject("PAIR_CLOSED")。 */
 function attempt(serverUrl: string, webUrl: string, label: string, fresh: boolean): Promise<Creds> {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(serverUrl, { handshakeTimeout: 20000 });
+    // #380 pairing 幀極小；仍顯式封頂，避免沿用 ws 默認 100MiB。
+    const ws = new WebSocket(serverUrl, { handshakeTimeout: 20000, maxPayload: 1 * 1024 * 1024 });
     let seenFirst = false;
     let refresher: ReturnType<typeof setInterval> | null = null;
     let settled = false;

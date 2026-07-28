@@ -36,6 +36,22 @@ function lineToMessage(o: unknown, ord: number): CodexMessage | null {
 }
 
 /**
+ * 檔內完整行數 = `\n` 個數 = 從 ord=0 讀完全部完整行後的「下一起始 ord」。
+ * 與 `readNewMessages(content, 0, 0).lineCount` 一致。
+ *
+ * ⚠️ 不可用 `content.split("\n").length`：尾 `\n` 時多出一個空串，恒多 1（#418）。
+ * seed / endOrd 等「水位快進到 EOF」路徑必須與增量路徑同一計法，否則 ordBase 偏移 →
+ * srcId 哈希不一致 → 跨路徑去重失效。
+ */
+export function nextOrdAtEof(content: string): number {
+  let n = 0;
+  for (let i = 0; i < content.length; i++) {
+    if (content.charCodeAt(i) === 0x0a) n += 1;
+  }
+  return n;
+}
+
+/**
  * 從 offset 起讀新內容,按整行解析(剩半行留到下次)。返回消息 + 新 offset。
  * ord 用**全文行號**(從 0 掃),保證同一文件內去重穩定;調用方傳入起始行號基準。
  */
@@ -43,6 +59,7 @@ export function readNewMessages(
   content: string,
   offset: number,
   ordBase: number,
+  maxMessages = Number.POSITIVE_INFINITY,
 ): { messages: CodexMessage[]; newOffset: number; lineCount: number } {
   const buf = Buffer.from(content, "utf8");
   if (buf.length <= offset) return { messages: [], newOffset: offset, lineCount: 0 };
@@ -53,17 +70,30 @@ export function readNewMessages(
   const lines = whole.split("\n");
   const messages: CodexMessage[] = [];
   let ord = ordBase;
+  let consumedBytes = 0;
+  let lineCount = 0;
   for (const line of lines) {
     const s = line.trim();
     if (s) {
       try {
         const m = lineToMessage(JSON.parse(s), ord);
-        if (m) messages.push(m);
+        if (m) {
+          if (messages.length >= maxMessages) {
+            return {
+              messages,
+              newOffset: offset + consumedBytes,
+              lineCount,
+            };
+          }
+          messages.push(m);
+        }
       } catch {
         /* 壞行跳過 */
       }
     }
+    consumedBytes += Buffer.byteLength(line, "utf8") + 1;
+    lineCount += 1;
     ord += 1;
   }
-  return { messages, newOffset: offset + lastNl + 1, lineCount: lines.length };
+  return { messages, newOffset: offset + lastNl + 1, lineCount };
 }

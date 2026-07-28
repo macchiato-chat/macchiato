@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { E2EKeyStore } from "../src/e2e/keys";
+import { deviceKeyFingerprint, E2EKeyStore } from "../src/e2e/keys";
 import { decrypt, genDeviceKeypair, unwrapKey } from "../src/e2e/crypto";
 import { isCommittedE2EBackfillResult } from "../src/cc/mirror";
 import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/e2e/control";
@@ -41,6 +41,7 @@ function device() {
   return {
     deviceId: "dev-1",
     pubKey: kp.pubB64,
+    keyFingerprint: deviceKeyFingerprint(kp.pubB64),
     open: (sealed: string, blob: string) => decrypt(unwrapKey(sealed, kp.priv), blob),
   };
 }
@@ -65,7 +66,11 @@ describe("#74 E2E 連接器編排端到端", () => {
   it("wrap → 設備解封 K_S → 解 encryptContent/encryptText 明文一致", () => {
     const e2e = freshStore();
     const dev = device();
-    const [w] = e2e.wrapForDevices(SID, [{ deviceId: dev.deviceId, pubKey: dev.pubKey }]);
+    const [w] = e2e.wrapForDevices(SID, [{
+      deviceId: dev.deviceId,
+      pubKey: dev.pubKey,
+      keyFingerprint: dev.keyFingerprint,
+    }]);
     expect(w).toBeTruthy();
     // 內容塊
     const enc = e2e.encryptContent(SID, { text: "secret hi", reasoning: "think", tools: [] });
@@ -79,7 +84,11 @@ describe("#74 E2E 連接器編排端到端", () => {
   it("鏡像加密批(Mirror.entry E2E 分支):title+每條 enc 設備可解,srcId 明文保留", async () => {
     const e2e = freshStore();
     const dev = device();
-    const [w] = e2e.wrapForDevices(SID, [{ deviceId: dev.deviceId, pubKey: dev.pubKey }]);
+    const [w] = e2e.wrapForDevices(SID, [{
+      deviceId: dev.deviceId,
+      pubKey: dev.pubKey,
+      keyFingerprint: dev.keyFingerprint,
+    }]);
     // 直接調 Mirror 的私有 entry(E2E 分支)
     const { Mirror } = await import("../src/cc/mirror");
     const m = new Mirror({ agentLinkId: "AL", isReady: true, send: () => {}, onFrame: () => () => {} } as any, e2e);
@@ -100,8 +109,13 @@ describe("#74 E2E 連接器編排端到端", () => {
     const e2e = freshStore();
     const dev = device();
     const wireSid = "01K0CCBACKFILLWIRE000000001";
-    e2e.wrapForDevices(wireSid, [{ deviceId: dev.deviceId, pubKey: dev.pubKey }]);
-    const [w] = e2e.wrapForDevices(wireSid, [{ deviceId: dev.deviceId, pubKey: dev.pubKey }]);
+    const target = {
+      deviceId: dev.deviceId,
+      pubKey: dev.pubKey,
+      keyFingerprint: dev.keyFingerprint,
+    };
+    e2e.wrapForDevices(wireSid, [target]);
+    const [w] = e2e.wrapForDevices(wireSid, [target]);
     // 造一個 transcript 讓 backfillE2E 讀
     const cfg = mkdtempSync(join(tmpdir(), "cc-e2e-cfg-"));
     process.env.CLAUDE_CONFIG_DIR = cfg;
@@ -136,7 +150,7 @@ describe("#74 E2E 連接器編排端到端", () => {
     // send 不是提交：成功 ACK 前不推进 transcript 水位线。
     expect((m as any).state.offsets[SID]).toBeUndefined();
     expect((m as any).state.offsets[wireSid]).toBeUndefined();
-    m.handleE2EBackfillResult(wireSid, "enable", true);
+    m.handleE2EBackfillResult(wireSid, "enable", enBatch.batchId, true);
     expect((m as any).state.offsets[SID]).toBe(statSync(f).size);
     expect((m as any).state.offsets[wireSid]).toBeUndefined();
 
@@ -153,11 +167,11 @@ describe("#74 E2E 連接器編排端到端", () => {
     expect(disBatch.session.messages[0].enc).toBeUndefined();
     expect(e2e.isE2E(wireSid)).toBe(true);
     expect(e2e.hasKey(wireSid)).toBe(true); // 仅发送成功不等于 server 事务提交，ACK 前绝不删
-    expect((m as any).pendingE2EBackfills.size).toBe(1);
+    expect(Object.keys((m as any).state.pendingE2EBackfills)).toHaveLength(1);
 
-    m.handleE2EBackfillResult(wireSid, "disable", true);
+    m.handleE2EBackfillResult(wireSid, "disable", disBatch.batchId, true);
     e2e.completeDisable(wireSid, disBatch.disableReceipt); // 模拟带 completion receipt 的成功结果
-    expect((m as any).pendingE2EBackfills.size).toBe(0);
+    expect(Object.keys((m as any).state.pendingE2EBackfills)).toHaveLength(0);
     expect(e2e.isE2E(wireSid)).toBe(false);
     expect(e2e.hasKey(wireSid)).toBe(false);
   });
@@ -201,9 +215,10 @@ describe("#74 E2E 連接器編排端到端", () => {
     (m as any).doPoll();
     expect((m as any).state.offsets[SID]).toBeUndefined(); // pending 时显式快进/普通 poll 都必须冻结
     expect(sent).toHaveLength(1);
-    m.handleE2EBackfillResult(wireSid, "disable", false);
+    const batchId = sent[0].batchId;
+    m.handleE2EBackfillResult(wireSid, "disable", batchId, false);
     expect((m as any).state.offsets[SID]).toBeUndefined();
-    expect((m as any).pendingE2EBackfills.size).toBe(0);
+    expect(Object.keys((m as any).state.pendingE2EBackfills)).toHaveLength(0);
     expect(e2e.hasKey(wireSid)).toBe(true);
   });
 
@@ -225,7 +240,11 @@ describe("#74 E2E 連接器編排端到端", () => {
   it("文件存在但無已結算消息 → found:false；disable 保留 K_S", async () => {
     const e2e = freshStore();
     const dev = device();
-    e2e.wrapForDevices(SID, [{ deviceId: dev.deviceId, pubKey: dev.pubKey }]);
+    e2e.wrapForDevices(SID, [{
+      deviceId: dev.deviceId,
+      pubKey: dev.pubKey,
+      keyFingerprint: dev.keyFingerprint,
+    }]);
     const cfg = mkdtempSync(join(tmpdir(), "cc-e2e-title-only-"));
     process.env.CLAUDE_CONFIG_DIR = cfg;
     const { mkdirSync } = await import("node:fs");

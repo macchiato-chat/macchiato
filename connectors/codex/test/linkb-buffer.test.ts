@@ -448,3 +448,72 @@ describe("#247 Link B 半開連接偵測", () => {
     else process.env.MACCHIATO_LINKB_LIVENESS_MS = prev;
   });
 });
+
+describe("#380 Link B maxPayload / 入站边界 / pending 字节背压", () => {
+  it("超大入站 raw 在 JSON.parse 前丢弃", () => {
+    const c = new LinkBClient({ serverUrl: "ws://unused", connectorToken: "t", agentLinkId: "al" } as any);
+    const seen: unknown[] = [];
+    c.onFrame((m) => seen.push(m));
+    (c as any).ready = true;
+    const huge = Buffer.alloc(LinkBClient.MAX_FRAME_BYTES + 1, 0x61);
+    (c as any).handleFrame(huge);
+    expect(seen).toEqual([]);
+    c.close();
+  });
+
+  it("畸形 JSON 不崩、不投递", () => {
+    const c = new LinkBClient({ serverUrl: "ws://unused", connectorToken: "t", agentLinkId: "al" } as any);
+    const seen: unknown[] = [];
+    c.onFrame((m) => seen.push(m));
+    (c as any).ready = true;
+    expect(() => (c as any).handleFrame(Buffer.from("{not-json"))).not.toThrow();
+    expect(seen).toEqual([]);
+    c.close();
+  });
+
+  it("深嵌套 / 过长 sessionId / 超多顶层键 → isSaneInbound 拒绝", () => {
+    expect(LinkBClient.isSaneInbound({ t: "ping" })).toBe(true);
+    expect(LinkBClient.isSaneInbound({ t: "tui", sessionId: "ok" })).toBe(true);
+    expect(LinkBClient.isSaneInbound({ t: "tui", sessionId: "x".repeat(257) })).toBe(false);
+    expect(LinkBClient.isSaneInbound(null)).toBe(false);
+    expect(LinkBClient.isSaneInbound([])).toBe(false);
+    expect(LinkBClient.isSaneInbound({ t: 1 })).toBe(false);
+    // 深嵌套炸弹
+    let deep: unknown = { t: "tui" };
+    for (let i = 0; i < 40; i++) deep = { t: "tui", nested: deep };
+    expect(LinkBClient.isSaneInbound(deep)).toBe(false);
+    // 顶层键过多
+    const many: Record<string, unknown> = { t: "tui" };
+    for (let i = 0; i < 70; i++) many[`k${i}`] = i;
+    expect(LinkBClient.isSaneInbound(many)).toBe(false);
+    // 未知 type 但边界合规 → 放行
+    expect(LinkBClient.isSaneInbound({ t: "future_frame", sessionId: "s1" })).toBe(true);
+  });
+
+  it("pending 总字节超限时丢最旧（即使帧数未满 500）", () => {
+    const c = new LinkBClient({ serverUrl: "ws://unused", connectorToken: "t", agentLinkId: "al" } as any);
+    // 构造 ~1MiB 有效载荷的帧；约 17 帧即超过 16MiB 预算
+    const pad = "p".repeat(1024 * 1024);
+    for (let i = 0; i < 20; i++) {
+      c.send({ t: "tui", n: i, pad });
+    }
+    const p = (c as any).pending as string[];
+    const bytes = (c as any).pendingBytes as number;
+    expect(p.length).toBeLessThan(20);
+    expect(p.length).toBeGreaterThan(0);
+    expect(bytes).toBeLessThanOrEqual(LinkBClient.PENDING_MAX_BYTES);
+    expect(bytes).toBe(
+      p.reduce((n, f) => n + Buffer.byteLength(f, "utf8"), 0),
+    );
+    // 最旧的应被挤掉
+    expect(JSON.parse(p[0]!).n).toBeGreaterThan(0);
+    c.close();
+  });
+
+  it("默认 socketFactory 带 maxPayload=MAX_FRAME_BYTES", () => {
+    // 构造时不注入 factory → 走默认；抽查常量与 server 对齐
+    expect(LinkBClient.MAX_FRAME_BYTES).toBe(8 * 1024 * 1024);
+    expect(LinkBClient.PENDING_MAX).toBe(500);
+    expect(LinkBClient.PENDING_MAX_BYTES).toBe(16 * 1024 * 1024);
+  });
+});

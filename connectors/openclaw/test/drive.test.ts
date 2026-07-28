@@ -147,6 +147,50 @@ describe("drive 下行分派", () => {
     await linkb.deliver(tui("session.interrupt", "agent:main:discord:channel:9"));
     expect(calls[0]).toMatchObject({ method: "sessions.abort", params: { key: "agent:main:discord:channel:9" } });
   });
+
+  it("#368 quiesce 等在途回合结束，并拒绝屏障后的新内容", async () => {
+    const { drive, gw, linkb, calls } = makeDrive();
+    const sid = "01SID";
+    const key = `${MACCHIATO_PREFIX}01sid`;
+    await linkb.deliver(tui("prompt.submit", sid, { text: "第一条" }));
+    gw.fire({
+      event: "agent",
+      payload: {
+        stream: "lifecycle",
+        data: { phase: "start" },
+        runId: "r1",
+        sessionKey: key,
+      },
+    });
+
+    let settled = false;
+    const barrier = drive.quiesceE2E(sid, "enable", "q-1").then((ok) => {
+      settled = true;
+      return ok;
+    });
+    const promptCalls = () => calls.filter((call) => call.method === "chat.send");
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(settled).toBe(false);
+    await linkb.deliver(tui("prompt.submit", sid, { text: "屏障后消息" }));
+    expect(promptCalls()).toHaveLength(1);
+
+    gw.fire({
+      event: "agent",
+      payload: {
+        stream: "lifecycle",
+        data: { phase: "end" },
+        runId: "r1",
+        sessionKey: key,
+      },
+    });
+    expect(await barrier).toBe(true);
+    drive.releaseE2EQuiesce(sid, "enable", "stale");
+    await linkb.deliver(tui("prompt.submit", sid, { text: "仍被挡住" }));
+    expect(promptCalls()).toHaveLength(1);
+    drive.releaseE2EQuiesce(sid, "enable", "q-1");
+    await linkb.deliver(tui("prompt.submit", sid, { text: "恢复" }));
+    expect(promptCalls()).toHaveLength(2);
+  });
 });
 
 describe("#370 E2E control ingress", () => {
@@ -416,6 +460,10 @@ describe("#60 附件入站", () => {
     });
     await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
     const port = (srv.address() as any).port;
+    // #379：生產默認拒 http→loopback，dev 須顯式放行（端口/路徑前綴同 attachments.test.ts 的寫法）。
+    process.env.MACCHIATO_ATTACH_ALLOW_LOCALHOST = "1";
+    process.env.MACCHIATO_ATTACH_LOCAL_PORT = String(port);
+    process.env.MACCHIATO_ATTACH_LOCAL_PATH_PREFIX = "";
     try {
       const { linkb, calls, sent } = makeDrive();
       await linkb.deliver(tui("prompt.submit", "01SID", {
@@ -430,6 +478,9 @@ describe("#60 附件入站", () => {
       ]);
       expect(sent.filter((m) => m.frame?.params?.type === "review.summary")).toEqual([]);
     } finally {
+      delete process.env.MACCHIATO_ATTACH_ALLOW_LOCALHOST;
+      delete process.env.MACCHIATO_ATTACH_LOCAL_PORT;
+      delete process.env.MACCHIATO_ATTACH_LOCAL_PATH_PREFIX;
       srv.close();
     }
   });
@@ -657,24 +708,44 @@ describe("#242 gateway 重連重置回合態", () => {
   });
 });
 
-describe("#158 出站附件", () => {
-  it("chat final 正文帶 MEDIA: 路徑 → media.attach 事件(base64 payload)", async () => {
-    const { mkdtempSync, writeFileSync } = await import("node:fs");
+describe("#158/#372 出站附件", () => {
+  it("chat final 正文帶 MEDIA: 且在允許根內 → media.attach 事件(base64 payload)", async () => {
+    const { mkdtempSync, writeFileSync, realpathSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
-    const img = join(mkdtempSync(join(tmpdir(), "oc-m-")), "out.png");
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "oc-m-")));
+    const img = join(dir, "out.png");
     writeFileSync(img, "IMGDATA");
+    const prev = process.env.MACCHIATO_MEDIA_ALLOW_ROOTS;
+    process.env.MACCHIATO_MEDIA_ALLOW_ROOTS = dir;
+    try {
+      const { gw, linkb, sent } = makeDrive();
+      const SID3 = "01OC158SID000000000000000A";
+      const KEY3 = `agent:main:macchiato:${SID3}`.toLowerCase();
+      await linkb.deliver(tui("prompt.submit", SID3, { text: "畫張圖" }));
+      gw.fire({ event: "chat", payload: { sessionKey: KEY3, state: "final", runId: "r1",
+        message: { role: "assistant", content: [{ type: "text", text: `畫好了\nMEDIA: ${img}` }] } } });
+      await new Promise((r) => setTimeout(r, 10));
+      const media = sent.find((f: any) => f.frame?.params?.type === "media.attach") as any;
+      expect(media).toBeTruthy();
+      expect(media.frame.params.payload).toMatchObject({ kind: "image", name: "out.png", mime: "image/png" });
+      expect(Buffer.from(media.frame.params.payload.data_b64, "base64").toString()).toBe("IMGDATA");
+    } finally {
+      if (prev === undefined) delete process.env.MACCHIATO_MEDIA_ALLOW_ROOTS;
+      else process.env.MACCHIATO_MEDIA_ALLOW_ROOTS = prev;
+    }
+  });
+
+  it("#372 MEDIA:/etc/hosts 不觸發 media.attach", async () => {
     const { gw, linkb, sent } = makeDrive();
-    const SID3 = "01OC158SID000000000000000A";
-    const KEY3 = `agent:main:macchiato:${SID3}`.toLowerCase();
-    await linkb.deliver(tui("prompt.submit", SID3, { text: "畫張圖" }));
-    gw.fire({ event: "chat", payload: { sessionKey: KEY3, state: "final", runId: "r1",
-      message: { role: "assistant", content: [{ type: "text", text: `畫好了\nMEDIA: ${img}` }] } } });
+    const SID4 = "01OC372SID000000000000000B";
+    const KEY4 = `agent:main:macchiato:${SID4}`.toLowerCase();
+    await linkb.deliver(tui("prompt.submit", SID4, { text: "讀 hosts" }));
+    gw.fire({ event: "chat", payload: { sessionKey: KEY4, state: "final", runId: "r372",
+      message: { role: "assistant", content: [{ type: "text", text: "MEDIA: /etc/hosts" }] } } });
     await new Promise((r) => setTimeout(r, 10));
-    const media = sent.find((f: any) => f.frame?.params?.type === "media.attach") as any;
-    expect(media).toBeTruthy();
-    expect(media.frame.params.payload).toMatchObject({ kind: "image", name: "out.png", mime: "image/png" });
-    expect(Buffer.from(media.frame.params.payload.data_b64, "base64").toString()).toBe("IMGDATA");
+    const media = sent.find((f: any) => f.frame?.params?.type === "media.attach");
+    expect(media).toBeUndefined();
   });
 });
 
@@ -721,6 +792,44 @@ describe("#261 live 工具事件(session.tool → tool.start/complete)", () => {
     expect(f.payload).toMatchObject({ tool_id: "call_X", name: "bash", duration_s: 1.5, result_text: "exit 0" });
     expect(f.payload.result).toMatchObject({ exitCode: 0, status: "completed" });
     expect(f.payload.args).toEqual({}); // result 事件無 args → 空對象
+  });
+
+  // #432 live 投過的工具,回合末鏡像打撈時只補內容、不再重複 append。
+  it("enrichLiveTool:live 投過該 callId → 補發同 tool_id 的 tool.complete 帶真輸出,返回 true", async () => {
+    const { gw, linkb, sent, drive } = makeDrive();
+    const KEY = `${MACCHIATO_PREFIX}01sid`;
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "x" }));
+    gw.fire(start(KEY)); // live 投過 call_X
+    sent.length = 0;
+    const claimed = (drive as any).enrichLiveTool("01SID", {
+      callId: "call_X", name: "bash", input: { command: "ls" }, output: "file1\nfile2",
+    });
+    expect(claimed).toBe(true); // 認領 → 打撈不再 append
+    expect(sent).toHaveLength(1);
+    const f = sent[0].frame.params;
+    expect(f.type).toBe("tool.complete");
+    expect(f.session_id).toBe("01SID");
+    expect(f.payload).toMatchObject({ tool_id: "call_X", result_text: "file1\nfile2", args: { command: "ls" } });
+  });
+
+  it("enrichLiveTool:live 沒投過的 callId → 返回 false 不發幀(打撈照舊 append,保真)", async () => {
+    const { gw, linkb, sent, drive } = makeDrive();
+    const KEY = `${MACCHIATO_PREFIX}01sid`;
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "x" }));
+    gw.fire(start(KEY));
+    sent.length = 0;
+    expect((drive as any).enrichLiveTool("01SID", { callId: "call_OTHER", name: "bash", output: "x" })).toBe(false);
+    expect(sent).toHaveLength(0);
+  });
+
+  it("enrichLiveTool:認領但無輸出可補 → 仍返回 true(重複 append 才是 bug),不發空幀", async () => {
+    const { gw, linkb, sent, drive } = makeDrive();
+    const KEY = `${MACCHIATO_PREFIX}01sid`;
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "x" }));
+    gw.fire(start(KEY));
+    sent.length = 0;
+    expect((drive as any).enrichLiveTool("01SID", { callId: "call_X", name: "bash", output: "  " })).toBe(true);
+    expect(sent).toHaveLength(0);
   });
 
   it("isError → result_text 帶 (error) + 失敗狀態", async () => {

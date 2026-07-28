@@ -24,7 +24,7 @@ import { fetchChatAttachment, type ChatAttachment } from "./attachments";
 import type { OpenClawGateway, GatewayEvent } from "./gateway";
 import { keyForSid, sidForKey, type Mirror } from "./mirror";
 import { generateTitle, loadTitled, saveTitled } from "./titles";
-import { extractMediaPaths, readMediaFile } from "./media";
+import { extractMediaPaths, readMediaFile, resolveMediaAllowRoots } from "./media";
 import type { E2EKeyStore, ServerE2EStateV1 } from "../e2e/keys";
 import {
   dispatchForE2EControl,
@@ -33,6 +33,7 @@ import {
   type E2EControlEnvelopeV1,
   type E2EControlKind,
 } from "../e2e/control";
+import { formatCommandInvokeLog, logContent, safeErr, shortId, textLen } from "../safe-log";
 
 // key ↔ sid 映射移居 mirror.ts（E2E 回灌也要用）；re-export 保持既有導入面不變。
 export { keyForSid, sidForKey };
@@ -68,13 +69,14 @@ const E2E_SENSITIVE_METHODS = new Set([
  */
 export function applyReadyE2EIdentityState(
   e2e: E2EKeyStore,
-  drive: Pick<Drive, "assertE2EIdentitySafe">,
+  drive: Pick<Drive, "applyE2EQuiesceState" | "assertE2EIdentitySafe">,
   mirror: Pick<Mirror, "assertE2EIdentitySafe">,
   rawState: unknown,
 ): string[] {
   const blocked = e2e.applyServerState(rawState);
   // applyServerState 已完整驗證 shape，之後才可读取 pending-enable 精確白名單。
   const state = rawState as ServerE2EStateV1;
+  drive.applyE2EQuiesceState(state.sessions);
   const pendingEnables = new Set(
     state.sessions
       .filter((session) => session.pendingOp === "enable")
@@ -165,6 +167,16 @@ export class Drive {
   /** 小寫 key → server 原始 sid（大寫 ULID）；回傳事件用它找回 server 認識的 sid。 */
   private readonly sidByKey = new Map<string, string>();
   /**
+   * #432 sid → 本進程 live 已投過的 toolCallId。gateway 的 live `session.tool` result 只帶
+   * `{status, exitCode, durationMs}`——**沒有工具輸出正文**,完整 input/output 只在 transcript 裡,
+   * 由鏡像回合末打撈。此表讓打撈能認出「這個工具 live 已經投過卡了」→ 走 enrichLiveTool 原地補內容,
+   * 而不是當作新內容再 append 一條消息(#261 加了 live 投遞卻沒改 #147 的打撈前提 → 同一批工具
+   * 在正文前後各出現一次,前空後滿)。有界:超額按 FIFO 淘汰最舊 sid。
+   */
+  private readonly liveToolIds = new Map<string, Set<string>>();
+  private static readonly LIVE_TOOL_SIDS = 64;
+  private static readonly LIVE_TOOL_IDS_PER_SID = 512;
+  /**
    * #202 對賬狀態(持久,跨重啟):驅動過的 key→sid + 每 key 已對賬的最大 __openclaw.seq 水位線。
    * driven key 的投遞是 live 獨佔(鏡像跳過),live 漏收 gateway 廣播(WS 重連窗/進程死)= 該段丟。
    * 對賬 = 重連/啟動時拉 chat.history(每條帶穩定 __openclaw.id + 單調 seq),把 seq>水位線的行
@@ -188,6 +200,11 @@ export class Drive {
   /** #113 已自動生成過標題的 sid(持久,重啟不重生、不覆蓋用戶手改)。 */
   private readonly titled = loadTitled();
   private readonly e2eControl?: E2EControlVerifier;
+  private readonly e2eQuiescing = new Map<
+    string,
+    { requestId: string; mode: "enable" | "disable" }
+  >();
+  private readonly contentInflight = new Set<string>();
 
   /** #4 已重投過的 `sid:text哈希`——每條 prompt 最多重投一次,寧丟勿雙發。 */
   private readonly promptRetried = new Set<string>();
@@ -229,6 +246,7 @@ export class Drive {
       (identity) => this.wireSessionIdForLocalIdentity(identity),
       () => this.plaintextLocalIdentityAllowed(),
     );
+    this.mirror?.setLiveToolEnricher?.((sid, tool) => this.enrichLiveTool(sid, tool)); // #432
   }
 
   private saveDriveState(): void {
@@ -301,12 +319,91 @@ export class Drive {
 
   /** 掛上兩側監聽（linkb.start 前調用）。 */
   wire(): void {
-    this.linkb.onFrame((m) => void this.onServerFrame(m));
+    this.linkb.onFrame((m) => {
+      const frame = m.frame as { method?: string; params?: { session_id?: string } } | undefined;
+      const sid = (m.sessionId ?? frame?.params?.session_id) as string | undefined;
+      const content = frame?.method === "prompt.submit" || frame?.method === "command.invoke";
+      if (content && sid && this.e2eQuiescing.has(sid)) {
+        console.error(`[E2E quiesce ${sid}] rejected late ${frame?.method}`);
+        return;
+      }
+      if (content && sid) this.contentInflight.add(sid);
+      void this.onServerFrame(m).finally(() => {
+        if (content && sid) this.contentInflight.delete(sid);
+      });
+    });
     this.gw.onEvent((e) => this.onGatewayEvent(e));
     // #202 重連後對賬 + #242 回合態重置(斷連窗內 lifecycle end 可能已丟)。
     this.gw.onConnected?.(() => void this.onGatewayConnected());
     // #302 gateway 死亡:在途回合立即定稿 error(否則 server 永卡 streaming,用戶氣泡轉圈無終態)。
     this.gw.onDisconnected?.(() => this.onGatewayDisconnected());
+  }
+
+  applyE2EQuiesceState(
+    sessions: Array<{ hermesSessionId: string; pendingOp: "enable" | "disable" | null }>,
+  ): void {
+    const pending = new Map(
+      sessions
+        .filter((session) => session.pendingOp !== null)
+        .map((session) => [session.hermesSessionId, session.pendingOp as "enable" | "disable"]),
+    );
+    for (const sid of this.e2eQuiescing.keys()) if (!pending.has(sid)) this.e2eQuiescing.delete(sid);
+    for (const [sid, mode] of pending) this.e2eQuiescing.set(sid, { requestId: `ready:${mode}`, mode });
+  }
+
+  beginE2ETransition(sid: string, mode: "enable" | "disable"): void {
+    const current = this.e2eQuiescing.get(sid);
+    this.e2eQuiescing.set(sid, { requestId: current?.requestId ?? `resume:${mode}`, mode });
+  }
+
+  /**
+   * 屏障可能是**重連時按 DB pending state 重建**的（`applyE2EQuiesceState`）或續跑補的
+   * （`beginE2ETransition`）——那時本地沒有真實請求可記，只能用 `ready:`/`resume:` 合成哨兵。
+   * 這種代次**永遠對不上** server 那個真 UUID：若嚴格比對 requestId，server 的權威釋放會被
+   * 丟掉、屏障永久殘留，該會話的 prompt/command 從此靜默丟棄（用戶側表現為「發了沒反應」）。
+   * 故合成代次一律接受同 mode 的權威釋放/接管。
+   */
+  private static isSyntheticQuiesceId(requestId: string): boolean {
+    return requestId.startsWith("ready:") || requestId.startsWith("resume:");
+  }
+
+  releaseE2EQuiesce(sid: string, mode?: "enable" | "disable", requestId?: string): void {
+    const current = this.e2eQuiescing.get(sid);
+    if (!current) return;
+    if (mode && current.mode !== mode) return;
+    if (
+      requestId &&
+      current.requestId !== requestId &&
+      !Drive.isSyntheticQuiesceId(current.requestId)
+    ) {
+      return;
+    }
+    this.e2eQuiescing.delete(sid);
+  }
+
+  async quiesceE2E(sid: string, mode: "enable" | "disable", requestId: string): Promise<boolean> {
+    const current = this.e2eQuiescing.get(sid);
+    // 合成哨兵代次可被真請求接管（否則重連後每次 quiesce 都直接 false，E2E 開關永遠失敗）。
+    if (current && current.requestId !== requestId && !Drive.isSyntheticQuiesceId(current.requestId)) {
+      return false;
+    }
+    this.e2eQuiescing.set(sid, { requestId, mode });
+    const key = keyForSid(sid);
+    const configured = Number(process.env.MACCHIATO_E2E_QUIESCE_MS);
+    const deadline = Date.now() + (Number.isFinite(configured) && configured > 0 ? configured : 4 * 60_000);
+    while (
+      this.active.has(key) ||
+      this.contentInflight.has(sid) ||
+      (this.pendingFollowUps.get(key)?.length ?? 0) > 0 ||
+      this.retryWaiting.has(key)
+    ) {
+      if (Date.now() >= deadline) {
+        this.releaseE2EQuiesce(sid, mode, requestId);
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return this.e2eQuiescing.get(sid)?.requestId === requestId;
   }
 
   /** #302 gateway 斷開:對齊 CC 語義(onChannelEnd 定稿 error)——所有在途 live 回合就地終態。
@@ -363,6 +460,40 @@ export class Drive {
     return this.driven.has(key);
   }
 
+
+  /** #432 記下 live 已投的工具 id(有界 FIFO)。 */
+  private rememberLiveTool(sid: string, toolId: string): void {
+    let ids = this.liveToolIds.get(sid);
+    if (!ids) {
+      ids = new Set();
+      this.liveToolIds.set(sid, ids);
+      while (this.liveToolIds.size > Drive.LIVE_TOOL_SIDS) {
+        this.liveToolIds.delete(this.liveToolIds.keys().next().value!);
+      }
+    }
+    ids.add(toolId);
+    while (ids.size > Drive.LIVE_TOOL_IDS_PER_SID) ids.delete(ids.keys().next().value!);
+  }
+
+  /**
+   * #432 鏡像打撈到某工具時問一句:live 投過同一個 callId 嗎?
+   *  - 投過 → 用 transcript 的完整 input/output 補發一次 `tool.complete`(同 tool_id),server 按
+   *    callId 找回原塊**原地補空洞**;返回 true,讓打撈把它從 mirror_append 批裡剔除(否則雙投)。
+   *  - 沒投過(老 gateway 無 session.tool / live 漏收)→ 返回 false,照舊走 append,保真不丟。
+   */
+  enrichLiveTool(sid: string, tool: { callId: string; name: string; input?: unknown; output?: string }): boolean {
+    if (!tool.callId || !this.liveToolIds.get(sid)?.has(tool.callId)) return false;
+    const output = typeof tool.output === "string" ? tool.output : "";
+    if (output.trim()) {
+      this.emit(sid, "tool.complete", {
+        tool_id: tool.callId,
+        name: tool.name,
+        ...(tool.input !== undefined ? { args: tool.input } : {}),
+        result_text: output,
+      });
+    }
+    return true; // 即使無輸出可補也算「已由 live 投遞」——重複 append 才是 bug
+  }
 
   private emit(sid: string, type: string, payload: Record<string, unknown>): void {
     this.linkb.send({
@@ -615,9 +746,17 @@ export class Drive {
             this.pendingUser.set(key, arr);
           }
           await this.markDriven(key, sid);
-          const logText =
-            authenticated && args ? `/skill ${name} [encrypted args]` : text;
-          console.log(`· #199 command.invoke ${logText} → ${key}`);
+          // #381:默认日志只记命令名 + args 长度 + 截断 id,绝不写 args/prompt 正文
+          console.log(
+            formatCommandInvokeLog({
+              tag: "#199",
+              name,
+              argsLen: args.length,
+              sid: key,
+              e2e: authenticated !== undefined,
+            }),
+          );
+          logContent("command.invoke", text);
           await this.sendPrompt(key, sid, text, [], authenticated === undefined);
           return;
         }
@@ -625,7 +764,7 @@ export class Drive {
           // #5:重投等待期(#4)收到中斷 → 標記取消重投。
           if (this.retryWaiting.has(key)) {
             this.retryCancelled.add(key);
-            console.log(`· 用戶中斷 → 取消待重投 prompt(${key})`);
+            console.log(`· 用戶中斷 → 取消待重投 prompt(${shortId(key)})`);
           }
           await this.gw.request("sessions.abort", { key });
           return;
@@ -783,9 +922,11 @@ export class Drive {
       const title = await generateTitle(this.gw, sid, firstUserText);
       if (!title) return;
       this.emit(sid, "session.title", { title });
-      console.log(`· 生成標題「${title}」→ ${sid}`);
+      // #381:标题正文可能含用户首条消息片段,默认只记长度
+      console.log(`· session.title len=${textLen(title)} → ${shortId(sid)}`);
+      logContent("session.title", title);
     } catch (e) {
-      console.error(`[auto title failed for ${sid}] ${(e as Error).message}`);
+      console.error(`[auto title failed for ${shortId(sid)}] ${safeErr(e)}`);
     }
   }
 
@@ -840,6 +981,7 @@ export class Drive {
       const name = String(d.name ?? "tool");
       const meta = typeof d.meta === "string" && d.meta ? d.meta : undefined;
       if (d.phase === "start") {
+        this.rememberLiveTool(sid, toolId); // #432 打撈時據此原地補內容,不再重複 append
         this.emit(sid, "tool.start", {
           tool_id: toolId,
           name,
@@ -911,18 +1053,26 @@ export class Drive {
     }
   }
 
-  /** #158 出站附件:回覆正文裡 MEDIA:/裸路徑標的文件 → media.attach(Hermes 同款,server 通吃)。 */
+  /**
+   * #158 出站附件 + #372 capability-bound:
+   * 回覆正文裡 `MEDIA:` 標的、且落在允許根內的文件 → media.attach(Hermes 同款,server 通吃)。
+   * 裸絕對路徑不再自動上傳;根外(/etc、~/.ssh…)一律拒。
+   */
   private emitMediaFromText(sid: string, text: string): void {
     try {
-      for (const path of extractMediaPaths(text)) {
-        const payload = readMediaFile(path);
+      // OpenClaw 目前無 per-session cwd 表;根 = macchiato 管理目錄 + MACCHIATO_MEDIA_ALLOW_ROOTS。
+      const roots = resolveMediaAllowRoots();
+      for (const path of extractMediaPaths(text, roots)) {
+        const payload = readMediaFile(path, roots);
         if (!payload) continue;
         this.emit(sid, "media.attach", payload as unknown as Record<string, unknown>);
-        console.log(`· media.attach ${payload.name}(${payload.size}B)→ ${sid}`);
+        // #381:不写文件名/路径(可能含客户数据);只记 size + 截断 sid
+        console.log(`· media.attach size=${payload.size}B → ${shortId(sid)}`);
+        logContent("media.attach", String(payload.name ?? ""));
       }
     } catch (e) {
       this.counters.driveErrors += 1;
-      console.error(`[#158 media extract failed ${sid}] ${(e as Error).message}`);
+      console.error(`[#158 media extract failed ${shortId(sid)}] ${safeErr(e)}`);
     }
   }
 

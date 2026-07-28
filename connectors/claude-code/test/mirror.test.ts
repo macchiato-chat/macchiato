@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, statSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Mirror } from "../src/cc/mirror";
@@ -202,6 +202,54 @@ describe("Mirror", () => {
     expect(last.messages[0].text).toBe("msg1"); // 重發
   });
 
+  it("#348 断线后 durable outbox 原 batchId 重放；ACK 前 offset/title 均不提交", () => {
+    setupEnv();
+    writeFileSync(file, userLine("durable"));
+    const first = fakeLinkb();
+    const m1 = new Mirror(first.linkb);
+    (m1 as any).doPoll();
+    const original = appends(first.sent)[0] as any;
+    expect((m1 as any).state.offsets[SID]).toBe(0);
+    expect((m1 as any).state.titles[SID]).toBeUndefined();
+
+    const second = fakeLinkb();
+    const m2 = new Mirror(second.linkb);
+    (m2 as any).doPoll();
+    const replay = appends(second.sent)[0] as any;
+    expect(replay.batchId).toBe(original.batchId);
+    expect(replay.sessions).toEqual(original.sessions);
+    expect((m2 as any).state.offsets[SID]).toBe(0);
+    m2.handleAck(replay.batchId);
+    expect((m2 as any).state.offsets[SID]).toBeGreaterThan(0);
+    expect((m2 as any).state.titles[SID]).toBe("durable");
+  });
+
+  it("#348 同会话乱序 ACK 不越过前序 NACK 的水位线", () => {
+    setupEnv();
+    process.env.MACCHIATO_CC_BATCH_MAX = "1";
+    writeFileSync(file, userLine("first") + userLine("second"));
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb);
+    (m as any).doPoll();
+    delete process.env.MACCHIATO_CC_BATCH_MAX;
+
+    const batches = appends(sent) as any[];
+    expect(batches).toHaveLength(2);
+    expect((m as any).state.offsets[SID]).toBe(0);
+
+    m.handleAck(batches[1].batchId);
+    expect((m as any).state.offsets[SID]).toBe(0);
+    expect((m as any).state.pendingMirrors).toHaveLength(2);
+
+    m.handleNack(batches[0].batchId);
+    expect((m as any).state.offsets[SID]).toBe(0);
+
+    m.handleAck(batches[0].batchId);
+    expect((m as any).state.pendingMirrors).toHaveLength(0);
+    expect((m as any).state.offsets[SID]).toBeGreaterThan(0);
+    expect((m as any).state.titles[SID]).toBe("first");
+  });
+
   it("#266 mirror_nack 也回退 titles:重發時「無真人消息不建會話」守衛照常生效", () => {
     setupEnv();
     writeFileSync(file, "");
@@ -211,10 +259,11 @@ describe("Mirror", () => {
     appendFileSync(file, userLine("問題")); // 首批含 user + 派生標題 → titles[sid] 被 set
     (m as any).doPoll();
     const sid = (appends(sent).at(-1) as any).sessions[0].hermesSessionId;
-    expect((m as any).state.titles[sid]).toBeTruthy(); // 發批後有標題
+    expect((m as any).state.titles[sid]).toBeUndefined(); // ACK 前 title 仍只是候選
+    expect((m as any).state.pendingMirrors.at(-1).title).toBeTruthy();
     const batchId = (appends(sent).at(-1) as any).batchId;
     m.handleNack(batchId);
-    expect((m as any).state.titles[sid]).toBeUndefined(); // #266 nack 一起回退 title(此前殘留)
+    expect((m as any).state.titles[sid]).toBeUndefined(); // nack 保留 outbox，不提前提交 title
   });
 
   it("driven 會話只快進不投遞", () => {
@@ -231,7 +280,7 @@ describe("Mirror", () => {
     expect(batches).toHaveLength(0);
   });
 
-  it("driven 回合末殘片(fastForward 後才落盤的 assistant)→ 不生成影子會話;真人續問才恢復", () => {
+  it("#200 driven 回合未 ACK 的 transcript/殘片都不生成影子會話", () => {
     setupEnv();
     writeFileSync(file, "");
     const { linkb, sent } = fakeLinkb();
@@ -250,16 +299,16 @@ describe("Mirror", () => {
     // 不得憑空建一個只有 agent 消息的影子會話
     const ghost = appends(sent).filter((f: any) => f.sessions?.[0]?.messages?.length > 0);
     expect(ghost).toHaveLength(0);
-    // 但用戶真在終端續這個會話(新 user 回合)→ 鏡像恢復、建會話
+    // 即使随后出现 user，曾 driven 的 UUID 也不能另建影子；恢复由 wire 会话显式重发驱动。
     appendFileSync(file, userLine("那怎麼修"));
     (m as any).doPoll();
     const resumed = appends(sent).filter((f: any) =>
       f.sessions?.[0]?.messages?.some((x: any) => x.text === "那怎麼修"),
     );
-    expect(resumed.length).toBeGreaterThan(0);
+    expect(resumed).toHaveLength(0);
   });
 
-  it("driven 回合末標題寫回(custom-title,零消息)→ 不生成影子會話;真人續問才建", () => {
+  it("#200 driven 回合標題/殘片/user 都不繞過影子會話守衛", () => {
     setupEnv();
     writeFileSync(file, "");
     const { linkb, sent } = fakeLinkb();
@@ -279,12 +328,10 @@ describe("Mirror", () => {
     appendFileSync(file, assistantLine("(補齊收尾)"));
     (m as any).doPoll();
     expect(appends(sent)).toHaveLength(0);
-    // 但用戶真在終端續這個會話 → 恢復鏡像(帶上寫回的標題)
+    // 后续 user 也留在原 driven UUID，不创建独立明文会话。
     appendFileSync(file, userLine("那怎麼修"));
     (m as any).doPoll();
-    const batch = (appends(sent).at(-1) as any)?.sessions?.[0];
-    expect(batch?.messages?.some((x: any) => x.text === "那怎麼修")).toBe(true);
-    expect(batch?.title).toBe("P4改為拍手"); // 寫回的標題被保留
+    expect(appends(sent)).toHaveLength(0);
   });
 
   it("第二道守衛:driven 過的 CLI 會話,即便有 user 續問也不單獨建鏡像會話;兜底計數恆 0", () => {
@@ -390,6 +437,136 @@ function inflightToolLine(): string {
   );
 }
 
+describe("E2E backfill 編不出合法幀時必須回終態(不能拋出後靜默掛死)", () => {
+  it("單條超幀預算 → 發 found:false 而非 throw；lastError 留給 health", async () => {
+    const cfg = mkdtempSync(join(tmpdir(), "cc-bf-"));
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
+    process.env.MACCHIATO_MIRROR_FRAME_BYTES = "4096"; // 縮小預算,單條就超
+    mkdirSync(join(cfg, "projects", "-home-x"), { recursive: true });
+    const f = join(cfg, "projects", "-home-x", `${SID}.jsonl`);
+    writeFileSync(f, userLine("x".repeat(20_000)));
+    writeFileSync(process.env.MACCHIATO_CC_MIRROR!, JSON.stringify({ offsets: {}, titles: {}, seeded: true }));
+    // MAX_WIRE_BYTES 是模塊常量,改 env 後要重新導入模塊。
+    vi.resetModules();
+    const { Mirror: Fresh } = await import("../src/cc/mirror");
+    try {
+      const wireSid = "01K0CCBACKFILLBUDGET0000001";
+      const { linkb, sent } = fakeLinkb();
+      const e2e: any = {
+        isE2E: () => true,
+        encryptText: (_s: string, t: string) => t,
+        encryptContent: (_s: string, c: any) => `E:${c.text}`,
+        disableReceiptForBackfill: () => undefined,
+      };
+      const m: any = new Fresh(linkb, e2e);
+      // 修前:這裡 throw,唯一調用點是 void ....catch(console.error) → 一幀不發、
+      // server pendingOp 永遠掛著、barrier 永不解、該會話所有 prompt 靜默丟棄。
+      await expect(m.backfillE2E(wireSid, SID, "enable")).resolves.toBeUndefined();
+      const frames = sent.frames.filter((x: any) => x.t === "e2e_backfill");
+      expect(frames).toHaveLength(1);
+      expect(frames[0]).toMatchObject({ hermesSessionId: wireSid, mode: "enable", found: false });
+      expect(m.lastError).toContain("frame budget");
+    } finally {
+      delete process.env.MACCHIATO_MIRROR_FRAME_BYTES;
+      vi.resetModules();
+    }
+  });
+});
+
+describe("durable outbox 的終態 NACK（凍結批不得永遠重發）", () => {
+  function world(): { m: any; sent: Sent; file: string } {
+    const cfg = mkdtempSync(join(tmpdir(), "cc-nack-"));
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
+    mkdirSync(join(cfg, "projects", "-home-x"), { recursive: true });
+    const f = join(cfg, "projects", "-home-x", `${SID}.jsonl`);
+    writeFileSync(process.env.MACCHIATO_CC_MIRROR!, JSON.stringify({ offsets: {}, titles: {}, seeded: true }));
+    const { linkb, sent } = fakeLinkb();
+    return { m: new Mirror(linkb) as any, sent, file: f };
+  }
+
+  it("e2e_direction:丟棄該會話全部凍結批、水位回退重讀——不再每 15s 重傳舊方向明文", () => {
+    const { m, sent, file } = world();
+    writeFileSync(file, userLine("開 E2E 前的明文") + assistantLine("明文回覆"));
+    m.doPoll();
+    const first = appends(sent)[0] as any;
+    expect(first.sessions[0].messages[0].text).toBe("開 E2E 前的明文");
+    expect(m.state.pendingMirrors).toHaveLength(1);
+
+    // 會話事後轉 E2E → 凍結的明文批被 server 方向校驗永遠拒絕。
+    m.handleNack(first.batchId, "e2e direction mismatch", "e2e_direction");
+    expect(m.state.pendingMirrors).toHaveLength(0); // 丟批,不再重發舊方向明文
+    expect(m.state.offsets[SID] ?? 0).toBe(0); // 水位停在最後一次 ACK → 下輪重讀重編
+    expect(m.counters.mirrorDirectionRewinds).toBe(1);
+
+    // 下輪 poll 按當前方向重新編碼同一段(這裡仍是明文,關鍵是「內容沒丟且批是新造的」)。
+    const before = appends(sent).length;
+    m.doPoll();
+    const again = appends(sent).slice(before) as any[];
+    expect(again).toHaveLength(1);
+    expect(again[0].batchId).not.toBe(first.batchId);
+    expect(again[0].sessions[0].messages.map((x: any) => x.text)).toEqual([
+      "開 E2E 前的明文",
+      "明文回覆",
+    ]);
+  });
+
+  it("malformed:丟批並跳過該段,水位前進,lastError 留給 health", () => {
+    const { m, sent, file } = world();
+    writeFileSync(file, userLine("畸形批"));
+    m.doPoll();
+    const first = appends(sent)[0] as any;
+    m.handleNack(first.batchId, "sessions too large", "malformed");
+    expect(m.state.pendingMirrors).toHaveLength(0);
+    expect(m.state.offsets[SID]).toBeGreaterThan(0); // 跳過,否則該會話永不再前進
+    expect(m.counters.mirrorDropped).toBe(1);
+    expect(m.lastError).toBe("sessions too large");
+  });
+
+  it("#348 lastError 不被下一輪 poll 抹掉:仍有卡住的待確認批就一直報錯", async () => {
+    const { m, sent, file } = world();
+    writeFileSync(file, userLine("等 ACK 的批"));
+    await m.poll();
+    const first = appends(sent)[0] as any;
+    m.handleNack(first.batchId, "mirror transaction failed");
+    expect(m.lastError).toBe("mirror transaction failed");
+    // 修前:doPoll() 正常返回即無條件清空 lastError → health.ts(唯一用戶可見出口)什麼也不說,
+    // #348 要求的「明確報錯」落成「靜默凍結」:水位不動、UI 無提示。
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 60_000);
+    await m.poll();
+    vi.useRealTimers();
+    expect(m.lastError).toBe("mirror transaction failed");
+    // ACK 到了 → 恢復正常,錯誤才清。
+    m.handleAck(first.batchId);
+    await m.poll();
+    expect(m.lastError).toBeNull();
+  });
+
+  it("狀態檔 0600(裡面裝完整正文,同倉 K_S 也是 0600);.bak 同權限", () => {
+    const { m, file } = world();
+    writeFileSync(file, userLine("完整正文會落進狀態檔"));
+    m.doPoll();
+    m.doPoll(); // 第二次寫觸發 .bak
+    const mode = (p: string): string => (statSync(p).mode & 0o777).toString(8);
+    expect(mode(process.env.MACCHIATO_CC_MIRROR!)).toBe("600");
+    if (existsSync(`${process.env.MACCHIATO_CC_MIRROR!}.bak`)) {
+      expect(mode(`${process.env.MACCHIATO_CC_MIRROR!}.bak`)).toBe("600");
+    }
+  });
+
+  it("無 code(舊 server)仍是保留重發語義", () => {
+    const { m, sent, file } = world();
+    writeFileSync(file, userLine("暫時失敗"));
+    m.doPoll();
+    const first = appends(sent)[0] as any;
+    m.handleNack(first.batchId, "mirror transaction failed");
+    expect(m.state.pendingMirrors).toHaveLength(1);
+    expect(m.state.offsets[SID] ?? 0).toBe(0);
+  });
+});
+
 describe("Mirror #56 mirror_activity", () => {
   let file = "";
   function setup(): { linkb: any; sent: Sent; m: Mirror } {
@@ -415,6 +592,9 @@ describe("Mirror #56 mirror_activity", () => {
     appendFileSync(file, userLine("user speaks"));
     (m as any).doPoll(); // 增長 → busy
     expect(acts(sent)).toEqual([{ hermesSessionId: SID, busy: true }]);
+    for (const pending of [...((m as any).state.pendingMirrors ?? [])]) {
+      m.handleAck(pending.batchId);
+    }
     (m as any).doPoll(); // 安靜第 1 輪:防抖,不動
     expect(acts(sent)).toHaveLength(1);
     (m as any).doPoll(); // 安靜第 2 輪 → idle
@@ -513,13 +693,127 @@ describe("#308 MACCHIATO_MIRROR=off(鏡像開關)", () => {
       vi.advanceTimersByTime(60_000);
       vi.useRealTimers();
       expect(appends(sent)).toHaveLength(0); // 終端側 transcript 一幀未發
-      // driven 衛生照常:fastForward 仍推水位線並落盤(關掉它 = 雙投回歸 #161/#318)
+      // #200：即使 mirror=off，fastForward 也不得把未 ACK 的副作用回合越過。
       m.fastForward(SID);
-      expect(((m as any).state as any).offsets[SID]).toBeGreaterThan(0);
+      expect(((m as any).state as any).offsets[SID]).toBeUndefined();
       m.tombstone(SID);
       expect(((m as any).state as any).tombstones).toContain(SID);
     } finally {
       delete process.env.MACCHIATO_MIRROR;
+    }
+  });
+
+  it("off:unsetDriven 不得全量掃 transcript(終端會話照樣不進 app)", () => {
+    const cfg = mkdtempSync(join(tmpdir(), "cc-cfg-"));
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
+    mkdirSync(join(cfg, "projects", "-home-x"), { recursive: true });
+    const f = join(cfg, "projects", "-home-x", `${SID}.jsonl`);
+    writeFileSync(f, userLine("純終端會話,用戶要求不進 app"));
+    writeFileSync(process.env.MACCHIATO_CC_MIRROR!, JSON.stringify({ offsets: {}, titles: {}, seeded: true }));
+    process.env.MACCHIATO_MIRROR = "off";
+    try {
+      const { linkb, sent } = fakeLinkb();
+      const m = new Mirror(linkb) as any; // 非 E2E
+      m.setDriven("some-other-sid");
+      m.unsetDriven("some-other-sid"); // 修前:這裡無條件全量 poll → 終端會話被鏡像進 app
+      expect(appends(sent)).toHaveLength(0);
+      expect(m.state.offsets[SID]).toBeUndefined();
+    } finally {
+      delete process.env.MACCHIATO_MIRROR;
+    }
+  });
+
+  it("off:E2E driven 回合仍可靠投遞——定向輪詢兜住晚落盤的尾巴", () => {
+    const cfg = mkdtempSync(join(tmpdir(), "cc-cfg-"));
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
+    mkdirSync(join(cfg, "projects", "-home-x"), { recursive: true });
+    const f = join(cfg, "projects", "-home-x", `${SID}.jsonl`);
+    const other = join(cfg, "projects", "-home-x", `00000000-0000-4000-8000-0000000000ff.jsonl`);
+    writeFileSync(other, userLine("終端會話,off 下絕不投"));
+    writeFileSync(f, userLine("E2E driven 問題"));
+    writeFileSync(process.env.MACCHIATO_CC_MIRROR!, JSON.stringify({ offsets: {}, titles: {}, seeded: false }));
+    process.env.MACCHIATO_MIRROR = "off";
+    try {
+      const wireSid = "01K0CCMIRROROFFWIRE00000001";
+      const { linkb, sent } = fakeLinkb();
+      const e2e: any = {
+        isE2E: (sid: string) => sid === wireSid,
+        encryptText: (_sid: string, t: string) => `T:${t}`,
+        encryptContent: (_sid: string, c: any) => `E:${c.text}`,
+      };
+      const m = new Mirror(linkb, e2e, (localSid: string) =>
+        localSid === SID ? wireSid : undefined,
+      ) as any;
+      m.setDriven(SID);
+      vi.useFakeTimers();
+      m.start(); // off:只裝定向輪詢
+      m.unsetDriven(SID);
+      m.handleAck((appends(sent).at(-1) as any).batchId);
+      // 回合末尾巴晚落盤:第一次定向 poll 之後才寫進 transcript。
+      appendFileSync(f, assistantLine("晚落盤的最後一塊"));
+      vi.advanceTimersByTime(30_000);
+      vi.useRealTimers();
+
+      const byBatch = new Map<string, any>();
+      for (const frame of appends(sent) as any[]) byBatch.set(frame.batchId, frame);
+      const msgs = [...byBatch.values()].flatMap((x: any) => x.sessions[0].messages);
+      expect(msgs.map((x: any) => x.enc)).toEqual(["E:E2E driven 問題", "E:晚落盤的最後一塊"]);
+      expect(appends(sent).every((x: any) => x.sessions[0].hermesSessionId === wireSid)).toBe(true);
+      // 終端會話一幀未發、水位未動;seeded 也不得被定向輪詢置真。
+      expect(m.state.offsets["00000000-0000-4000-8000-0000000000ff"]).toBeUndefined();
+      expect(m.state.seeded).not.toBe(true);
+    } finally {
+      delete process.env.MACCHIATO_MIRROR;
+    }
+  });
+
+  it("#350 E2E 回合末尾巴在亞秒內追平,不必等滿一個 5s 輪詢周期", () => {
+    // 取消 fire-and-forget 直發後,E2E 回覆只剩 transcript 一條路;而 SDK result 常早於 CLI
+    // 寫完尾巴 → unsetDriven 那次即時 poll 讀不到最後一塊,舊行為要等下一個 POLL_MS(5s)tick,
+    // 用戶側就是「回覆延遲 0–5s、且常被拆成兩段」。回合末的短間隔定向 poll 把它壓到亞秒級。
+    const cfg = mkdtempSync(join(tmpdir(), "cc-cfg-"));
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
+    mkdirSync(join(cfg, "projects", "-home-x"), { recursive: true });
+    const f = join(cfg, "projects", "-home-x", `${SID}.jsonl`);
+    writeFileSync(f, userLine("E2E 問題"));
+    writeFileSync(
+      process.env.MACCHIATO_CC_MIRROR!,
+      JSON.stringify({ offsets: {}, titles: {}, seeded: true }),
+    );
+    const wireSid = "01K0CCTAILPOLLWIRE000000001";
+    const { linkb, sent } = fakeLinkb();
+    const e2e: any = {
+      isE2E: (sid: string) => sid === wireSid,
+      encryptText: (_sid: string, t: string) => `T:${t}`,
+      encryptContent: (_sid: string, c: any) => `E:${c.text}`,
+    };
+    const m = new Mirror(linkb, e2e, (localSid: string) =>
+      localSid === SID ? wireSid : undefined,
+    ) as any;
+    m.setDriven(SID);
+    vi.useFakeTimers();
+    try {
+      m.start();
+      m.unsetDriven(SID); // 即時 poll:此刻尾巴還沒落盤
+      m.handleAck((appends(sent).at(-1) as any).batchId);
+      appendFileSync(f, assistantLine("回合末晚落盤的回覆"));
+      // 只推進 1s——遠不到一個 POLL_MS(5s)。修前這裡一幀都不會有。
+      vi.advanceTimersByTime(1_000);
+      const tail = appends(sent).at(-1) as any;
+      expect(tail.sessions[0].messages.map((x: any) => x.enc)).toEqual([
+        "E:回合末晚落盤的回覆",
+      ]);
+      expect(tail.sessions[0].hermesSessionId).toBe(wireSid);
+      // 排程有界:停掉鏡像後不再有殘留定時器繼續打。
+      m.stop();
+      const before = appends(sent).length;
+      vi.advanceTimersByTime(60_000);
+      expect(appends(sent)).toHaveLength(before);
+    } finally {
+      vi.useRealTimers();
     }
   });
 

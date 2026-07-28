@@ -9,7 +9,12 @@ import { fileURLToPath } from "node:url";
 import { loadCreds, quarantineCreds } from "./linkb/creds";
 import { LinkBClient } from "./linkb/client";
 import { runPairing } from "./linkb/pairing";
-import { E2EKeyStore, settleE2EBackfillAck } from "./e2e/keys";
+import {
+  E2EKeyStore,
+  E2EKeyStoreStateError,
+  settleE2EBackfillAck,
+  type WrappedDeviceKey,
+} from "./e2e/keys";
 import { authorizeE2EDisableResume } from "./e2e/control";
 import { Mirror } from "./codex/mirror";
 import { announceImportAvailable, runImport } from "./codex/history-import";
@@ -28,7 +33,7 @@ import { runVerifiedSelfUpdate } from "./selfupdate";
 // 四連接器常量(cc/codex/openclaw 各自 src/index.ts + hermes connector.py)+ protocol link.ts 全局。
 // 全局是 server 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」
 // (本機與公開用戶一起亮,重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-const CONNECTOR_VERSION = "1.5.51";
+const CONNECTOR_VERSION = "1.5.56";
 
 function runSelfUpdate(): void {
   // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。
@@ -39,8 +44,15 @@ function runSelfUpdate(): void {
 
 type E2EControlLink = Pick<LinkBClient, "agentLinkId" | "send"> &
   Partial<Pick<LinkBClient, "unblockSession">>;
-type E2EBackfiller = Pick<Mirror, "backfillE2E" | "handleE2EBackfillResult">;
-type E2ELocalSessionResolver = { localSessionIdFor(sid: string): string | undefined };
+type E2EBackfiller = Pick<Mirror, "backfillE2E"> & {
+  acceptsE2EBackfillResult?: Mirror["acceptsE2EBackfillResult"];
+  handleE2EBackfillResult: (...args: any[]) => void;
+};
+type E2ELocalSessionResolver = {
+  localSessionIdFor(sid: string): string | undefined;
+  beginE2ETransition?(sid: string, mode: "enable" | "disable"): void;
+  releaseE2EQuiesce?(sid: string, mode?: "enable" | "disable", requestId?: string): void;
+};
 
 function startE2EBackfill(
   mirror: E2EBackfiller,
@@ -65,40 +77,63 @@ export function handleE2EControlFrame(
   const sid = typeof msg.hermesSessionId === "string" ? msg.hermesSessionId : undefined;
 
   if (msg.t === "e2e_wrap_request" && sid) {
-    const devices = Array.isArray(msg.devices) ? (msg.devices as any[]) : [];
-    const isEnable = msg.backfill === true;
-    let wrapped: { deviceId: string; sealed: string }[];
-    if (isEnable) {
-      // 首次 enable 是唯一允許建 K_S 的路徑。
-      e2e.beginEnable(sid, msg.disableReceipt);
-      assertIdentitySafe();
-      wrapped = e2e.wrapForEnable(sid, devices);
-    } else {
-      // 新設備補封必須沿用既有 K_S，缺鑰時 fail closed，絕不生成 K₂。
-      wrapped = e2e.wrapExistingForDevices(sid, devices);
+    // ⚠️ 內層 catch 是硬要求（與 cc / openclaw / hermes 對稱，#366 驗收項）：
+    // 狀態級拒絕（畸形 devices、指紋不符、缺 K_S…）只能軟拒絕該幀。若讓它冒泡到外層的
+    // linkb.close() + onFatal() → process.exit(1)，server 會在重連後的 bootstrapE2E 重發
+    // 同一幀 → 再退出，一幀畸形請求即可讓連接器永久起不來。持久化/poison 錯誤仍照舊上拋。
+    try {
+      const devices = Array.isArray(msg.devices) ? (msg.devices as any[]) : [];
+      const isEnable = msg.backfill === true;
+      let wrapped: WrappedDeviceKey[];
+      if (isEnable) {
+        // 首次 enable 是唯一允許建 K_S 的路徑。
+        sessions.beginE2ETransition?.(sid, "enable");
+        e2e.beginEnable(sid, msg.disableReceipt);
+        assertIdentitySafe();
+        wrapped = e2e.wrapForEnable(sid, devices);
+      } else {
+        // 新設備補封必須沿用既有 K_S，缺鑰時 fail closed，絕不生成 K₂。
+        wrapped = e2e.wrapExistingForDevices(sid, devices);
+      }
+      linkb.send({ t: "e2e_key", agentLinkId: linkb.agentLinkId, hermesSessionId: sid, wrapped });
+      console.log(`· E2E: session ${sid} — wrapped K_S for ${wrapped.length} device(s)`);
+      if (isEnable) startE2EBackfill(mirror, sessions, sid, "enable");
+    } catch (error) {
+      if (!(error instanceof E2EKeyStoreStateError)) throw error;
+      console.error(`[E2E wrap rejected ${sid}] ${(error as Error).message}`);
     }
-    linkb.send({ t: "e2e_key", agentLinkId: linkb.agentLinkId, hermesSessionId: sid, wrapped });
-    console.log(`· E2E: session ${sid} — wrapped K_S for ${wrapped.length} device(s)`);
-    if (isEnable) startE2EBackfill(mirror, sessions, sid, "enable");
     return true;
   }
 
   if (msg.t === "e2e_disable_request" && sid) {
     // 裸帧只用于 connector 重启后恢复“本地已由签封控制持久化”的 pending-disable。
     // server 无权从 stable 状态发起降级，否则可强迫明文历史回灌。
-    if (!authorizeE2EDisableResume(e2e, linkb, sid)) {
-      console.error(`[E2E raw disable rejected ${sid}] no authenticated local pending-disable`);
-      return true;
+    try {
+      if (!authorizeE2EDisableResume(e2e, linkb, sid)) {
+        console.error(`[E2E raw disable rejected ${sid}] no authenticated local pending-disable`);
+        return true;
+      }
+      sessions.beginE2ETransition?.(sid, "disable");
+      e2e.markServerE2E(sid, "disable");
+      assertIdentitySafe();
+      startE2EBackfill(mirror, sessions, sid, "disable");
+    } catch (error) {
+      if (!(error instanceof E2EKeyStoreStateError)) throw error;
+      console.error(`[E2E disable rejected ${sid}] ${(error as Error).message}`);
     }
-    e2e.markServerE2E(sid, "disable");
-    assertIdentitySafe();
-    startE2EBackfill(mirror, sessions, sid, "disable");
     return true;
   }
 
   if (msg.t === "e2e_backfill_result" && sid) {
     if (msg.mode !== "enable" && msg.mode !== "disable") {
       console.error(`⚠️ E2E backfill result mode 無效，session ${sid} 狀態不變`);
+      return true;
+    }
+    if (
+      mirror.acceptsE2EBackfillResult &&
+      !mirror.acceptsE2EBackfillResult(sid, msg.mode, msg.batchId)
+    ) {
+      console.error(`⚠️ E2E backfill stale/mismatched ACK ignored: ${sid} batch=${String(msg.batchId)}`);
       return true;
     }
     const committed =
@@ -116,7 +151,12 @@ export function handleE2EControlFrame(
       // found:false/明确拒绝且 receipt 尚未释放：撤销旧 intent，保留 K_S，允许设备重新签请求。
       e2e.cancelDisableBeforeRelease(sid);
     }
-    mirror.handleE2EBackfillResult(sid, msg.mode, accepted);
+    if (mirror.acceptsE2EBackfillResult) {
+      mirror.handleE2EBackfillResult(sid, msg.mode, msg.batchId, accepted);
+    } else {
+      mirror.handleE2EBackfillResult(sid, msg.mode, accepted);
+    }
+    sessions.releaseE2EQuiesce?.(sid, msg.mode);
     if (!accepted) {
       console.error(
         `⚠️ E2E backfill 未確認提交，session ${sid} mode=${msg.mode} ` +
@@ -146,6 +186,14 @@ async function main(): Promise<void> {
     creds,
     (state) => {
       const blocked = e2e.applyServerState(state);
+      drive.applyE2EQuiesceState(
+        (state as {
+          sessions?: Array<{
+            hermesSessionId: string;
+            pendingOp: "enable" | "disable" | null;
+          }>;
+        }).sessions ?? [],
+      );
       drive.assertE2EIdentitySafe();
       return blocked;
     },
@@ -223,6 +271,50 @@ async function main(): Promise<void> {
     },
   };
   linkb.onFrame((msg) => {
+    if (
+      msg.t === "e2e_quiesce" &&
+      typeof msg.hermesSessionId === "string" &&
+      (msg.mode === "enable" || msg.mode === "disable") &&
+      typeof msg.requestId === "string"
+    ) {
+      void drive
+        .quiesceE2E(msg.hermesSessionId, msg.mode, msg.requestId)
+        .then((ok) =>
+          linkb.send({
+            t: "e2e_quiesce_result",
+            agentLinkId: linkb.agentLinkId,
+            hermesSessionId: msg.hermesSessionId,
+            mode: msg.mode,
+            requestId: msg.requestId,
+            ok,
+            ...(!ok ? { error: "busy_timeout" as const } : {}),
+          }),
+        )
+        .catch((error) => {
+          linkb.send({
+            t: "e2e_quiesce_result",
+            agentLinkId: linkb.agentLinkId,
+            hermesSessionId: msg.hermesSessionId,
+            mode: msg.mode,
+            requestId: msg.requestId,
+            ok: false,
+            error: "quiesce_failed",
+          });
+        });
+      return;
+    }
+    if (
+      msg.t === "e2e_quiesce_release" &&
+      typeof msg.hermesSessionId === "string" &&
+      (msg.mode === "enable" || msg.mode === "disable")
+    ) {
+      drive.releaseE2EQuiesce(
+        msg.hermesSessionId,
+        msg.mode,
+        typeof msg.requestId === "string" ? msg.requestId : undefined,
+      );
+      return;
+    }
     try {
       if (handleE2EControlFrame(msg, linkb, e2e, mirror, drive, () => drive.assertE2EIdentitySafe())) return;
     } catch (error) {
@@ -232,7 +324,23 @@ async function main(): Promise<void> {
       linkb.onFatal();
       return;
     }
-    if (msg.t === "mirror_nack" && typeof msg.batchId === "number") mirror.handleNack(msg.batchId);
+    if (
+      msg.t === "mirror_nack" &&
+      (typeof msg.batchId === "number" || typeof msg.batchId === "string")
+    ) {
+      mirror.handleNack(
+        msg.batchId,
+        typeof msg.error === "string" ? msg.error : undefined,
+        typeof (msg as { code?: unknown }).code === "string"
+          ? ((msg as { code: string }).code)
+          : undefined,
+      );
+    } else if (
+      msg.t === "mirror_ack" &&
+      (typeof msg.batchId === "number" || typeof msg.batchId === "string")
+    ) {
+      mirror.handleAck(msg.batchId);
+    }
     else if (msg.t === "import_start") runImport(linkb, localE2EStatus(), Array.isArray(msg.projects) ? (msg.projects as string[]) : undefined); // #154 可按 project 過濾
     else if (msg.t === "self_update") runSelfUpdate();
     else if (msg.t === "auth_login_start") login.start(loginEvents);
