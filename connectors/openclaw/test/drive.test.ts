@@ -880,5 +880,254 @@ describe("#261 live 工具事件(session.tool → tool.start/complete)", () => {
     gw.triggerConnected();
     await new Promise((r) => setTimeout(r, 10));
     expect(calls.some((c) => c.method === "sessions.subscribe")).toBe(true);
+    // F-09:重連後也 list 回填掛起審批
+    expect(calls.some((c) => c.method === "exec.approval.list")).toBe(true);
+  });
+});
+
+// ── F-09/#486 OpenClaw live 審批橋 ──────────────────────────────────────────
+
+describe("Drive F-09 exec.approval → approval.request", () => {
+  async function drivenDrive() {
+    // makeDrive 已 wire()；勿再 wire，否則 frame handler 雙註冊 → resolve 調兩次。
+    const { drive, gw, linkb, calls, sent } = makeDrive();
+    const SID = "01APPROVAL01";
+    await linkb.deliver({
+      t: "tui",
+      sessionId: SID,
+      frame: { method: "session.create", params: { session_id: SID } },
+    });
+    const KEY = `${MACCHIATO_PREFIX}${SID.toLowerCase()}`;
+    sent.length = 0;
+    calls.length = 0;
+    return { drive, gw, linkb, calls, sent, SID, KEY };
+  }
+
+  function fireRequested(
+    gw: any,
+    opts: {
+      id: string;
+      sessionKey: string;
+      command?: string;
+      cwd?: string;
+      unavailableDecisions?: string[];
+    },
+  ) {
+    gw.fire({
+      event: "exec.approval.requested",
+      payload: {
+        id: opts.id,
+        createdAtMs: Date.now(),
+        expiresAtMs: Date.now() + 60_000,
+        request: {
+          command: opts.command ?? "rm -rf /tmp/x",
+          cwd: opts.cwd ?? "/tmp",
+          sessionKey: opts.sessionKey,
+          host: "gateway",
+          ...(opts.unavailableDecisions
+            ? { unavailableDecisions: opts.unavailableDecisions }
+            : {}),
+        },
+      },
+    });
+  }
+
+  it("exec.approval.requested → approval.request（driven 會話）", async () => {
+    const { gw, sent, SID, KEY } = await drivenDrive();
+    fireRequested(gw, { id: "appr-1", sessionKey: KEY, command: "getconf PAGESIZE" });
+    const frames = sent.filter((m) => m.t === "tui");
+    expect(frames).toHaveLength(1);
+    expect(frames[0].sessionId).toBe(SID);
+    const params = frames[0].frame.params;
+    expect(params.type).toBe("approval.request");
+    expect(params.session_id).toBe(SID);
+    expect(params.payload.request_id).toBe("appr-1");
+    expect(params.payload.pattern_key).toBe("shell");
+    expect(params.payload.command).toContain("getconf");
+    expect(params.payload.description).toMatch(/OpenClaw wants to run/);
+  });
+
+  it("非 driven 會話忽略（不搶渠道原生審批）", async () => {
+    const { gw, sent } = await drivenDrive();
+    fireRequested(gw, {
+      id: "appr-other",
+      sessionKey: "agent:main:discord:channel:123",
+      command: "echo hi",
+    });
+    expect(sent.filter((m) => m.t === "tui")).toEqual([]);
+  });
+
+  it("approval.respond yes → exec.approval.resolve allow-once", async () => {
+    const { gw, linkb, calls, SID, KEY } = await drivenDrive();
+    fireRequested(gw, { id: "appr-yes", sessionKey: KEY });
+    calls.length = 0;
+    await linkb.deliver({
+      t: "tui",
+      sessionId: SID,
+      frame: {
+        method: "approval.respond",
+        params: { session_id: SID, choice: "yes", request_id: "appr-yes" },
+      },
+    });
+    const resolveCalls = calls.filter((c) => c.method === "exec.approval.resolve");
+    expect(resolveCalls).toEqual([
+      { method: "exec.approval.resolve", params: { id: "appr-yes", decision: "allow-once" } },
+    ]);
+  });
+
+  it("approval.respond always → allow-always；unavailable 時降 allow-once", async () => {
+    const { gw, linkb, calls, SID, KEY } = await drivenDrive();
+    fireRequested(gw, { id: "appr-always", sessionKey: KEY });
+    calls.length = 0;
+    await linkb.deliver({
+      t: "tui",
+      sessionId: SID,
+      frame: {
+        method: "approval.respond",
+        params: { session_id: SID, choice: "always", request_id: "appr-always" },
+      },
+    });
+    expect(calls[0]).toEqual({
+      method: "exec.approval.resolve",
+      params: { id: "appr-always", decision: "allow-always" },
+    });
+
+    fireRequested(gw, {
+      id: "appr-once-only",
+      sessionKey: KEY,
+      unavailableDecisions: ["allow-always"],
+    });
+    calls.length = 0;
+    await linkb.deliver({
+      t: "tui",
+      sessionId: SID,
+      frame: {
+        method: "approval.respond",
+        params: { session_id: SID, choice: "always", all: true, request_id: "appr-once-only" },
+      },
+    });
+    expect(calls[0].params.decision).toBe("allow-once");
+  });
+
+  it("approval.respond no → deny", async () => {
+    const { gw, linkb, calls, SID, KEY } = await drivenDrive();
+    fireRequested(gw, { id: "appr-no", sessionKey: KEY });
+    calls.length = 0;
+    await linkb.deliver({
+      t: "tui",
+      sessionId: SID,
+      frame: {
+        method: "approval.respond",
+        params: { session_id: SID, choice: "no", request_id: "appr-no" },
+      },
+    });
+    expect(calls[0].params.decision).toBe("deny");
+  });
+
+  it("exec.approval.resolved 清掛起，後續 respond 不誤發", async () => {
+    const { gw, linkb, calls, SID, KEY } = await drivenDrive();
+    fireRequested(gw, { id: "appr-ext", sessionKey: KEY });
+    gw.fire({
+      event: "exec.approval.resolved",
+      payload: { id: "appr-ext", decision: "deny" },
+    });
+    calls.length = 0;
+    await linkb.deliver({
+      t: "tui",
+      sessionId: SID,
+      frame: {
+        method: "approval.respond",
+        params: { session_id: SID, choice: "yes", request_id: "appr-ext" },
+      },
+    });
+    expect(calls.filter((c) => c.method === "exec.approval.resolve")).toEqual([]);
+  });
+
+  it("resolve 失敗時保留 pending，重試可再 resolve（review #517）", async () => {
+    const { gw, linkb, calls, SID, KEY } = await drivenDrive();
+    fireRequested(gw, { id: "appr-retry", sessionKey: KEY });
+    calls.length = 0;
+    const orig = gw.request.bind(gw);
+    let n = 0;
+    gw.request = async (method: string, params: any) => {
+      if (method === "exec.approval.resolve") {
+        calls.push({ method, params });
+        n += 1;
+        if (n === 1) throw new Error("gateway down");
+        return {};
+      }
+      return orig(method, params);
+    };
+    // non-E2E drive 吞掉 resolve 錯誤（只 log），但 pending 必須仍在
+    await linkb.deliver({
+      t: "tui",
+      sessionId: SID,
+      frame: {
+        method: "approval.respond",
+        params: { session_id: SID, choice: "yes", request_id: "appr-retry" },
+      },
+    });
+    expect(calls.filter((c) => c.method === "exec.approval.resolve")).toHaveLength(1);
+    // 第二次 respond 仍能命中 pending
+    await linkb.deliver({
+      t: "tui",
+      sessionId: SID,
+      frame: {
+        method: "approval.respond",
+        params: { session_id: SID, choice: "yes", request_id: "appr-retry" },
+      },
+    });
+    const resolves = calls.filter((c) => c.method === "exec.approval.resolve");
+    expect(resolves).toHaveLength(2);
+    expect(resolves[1].params).toEqual({ id: "appr-retry", decision: "allow-once" });
+  });
+
+  it("list 回填把 pending 轉成 approval.request", async () => {
+    const { drive, gw, calls, sent, SID, KEY } = await drivenDrive();
+    // mock list 回 pending 投影
+    const orig = gw.request.bind(gw);
+    gw.request = async (method: string, params: any) => {
+      if (method === "exec.approval.list") {
+        calls.push({ method, params });
+        return {
+          approvals: [
+            {
+              id: "appr-list-1",
+              command: "uname -a",
+              cwd: "/home",
+              sessionKey: KEY,
+            },
+          ],
+        };
+      }
+      return orig(method, params);
+    };
+    sent.length = 0;
+    await drive.backfillExecApprovals();
+    const frames = sent.filter((m) => m.t === "tui");
+    expect(frames).toHaveLength(1);
+    expect(frames[0].frame.params.payload.request_id).toBe("appr-list-1");
+    expect(frames[0].sessionId).toBe(SID);
+  });
+
+  it("同 id 冪等：live + list 不雙掛", async () => {
+    const { drive, gw, sent, KEY } = await drivenDrive();
+    fireRequested(gw, { id: "appr-dup", sessionKey: KEY });
+    const n1 = sent.filter((m) => m.t === "tui").length;
+    // 再走一次 list 形
+    (drive as any).onExecApprovalRequested({
+      id: "appr-dup",
+      request: { command: "echo", sessionKey: KEY },
+    });
+    expect(sent.filter((m) => m.t === "tui")).toHaveLength(n1);
+  });
+});
+
+describe("GATEWAY_OPERATOR_SCOPES", () => {
+  it("含 operator.approvals（收審批事件 + resolve）", async () => {
+    const { GATEWAY_OPERATOR_SCOPES } = await import("../src/openclaw/gateway");
+    expect(GATEWAY_OPERATOR_SCOPES).toContain("operator.read");
+    expect(GATEWAY_OPERATOR_SCOPES).toContain("operator.write");
+    expect(GATEWAY_OPERATOR_SCOPES).toContain("operator.approvals");
   });
 });

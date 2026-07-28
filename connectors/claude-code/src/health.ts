@@ -1,7 +1,10 @@
 /**
  * 健康上報 + 鏡像看門狗（對齊 Hermes/OpenClaw 連接器）。
  * Claude Code 無常駐 gateway（SDK 按需 spawn CLI）→ gatewayAlive = transcript 目錄可讀 + CLI 在位。
+ *
+ * 形狀對齊 `ConnectorHealthState` core+optional（#492）——不發 Hermes 專屬觀測字段。
  */
+import type { ConnectorHealthState } from "./linkb/proto";
 import { gcAttachments } from "./cc/attachments";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -17,20 +20,16 @@ const MIRROR_STUCK_MS = Number(process.env.MACCHIATO_MIRROR_STUCK_MS) || 120_000
 /** #259 CLI 版本重探節流:CLI 自動升級後不能永遠用啟動時的舊值(env 可調)。 */
 const CLI_REPROBE_MS = Number(process.env.MACCHIATO_CLI_REPROBE_MS) || 3_600_000;
 
-export interface HealthSnapshot {
-  gatewayAlive: boolean;
-  compatOk: boolean;
-  mirrorLastPollAgeS: number;
-  lastError: string | null;
+/** 本連接器 health 上報體 = protocol core + 本家 optional/擴展。 */
+export interface HealthSnapshot extends ConnectorHealthState {
   kind: "claude-code";
   connectorVersion: string;
+  /** 本家總是發 number（mirror off → 0）。 */
+  mirrorLastPollAgeS: number;
   /** #89：無本地 STT——server 據此把語音輸入直接路由到雲端 BYOK STT（不再下達音頻）。 */
   stt: false;
+  /** 擴展：CLI 版本字串（server 不解析）。 */
   cliVersion?: string;
-  /** #310 登錄態:false=最近驅動回合認證失敗(app 顯「需重新登錄」);成功回合恢復 true。 */
-  authOk?: boolean;
-  /** #10:累計計數(進程生命週期)——鏡像條數/nack/驅動錯誤,一次性的丟/重複才看得見。 */
-  counters?: Record<string, number>;
 }
 
 export class HealthLoop {

@@ -9,6 +9,9 @@
  *   chat state:"delta" {deltaText}        → message.start（首個 delta 補發）+ message.delta
  *   chat state:"final" {message.content}  → message.complete（ingest 對累積/增量雙容）
  *   agent lifecycle start/end             → 回合活躍表 + 結束時讓鏡像快進（防雙投）
+ *   exec.approval.requested               → approval.request（F-09/#486 live 審批卡）
+ * 下行審批：
+ *   approval.respond                      → exec.approval.resolve{id, decision}
  *
  * 會話映射：server 下發 hermesSessionId；`agent:` 開頭 = OpenClaw 真實 key（鏡像來的會話, 直接續聊）；
  * 否則是 Macchiato 新建會話 → 包成 `agent:main:macchiato:<sid>`（無渠道綁定, 回覆只走 Macchiato）。
@@ -27,13 +30,45 @@ import { generateTitle, loadTitled, saveTitled } from "./titles";
 import { extractMediaPaths, readMediaFile, resolveMediaAllowRoots } from "./media";
 import type { E2EKeyStore, ServerE2EStateV1 } from "../e2e/keys";
 import {
+  canonicalE2EApprovalDisplay,
   dispatchForE2EControl,
+  e2eApprovalRequestDigest,
   E2EControlError,
   E2EControlVerifier,
+  immutableE2EApprovalSnapshot,
   type E2EControlEnvelopeV1,
   type E2EControlKind,
 } from "../e2e/control";
 import { formatCommandInvokeLog, logContent, safeErr, shortId, textLen } from "../safe-log";
+
+/** E2E 加密審批明文尺寸閘（與 CC/Codex 對齊；須先於 emit/掛起）。 */
+const E2E_APPROVAL_PLAINTEXT_MAX_BYTES = 64 * 1024;
+
+/** OpenClaw gateway 審批決策（官方 resolve 枚舉）。 */
+type ExecApprovalDecision = "allow-once" | "allow-always" | "deny";
+
+interface PendingExecApproval {
+  /** gateway 審批 id（exec.approval.resolve 回帶）。 */
+  id: string;
+  sid: string;
+  /** E2E: keyed digest，respond 必須對得上才執行。 */
+  requestDigest?: string;
+  executionSnapshot?: Record<string, unknown>;
+  /** gateway 標明不可用的決策（常見：allow-always）。 */
+  unavailableDecisions: Set<string>;
+}
+
+type OpenClawApprovalExecutionSnapshot = {
+  v: 1;
+  connector: "openclaw";
+  sessionId: string;
+  requestId: string;
+  command: string;
+  cwd: string;
+  host?: string;
+  agentId?: string;
+  sessionKey?: string;
+} & Record<string, unknown>;
 
 // key ↔ sid 映射移居 mirror.ts（E2E 回灌也要用）；re-export 保持既有導入面不變。
 export { keyForSid, sidForKey };
@@ -215,7 +250,21 @@ export class Drive {
   private readonly retryCancelled = new Set<string>();
 
   /** #10:累計計數(進程生命週期),健康上報帶出。 */
-  readonly counters: Record<string, number> = { promptRetries: 0, promptRetryFails: 0, driveErrors: 0 };
+  readonly counters: Record<string, number> = {
+    promptRetries: 0,
+    promptRetryFails: 0,
+    driveErrors: 0,
+    approvalsRequested: 0,
+    approvalsResolved: 0,
+  };
+
+  /**
+   * F-09/#486:gateway 掛起的 exec 審批（id → pending）。
+   * request_id 精確配對；缺省時按 sid FIFO（舊 server 兼容）。
+   */
+  private readonly pendingApprovals = new Map<string, PendingExecApproval>();
+  /** sid → 該會話掛起審批 id 順序（FIFO 兜底）。 */
+  private readonly pendingApprovalOrder = new Map<string, string[]>();
 
   constructor(
     private readonly gw: OpenClawGateway,
@@ -443,6 +492,8 @@ export class Drive {
     } catch (e) {
       console.error("[sessions.subscribe failed]", (e as Error).message);
     }
+    // F-09:重連/首連後回填斷線窗內已掛起的 exec 審批（官方 gateway client 契約）。
+    await this.backfillExecApprovals();
   }
 
   private async onGatewayConnected(): Promise<void> {
@@ -452,6 +503,9 @@ export class Drive {
     this.started.clear(); // 斷線期的 runId 條目一併作廢(否則只在 lifecycle end 清 → 洩漏)
     this.acc.clear();
     this.completed.clear();
+    // 斷連窗內審批可能已被別處 resolve 或過期——清空本地掛起,靠 backfill 重掛仍 pending 的。
+    this.pendingApprovals.clear();
+    this.pendingApprovalOrder.clear();
     await this.reconcileAll("reconnect");
     for (const key of stale) await this.flushFollowUps(key);
   }
@@ -794,6 +848,10 @@ export class Drive {
         case "session.create":
           await this.markDriven(key, sid); // 會話本體由首次 chat.send 自動建
           return;
+        case "approval.respond": {
+          await this.onApprovalRespond(sid, params, authenticated);
+          return;
+        }
         default:
           return; // 其它方法 v1 忽略
       }
@@ -930,7 +988,307 @@ export class Drive {
     }
   }
 
+  // ── F-09/#486 OpenClaw live 審批：exec.approval.* ↔ approval.request/respond ──
+
+  /**
+   * 官方 client 契約：hello-ok 後 list 回填斷線前已掛起的審批。
+   * list 形狀在版本間可能是 `{approvals|pending|items:[]}` 或直接數組；字段寬鬆解析。
+   * 失敗只記日誌（舊 gateway / 無 scope 時不擋主路徑）。
+   */
+  async backfillExecApprovals(): Promise<void> {
+    try {
+      const r = (await this.gw.request("exec.approval.list", {})) as
+        | Record<string, unknown>
+        | unknown[]
+        | null
+        | undefined;
+      const arr = Array.isArray(r)
+        ? r
+        : Array.isArray((r as any)?.approvals)
+          ? ((r as any).approvals as unknown[])
+          : Array.isArray((r as any)?.pending)
+            ? ((r as any).pending as unknown[])
+            : Array.isArray((r as any)?.items)
+              ? ((r as any).items as unknown[])
+              : [];
+      for (const item of arr) {
+        if (!item || typeof item !== "object") continue;
+        const row = item as Record<string, unknown>;
+        // list 可能直接是 pending 投影(id+commandText…),也可能是 {id,request,…} 事件形。
+        if (row.request && typeof row.request === "object") {
+          this.onExecApprovalRequested(row);
+        } else {
+          this.onExecApprovalRequested({
+            id: row.id,
+            request: row,
+            createdAtMs: row.createdAtMs,
+            expiresAtMs: row.expiresAtMs,
+          });
+        }
+      }
+      if (arr.length) console.log(`· #486 exec.approval.list backfill: ${arr.length} pending`);
+    } catch (e) {
+      console.error(`[#486 exec.approval.list failed] ${safeErr(e)}`);
+    }
+  }
+
+  /**
+   * gateway 廣播 / list 回填 → Macchiato approval.request 卡。
+   * 只處理 driven 會話（Macchiato 遠程驅動面）；渠道會話的審批留給原生 channel UI。
+   * **不**改 OpenClaw 默認 exec 策略——僅在 gateway 已決定要人批時轉卡。
+   */
+  private onExecApprovalRequested(payload: Record<string, unknown>): void {
+    const id = String(payload.id ?? "").trim();
+    if (!id) return;
+    if (this.pendingApprovals.has(id)) return; // 冪等：list 與 live 競態不雙掛
+
+    const request = (
+      payload.request && typeof payload.request === "object"
+        ? (payload.request as Record<string, unknown>)
+        : payload
+    ) as Record<string, unknown>;
+    const plan =
+      request.systemRunPlan && typeof request.systemRunPlan === "object"
+        ? (request.systemRunPlan as Record<string, unknown>)
+        : undefined;
+
+    const sessionKeyRaw =
+      (typeof request.sessionKey === "string" && request.sessionKey) ||
+      (typeof plan?.sessionKey === "string" && plan.sessionKey) ||
+      (typeof payload.sessionKey === "string" && payload.sessionKey) ||
+      "";
+    const key = sessionKeyRaw ? sessionKeyRaw.toLowerCase() : "";
+    if (!key || !this.driven.has(key)) {
+      // 非 Macchiato 驅動會話：不搶渠道/Control UI 的審批路由。
+      return;
+    }
+    const sid = this.sidByKey.get(key) ?? sidForKey(key);
+
+    const command = String(
+      request.command ??
+        request.commandText ??
+        plan?.commandText ??
+        plan?.commandPreview ??
+        "",
+    ).trim();
+    const cwd = String(request.cwd ?? plan?.cwd ?? "").trim();
+    const host = typeof request.host === "string" ? request.host : undefined;
+    const agentId =
+      (typeof request.agentId === "string" && request.agentId) ||
+      (typeof plan?.agentId === "string" && plan.agentId) ||
+      undefined;
+    const cmdPreview = (command || "(exec)").slice(0, 500);
+    const desc = cwd
+      ? `OpenClaw wants to run a command in ${cwd}`
+      : host
+        ? `OpenClaw wants to run a command on ${host}`
+        : "OpenClaw wants to run a command";
+    const patternKey = "shell";
+
+    const unavailable = new Set<string>();
+    const rawUnavail = request.unavailableDecisions ?? payload.unavailableDecisions;
+    if (Array.isArray(rawUnavail)) {
+      for (const d of rawUnavail) if (typeof d === "string" && d) unavailable.add(d);
+    }
+
+    const isE2E = this.e2e?.isE2E(sid) ?? false;
+    let executionSnapshot: OpenClawApprovalExecutionSnapshot | undefined;
+    let executionDisplay: string | undefined;
+    let requestDigest: string | undefined;
+    if (isE2E) {
+      try {
+        executionSnapshot = immutableE2EApprovalSnapshot<OpenClawApprovalExecutionSnapshot>({
+          v: 1,
+          connector: "openclaw",
+          sessionId: sid,
+          requestId: id,
+          command: cmdPreview,
+          cwd,
+          ...(host ? { host } : {}),
+          ...(agentId ? { agentId } : {}),
+          ...(sessionKeyRaw ? { sessionKey: sessionKeyRaw } : {}),
+        });
+        executionDisplay = canonicalE2EApprovalDisplay(executionSnapshot);
+        requestDigest = e2eApprovalRequestDigest(this.e2e!.requireKey(sid), executionSnapshot);
+      } catch (error) {
+        console.error(
+          `[E2E approval auto-denied ${shortId(sid)}] ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        void this.resolveExecApproval(id, "deny");
+        return;
+      }
+    }
+
+    const approvalPlaintext =
+      isE2E && requestDigest && executionSnapshot
+        ? {
+            command: cmdPreview,
+            description: desc,
+            patternKey,
+            requestId: id,
+            requestDigest,
+            executionRequest: executionSnapshot,
+            executionDisplay,
+          }
+        : undefined;
+    if (
+      approvalPlaintext &&
+      Buffer.byteLength(JSON.stringify(approvalPlaintext), "utf8") > E2E_APPROVAL_PLAINTEXT_MAX_BYTES
+    ) {
+      console.error(
+        `[E2E approval auto-denied ${shortId(sid)}] encrypted approval payload exceeds device limit`,
+      );
+      void this.resolveExecApproval(id, "deny");
+      return;
+    }
+    // 尺寸閘門必須先於 emit / 掛起；否則設備拒卡後 gateway 永久等不到 resolve。
+    const enc = approvalPlaintext
+      ? this.e2e!.encryptContent(sid, approvalPlaintext)
+      : undefined;
+
+    this.pendingApprovals.set(id, {
+      id,
+      sid,
+      requestDigest,
+      executionSnapshot,
+      unavailableDecisions: unavailable,
+    });
+    const order = this.pendingApprovalOrder.get(sid) ?? [];
+    order.push(id);
+    this.pendingApprovalOrder.set(sid, order);
+    this.counters.approvalsRequested += 1;
+
+    this.emit(sid, "approval.request", {
+      command: isE2E ? "🔒 加密審批請求" : cmdPreview,
+      pattern_key: patternKey,
+      pattern_keys: [patternKey],
+      description: isE2E ? "" : desc,
+      ...(enc ? { enc } : {}),
+      request_id: id,
+      ...(requestDigest ? { request_digest: requestDigest } : {}),
+    });
+    console.log(`· #486 approval.request id=${id.slice(0, 12)}… → ${shortId(sid)}`);
+  }
+
+  /** 他處（CLI/渠道/逾時）已 resolve → 清本地掛起,避免後續 respond 誤發。 */
+  private onExecApprovalResolved(payload: Record<string, unknown>): void {
+    const id = String(payload.id ?? payload.approvalId ?? "").trim();
+    if (!id) return;
+    if (!this.pendingApprovals.has(id)) return;
+    this.dropPendingApproval(id);
+    this.counters.approvalsResolved += 1;
+  }
+
+  private dropPendingApproval(id: string): void {
+    const pending = this.pendingApprovals.get(id);
+    if (!pending) return;
+    this.pendingApprovals.delete(id);
+    const order = this.pendingApprovalOrder.get(pending.sid);
+    if (order) {
+      const next = order.filter((x) => x !== id);
+      if (next.length) this.pendingApprovalOrder.set(pending.sid, next);
+      else this.pendingApprovalOrder.delete(pending.sid);
+    }
+  }
+
+  /**
+   * Macchiato choice → gateway decision:
+   *   yes/allow → allow-once；always/all → allow-always（若 gateway 標 unavailable 則降為 once）；
+   *   no/deny → deny。
+   */
+  private choiceToDecision(
+    choice: string,
+    all: boolean,
+    unavailable: Set<string>,
+  ): ExecApprovalDecision {
+    const c = choice.toLowerCase();
+    const allow = c === "allow" || c === "always" || c === "yes";
+    if (!allow) return "deny";
+    const wantAlways = all || c === "always";
+    if (wantAlways && !unavailable.has("allow-always")) return "allow-always";
+    return "allow-once";
+  }
+
+  private async resolveExecApproval(id: string, decision: ExecApprovalDecision): Promise<void> {
+    try {
+      await this.gw.request("exec.approval.resolve", { id, decision });
+      this.counters.approvalsResolved += 1;
+    } catch (e) {
+      this.counters.driveErrors += 1;
+      console.error(`[#486 exec.approval.resolve failed id=${id.slice(0, 12)}…] ${safeErr(e)}`);
+      throw e;
+    }
+  }
+
+  private async onApprovalRespond(
+    sid: string,
+    params: Record<string, unknown>,
+    authenticated: AuthenticatedControlTag | undefined,
+  ): Promise<void> {
+    const reqId = typeof params.request_id === "string" ? params.request_id : "";
+    const reqDigest = typeof params.requestDigest === "string" ? params.requestDigest : "";
+    let pending: PendingExecApproval | undefined;
+
+    if (authenticated) {
+      if (authenticated.kind !== "approval.respond" || !reqId || !reqDigest) {
+        throw new E2EControlError("authenticated approval is missing request identity");
+      }
+      const candidate = this.pendingApprovals.get(reqId);
+      if (
+        !candidate ||
+        candidate.sid !== sid ||
+        !candidate.executionSnapshot ||
+        candidate.requestDigest !== reqDigest ||
+        e2eApprovalRequestDigest(this.e2e!.requireKey(sid), candidate.executionSnapshot) !==
+          reqDigest
+      ) {
+        throw new E2EControlError("approval request id/digest mismatch");
+      }
+      pending = candidate;
+    } else if (reqId) {
+      const candidate = this.pendingApprovals.get(reqId);
+      if (candidate && candidate.sid === sid) pending = candidate;
+    }
+    if (!pending) {
+      // FIFO 兜底（舊 server 不回帶 request_id）
+      const order = this.pendingApprovalOrder.get(sid) ?? [];
+      while (order.length && !pending) {
+        const id = order[0]!;
+        const candidate = this.pendingApprovals.get(id);
+        if (candidate) pending = candidate;
+        else order.shift();
+      }
+      this.pendingApprovalOrder.set(sid, order);
+    }
+    if (!pending) {
+      if (authenticated) throw new E2EControlError("no matching pending approval");
+      return;
+    }
+
+    const choice = String(params.choice ?? "deny");
+    const all = params.all === true;
+    const decision = this.choiceToDecision(choice, all, pending.unavailableDecisions);
+    // 先 resolve 成功再 drop：gateway 失敗時保留 pending，用戶可重試（review #517）。
+    await this.resolveExecApproval(pending.id, decision);
+    this.dropPendingApproval(pending.id);
+    console.log(
+      `· #486 approval.respond id=${pending.id.slice(0, 12)}… decision=${decision} → ${shortId(sid)}`,
+    );
+  }
+
   onGatewayEvent(evt: GatewayEvent): void {
+    // F-09/#486:exec 審批事件的 sessionKey 在 request 內嵌,不走頂層 driven 門——先分流。
+    if (evt.event === "exec.approval.requested") {
+      this.onExecApprovalRequested((evt.payload ?? {}) as Record<string, unknown>);
+      return;
+    }
+    if (evt.event === "exec.approval.resolved") {
+      this.onExecApprovalResolved((evt.payload ?? {}) as Record<string, unknown>);
+      return;
+    }
+
     const p = (evt.payload ?? {}) as Record<string, any>;
     const key = typeof p.sessionKey === "string" ? p.sessionKey.toLowerCase() : undefined;
     if (!key || !this.driven.has(key)) return;

@@ -338,13 +338,27 @@ export class AppServerDrive {
     this.client.close();
   }
 
-  /** #200:上個進程死於回合中途 → 提示重發(index.ts 在 ready 後調;冪等)。 */
+  /**
+   * #200 + #489 F-12:優先從本地 rollout 只讀補撈已落盤 agent 內容；失敗回退「請重發」。
+   * **絕不**自動重投 prompt（副作用雙投雷）。冪等。index.ts 在 ready 後調。
+   */
   flushAbandonedTurns(): void {
     const sids = this.abandonedTurns;
     this.abandonedTurns = [];
     for (const sid of sids) {
       if (this.e2e?.isE2E(sid)) continue;
-      this.emit(sid, "review.summary", { summary: "⚠️ 連接器剛重啟,上一條消息可能沒跑完——請重發一次。" });
+      let salvaged = false;
+      try {
+        const local = this.localSessionIdFor(sid);
+        if (local && this.mirror) salvaged = this.mirror.salvageCrash(local, sid);
+      } catch (e) {
+        console.error(`[F-12 salvage ${sid}] ${(e as Error).message}`);
+      }
+      this.emit(sid, "review.summary", {
+        summary: salvaged
+          ? "♻️ 連接器剛重啟——已從本地 rollout 補撈已落盤內容（未自動重跑，避免副作用雙投）。若仍不完整，請先檢查後再決定是否手動重發。"
+          : "⚠️ 連接器剛重啟,上一條消息可能沒跑完——請重發一次。",
+      });
     }
   }
 

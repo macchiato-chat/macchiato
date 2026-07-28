@@ -110,7 +110,7 @@ LINK_B_PROTO = 5  # 對齊 server（packages/protocol：B=5，#348/#368 可靠 A
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.56"
+CONNECTOR_VERSION = "1.5.57"
 E2E_APPROVAL_PLAINTEXT_MAX = 64 * 1024
 # #279 E2E prompt 解密失敗的用戶可見回執(僅提示語,零內容洩漏;四連接器同文案)。
 E2E_DECRYPT_FAIL_WARNING = "無法解密這條消息(設備與連接器的加密密鑰可能失步)——請重試,或重新關閉再開啟本會話的端到端加密。"
@@ -154,6 +154,8 @@ def _build_installer_env(source: dict[str, str], manifest_path: str) -> dict[str
 IMPORT_BATCH = 20
 # §15 全渠道持續鏡像（tail state.db）——默認常開;#308 MACCHIATO_MIRROR=off 可停(見 MIRROR_OFF)。
 MIRROR_POLL_S = float(os.environ.get("MACCHIATO_MIRROR_POLL_S", "2"))  # 輪詢間隔（小=更即時、多步回合更增量）
+# F-01 / #348 durable outbox：未 ACK 批按此間隔重發（對齊 CC/Codex 15s），避免每 2s 刷 server。
+MIRROR_RESEND_S = float(os.environ.get("MACCHIATO_MIRROR_RESEND_S", "15"))
 # #308 MACCHIATO_MIRROR=off:停鏡像輪詢+首裝自動導入(終端側活動不進 app)。⚠️ 只停這兩樣——
 # driven 會話路徑/dedup 衛生照常;_mirror_last_run 恆 None → 看門狗與 server staleness 天然跳過。
 MIRROR_OFF = os.environ.get("MACCHIATO_MIRROR", "").lower() in ("off", "0", "false", "no")
@@ -904,7 +906,11 @@ class Connector:
         self._proj_last_hash: dict = {}  # #227 canon → AGENTS.md hash(回合末比對)
         self._projects_load()
         self._mirror_batch_id = 0
-        self._mirror_rewind = deque(maxlen=64)  # (batchId, {sid: 舊floor})，供 nack 回退
+        # F-01 / #348 durable outbox：進程內「上次嘗試發送」時間戳（batchId → monotonic）。
+        # 落盤的 pendingMirrors 只存 frame/水位候選；節流用內存即可（重啟後立刻重發一次）。
+        self._mirror_sent_at: dict = {}
+        # NACK 後 lastError 黏住，直到某批真被 server ACK 才清（對齊 CC #348 errorSticky）。
+        self._mirror_error_sticky = False
         # #380 斷線出站緩衝：幀數 + 總字節雙限（不再只靠 maxlen=500）。
         self._out_pending: deque[str] = deque()
         self._out_pending_bytes = 0
@@ -2065,6 +2071,9 @@ class Connector:
                 st.setdefault("sessions", {})
                 st.setdefault("tombstones", [])  # #161 墓碑:app 刪過的會話,鏡像永不再撈
                 st.setdefault("pendingE2EBackfills", {})
+                # F-01 / #348：日常 mirror_append 的 durable outbox（幀落盤 → ACK 才推水位）。
+                if not isinstance(st.get("pendingMirrors"), list):
+                    st["pendingMirrors"] = []
                 if is_bak:
                     print(
                         f"⚠️ mirror.json 損壞/丟失 → 已從 .bak 恢復水位線（{path}）。"
@@ -2076,7 +2085,12 @@ class Connector:
                 if not isinstance(exc, FileNotFoundError):
                     print(f"[mirror state 損壞 {path}] {exc!r}", file=sys.stderr)
                 continue
-        return {"baseline": None, "sessions": {}, "pendingE2EBackfills": {}}
+        return {
+            "baseline": None,
+            "sessions": {},
+            "pendingE2EBackfills": {},
+            "pendingMirrors": [],
+        }
 
     def _save_mirror_state(self, st: dict, *, strict: bool = False) -> None:
         try:
@@ -2283,23 +2297,137 @@ class Connector:
             except Exception as exc:
                 print(f"[health loop error] {exc!r}", file=sys.stderr)
 
-    def _mirror_handle_nack(self, batch_id) -> None:
-        """收到 server 的 mirror_nack：回退該批會話的水位線 → 下輪重發（#3 防丟）。"""
+    def _pending_mirrors(self) -> list:
+        st = self._mirror_st
+        if st is None:
+            return []
+        pending = st.setdefault("pendingMirrors", [])
+        if not isinstance(pending, list):
+            st["pendingMirrors"] = []
+            return st["pendingMirrors"]
+        return pending
+
+    def _find_pending_mirror(self, batch_id):
+        if batch_id is None:
+            return None
+        want = str(batch_id)
+        for pending in self._pending_mirrors():
+            if isinstance(pending, dict) and str(pending.get("batchId")) == want:
+                return pending
+        return None
+
+    def _drop_pending_mirror(self, batch_id) -> None:
+        want = str(batch_id)
+        pending = self._pending_mirrors()
+        self._mirror_st["pendingMirrors"] = [
+            p for p in pending if not (isinstance(p, dict) and str(p.get("batchId")) == want)
+        ]
+        self._mirror_sent_at.pop(want, None)
+        self._mirror_sent_at.pop(batch_id, None)
+
+    def _commit_pending_watermarks(self, pending: dict) -> None:
+        """把 durable 批的候選水位/標題提交到已確認狀態（ACK 或 malformed 跳過）。"""
+        st = self._mirror_st
+        wm = st.setdefault("sessions", {})
+        titles = st.setdefault("titles", {})
+        ta = st.setdefault("touched_at", {})
+        now = int(time.time())
+        for sid, new_wm in (pending.get("watermarks") or {}).items():
+            if not isinstance(sid, str) or not isinstance(new_wm, int):
+                continue
+            if new_wm > wm.get(sid, 0):
+                wm[sid] = new_wm
+                ta[sid] = now
+        for sid, title in (pending.get("titles") or {}).items():
+            if isinstance(sid, str) and isinstance(title, str):
+                titles[sid] = title
+
+    def _mirror_handle_ack(self, batch_id) -> None:
+        """mirror_ack：只有 server 事務已提交後才推水位（F-01 / #348）。"""
         if self._mirror_st is None or batch_id is None:
             return
-        for bid, rewind in self._mirror_rewind:
-            if bid == batch_id:
-                wm = self._mirror_st["sessions"]
-                for sid, old in rewind.items():
-                    wm[sid] = min(wm.get(sid, old), old)
-                self._save_mirror_state(self._mirror_st)
-                self._count("mirrorNacks")  # #10
-                self._last_error = f"mirror_nack: batch {batch_id}"
-                print(
-                    f"· mirror_nack batch {batch_id}：回退 {len(rewind)} 會話水位線、下輪重發",
-                    file=sys.stderr,
-                )
-                return
+        pending = self._find_pending_mirror(batch_id)
+        if pending is None:
+            return
+        self._commit_pending_watermarks(pending)
+        self._drop_pending_mirror(batch_id)
+        self._mirror_error_sticky = False
+        self._last_error = None
+        self._save_mirror_state(self._mirror_st)
+        print(f"· mirror_ack batch {batch_id}：水位線已提交")
+
+    def _mirror_handle_nack(self, batch_id, error: str | None = None, code: str | None = None) -> None:
+        """mirror_nack（F-01 / #348 對齊 CC/Codex）。
+
+        默認：保留 durable 批、同 batchId 重發（水位**不**回退——本來就還沒推）。
+        終態 code：
+          - e2e_direction：幀凍結在舊明/密文方向，重發永遠被拒 → 丟棄涉及會話的全部
+            待確認批，水位停在最後一次 ACK，下輪 poll 重讀重編。
+          - malformed：毒批/畸形，重試永遠不會好 → 丟批並**跳過**（推候選水位），否則
+            該會話永不再前進；lastError 留給 health。
+        """
+        if self._mirror_st is None or batch_id is None:
+            return
+        target = self._find_pending_mirror(batch_id)
+        if target is None:
+            return
+        self._count("mirrorNacks")  # #10
+        self._last_error = error or f"mirror_nack: batch {batch_id}"
+        self._mirror_error_sticky = True
+        self._mirror_sent_at.pop(str(batch_id), None)
+        self._mirror_sent_at.pop(batch_id, None)
+
+        if code == "e2e_direction":
+            # 水位鍵 = state.db sid；同 sid 後續凍結批同樣是舊方向 → 一併丟棄。
+            sids = {
+                sid
+                for sid in (target.get("watermarks") or {})
+                if isinstance(sid, str)
+            }
+            dropped = []
+            kept = []
+            for pending in self._pending_mirrors():
+                if not isinstance(pending, dict):
+                    continue
+                p_wms = pending.get("watermarks") or {}
+                same_batch = str(pending.get("batchId")) == str(batch_id)
+                touches = bool(sids) and any(sid in sids for sid in p_wms)
+                if same_batch or touches:
+                    dropped.append(pending)
+                    bid = pending.get("batchId")
+                    self._mirror_sent_at.pop(str(bid), None)
+                    self._mirror_sent_at.pop(bid, None)
+                else:
+                    kept.append(pending)
+            self._mirror_st["pendingMirrors"] = kept
+            self._count("mirrorDirectionRewinds")
+            self._save_mirror_state(self._mirror_st)
+            print(
+                f"· mirror_nack(e2e_direction) batch {batch_id} → 丟棄 {len(dropped)} 個舊方向凍結批,"
+                f"回退到已提交水位重讀重編",
+                file=sys.stderr,
+            )
+            return
+
+        if code == "malformed":
+            # 毒批：跳過這段，否則會話永久卡死在無限重放。
+            self._commit_pending_watermarks(target)
+            self._drop_pending_mirror(batch_id)
+            self._count("mirrorDropped")
+            self._save_mirror_state(self._mirror_st)
+            print(
+                f"· mirror_nack(malformed) batch {batch_id} → 丟棄該批並跳過"
+                f"(server 判畸形/毒批):{self._last_error}",
+                file=sys.stderr,
+            )
+            return
+
+        # transient / e2e_pending / 無 code（舊 server）：保留 outbox 重發。
+        print(
+            f"· mirror_nack batch {batch_id} → durable outbox retained for resend"
+            + (f" (code={code})" if code else ""),
+            file=sys.stderr,
+        )
 
     def _mirror_entry(self, sid, title, source, archived, msgs, e2e):
         """構造一個鏡像批次條目。E2E 會話（方案 A）：標題 + 各消息內容加密、打 e2e 標記，server 盲存。"""
@@ -2361,9 +2489,21 @@ class Connector:
             self._save_mirror_state(st)
             print(f"· #9 裁剪 {pruned} 個閒置水位線（剩 {len(wm)}，pruned_floor={st['pruned_floor']}）")
 
+    def _sync_mirror_batch_id_from_pending(self) -> None:
+        """重啟後 batch 計數器從 0 起；抬到 pending 最大 id，避免新批撞上未 ACK 的 batchId。"""
+        max_id = int(getattr(self, "_mirror_batch_id", 0) or 0)
+        for pending in self._pending_mirrors():
+            bid = pending.get("batchId") if isinstance(pending, dict) else None
+            if isinstance(bid, int) and bid > max_id:
+                max_id = bid
+            elif isinstance(bid, str) and bid.isdigit() and int(bid) > max_id:
+                max_id = int(bid)
+        self._mirror_batch_id = max_id
+
     async def _mirror_loop(self) -> None:
         """tail state.db：把其他渠道（Discord/Telegram/…）的新消息 mirror_append 給 server。"""
         st = self._mirror_st = self._load_mirror_state()
+        self._sync_mirror_batch_id_from_pending()
         if st.get("baseline") is None:
             st["baseline"] = await current_max_id()  # 基線=當前 max；只鏡像此後的新消息
             self._save_mirror_state(st)
@@ -2390,7 +2530,41 @@ class Connector:
                 self._count("mirrorErrors")  # #10
                 print(f"[mirror loop error] {exc!r}", file=sys.stderr)
 
+    async def _resend_pending_mirrors(self, *, force: bool = False) -> bool:
+        """重發 durable outbox 中未 ACK 的 mirror_append。返回是否仍有待確認批。
+
+        force=True（ready 補發）忽略節流；日常 poll 按 MIRROR_RESEND_S 節流，對齊 CC 15s。
+        """
+        st = self._mirror_st
+        if st is None:
+            return False
+        pending = self._pending_mirrors()
+        if not pending:
+            return False
+        now = time.monotonic()
+        for item in list(pending):
+            if not isinstance(item, dict):
+                continue
+            frame = item.get("frame")
+            bid = item.get("batchId")
+            if not isinstance(frame, dict) or bid is None:
+                continue
+            key = str(bid)
+            last = self._mirror_sent_at.get(key, 0.0)
+            if not force and last and (now - last) < MIRROR_RESEND_S:
+                continue
+            ok = await self._send(frame)
+            if ok:
+                self._mirror_sent_at[key] = now
+            else:
+                self._count("mirrorSendFailed")
+        return bool(self._pending_mirrors())
+
     async def _mirror_poll_once(self, st, baseline, wm, titles) -> None:
+        # F-01 / #348：有未 ACK 批時只重發 outbox、不造新批——水位未提交，重讀會再造一份
+        # 不同 batchId 的重複內容；凍結幀必須原樣重投直到 ACK / 終態 NACK。
+        if await self._resend_pending_mirrors():
+            return
         batch, touched, title_updates = [], {}, {}
         # #9:未知會話的 floor 回退 max(baseline, pruned_floor)——被裁會話復活不重發舊消息。
         default_floor = max(baseline, st.get("pruned_floor", 0))
@@ -2474,34 +2648,37 @@ class Connector:
         if batch:
             self._mirror_batch_id += 1
             bid = self._mirror_batch_id
-            rewind = {sid: (wm[sid] if sid in wm else default_floor) for sid in touched}  # advance 前的舊 floor
-            ok = await self._send({
+            frame = {
                 "t": "mirror_append",
                 "agentLinkId": self.agent_link_id,
                 "batchId": bid,
                 "sessions": batch,
-            })
+            }
+            # F-01：幀先入 durable outbox 再發；只有 mirror_ack 才提交水位/標題。
+            pending = {
+                "batchId": bid,
+                "frame": frame,
+                "watermarks": dict(touched),
+                "titles": dict(title_updates),
+            }
+            self._pending_mirrors().append(pending)
+            self._save_mirror_state(st, strict=True)
+            ok = await self._send(frame)
             if not ok:
-                # #239:批根本沒到 server(斷線/半路失敗)→ 不推水位線、不記 rewind、不記標題,
-                # 下輪 poll 原地重撈重發。照推的話 server 永不 nack(沒收到),消息永久丟失。
+                # #239:批根本沒到 server → outbox 已落盤,水位不推;下輪/重連原 batchId 重發。
                 self._count("mirrorSendFailed")
-                print(f"[mirror batch {bid} 未發出 → 水位線不推進,下輪重試]", file=sys.stderr)
+                print(
+                    f"[mirror batch {bid} 未發出 → durable outbox 保留,水位線不推進,下輪重試]",
+                    file=sys.stderr,
+                )
                 return
-            self._mirror_rewind.append((bid, rewind))
-            # 修 B：只在水位線未被併發 nack 回退時推進（否則回退會被覆蓋 → 丟）。
-            ta = st.setdefault("touched_at", {})
-            for sid, new_wm in touched.items():
-                if (wm[sid] if sid in wm else default_floor) == rewind[sid]:
-                    wm[sid] = new_wm
-                    ta[sid] = int(time.time())  # #9:記活躍時間,供裁剪判齡
-            titles.update(title_updates)  # 發送成功才記，免得失敗後不再重發
-            self._save_mirror_state(st)
+            self._mirror_sent_at[str(bid)] = time.monotonic()
             n = sum(len(s["messages"]) for s in batch)
             self._count("mirrorBatches")  # #10
             self._count("mirrorMessages", n)
             nt = sum(1 for s in batch if not s["messages"])
             extra = f"（含 {nt} 純標題更新）" if nt else ""
-            print(f"· 鏡像 {len(batch)} 會話 / {n} 條 → server (batch {bid}){extra}")
+            print(f"· 鏡像 {len(batch)} 會話 / {n} 條 → server (batch {bid}, awaiting ack){extra}")
 
     async def _e2e_snapshot(self, server_sid: str):
         """按 server sid 定位 state.db 會話並全量快照。導入/鏡像會話：hermesSessionId 就是
@@ -3242,6 +3419,10 @@ class Connector:
                     print(f"[積壓補發失敗,剩 {len(self._out_pending)}] {exc!r}", file=sys.stderr)
             # #251:補發完成後才置 ready——補發期間並發的 _send 走緩衝、由上面循環按序帶出,不亂序。
             self._linkb_ready = True
+            # F-01：重連後立刻補發未 ACK 的 mirror_append（同 batchId；對齊 E2E backfill）。
+            if self._mirror_st is None:
+                self._mirror_st = self._load_mirror_state()
+            await self._resend_pending_mirrors(force=True)
             await self._resend_pending_e2e_backfills()
             await self._advertise_import()
             await self._report_commands()  # #199 每次 ready 重發(server 重啟丟內存緩存)
@@ -3279,8 +3460,16 @@ class Connector:
         if t == "import_start":
             await self._run_import()
             return
+        if t == "mirror_ack":
+            self._mirror_handle_ack(msg.get("batchId"))
+            return
         if t == "mirror_nack":
-            self._mirror_handle_nack(msg.get("batchId"))
+            code = msg.get("code")
+            self._mirror_handle_nack(
+                msg.get("batchId"),
+                error=msg.get("error") if isinstance(msg.get("error"), str) else None,
+                code=code if isinstance(code, str) else None,
+            )
             return
         if t == "self_update":
             self._self_update()

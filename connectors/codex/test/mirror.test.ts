@@ -718,3 +718,110 @@ describe("#236 seeded 基線語義(pollOnce 核心路徑)", () => {
     expect(m2.state.offsets[T2]).toBeGreaterThan(0);
   });
 });
+
+/**
+ * F-02 / #491：hello 宣告 mirrorDurable ⇒ malformed 終態必須丟批（跳過該段、水位前進），
+ * 不得一律回退重發（否則毒批無限重放、該會話永不再前進）。對齊 CC mirror 同名用例。
+ */
+describe("durable outbox 的終態 NACK（#491 mirrorDurable 能力閘）", () => {
+  const mkWorld = async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, appendFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { Mirror } = await import("../src/codex/mirror");
+    const root = mkdtempSync(join(tmpdir(), "cx-nack-491-"));
+    process.env.MACCHIATO_CODEX_SESSIONS_DIR = join(root, "sessions");
+    process.env.MACCHIATO_CODEX_MIRROR = join(root, "mirror.json");
+    const dir = join(root, "sessions", "2026", "07", "16");
+    mkdirSync(dir, { recursive: true });
+    const line = (role: "user_message" | "agent_message", text: string) =>
+      JSON.stringify({ timestamp: "2026-07-16T00:00:01Z", type: "event_msg", payload: { type: role, message: text } }) + "\n";
+    const rollout = (tid: string, ...texts: string[]) => {
+      const f = join(dir, `rollout-2026-07-16T00-00-00-${tid}.jsonl`);
+      writeFileSync(f, texts.map((t) => line("user_message", t)).join(""));
+      return f;
+    };
+    return { Mirror, rollout, line, appendFileSync };
+  };
+  const T_SEED = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee0491";
+  const T_POISON = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee0492";
+
+  it("malformed:丟批並跳過該段,水位前進,lastError 留給 health——不無限重發", async () => {
+    const { Mirror, rollout } = await mkWorld();
+    rollout(T_SEED, "存量");
+    const sent: any[] = [];
+    const m: any = new Mirror({
+      agentLinkId: "al",
+      isReady: true,
+      send: (x: any) => sent.push(x),
+      onFrame: () => () => {},
+    } as any);
+    m.pollOnce(); // seeded
+    rollout(T_POISON, "畸形/毒批內容");
+    m.pollOnce();
+    const first = sent.filter((x) => x.t === "mirror_append").at(-1);
+    expect(first).toBeTruthy();
+    expect(m.state.pendingMirrors).toHaveLength(1);
+    expect(m.state.offsets[T_POISON]).toBeUndefined(); // ACK 前水位不動
+
+    m.handleNack(first.batchId, "sessions too large", "malformed");
+    expect(m.state.pendingMirrors).toHaveLength(0); // 丟批，不再同 batchId 重放
+    expect(m.state.offsets[T_POISON]).toBeGreaterThan(0); // 跳過，否則該會話永不再前進
+    expect(m.counters.mirrorDropped).toBe(1);
+    expect(m.lastError).toBe("sessions too large");
+
+    // 下輪 poll 不得再以同批內容無限重發（水位已跳過）
+    const before = sent.filter((x) => x.t === "mirror_append").length;
+    m.pollOnce();
+    expect(sent.filter((x) => x.t === "mirror_append")).toHaveLength(before);
+  });
+
+  it("e2e_direction:丟棄凍結批,水位回退重讀——不再週期重傳舊方向", async () => {
+    const { Mirror, rollout } = await mkWorld();
+    rollout(T_SEED, "存量");
+    const sent: any[] = [];
+    const m: any = new Mirror({
+      agentLinkId: "al",
+      isReady: true,
+      send: (x: any) => sent.push(x),
+      onFrame: () => () => {},
+    } as any);
+    m.pollOnce();
+    rollout(T_POISON, "開 E2E 前的明文");
+    m.pollOnce();
+    const first = sent.filter((x) => x.t === "mirror_append").at(-1);
+    expect(m.state.pendingMirrors).toHaveLength(1);
+
+    m.handleNack(first.batchId, "e2e direction mismatch", "e2e_direction");
+    expect(m.state.pendingMirrors).toHaveLength(0);
+    expect(m.state.offsets[T_POISON]).toBeUndefined(); // 回退到已提交水位（此處尚無 ACK）
+    expect(m.counters.mirrorDirectionRewinds).toBe(1);
+
+    // 下輪重讀重編：新 batchId，內容不丟
+    const before = sent.filter((x) => x.t === "mirror_append").length;
+    m.pollOnce();
+    const again = sent.filter((x) => x.t === "mirror_append").slice(before);
+    expect(again).toHaveLength(1);
+    expect(again[0].batchId).not.toBe(first.batchId);
+    expect(again[0].sessions[0].messages[0].text).toBe("開 E2E 前的明文");
+  });
+
+  it("無 code(舊 server / transient)仍是保留重發語義", async () => {
+    const { Mirror, rollout } = await mkWorld();
+    rollout(T_SEED, "存量");
+    const sent: any[] = [];
+    const m: any = new Mirror({
+      agentLinkId: "al",
+      isReady: true,
+      send: (x: any) => sent.push(x),
+      onFrame: () => () => {},
+    } as any);
+    m.pollOnce();
+    rollout(T_POISON, "暫時失敗");
+    m.pollOnce();
+    const first = sent.filter((x) => x.t === "mirror_append").at(-1);
+    m.handleNack(first.batchId, "mirror transaction failed");
+    expect(m.state.pendingMirrors).toHaveLength(1); // durable outbox 保留
+    expect(m.state.offsets[T_POISON]).toBeUndefined();
+  });
+});

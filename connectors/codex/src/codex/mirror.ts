@@ -358,6 +358,84 @@ export class Mirror {
     void threadId;
   }
 
+  /**
+   * #489 F-12 崩潰補撈：只讀 rollout **已落盤** agent 消息，經 durable `mirror_append` 補投。
+   * 絕不重跑回合；只補 agent；E2E 明文跳過；水位走 ACK。false → 回退「請重發」。
+   */
+  salvageCrash(localThreadId: string, wireSid?: string): boolean {
+    if (!localThreadId) return false;
+    if (this.state.tombstones?.includes(localThreadId)) return false;
+    if (this.hasPendingE2EBackfill(localThreadId)) return false;
+    // 已有 durable 批在途 → 交給 outbox
+    if ((this.state.pendingMirrors ?? []).some((p) => p.offsets[localThreadId] !== undefined)) {
+      return false;
+    }
+
+    const rf = discoverRollouts().rollouts.find((r) => r.threadId === localThreadId);
+    if (!rf || !existsSync(rf.file)) return false;
+    let content: string;
+    try {
+      content = readFileSync(rf.file, "utf8");
+    } catch {
+      return false;
+    }
+    const size = Buffer.byteLength(content, "utf8");
+    const startOff = this.state.offsets[localThreadId] ?? 0;
+    const ordBase = this.state.ords[localThreadId] ?? 0;
+    if (size <= startOff) return false;
+
+    const { messages, newOffset, lineCount } = readNewMessages(content, startOff, ordBase);
+    const agents = messages.filter((m) => m.role === "agent" && m.text.trim());
+    if (!agents.length) return false;
+
+    const mappedWire = this.e2eWireSidForLocal?.(localThreadId);
+    const targetSid = wireSid ?? mappedWire ?? localThreadId;
+    if (this.e2e?.isE2E(targetSid) || this.e2e?.isE2E(localThreadId)) return false;
+    if (!wireSid && !mappedWire && this.plaintextLocalAllowed?.() === false) return false;
+
+    const { title } = deriveMeta(content);
+    // 投到 wire sid（app ULID）而非本地 threadId，掛回原會話
+    const entry = {
+      hermesSessionId: targetSid,
+      title,
+      source: "codex",
+      messages: agents.map((m) => ({
+        role: m.role,
+        text: m.text,
+        srcId: srcIdFor(localThreadId, m),
+      })),
+    };
+    const batchId = randomUUID();
+    const frame = {
+      t: "mirror_append",
+      agentLinkId: this.linkb.agentLinkId,
+      sessions: [entry],
+      batchId,
+    };
+    if (Buffer.byteLength(JSON.stringify(frame), "utf8") > MAX_WIRE_BYTES) {
+      this.lastError = `F-12 salvage exceeds ${MAX_WIRE_BYTES} byte frame budget (${localThreadId})`;
+      this.errorSticky = true;
+      console.error(`[mirror] ${this.lastError}; watermark retained`);
+      return false;
+    }
+    // endOffset 推過本段全部完整行（含 user）：user live 已投；agent 帶 srcId 冪等
+    (this.state.pendingMirrors ??= []).push({
+      batchId,
+      frame,
+      offsets: { [localThreadId]: newOffset },
+      ords: { [localThreadId]: ordBase + lineCount },
+    });
+    this.save(true);
+    this.linkb.send(frame as any);
+    this.sentBatchAt.set(batchId, Date.now());
+    this.counters.mirrorBatches += 1;
+    this.counters.mirrorMessages += agents.length;
+    console.log(
+      `· #489 F-12 salvageCrash ${localThreadId} → ${targetSid}: ${agents.length} agent msg(s)`,
+    );
+    return true;
+  }
+
   start(): void {
     if (this.disabled) {
       // ⚠️ 回歸契約:scripts/localchain/scenarios-mirror-off.mjs 斷言此串,改文案需同步

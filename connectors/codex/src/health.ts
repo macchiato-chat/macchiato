@@ -1,7 +1,10 @@
 /**
  * 健康上報 + 鏡像看門狗（對齊 Hermes/OpenClaw 連接器）。
  * Codex 無常駐 gateway（每回合 spawn codex exec）→ gatewayAlive = sessions 目錄可讀 + CLI 在位。
+ *
+ * 形狀對齊 `ConnectorHealthState` core+optional（#492）——不發 Hermes 專屬觀測字段。
  */
+import type { ConnectorHealthState } from "./linkb/proto";
 import { gcAttachments } from "./codex/attachments";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -14,20 +17,16 @@ import { resolveCodexBin } from "./codex/codex-bin";
 const HEALTH_INTERVAL_MS = Number(process.env.MACCHIATO_HEALTH_INTERVAL_MS) || 60_000;
 const MIRROR_STUCK_MS = Number(process.env.MACCHIATO_MIRROR_STUCK_MS) || 120_000;
 
-export interface HealthSnapshot {
-  gatewayAlive: boolean;
-  compatOk: boolean;
-  mirrorLastPollAgeS: number;
-  lastError: string | null;
+/** 本連接器 health 上報體 = protocol core + 本家 optional/擴展。 */
+export interface HealthSnapshot extends ConnectorHealthState {
   kind: "codex";
   connectorVersion: string;
+  /** 本家總是發 number（mirror off → 0）。 */
+  mirrorLastPollAgeS: number;
   /** #89：無本地 STT——server 據此把語音輸入直接路由到雲端 BYOK STT（不再下達音頻）。 */
   stt: false;
+  /** 擴展：CLI 版本字串（server 不解析）。 */
   cliVersion?: string;
-  /** #310 登錄態:false=最近驅動回合認證失敗(app 顯「需重新登錄」);成功回合恢復 true。 */
-  authOk?: boolean;
-  /** #10:累計計數(進程生命週期)。 */
-  counters?: Record<string, number>;
   /** #260 引擎 + app-server v2 狀態(exec v1 省略):重啟風暴/死活可見。 */
   engine?: "app-server" | "exec";
   appServerReady?: boolean;

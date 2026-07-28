@@ -1,9 +1,12 @@
 /**
  * 健康上報 + 看門狗（對齊 Hermes 連接器）：
- *  - 每 HEALTH_INTERVAL_MS 發 connector_health（server 讀 gatewayAlive/compatOk/mirrorLastPollAgeS/lastError, 
+ *  - 每 HEALTH_INTERVAL_MS 發 connector_health（server 讀 gatewayAlive/compatOk/mirrorLastPollAgeS/lastError,
  *    據此顯示「在線但降級」）。
  *  - 鏡像 watchdog：poll 停擺超過 MIRROR_STUCK_MS → 重啟鏡像自愈。
+ *
+ * 形狀對齊 `ConnectorHealthState` core+optional（#492）——不發 Hermes 專屬觀測字段。
  */
+import type { ConnectorHealthState } from "./linkb/proto";
 import type { LinkBClient } from "./linkb/client";
 import type { OpenClawGateway } from "./openclaw/gateway";
 import type { Drive } from "./openclaw/drive";
@@ -13,17 +16,14 @@ import { smokeParseLatest } from "./openclaw/history-import";
 const HEALTH_INTERVAL_MS = Number(process.env.MACCHIATO_HEALTH_INTERVAL_MS) || 60_000;
 const MIRROR_STUCK_MS = Number(process.env.MACCHIATO_MIRROR_STUCK_MS) || 120_000;
 
-export interface HealthSnapshot {
-  gatewayAlive: boolean;
-  compatOk: boolean;
-  mirrorLastPollAgeS: number;
-  lastError: string | null;
+/** 本連接器 health 上報體 = protocol core + 本家 optional。 */
+export interface HealthSnapshot extends ConnectorHealthState {
   kind: "openclaw";
   connectorVersion: string; // §update：server 據此判 updateAvailable（欄位名對齊 protocol）
+  /** 本家總是發 number（mirror off → 0）。 */
+  mirrorLastPollAgeS: number;
   /** #89：無本地 STT——server 據此把語音輸入直接路由到雲端 BYOK STT（不再下達音頻）。 */
   stt: false;
-  /** #10:累計計數(進程生命週期)——鏡像條數/nack/重投/錯誤,一次性的丟/重複才看得見。 */
-  counters?: Record<string, number>;
 }
 
 /**

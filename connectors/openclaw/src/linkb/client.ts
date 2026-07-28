@@ -113,6 +113,7 @@ export class LinkBClient {
           e2eControlAuth: 1,
           e2eKeyVersionBinding: 1,
           e2eQuiesce: 1,
+          mirrorDurable: 1, // #348 / F-10：durable outbox + 懂 mirror_nack.code 終態語義
         }),
       );
     });

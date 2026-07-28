@@ -308,3 +308,30 @@ describe("#378 符號連結:安全解析 + 包含性檢查(項目內照用、項
     expect(op({ reqId: 3, op: "mem_write", path: workdir, content: "x" }).ok).toBe(false);
   });
 });
+
+describe("#498/F-14 ~/ 展開：server 形路徑作註冊表鍵、fs 走 $HOME", () => {
+  it("register path=~/rel → 寫入 $HOME/rel；mem_read 仍用 ~/rel 鍵命中", () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "codex-home-"));
+    const prevHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      const rel = `f14-tilde-${Date.now()}`;
+      const serverPath = `~/${rel}`;
+      const abs = join(fakeHome, rel);
+      mkdirSync(abs, { recursive: true });
+      writeFileSync(join(abs, "AGENTS.md"), "# tilde-mem");
+      const { op } = setup();
+      const r = op({ reqId: 1, op: "register", path: serverPath });
+      expect(r.ok).toBe(true);
+      expect(r.agentsMd).toBe("# tilde-mem");
+      expect(existsSync(join(abs, "CLAUDE.md"))).toBe(true);
+      expect(op({ reqId: 2, op: "mem_read", path: serverPath }).agentsMd).toBe("# tilde-mem");
+      expect(op({ reqId: 3, op: "mem_read", path: abs }).ok).toBe(false);
+      expect(op({ reqId: 4, op: "mem_write", path: serverPath, content: "# via-tilde" }).ok).toBe(true);
+      expect(readFileSync(join(abs, "AGENTS.md"), "utf8")).toBe("# via-tilde");
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
+  });
+});

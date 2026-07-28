@@ -334,18 +334,92 @@ describe("Mirror", () => {
     expect(appends(sent)).toHaveLength(0);
   });
 
-  it("第二道守衛:driven 過的 CLI 會話,即便有 user 續問也不單獨建鏡像會話;兜底計數恆 0", () => {
+  it("第二道守衛:driven 過且無 wire 映射 → 即便有 user 續問也不單獨建鏡像會話;兜底計數恆 0", () => {
     setupEnv();
     writeFileSync(file, "");
     const { linkb, sent } = fakeLinkb();
     const m = new Mirror(linkb);
     m.markDrivenUuid(SID); // 標記:此 CLI uuid 被 Macchiato 驅動過
     (m as any).doPoll();
-    // 終端裡真人續問(有 user)——但因為是 driven 過的 uuid,鏡像永不單獨建會話
+    // 終端裡真人續問(有 user)——無 wire 反向映射時仍永不單獨建(防影子)
     writeFileSync(file, userLine("終端續問") + assistantLine("回覆"));
     (m as any).doPoll();
     expect(appends(sent)).toHaveLength(0);
     expect(m.counters.mirrorGhostBlocked).toBe(0); // 主守衛悄悄攔在 emit 前,絆線不觸發
+  });
+
+  it("#395 有 wire 映射時,driven CLI 的終端續聊掛回原 wire 會話(不另建影子)", () => {
+    setupEnv();
+    writeFileSync(file, "");
+    const wireSid = "01ULIDWIRESESSION0000000001";
+    const { linkb, sent } = fakeLinkb();
+    // 明文 ULID 映射——與 E2E 路徑同形,但 target 不加密
+    const m = new Mirror(linkb, undefined, (local) => (local === SID ? wireSid : undefined));
+    m.markDrivenUuid(SID);
+    (m as any).doPoll(); // 空檔 baseline
+    // 用戶在終端 `claude --resume <uuid>` 續問
+    writeFileSync(file, userLine("終端續聊內容") + assistantLine("終端側回覆"));
+    (m as any).doPoll();
+    const batches = appends(sent);
+    expect(batches.length).toBeGreaterThanOrEqual(1);
+    const batch = batches[0] as any;
+    expect(batch.sessions[0].hermesSessionId).toBe(wireSid); // 掛回原 Macchiato 會話
+    expect(batch.sessions[0].hermesSessionId).not.toBe(SID); // 絕不另建 CLI-uuid 影子
+    const texts = batch.sessions[0].messages.map((x: any) => x.text);
+    expect(texts).toEqual(["終端續聊內容", "終端側回覆"]);
+    expect(m.counters.mirrorGhostBlocked).toBe(0);
+  });
+
+  it("#395 在途 driven 仍讓路;解除後有映射的續聊才回流", () => {
+    setupEnv();
+    writeFileSync(file, "");
+    const wireSid = "01ULIDWIRESESSION0000000002";
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb, undefined, (local) => (local === SID ? wireSid : undefined));
+    (m as any).doPoll();
+    m.setDriven(SID); // 回合在途
+    appendFileSync(file, userLine("app 在途") + assistantLine("live 獨佔"));
+    (m as any).doPoll();
+    expect(appends(sent)).toHaveLength(0); // drivenSids 讓路,零投遞
+    m.unsetDriven(SID);
+    // 終端後續新回合
+    appendFileSync(file, userLine("終端後續") + assistantLine("終端回"));
+    (m as any).doPoll();
+    const all = appends(sent).flatMap((f: any) => f.sessions[0].messages.map((x: any) => x.text));
+    // 解除後整段 transcript 可掛回 wire(歷史 live 靠 server srcId 去重;此單測無 server)
+    expect(all).toContain("終端後續");
+    expect(all).toContain("終端回");
+    expect(appends(sent).every((f: any) => f.sessions[0].hermesSessionId === wireSid)).toBe(true);
+  });
+
+  it("#395 MIRROR=off × 明文 wire 映射:不得當 E2E 定向投遞(守 #308)", () => {
+    // 回歸:wireSessionIdFor 對明文 ULID 也回真後,isE2ESession 若只看 !!callback 會把明文
+    // 誤當 E2E → off 下 unsetDriven 仍 watch + poll,終端續聊進 app。
+    setupEnv();
+    writeFileSync(file, userLine("app 回合") + assistantLine("live 正文"));
+    const wireSid = "01ULIDPLAINTEXTOFF00000001"; // 明文 ULID,非 E2E
+    process.env.MACCHIATO_MIRROR = "off";
+    try {
+      const { linkb, sent } = fakeLinkb();
+      // 無 e2e store;callback 對明文有映射(與生產 index 接 wireSessionIdFor 同形)
+      const m = new Mirror(linkb, undefined, (local) => (local === SID ? wireSid : undefined)) as any;
+      m.markDrivenUuid(SID);
+      m.setDriven(SID);
+      expect(m.drivenE2EWatch.has(SID)).toBe(false); // 明文不得進 E2E watch
+      vi.useFakeTimers();
+      m.start();
+      m.unsetDriven(SID);
+      // 終端續聊落盤
+      appendFileSync(file, userLine("終端 off 不該進") + assistantLine("也不該"));
+      vi.advanceTimersByTime(30_000);
+      vi.useRealTimers();
+      expect(appends(sent)).toHaveLength(0); // 一幀不得進 app
+      expect(m.drivenE2EWatch.has(SID)).toBe(false);
+      expect(m.state.offsets[SID]).toBeUndefined();
+    } finally {
+      delete process.env.MACCHIATO_MIRROR;
+      vi.useRealTimers();
+    }
   });
 
   it("連接器啟動後新建的會話 → 從 0 全量鏡像(claude -p 短會話不丟)", async () => {
@@ -833,5 +907,75 @@ describe("#308 MACCHIATO_MIRROR=off(鏡像開關)", () => {
     } finally {
       delete process.env.MACCHIATO_MIRROR;
     }
+  });
+});
+
+
+describe("#489 F-12 salvageCrash 崩潰補撈", () => {
+  it("只補 agent、掛 wire sid、進 durable outbox；無 agent 則 false", () => {
+    const cfg = mkdtempSync(join(tmpdir(), "cc-f12-"));
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
+    mkdirSync(join(cfg, "projects", "-home-x"), { recursive: true });
+    const file = join(cfg, "projects", "-home-x", `${SID}.jsonl`);
+    writeFileSync(
+      process.env.MACCHIATO_CC_MIRROR!,
+      JSON.stringify({ offsets: { [SID]: 0 }, titles: { [SID]: "t" }, seeded: true }),
+    );
+    // user + agent 已落盤
+    writeFileSync(file, userLine("please do x") + assistantLine("done with x"));
+    const { linkb, sent } = fakeLinkb();
+    const wireSid = "01WIREULIDF12SALVAGE0000001";
+    const m = new Mirror(linkb, undefined, () => wireSid);
+    const ok = m.salvageCrash(SID, wireSid);
+    expect(ok).toBe(true);
+    const apps = appends(sent);
+    expect(apps).toHaveLength(1);
+    const sess = (apps[0] as any).sessions[0];
+    expect(sess.hermesSessionId).toBe(wireSid);
+    expect(sess.messages).toHaveLength(1);
+    expect(sess.messages[0].role).toBe("agent");
+    expect(sess.messages[0].text).toBe("done with x");
+    expect(sess.messages[0].srcId).toBeTruthy();
+    // durable pending
+    expect((m as any).state.pendingMirrors).toHaveLength(1);
+  });
+
+  it("無 agent 內容 → false（回退請重發）", () => {
+    const cfg = mkdtempSync(join(tmpdir(), "cc-f12b-"));
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
+    mkdirSync(join(cfg, "projects", "-home-x"), { recursive: true });
+    const file = join(cfg, "projects", "-home-x", `${SID}.jsonl`);
+    writeFileSync(
+      process.env.MACCHIATO_CC_MIRROR!,
+      JSON.stringify({ offsets: { [SID]: 0 }, titles: { [SID]: "t" }, seeded: true }),
+    );
+    writeFileSync(file, userLine("only user so far"));
+    const { linkb } = fakeLinkb();
+    const m = new Mirror(linkb);
+    expect(m.salvageCrash(SID)).toBe(false);
+  });
+
+  it("已有 pending 批 → false 不另開 salvage", () => {
+    const cfg = mkdtempSync(join(tmpdir(), "cc-f12c-"));
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
+    mkdirSync(join(cfg, "projects", "-home-x"), { recursive: true });
+    const file = join(cfg, "projects", "-home-x", `${SID}.jsonl`);
+    writeFileSync(
+      process.env.MACCHIATO_CC_MIRROR!,
+      JSON.stringify({
+        offsets: { [SID]: 0 },
+        titles: { [SID]: "t" },
+        seeded: true,
+        pendingMirrors: [{ batchId: "b1", frame: {}, sid: SID, endOffset: 10 }],
+      }),
+    );
+    writeFileSync(file, userLine("u") + assistantLine("a"));
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb);
+    expect(m.salvageCrash(SID)).toBe(false);
+    expect(appends(sent)).toHaveLength(0);
   });
 });

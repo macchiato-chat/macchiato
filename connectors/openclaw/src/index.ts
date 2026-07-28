@@ -25,7 +25,7 @@ import { join } from "node:path";
 // 四連接器常量(cc/codex/openclaw 各自 src/index.ts + hermes connector.py)+ protocol link.ts 全局。
 // 全局是 server 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」
 // (本機與公開用戶一起亮,重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-const CONNECTOR_VERSION = "1.5.56";
+const CONNECTOR_VERSION = "1.5.57";
 
 /** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
 function runSelfUpdate(): void {
@@ -82,10 +82,11 @@ async function main(): Promise<void> {
   const mirrorMain = process.env.MACCHIATO_OPENCLAW_MIRROR || join(homedir(), ".macchiato/openclaw-mirror.json");
   const freshInstall = !existsSync(mirrorMain) && !existsSync(mirrorMain + ".bak");
   mirror = new Mirror(gw, linkb, e2e);
-  // #256:OpenClaw **不是 project-capable**(gateway 無 per-session cwd 通道;web PROJECT_CAPABLE_KINDS
-  // 已排除)。不接線 project_op handler——否則 server 被攻破可驅動這個本不該存在的路徑,往任意目錄
-  // 寫 AGENTS.md/CLAUDE.md(持久化 prompt injection)。project_op 幀無 handler = 直接忽略(server
-  // 只在 ready 對 openclaw 發空 registry、fire-and-forget,無回應期待)。Projects 走 cc/codex/hermes。
+  // #256 / F-14 #498:OpenClaw **故意不做 Projects**(產品+安全邊界,見 docs/projects.md §3.1)。
+  // gateway 無 per-session cwd 通道;web PROJECT_CAPABLE_KINDS 已排除。**不**接線 project_op
+  // handler——否則 server 被攻破可驅動本不該存在的路徑,往任意目錄寫 AGENTS.md/CLAUDE.md
+  // (持久化 prompt injection)。project_op 幀無 handler = 直接忽略;server ready 時若該 link
+  // 無綁定 project 則不下發 registry。Projects 只走 cc/codex/hermes。
   drive = new Drive(gw, linkb, mirror, e2e);
   const localE2EStatus = () => mirror.localSessionE2EStatus();
   const preflightIdentity = async (reason: string): Promise<void> => {
@@ -150,7 +151,23 @@ async function main(): Promise<void> {
       return;
     }
     try {
-    if (msg.t === "mirror_nack" && typeof msg.batchId === "number") mirror.handleNack(msg.batchId);
+    if (
+      msg.t === "mirror_nack" &&
+      (typeof msg.batchId === "number" || typeof msg.batchId === "string")
+    ) {
+      mirror.handleNack(
+        msg.batchId,
+        typeof msg.error === "string" ? msg.error : undefined,
+        typeof (msg as { code?: unknown }).code === "string"
+          ? (msg as { code: string }).code
+          : undefined,
+      );
+    } else if (
+      msg.t === "mirror_ack" &&
+      (typeof msg.batchId === "number" || typeof msg.batchId === "string")
+    ) {
+      mirror.handleAck(msg.batchId);
+    }
     else if (msg.t === "import_start") void runIdentitySafeImport(); // web「re-import」→ 身份對賬後回灌全量歷史
     else if (msg.t === "self_update") runSelfUpdate(); // §update：一鍵更新
     else if (msg.t === "e2e_wrap_request" && typeof msg.hermesSessionId === "string") {

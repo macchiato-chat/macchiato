@@ -437,6 +437,34 @@ function stableJSON(value: unknown): string {
   throw new E2EControlError("request digest contains unsupported value");
 }
 
+/** 设备必须完整显示的 canonical 执行请求上限（与 CC/Codex 对齐）。 */
+export const E2E_APPROVAL_DISPLAY_MAX_BYTES = 48 * 1024;
+
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const item of Object.values(value as Record<string, unknown>)) deepFreeze(item);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/**
+ * 将 gateway 审批参数复制为唯一 canonical JSON 快照并递归冻结。digest、加密卡片与
+ * resolve 后的执行必须共用这份快照，不能继续引用调用方随后仍可修改的对象。
+ */
+export function immutableE2EApprovalSnapshot<T>(value: T): T {
+  return deepFreeze(JSON.parse(stableJSON(value)) as T);
+}
+
+/** 设备必须完整显示的 canonical 执行请求；超限时 connector 直接拒绝本次审批。 */
+export function canonicalE2EApprovalDisplay(value: unknown): string {
+  const display = stableJSON(value);
+  if (Buffer.byteLength(display, "utf8") > E2E_APPROVAL_DISPLAY_MAX_BYTES) {
+    throw new E2EControlError("E2E approval execution request exceeds display limit");
+  }
+  return display;
+}
+
 /**
  * connector 生成的审批上下文摘要。用 K_ctrl 做 keyed digest，避免不可信 server 根据公开
  * requestId/sessionId 对低熵命令、路径做离线字典猜测。

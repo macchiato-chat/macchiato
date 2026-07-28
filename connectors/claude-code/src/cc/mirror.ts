@@ -6,9 +6,11 @@
  *  - 字節偏移水位線 + in-flight 保留（見 transcripts.foldEntries）。durable outbox（#348）：幀落盤
  *    後才發，只有 `mirror_ack` 才提交水位；`mirror_nack` 默認保留原批重發，終態 `code`
  *    （`e2e_direction` 方向翻轉 / `malformed` 畸形毒批）則丟批——見 `handleNack`。
- *  - driven 會話（本進程經 SDK 驅動）：live 路徑獨佔投遞；回合末**不再快進水位**（#200/#348：未經
- *    server ACK 絕不推進），明文靠 #393 的 srcId 去重、E2E 靠 durable outbox 補投；`drivenUuids`
- *    守衛保證鏡像永不為被驅動過的 CLI 會話另建影子會話。
+ *  - driven 會話（本進程經 SDK 驅動）：live 路徑獨佔投遞；回合在途靠 `drivenSids` 讓路（#200/#348：
+ *    未經 server ACK 絕不推進水位），明文靠 #393 的 srcId 去重、E2E 靠 durable outbox 補投。
+ *  - `drivenUuids` + wire 反向映射（#395）：曾被驅動的 CLI uuid **不得另建影子會話**；但若能反查到
+ *    既有 wire sid（app ULID / 鏡像同源 uuid），終端對該 uuid 的續聊**掛回原 wire 會話**回流。
+ *    無映射時仍永久攔截（防影子）。
  *  - §9：消息帶 srcId（transcript 行 uuid），server 端崩潰重發去重。
  */
 import {
@@ -232,10 +234,11 @@ export class Mirror {
   private readonly drivenSids = new Set<string>();
   private readonly sentBatchAt = new Map<string, number>();
   /**
-   * 影子 session 兜底(第二道防護,2026-07-13):**曾被 Macchiato 驅動過**的 CLI 會話 uuid(持久,
-   * 由 Drive 從 ULID→CLI 映射灌入,跨重啟)。driven 會話的正文由 live 在 ULID 下獨佔投遞,鏡像
-   * **永遠不該**給這些 uuid 單獨建會話——不管是殘片還是終端續問(極少見,取捨)。與「無 user 不建」
-   * 是雙保險;真觸發 emit 即記 mirrorGhostBlocked 計數 + 錯誤日誌(自檢告警,漏了當場可見)。
+   * 影子 session 兜底(第二道防護,2026-07-13 / #395 重估):**曾被 Macchiato 驅動過**的 CLI 會話
+   * uuid(持久,由 Drive 從 wire→CLI 映射灌入,跨重啟)。無 wire 反向映射時,鏡像**永不**為這些
+   * uuid **單獨建**會話(正文由 live 在 wire sid 下投遞,另建 = 影子)。有映射時終端續聊掛回原
+   * wire 會話(#395,配合 #393 srcId 去重歷史 live 內容)。與「無 user 不建」是雙保險;無映射卻
+   * 仍觸發 emit 即記 mirrorGhostBlocked + 錯誤日誌(自檢告警)。
    */
   private readonly drivenUuids = new Set<string>();
   /**
@@ -303,7 +306,10 @@ export class Mirror {
   constructor(
     private readonly linkb: LinkBClient,
     private readonly e2e?: E2EKeyStore,
-    /** app-driven 本地 CC uuid → E2E wire sid；terminal 續聊仍歸原加密會話。 */
+    /**
+     * 本地 CC uuid → Macchiato wire sid（#395；字段名沿用歷史 e2e* 前綴）。
+     * 明文 ULID 與 E2E wire 都走這條——有映射才允許 driven uuid 的終端續聊回流原會話。
+     */
     private readonly e2eWireSidForLocal?: (localSid: string) => string | undefined,
     /** 身份快照無法證明完整時，未知 local uuid 不能回落成 plaintext shadow。 */
     private readonly plaintextLocalAllowed?: (localSid: string) => boolean,
@@ -355,8 +361,9 @@ export class Mirror {
     }
   }
 
-  /** 影子兜底(2026-07-13):登記「曾被 Macchiato 驅動」的 CLI 會話 uuid(持久)。Drive 在 init 存
-   * ULID→CLI 映射時、及啟動時從既有映射批量灌入。鏡像據此永不給這些 uuid 單獨建會話。 */
+  /** 影子兜底(2026-07-13 / #395):登記「曾被 Macchiato 驅動」的 CLI 會話 uuid(持久)。Drive 在
+   * init 存 wire→CLI 映射時、及啟動時從既有映射批量灌入。無 wire 反向映射時永不為其單獨建會話;
+   * 有映射時終端續聊掛回原 wire(見 poll 第二道)。 */
   markDrivenUuid(cliUuid: string): void {
     if (cliUuid) this.drivenUuids.add(cliUuid);
   }
@@ -441,9 +448,18 @@ export class Mirror {
     this.tailPollTimers.delete(sid);
   }
 
-  /** 該本地會話當前是否受 E2E 保護（有 wire 映射或本地直接持鑰）。 */
+  /**
+   * 該本地會話當前是否受 E2E 保護（#308 定向輪詢 / 尾巴追讀的門控）。
+   *
+   * #395 後 `e2eWireSidForLocal` 回**任意** wire（含明文 ULID）以掛回原會話——**不能**再
+   * `!!callback(sid)` 當 E2E 判定，否則明文映射會被誤當 E2E，`MIRROR=off` 下也會
+   * `watchDrivenE2E` + 定向 poll，把終端續聊灌進 app（#308 契約反向破裂）。
+   * 判定：本地直接持鑰，或映射到的 wire 本身是 E2E。
+   */
   private isE2ESession(sid: string): boolean {
-    return !!this.e2eWireSidForLocal?.(sid) || this.e2e?.isE2E(sid) === true;
+    if (this.e2e?.isE2E(sid) === true) return true;
+    const wire = this.e2eWireSidForLocal?.(sid);
+    return !!wire && this.e2e?.isE2E(wire) === true;
   }
 
   /** MIRROR=off 下仍需定向輪詢的 app-driven E2E 會話（有界 FIFO，防無限增長）。 */
@@ -479,6 +495,72 @@ export class Mirror {
   /** #200/#348：回合結束不再未經 ACK 快進；plaintext live 靠 srcId 去重(#393)，E2E 交 durable mirror。 */
   fastForward(sid: string): void {
     void sid;
+  }
+
+  /**
+   * #489 F-12 崩潰補撈：只讀 transcript **已落盤**內容，經 durable `mirror_append` 補投 agent 消息。
+   *
+   * 硬約束（prod safety）：
+   *  - **絕不**重跑/重投 prompt（雙投副作用雷）；
+   *  - 只補 `role=agent`（user 通常 live 已投，重投易雙份；agent 半截 live 可能已 interrupted）；
+   *  - force-settle 尾部 in-flight 組（agent 死於工具中途也能撈到已寫文本/工具卡）；
+   *  - 水位走 ACK 路徑推進（與 #348 同款）；
+   *  - E2E 明文路徑跳過（密文/回灌另走）。
+   *
+   * @returns 是否補到任何 agent 內容（false → 調用方回退舊「請重發」提示）
+   */
+  salvageCrash(localSid: string, wireSid?: string): boolean {
+    if (!localSid) return false;
+    if (this.state.tombstones?.includes(localSid)) return false;
+    if (this.hasPendingE2EBackfill(localSid)) return false;
+    // 已有 durable 批在途 → 交給 outbox，不另開 salvage 批（防同段雙投）
+    if ((this.state.pendingMirrors ?? []).some((p) => p.sid === localSid)) return false;
+
+    const file = this.fileForSid(localSid);
+    if (!file) return false;
+    let size: number;
+    try {
+      size = statSync(file).size;
+    } catch {
+      return false;
+    }
+    const off = this.pendingOffset(localSid);
+    if (size <= off) return false;
+
+    const { entries, endOffset } = readEntries(file, off);
+    if (!entries.length) return false;
+    // force-settle 尾部 in-flight（now=MAX），把半截 agent 文本/工具也撈出來
+    const folded = foldEntries(entries, endOffset, Number.MAX_SAFE_INTEGER);
+    const agents = folded.messages.filter(
+      (m) =>
+        m.role === "agent" &&
+        (!!m.text.trim() || !!m.reasoning?.trim() || (m.tools?.length ?? 0) > 0),
+    );
+    if (!agents.length) return false;
+
+    const mappedWire = this.e2eWireSidForLocal?.(localSid);
+    const targetSid = wireSid ?? mappedWire ?? localSid;
+    // E2E 不走明文 salvage（加密批/回灌是獨立路徑）
+    if (this.e2e?.isE2E(targetSid) || this.e2e?.isE2E(localSid)) return false;
+    if (!wireSid && !mappedWire && this.plaintextLocalAllowed?.(localSid) === false) {
+      return false;
+    }
+
+    const title = this.pendingTitle(localSid) ?? "Claude Code";
+    // endOffset 用 fold 全量 consumedUpTo（含跳過的 user 行）：user 本回合 live 已投，
+    // 水位推過後常規 poll 不再重讀；agent 帶 srcId，server 冪等索引兜底可見重複。
+    const sent = this.sendOne(
+      localSid,
+      this.entry(targetSid, title, agents),
+      folded.consumedUpTo,
+      undefined,
+    );
+    if (sent) {
+      console.log(
+        `· #489 F-12 salvageCrash ${localSid} → ${targetSid}: ${agents.length} agent msg(s)`,
+      );
+    }
+    return sent;
   }
 
   /**
@@ -820,8 +902,10 @@ export class Mirror {
         //       「只有 title、零消息」的批次,會走下面 `newTitle` 分支 emit 出去憑空建會話。故**不能加
         //       `messages.length` 條件**（那樣 title-only 批次繞過守衛,2026-07-13 實測復發）。
         // 真會話首批必含首條 user prompt,故不受影響;殘片會話後續出現真 user 即恢復全量鏡像。
-        // 第二道(2026-07-13):`drivenUuids.has(sid)` —— 曾被 Macchiato 驅動的 CLI 會話**永不**單獨建
-        // 鏡像會話(其正文由 live 在 ULID 下獨佔投遞),連「有 user 的終端續問」也不建(極少見,取捨)。
+        // 第二道(2026-07-13 / #395 重估):`drivenUuids.has(sid) && !mappedWireSid` —— 曾被驅動且
+        // **沒有** wire 反向映射的 CLI uuid 永不單獨建會話(防影子)。有映射時(app ULID / 同源
+        // uuid / E2E wire)終端續聊掛回原 wire——#389+#394 後此路徑不再「極少見」,必須回流;
+        // 歷史 live 內容靠 #393 srcId 撞唯一索引去重,在途回合仍由 drivenSids 讓路。
         const mappedWireSid = this.e2eWireSidForLocal?.(sid);
         const knownTitle = this.pendingTitle(sid);
         if (
@@ -847,9 +931,9 @@ export class Mirror {
             );
             break;
           }
-          // 兜底自檢(2026-07-13):若竟為 driven CLI 會話走到「首次 emit(=建會話)」,說明上面兩道守衛
-          // 有洞——這正是影子 session。阻止落地 + 記 mirrorGhostBlocked(健康上報帶出;正常恆 0,非 0=有洞
-          // 當場可見)+ 錯誤日誌。正常路徑上這永遠不觸發(主守衛已攔)——它是防未來回歸的絆線。
+          // 兜底自檢(2026-07-13 / #395):無 wire 映射卻為 driven CLI 走到「首次 emit(=建會話)」=
+          // 上面守衛有洞,影子 session。阻止落地 + 記 mirrorGhostBlocked(正常恆 0)。有映射時
+          // targetSid 是原 wire,屬合法回流,不觸發。
           if (!mappedWireSid && !knownTitle && this.drivenUuids.has(sid)) {
             this.counters.mirrorGhostBlocked += 1;
             console.error(

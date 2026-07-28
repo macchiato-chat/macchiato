@@ -555,16 +555,30 @@ export class Drive {
   }
 
   /**
-   * #200 一期:Link B ready 後,對「上個進程死時被殺的在途回合」回一條 system 提示,把靜默無響應變
-   * 成明確可操作(重發)。非 E2E 才發明文提示(E2E 不洩明文;其會話重發即可)。冪等——清空後不再發。
+   * #200 + #489 F-12:Link B ready 後處理上個進程死時的在途回合。
+   *
+   * 策略（prod safety，寫死）:
+   *  1. **優先**從本地 transcript **只讀補撈**已落盤 agent 內容（`mirror.salvageCrash`）—
+   *     可見恢復，**絕不**自動重投 prompt / 重跑有副作用回合（#200 雙投雷）；
+   *  2. 補撈失敗（無映射 / 檔未寫 / 空）→ 回退舊「請重發」提示（#200 一期可見化）；
+   *  3. 非 E2E 才發明文提示（E2E 不洩明文）。冪等——清空後不再發。
    */
   flushAbandonedTurns(): void {
     const sids = this.abandonedTurns;
     this.abandonedTurns = [];
     for (const sid of sids) {
       if (this.e2e?.isE2E(sid)) continue;
+      let salvaged = false;
+      try {
+        const local = this.ccSidFor(sid);
+        if (local && this.mirror) salvaged = this.mirror.salvageCrash(local, sid);
+      } catch (e) {
+        console.error(`[F-12 salvage ${sid}] ${(e as Error).message}`);
+      }
       this.emit(sid, "review.summary", {
-        summary: "⚠️ 連接器剛重啟,上一條消息可能沒跑完——請重發一次。",
+        summary: salvaged
+          ? "♻️ 連接器剛重啟——已從本地 transcript 補撈已落盤內容（未自動重跑，避免副作用雙投）。若仍不完整，請先檢查後再決定是否手動重發。"
+          : "⚠️ 連接器剛重啟,上一條消息可能沒跑完——請重發一次。",
       });
     }
   }
@@ -759,15 +773,23 @@ export class Drive {
     return this.ccSidFor(sid);
   }
 
-  /** Mirror / push 等本地 UUID 路徑使用的反向 wire identity。 */
-  e2eWireSessionIdFor(localSid: string): string | undefined {
-    if (!this.e2e) return undefined;
+  /**
+   * 本地 CC transcript uuid → Macchiato wire sid 的反向映射（#395）。
+   * app 建的會話 wire=ULID、鏡像來源的 wire 常即 CLI uuid；E2E 與明文都走同一表。
+   * Mirror 用它把「終端對 driven CLI uuid 的續聊」掛回原 wire 會話，而不是另建影子。
+   */
+  wireSessionIdFor(localSid: string): string | undefined {
+    if (!localSid) return undefined;
     for (const wireSid of new Set([...Object.keys(this.aliases), ...Object.keys(this.map)])) {
-      if (this.localSessionIdsForWire(wireSid).includes(localSid) && this.e2e.isE2E(wireSid)) {
-        return wireSid;
-      }
+      if (this.localSessionIdsForWire(wireSid).includes(localSid)) return wireSid;
     }
     return undefined;
+  }
+
+  /** E2E-only 反向映射（backfill / 身份檢查）；明文 wire 不在此返回。 */
+  e2eWireSessionIdFor(localSid: string): string | undefined {
+    const wire = this.wireSessionIdFor(localSid);
+    return wire && this.e2e?.isE2E(wire) ? wire : undefined;
   }
 
   private localSessionIdsForWire(wireSid: string): string[] {

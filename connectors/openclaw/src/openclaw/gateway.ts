@@ -16,6 +16,19 @@ export type EventHandler = (evt: GatewayEvent) => void;
 const REQ_TIMEOUT_MS = 15000;
 const CHALLENGE_WAIT_MS = 200;
 
+/**
+ * F-09/#281/#486:operator 握手 scopes。
+ * - read/write:既有鏡像與驅動
+ * - operator.approvals:訂閱 `exec.approval.requested` / 調 `exec.approval.resolve`
+ *   （官方 gateway 客戶端契約；**不**改 tools.exec 默認安全策略——只在 OpenClaw 自己要
+ *   人批時把卡轉到 App）
+ */
+export const GATEWAY_OPERATOR_SCOPES = [
+  "operator.read",
+  "operator.write",
+  "operator.approvals",
+] as const;
+
 interface Pending {
   resolve: (payload: unknown) => void;
   reject: (err: Error) => void;
@@ -102,8 +115,9 @@ export class OpenClawGateway {
       maxProtocol: 4,
       client: { id: "gateway-client", version: "0.1.0", platform: process.platform, mode: "backend" },
       role: "operator",
-      scopes: ["operator.read", "operator.write"],
-      caps: [],
+      scopes: [...GATEWAY_OPERATOR_SCOPES],
+      // 宣告我們會處理審批 UI(第三方客戶端契約);授權仍靠 operator.approvals scope。
+      caps: ["approvals", "exec-approvals"],
       commands: [],
       permissions: {},
       auth: { token: this.cfg.token },

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -36,9 +36,18 @@ async function* yieldScript(script: Array<Record<string, unknown>>) {
 }
 
 const renameCalls: Array<[string, string]> = [];
+/** #473 / F-13 forkSession 樁:記錄參數,回可控新 sessionId。 */
+const forkCalls: Array<{ sid: string; opts: { upToMessageId?: string } }> = [];
+let forkResultSid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+let forkShouldThrow = false;
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   renameSession: async (sid: string, title: string) => {
     renameCalls.push([sid, title]);
+  },
+  forkSession: async (sid: string, opts: { upToMessageId?: string } = {}) => {
+    forkCalls.push({ sid, opts });
+    if (forkShouldThrow) throw new Error("fork failed");
+    return { sessionId: forkResultSid };
   },
   query: (args: { prompt: unknown; options: any }) => {
     lastOptions = args.options;
@@ -66,6 +75,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 }));
 
 import { Drive } from "../src/cc/drive";
+import { Mirror } from "../src/cc/mirror";
 import {
   e2eControlKeyId,
   e2eControlMac,
@@ -148,6 +158,9 @@ beforeEach(() => {
   pushedMessages = [];
   interrupts.length = 0;
   lastOptions = null;
+  forkCalls.length = 0;
+  forkResultSid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  forkShouldThrow = false;
   mockMaterialize = async () => {
     throw new Error("not stubbed");
   };
@@ -303,6 +316,23 @@ describe("Drive", () => {
       .filter((f: any) => f.frame?.params?.type === "session.localSessionId") as any[];
     expect(secondBatch.length).toBeGreaterThanOrEqual(1);
     expect(secondBatch[0].frame.params.payload.localSessionId).toBe(CC_SID);
+  });
+
+  it("#395 明文 ULID:wireSessionIdFor 反查 local→wire;e2eWireSessionIdFor 仍只回 E2E", async () => {
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    const wireSid = "01ULIDSERVERSID000000000BB";
+    fire(tuiFrame(wireSid, "prompt.submit", { text: "map me" }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(d.localSessionIdFor(wireSid)).toBe(CC_SID);
+    expect(d.wireSessionIdFor(CC_SID)).toBe(wireSid); // 明文也要能反查(終端續聊掛回)
+    expect(d.e2eWireSessionIdFor(CC_SID)).toBeUndefined(); // 非 E2E 不冒充
+    expect(d.wireSessionIdFor("00000000-0000-4000-8000-ffffffffffff")).toBeUndefined();
   });
 
   it("#389 通道帶 env:聲明 entrypoint=macchiato(終端 /resume 可見)且展開了 process.env", async () => {
@@ -2048,6 +2078,69 @@ describe("#200 在途回合可見化(重啟提示重發)", () => {
     d2.dispose();
     delete process.env.MACCHIATO_CC_TITLE_MODE;
   });
+
+  it("#489 F-12 transcript 有 agent → 補撈提示且不自動重投 prompt", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "off";
+    // 模擬進程死在回合中途
+    emitScript = [{ type: "system", subtype: "init", session_id: CC_SID }, { __wait: 9000 }];
+    const { linkb, fire } = fakeLinkb();
+    // 準備 transcript 已落盤 agent 內容
+    const cfg = mkdtempSync(join(tmpdir(), "cc-dr-f12-"));
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    process.env.MACCHIATO_CC_MIRROR = join(cfg, "mirror-state.json");
+    mkdirSync(join(cfg, "projects", "-home-x"), { recursive: true });
+    const tf = join(cfg, "projects", "-home-x", `${CC_SID}.jsonl`);
+    writeFileSync(
+      process.env.MACCHIATO_CC_MIRROR,
+      JSON.stringify({ offsets: { [CC_SID]: 0 }, titles: { [CC_SID]: "t" }, seeded: true }),
+    );
+    const u =
+      JSON.stringify({
+        type: "user",
+        uuid: "00000000-0000-4000-8000-00000000f120",
+        sessionId: CC_SID,
+        timestamp: "2026-07-28T10:00:00.000Z",
+        message: { role: "user", content: "hi" },
+      }) + "\n";
+    const a =
+      JSON.stringify({
+        type: "assistant",
+        uuid: "00000000-0000-4000-8000-00000000f121",
+        sessionId: CC_SID,
+        timestamp: "2026-07-28T10:00:01.000Z",
+        message: {
+          id: "msg_f12",
+          role: "assistant",
+          content: [{ type: "text", text: "SALVAGED_AGENT_TEXT" }],
+        },
+      }) + "\n";
+    writeFileSync(tf, u + a);
+
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+
+    const { linkb: lb2, sent: sent2 } = fakeLinkb();
+    const mirror2 = new Mirror(lb2 as any);
+    const d2 = new Drive(lb2 as any, mirror2);
+    d2.flushAbandonedTurns();
+    const notice = sent2.map((f) => JSON.stringify(f)).join("\n");
+    expect(notice).toContain("補撈已落盤");
+    expect(notice).not.toContain("請重發一次");
+    // 絕不能自動 startTurn（無新的 query 調用來自 d2）
+    const queryBefore = queryCalls;
+    await new Promise((r) => setTimeout(r, 20));
+    expect(queryCalls).toBe(queryBefore);
+    // mirror_append 帶 agent 正文
+    const apps = sent2.filter((f: any) => f.t === "mirror_append");
+    expect(apps.length).toBeGreaterThanOrEqual(1);
+    const texts = apps.flatMap((f: any) => f.sessions?.[0]?.messages ?? []).map((m: any) => m.text);
+    expect(texts).toContain("SALVAGED_AGENT_TEXT");
+    d.dispose();
+    d2.dispose();
+    delete process.env.MACCHIATO_CC_TITLE_MODE;
+  });
 });
 
 describe("#201 SDK 自發喚醒的續寫回合", () => {
@@ -2099,36 +2192,118 @@ describe("#161 手動改名回寫", () => {
     expect(renameCalls.length).toBe(n);
     d.dispose();
   });
+});
 
-  // #141b SDK 運行時 usage 為權威(session 累計 − 基線,含 subagent);拿不到退回本地累加。
-  describe("#141b turn output tokens", () => {
-    it("turnOutput:SDK 聚合增量(含 subagent)疊加 outputLive;無基線退回本地累加;max 兜輪詢空窗", () => {
-      const { linkb } = fakeLinkb();
-      const d = new Drive(linkb) as any;
-      // 無基線(SDK 不可用)→ 純本地 outputBase+outputLive
-      expect(d.turnOutput({ usageBaseline: null, sdkOutput: null, outputBase: 300, outputLive: 40 })).toBe(340);
-      // 有基線:sdkΔ=5000−1000=4000(含 subagent)> outputBase 300 → 4000 + live 40
-      expect(d.turnOutput({ usageBaseline: 1000, sdkOutput: 5000, outputBase: 300, outputLive: 40 })).toBe(4040);
-      // SDK 輪詢暫落後(子消息剛完成、sdkΔ 200 < 本地 outputBase 500)→ max 取 outputBase 兜住
-      expect(d.turnOutput({ usageBaseline: 1000, sdkOutput: 1200, outputBase: 500, outputLive: 10 })).toBe(510);
-    });
+// #141b SDK 運行時 usage 為權威(session 累計 − 基線,含 subagent);拿不到退回本地累加。
+describe("#141b turn output tokens", () => {
+  it("turnOutput:SDK 聚合增量(含 subagent)疊加 outputLive;無基線退回本地累加;max 兜輪詢空窗", () => {
+    const { linkb } = fakeLinkb();
+    const d = new Drive(linkb) as any;
+    // 無基線(SDK 不可用)→ 純本地 outputBase+outputLive
+    expect(d.turnOutput({ usageBaseline: null, sdkOutput: null, outputBase: 300, outputLive: 40 })).toBe(340);
+    // 有基線:sdkΔ=5000−1000=4000(含 subagent)> outputBase 300 → 4000 + live 40
+    expect(d.turnOutput({ usageBaseline: 1000, sdkOutput: 5000, outputBase: 300, outputLive: 40 })).toBe(4040);
+    // SDK 輪詢暫落後(子消息剛完成、sdkΔ 200 < 本地 outputBase 500)→ max 取 outputBase 兜住
+    expect(d.turnOutput({ usageBaseline: 1000, sdkOutput: 1200, outputBase: 500, outputLive: 10 })).toBe(510);
+  });
 
-    it("sdkOutputTotal:求和 model_usage.outputTokens(主 + subagent model);接口缺失/報錯 → null", async () => {
-      const { linkb } = fakeLinkb();
-      const d = new Drive(linkb) as any;
-      expect(await d.sdkOutputTotal({ q: {} })).toBeNull(); // 缺方法 → 退回本地
-      const q = {
-        usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
-          session: { model_usage: { opus: { outputTokens: 1200 }, "haiku(subagent)": { outputTokens: 800 } } },
-        }),
-      };
-      expect(await d.sdkOutputTotal({ q })).toBe(2000);
-      const qErr = {
-        usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => {
-          throw new Error("experimental gone");
-        },
-      };
-      expect(await d.sdkOutputTotal({ q: qErr })).toBeNull(); // 報錯絕不拋 → null 兜底
-    });
+  it("sdkOutputTotal:求和 model_usage.outputTokens(主 + subagent model);接口缺失/報錯 → null", async () => {
+    const { linkb } = fakeLinkb();
+    const d = new Drive(linkb) as any;
+    expect(await d.sdkOutputTotal({ q: {} })).toBeNull(); // 缺方法 → 退回本地
+    const q = {
+      usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
+        session: { model_usage: { opus: { outputTokens: 1200 }, "haiku(subagent)": { outputTokens: 800 } } },
+      }),
+    };
+    expect(await d.sdkOutputTotal({ q })).toBe(2000);
+    const qErr = {
+      usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => {
+        throw new Error("experimental gone");
+      },
+    };
+    expect(await d.sdkOutputTotal({ q: qErr })).toBeNull(); // 報錯絕不拋 → null 兜底
+  });
+});
+
+// #473 / F-13:session.rewind happy path——forkSession + adoptForked + onRewindResult ACK。
+describe("#473/#490 session.rewind happy path", () => {
+  it("中間用戶消息 → fork 前一條 + 映射換新 uuid + onRewindResult(ok)", async () => {
+    const targetUuid = "00000000-0000-4000-8000-000000000003";
+    const keepUuid = "00000000-0000-4000-8000-000000000002";
+    const adoptCalls: string[] = [];
+    const mirror = {
+      rewindPlan: (sid: string, target: string) => {
+        expect(sid).toBe(CC_SID);
+        expect(target).toBe(targetUuid);
+        return { keepUpToUuid: keepUuid, dropped: 2 };
+      },
+      adoptForked: (sid: string) => {
+        adoptCalls.push(sid);
+        return true;
+      },
+    } as any;
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb, mirror);
+    const results: Array<Record<string, unknown>> = [];
+    d.onRewindResult = (r) => results.push(r as unknown as Record<string, unknown>);
+    d.wire();
+    // 鏡像來的 sid 本身就是 CC uuid → 直接 resume 身份
+    fire(
+      tuiFrame(CC_SID, "session.rewind", {
+        request_id: "req-rw-1",
+        target_src_id: targetUuid,
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 40));
+    expect(forkCalls).toEqual([{ sid: CC_SID, opts: { upToMessageId: keepUuid } }]);
+    // adopt 必須先於 map 落盤(防歷史重灌);此處至少被調一次
+    expect(adoptCalls).toEqual([forkResultSid]);
+    expect(results).toEqual([
+      {
+        hermesSessionId: CC_SID,
+        requestId: "req-rw-1",
+        ok: true,
+        dropped: 2,
+      },
+    ]);
+    // 映射已換到 fork 出的新會話
+    expect((d as any).map[CC_SID]).toBe(forkResultSid);
+    d.dispose();
+  });
+
+  it("目標即首條 → 不 fork、丟映射、仍 ACK ok", async () => {
+    const targetUuid = "00000000-0000-4000-8000-000000000001";
+    const mirror = {
+      rewindPlan: () => ({ keepUpToUuid: null, dropped: 2 }),
+      adoptForked: () => {
+        throw new Error("首條不該 fork/adopt");
+      },
+    } as any;
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb, mirror);
+    // 先塞一條映射,確認 rewind 會清掉
+    (d as any).map[CC_SID] = CC_SID;
+    const results: Array<Record<string, unknown>> = [];
+    d.onRewindResult = (r) => results.push(r as unknown as Record<string, unknown>);
+    d.wire();
+    fire(
+      tuiFrame(CC_SID, "session.rewind", {
+        request_id: "req-first",
+        target_src_id: targetUuid,
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 40));
+    expect(forkCalls).toEqual([]);
+    expect(results).toEqual([
+      {
+        hermesSessionId: CC_SID,
+        requestId: "req-first",
+        ok: true,
+        dropped: 2,
+      },
+    ]);
+    expect((d as any).map[CC_SID]).toBeUndefined();
+    d.dispose();
   });
 });

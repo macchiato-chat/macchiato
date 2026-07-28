@@ -3,20 +3,72 @@
  *  - 索引（標題/平台）來自 gateway `sessions.list`；消息來自各會話 `<sessionId>.jsonl`
  *    （穩定 append-only, 以**字節偏移**做水位線, 半行字節留到下輪）。
  *  - 新會話只鏡像「連接器啟動後」的消息（baseline = 當前文件末）, 避免全量回灌。
- *  - mirror_nack → 回退該批水位線下輪重發。
+ *  - durable outbox（#348 / F-10 #487）：幀落盤後才發，只有 `mirror_ack` 才提交水位；
+ *    `mirror_nack` 默認保留原批重發，終態 `code`（`e2e_direction` / `malformed`）則丟批。
+ *    死在 ACK 前不靜默跳批——重啟後同 batchId 重放。
  */
-import { createHash } from "node:crypto";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { LinkBClient } from "../linkb/client";
 import type { OpenClawGateway } from "./gateway";
 import type { E2EKeyStore } from "../e2e/keys";
 
 const POLL_MS = Number(process.env.MACCHIATO_OPENCLAW_POLL_MS) || 5000;
-const REWIND_KEEP = 32;
 /** #9:水位線條目從 sessions.list 消失多久後裁掉(默認 7 天)。 */
 const PRUNE_MS = Number(process.env.MACCHIATO_MIRROR_PRUNE_MS) || 7 * 24 * 3600 * 1000;
+
+/**
+ * 鏡像狀態檔的耐久寫（0600 + fsync + 原子 rename + 目錄 fsync）。
+ * durable outbox 起裝完整消息正文——與 CC/Codex 同款，掉電也不得半截/默認 0644。
+ */
+function durableWrite(target: string, contents: string): void {
+  const dir = dirname(target);
+  mkdirSync(dir, { recursive: true });
+  const temp = join(dir, `.${basename(target)}.${process.pid}.${randomUUID()}.tmp`);
+  const fd = openSync(temp, "wx", 0o600);
+  let open = true;
+  try {
+    writeFileSync(fd, contents, "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    open = false;
+    renameSync(temp, target);
+  } catch (error) {
+    if (open) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* 保留原始寫入錯誤 */
+      }
+    }
+    try {
+      unlinkSync(temp);
+    } catch {
+      /* temp 可能未建成或已 rename 走 */
+    }
+    throw error;
+  }
+  const dirFd = openSync(dir, "r");
+  try {
+    fsyncSync(dirFd);
+  } finally {
+    closeSync(dirFd);
+  }
+}
 
 /** #6:狀態文件安全讀寫——原子寫 + .bak 輪替;主文件損壞/丟失從 .bak 恢復。
  * 此前 load 失敗靜默重置 = 所有會話回到 baseline-to-end,中間消息永久跳過(寧重發不丟)。 */
@@ -348,6 +400,18 @@ interface State {
    * 舊 schema 在 protected 狀態下補 seed 仍可能早已丟過 rotation alias，必須持久 false。
    */
   aliasHistoryTrusted?: boolean;
+  /**
+   * #348 / F-10 durable outbox：已發未 ACK 的 mirror_append 幀。
+   * ACK 前不得提交 offsets；重啟後按同 batchId 重放。ACK 可亂序——同 key 只從隊首連續提交。
+   */
+  pendingMirrors?: Array<{
+    batchId: string;
+    frame: Record<string, unknown>;
+    key: string;
+    endOffset: number;
+    /** ACK 可亂序到達；只有同 key 的前序批全 ACK 後才允許連續提交水位。 */
+    acked?: boolean;
+  }>;
 }
 
 export class Mirror {
@@ -357,8 +421,6 @@ export class Mirror {
   /** 歷代 local UUID registry 只有新 schema 主檔可證明完整；舊 schema/backup 不得靠普通 save 自升。 */
   private aliasHistoryTrusted = false;
   private timer: ReturnType<typeof setInterval> | null = null;
-  private batchId = 0;
-  private readonly rewind: Array<{ id: number; prev: Record<string, number> }> = [];
   /** drive 驅動中的 key：live 路徑獨佔投遞文字;#147 鏡像只「打撈」tool/thinking(去正文),不發文字（防雙投）。 */
   private readonly drivenKeys = new Set<string>();
   /** #147 driven key → server sid(真大小寫;mirror_append 的 hermesSessionId 用它,sidForKey 會丟大小寫)。 */
@@ -371,12 +433,26 @@ export class Mirror {
   private identityPersistenceDirty = false;
   /** 每次 history import 前須先以 gateway 當前 key→sessionId 對賬，防離線 rotation 新 UUID 漏保護。 */
   private identityPreflightComplete = false;
+  /** durable outbox 最近一次 send 時刻（重啟後 0 → 立刻重放）。 */
+  private readonly sentBatchAt = new Map<string, number>();
   /** 健康：最近一次 poll 完成時刻（watchdog 用）。 */
   lastPollAt = Date.now();
   /** 健康：最近一次 poll 錯誤（成功清空）。 */
   lastError: string | null = null;
+  /**
+   * #348 lastError 的「未結清」標記。poll 成功返回**不等於**問題解決——NACK 後批次仍留在
+   * durable outbox 重試、水位就是不動的。錯誤一旦記下就黏住，直到真有一批被 server 提交（ACK）。
+   */
+  private errorSticky = false;
   /** #10:累計計數(進程生命週期),健康上報帶出。 */
-  readonly counters: Record<string, number> = { mirrorBatches: 0, mirrorMessages: 0, mirrorNacks: 0, mirrorErrors: 0 };
+  readonly counters: Record<string, number> = {
+    mirrorBatches: 0,
+    mirrorMessages: 0,
+    mirrorNacks: 0,
+    mirrorErrors: 0,
+    mirrorDirectionRewinds: 0,
+    mirrorDropped: 0,
+  };
   private polling = false;
   /** #347 backfill send 不是提交成功；水位线/K_S 要等 server 事务 ACK。 */
   private readonly pendingE2EBackfills = new Map<
@@ -601,7 +677,7 @@ export class Mirror {
     return true;
   }
 
-  /** 回合結束:打撈該 key 新寫入的 tool/thinking 塊(#147)並推進水位線(文字 live 已投,不重發)。 */
+  /** 回合結束:打撈該 key 新寫入的 tool/thinking 塊(#147)。#348：有內容要發時 ACK 前不推水位。 */
   fastForward(key: string): void {
     if (this.isE2ETransitionLocked(key)) return;
     // 下一輪 poll 對 driven key 也會打撈;這裡主動立即跑一次, 縮小競態窗口。
@@ -609,9 +685,9 @@ export class Mirror {
   }
 
   private async salvageToEnd(key: string): Promise<void> {
-    // #252 Link B 未 ready 時整體跳過:不拉 sessionsList、不推水位線、不發——否則 salvageDriven
-    // 已推 offset(:401)但 mirror_append 被 client 丟(非 E2E 不緩衝),tool/thinking 永久缺失。
-    // 下輪 pollOnce(ready 後)照樣對 driven key 打撈(:575),水位線沒動 → 補得回。同 pollOnce(:542)。
+    // #252 Link B 未 ready 時整體跳過:不拉 sessionsList、不推水位線、不發——否則 salvage 已推
+    // offset 但 mirror_append 被 client 丟(非 E2E 不緩衝),tool/thinking 永久缺失。
+    // #348 後有內容走 durable outbox，未 ready 仍不得落盤/發。
     if (!this.linkb.isReady || this.isE2ETransitionLocked(key)) return;
     try {
       // pending-enable ready bootstrap 只准控制面補 fileId；映射補齊前所有 mirror 水位/明文都凍結。
@@ -621,16 +697,8 @@ export class Mirror {
       if (!s?.sessionId) return;
       const file = join(sessionsDir(), `${s.sessionId}.jsonl`);
       if (!existsSync(file)) return;
-      const prevOff = this.state.offsets[key];
-      const entry = this.salvageDriven(key, file);
-      if (entry) {
-        this.batchId += 1;
-        this.rewind.push({ id: this.batchId, prev: { [key]: prevOff ?? 0 } });
-        if (this.rewind.length > REWIND_KEEP) this.rewind.shift();
-        this.linkb.send({ t: "mirror_append", agentLinkId: this.linkb.agentLinkId, sessions: [entry], batchId: this.batchId });
-        this.counters.mirrorBatches += 1;
-        this.counters.mirrorMessages += entry.messages.length;
-      }
+      const built = this.salvageDriven(key, file);
+      if (built) this.sendOne(key, built.entry, built.endOffset);
       this.save();
     } catch {
       /* 下輪 poll 兜底 */
@@ -643,9 +711,14 @@ export class Mirror {
    * agent 消息去掉正文**(正文 live 已投,防雙投)後補進歷史;純文字行照舊跳過。srcId 用原始內容
    * 指紋(重發冪等)。E2E driven 會話跳過(方案 A:內容走加密批,tools 打撈是獨立課題)——只推水位。
    * 基線:macchiato-native 新會話從 0(文件隨會話新建,首回合工具不丟);頻道續聊 key 首見基線到
-   * 文件末(舊歷史已按完整消息鏡像過/或屬導入範疇,不重複)。返回 batch entry 或 null;推進水位線。
+   * 文件末(舊歷史已按完整消息鏡像過/或屬導入範疇,不重複)。
+   * #348：有內容要發時**不**推 committed offsets（交給 durable outbox / ACK）；僅「無內容可發」
+   * 的本地跳過（純文字 / E2E 明文不打撈）在無 pending 時可提交水位，防每輪空轉。
    */
-  private salvageDriven(key: string, file: string): { hermesSessionId: string; source: string; messages: any[] } | null {
+  private salvageDriven(
+    key: string,
+    file: string,
+  ): { entry: { hermesSessionId: string; source: string; messages: any[] }; endOffset: number } | null {
     if (this.isE2ETransitionLocked(key)) return null;
     const resolvedWireSid =
       this.driveIdentityResolver?.(key) ??
@@ -664,15 +737,15 @@ export class Mirror {
       this.state.offsets[key] = key.startsWith(MACCHIATO_PREFIX) ? 0 : size;
       if (!key.startsWith(MACCHIATO_PREFIX)) return null;
     }
-    const from = this.state.offsets[key] ?? 0;
+    const from = this.pendingOffset(key);
     if (size <= from) return null;
     const sid = resolvedWireSid ?? sidForKey(key);
     if (this.e2e?.isE2E(sid) || this.e2e?.isE2E(key)) {
-      this.state.offsets[key] = size; // E2E:加密批投遞,明文打撈不做
+      // E2E:加密批投遞,明文打撈不做。有 pending 時不得越过——e2e_direction 要回退重編。
+      if (!this.hasPendingMirror(key)) this.state.offsets[key] = size;
       return null;
     }
     const { messages, newOffset } = readNewMessages(file, from);
-    this.state.offsets[key] = newOffset;
     const salvaged = messages
       .filter((m) => m.role === "agent" && (m.reasoning || m.tools?.length))
       .map((m) => {
@@ -691,8 +764,15 @@ export class Mirror {
       })
       // 工具全被 live 認領且無 reasoning → 整條沒內容可補,別發空殼消息
       .filter((m) => m.reasoning || (m as { tools?: MirrorTool[] }).tools?.length);
-    if (!salvaged.length) return null;
-    return { hermesSessionId: sid, source: "openclaw", messages: salvaged };
+    if (!salvaged.length) {
+      // 本地跳過（純文字 / 工具全被 live 認領）：無 pending 時可提交，否則等前序批 ACK。
+      if (!this.hasPendingMirror(key)) this.state.offsets[key] = newOffset;
+      return null;
+    }
+    return {
+      entry: { hermesSessionId: sid, source: "openclaw", messages: salvaged },
+      endOffset: newOffset,
+    };
   }
 
 
@@ -729,14 +809,111 @@ export class Mirror {
     if (this.timer) clearInterval(this.timer);
   }
 
-  /** server 回 mirror_nack → 回退這批會話的水位線, 下輪重發。 */
-  handleNack(batchId: number): void {
-    const e = this.rewind.find((r) => r.id === batchId);
-    if (!e) return;
+  /**
+   * mirror_nack。默認語義是「保留 durable 批、按同 batchId 重發」——但幀是在**發送時**凍結進
+   * outbox 的，會話事後轉 E2E（或關 E2E）後,凍結的舊方向批被 server 的方向校驗**永遠**拒絕：
+   * 水位永久凍結,且每 15 秒把開啟 E2E 前的明文正文重發一次給 server。故終態 code 必須丟批:
+   *  - `e2e_direction`:丟掉**該 key 的全部**待確認批,水位停在最後一次 ACK → 下輪重讀重編。
+   *  - `malformed`:批畸形/毒批,重試永遠不會好 → 丟批並**跳過**這段(推水位),否則該會話從此
+   *    永不再前進;lastError 留給 health 讓用戶看見丟了東西。
+   */
+  handleNack(batchId: string | number, error?: string, code?: string): void {
+    const target = (this.state.pendingMirrors ?? []).find(
+      (pending) => pending.batchId === String(batchId),
+    );
+    if (!target) return;
     this.counters.mirrorNacks += 1; // #10
-    for (const [k, off] of Object.entries(e.prev)) this.state.offsets[k] = off;
-    this.save();
-    console.warn(`· mirror_nack batch ${batchId} → rewinding watermark for resend`);
+    this.lastError = error ?? `mirror_nack batch ${batchId}`;
+    this.errorSticky = true;
+    this.sentBatchAt.delete(String(batchId));
+    if (code === "e2e_direction") {
+      const key = target.key;
+      const dropped = (this.state.pendingMirrors ?? []).filter((pending) => pending.key === key);
+      for (const pending of dropped) this.sentBatchAt.delete(pending.batchId);
+      this.state.pendingMirrors = (this.state.pendingMirrors ?? []).filter(
+        (pending) => pending.key !== key,
+      );
+      this.counters.mirrorDirectionRewinds += 1;
+      this.save(true);
+      console.warn(
+        `· mirror_nack(e2e_direction) ${key} → 丟棄 ${dropped.length} 個舊方向凍結批,回退到水位 ${this.state.offsets[key] ?? 0} 重讀重編`,
+      );
+      return;
+    }
+    if (code === "malformed") {
+      this.state.offsets[target.key] = Math.max(
+        this.state.offsets[target.key] ?? 0,
+        target.endOffset,
+      );
+      this.state.pendingMirrors = (this.state.pendingMirrors ?? []).filter(
+        (pending) => pending.batchId !== target.batchId,
+      );
+      this.counters.mirrorDropped += 1;
+      this.save(true);
+      console.error(
+        `· mirror_nack(malformed) batch ${batchId} → 丟棄該批並跳過(server 判畸形/毒批):${this.lastError}`,
+      );
+      return;
+    }
+    console.warn(`· mirror_nack batch ${batchId} → durable outbox retained for resend`);
+  }
+
+  /** server 事務提交後才推水位；同 key 亂序 ACK 只從隊首連續消費。 */
+  handleAck(batchId: string | number): void {
+    const pending = (this.state.pendingMirrors ?? []).find(
+      (candidate) => candidate.batchId === String(batchId),
+    );
+    if (!pending) return;
+    pending.acked = true;
+    while (true) {
+      const head = (this.state.pendingMirrors ?? []).find(
+        (candidate) => candidate.key === pending.key,
+      );
+      if (!head?.acked) break;
+      this.state.offsets[head.key] = Math.max(
+        this.state.offsets[head.key] ?? 0,
+        head.endOffset,
+      );
+      this.state.pendingMirrors = this.state.pendingMirrors!.filter(
+        (candidate) => candidate.batchId !== head.batchId,
+      );
+      this.sentBatchAt.delete(head.batchId);
+    }
+    this.sentBatchAt.delete(String(batchId));
+    this.errorSticky = false;
+    this.save(true);
+  }
+
+  private hasPendingMirror(key: string): boolean {
+    return (this.state.pendingMirrors ?? []).some((pending) => pending.key === key);
+  }
+
+  /** 已提交水位 + 未 ACK 批的 endOffset 高水位——讀取起點，防 ACK 前重複編批。 */
+  private pendingOffset(key: string): number {
+    let offset = this.state.offsets[key] ?? 0;
+    for (const pending of this.state.pendingMirrors ?? []) {
+      if (pending.key === key) offset = Math.max(offset, pending.endOffset);
+    }
+    return offset;
+  }
+
+  /** 單幀先 WAL 落盤；mirror_ack 才提交 offset。 */
+  private sendOne(key: string, entry: Record<string, unknown>, endOffset: number): void {
+    const batchId = randomUUID();
+    const frame = {
+      t: "mirror_append",
+      agentLinkId: this.linkb.agentLinkId,
+      sessions: [entry],
+      batchId,
+    };
+    (this.state.pendingMirrors ??= []).push({ batchId, frame, key, endOffset });
+    this.save(true);
+    this.linkb.send(frame);
+    this.sentBatchAt.set(batchId, Date.now());
+    this.counters.mirrorBatches += 1; // #10
+    this.counters.mirrorMessages += Array.isArray((entry as { messages?: unknown[] }).messages)
+      ? (entry as { messages: unknown[] }).messages.length
+      : 0;
   }
 
   handleE2EBackfillResult(
@@ -758,9 +935,11 @@ export class Mirror {
     this.polling = true;
     try {
       await this.pollOnce();
-      this.lastError = null;
+      // 只有「本輪成功且沒有仍在重試的待確認錯誤」才清 lastError（#348 靜默凍結教訓）。
+      if (!this.errorSticky) this.lastError = null;
     } catch (e) {
       this.lastError = (e as Error).message;
+      this.errorSticky = true;
       this.counters.mirrorErrors += 1; // #10
       console.error("[mirror poll error]", this.lastError);
     } finally {
@@ -869,6 +1048,13 @@ export class Mirror {
 
   private async pollOnce(): Promise<void> {
     if (!this.linkb.isReady) return;
+    // #348 待確認批超 15s 同 batchId 重放（斷線/ACK 丟失）；死在 ACK 前不靜默跳批。
+    for (const pending of this.state.pendingMirrors ?? []) {
+      if (Date.now() - (this.sentBatchAt.get(pending.batchId) ?? 0) >= 15_000) {
+        this.linkb.send(pending.frame as any);
+        this.sentBatchAt.set(pending.batchId, Date.now());
+      }
+    }
     // ready callback 可精確豁免 pending-enable 的「待補 fileId」，但內容面永遠 strict；
     // bootstrap control 尚未到或上次崩在補圖前時，不讀、不推水位、不發任何 mirror payload。
     this.assertE2EIdentitySafe();
@@ -881,9 +1067,6 @@ export class Mirror {
     const sessions: any[] = Array.isArray(list?.sessions) ? list.sessions : [];
     this.prune(new Set(sessions.map((s: any) => s.key).filter(Boolean)));
     const dir = sessionsDir();
-    const batch: any[] = [];
-    const batchKeys: string[] = []; // #152 平行數組:每條 entry 的水位線鍵(salvage 條目 hermesSessionId≠key)
-    const prev: Record<string, number> = {};
     for (const s of sessions) {
       const key: string | undefined = s.key;
       const sessionId: string | undefined = s.sessionId;
@@ -897,6 +1080,10 @@ export class Mirror {
         if (previousFileId !== undefined && this.state.offsets[key] !== undefined) {
           console.log(`· #211 ${key} 文件輪換(${previousFileId.slice(0, 8)}→${String(sessionId).slice(0, 8)}),水位線歸零重讀`);
           this.state.offsets[key] = 0;
+          // 輪換後舊文件上的凍結批已無意義——丟棄，從新檔重編。
+          const dropped = (this.state.pendingMirrors ?? []).filter((p) => p.key === key);
+          for (const p of dropped) this.sentBatchAt.delete(p.batchId);
+          this.state.pendingMirrors = (this.state.pendingMirrors ?? []).filter((p) => p.key !== key);
         }
       }
       // crash-before-save 不能留下「新 transcript 已讀/發、alias 尚未落盤」的證明窗口。
@@ -905,16 +1092,12 @@ export class Mirror {
         this.persistIdentityStateOrThrow(`rotation ${key} → ${sessionId}`);
       }
       if (key.startsWith(MACCHIATO_PREFIX) || this.drivenKeys.has(key)) {
-        // #147 drive 的會話:文字由 live 投遞;鏡像打撈 tool/thinking(去正文)補進歷史,推進水位線。
+        // #147 drive 的會話:文字由 live 投遞;鏡像打撈 tool/thinking(去正文)補進歷史。
+        // #348：有內容走 durable outbox，ACK 前不推 committed 水位。
         const f = join(dir, `${sessionId}.jsonl`);
         if (existsSync(f)) {
-          const prevOff = this.state.offsets[key];
-          const entry = this.salvageDriven(key, f);
-          if (entry) {
-            prev[key] = prevOff ?? 0;
-            batch.push(entry);
-            batchKeys.push(key);
-          }
+          const built = this.salvageDriven(key, f);
+          if (built) this.sendOne(key, built.entry, built.endOffset);
         }
         continue;
       }
@@ -926,19 +1109,28 @@ export class Mirror {
         this.state.offsets[key] = size; // baseline：新會話只鏡像啟動後的消息
         continue;
       }
-      if (size < off) {
+      const readFrom = this.pendingOffset(key);
+      if (size < this.state.offsets[key]!) {
         // #211 兜底:文件比水位線短(被重寫/截短)→ 歸零重讀,srcId 去重兜住;別靜默卡死。
-        console.log(`· #211 ${key} 文件縮短(size=${size} < off=${off}),水位線歸零重讀`);
+        console.log(`· #211 ${key} 文件縮短(size=${size} < off=${this.state.offsets[key]}),水位線歸零重讀`);
         this.state.offsets[key] = 0;
+        const dropped = (this.state.pendingMirrors ?? []).filter((p) => p.key === key);
+        for (const p of dropped) this.sentBatchAt.delete(p.batchId);
+        this.state.pendingMirrors = (this.state.pendingMirrors ?? []).filter((p) => p.key !== key);
         continue; // 下輪從 0 讀(本輪 off 已失效)
       }
-      if (size <= off) continue;
-      const { messages, newOffset } = readNewMessages(file, off, BATCH_MAX); // #152
-      if (messages.length) {
-        prev[key] = off;
-        if (this.e2e?.isE2E(key)) {
-          // §19：原生會話（如 Discord）被標 E2E → 標題+內容加密、打 e2e, server 盲存
-          batch.push({
+      if (size <= readFrom) continue;
+      const { messages, newOffset } = readNewMessages(file, readFrom, BATCH_MAX); // #152
+      if (!messages.length) {
+        // hold-back / 半行：無消息但 newOffset 可能前進——無 pending 時可提交，否則等 ACK。
+        if (!this.hasPendingMirror(key) && newOffset > (this.state.offsets[key] ?? 0)) {
+          this.state.offsets[key] = newOffset;
+        }
+        continue;
+      }
+      const entry = this.e2e?.isE2E(key)
+        ? {
+            // §19：原生會話（如 Discord）被標 E2E → 標題+內容加密、打 e2e, server 盲存
             hermesSessionId: key,
             title: this.e2e.encryptText(key, deriveTitle(s)),
             source: deriveSource(s),
@@ -954,47 +1146,28 @@ export class Mirror {
                 ...(mm.tools ? { tools: mm.tools } : {}),
               }),
             })),
-          });
-          batchKeys.push(key);
-        } else {
-          batch.push({
+          }
+        : {
             hermesSessionId: key,
             title: deriveTitle(s),
             source: deriveSource(s),
             messages: messages.map((m) => ({ ...m, srcId: srcIdFor(m) })), // §9
-          });
-          batchKeys.push(key);
-        }
-      }
-      this.state.offsets[key] = newOffset;
-    }
-    // #152 單會話單幀(對齊 CC):每幀 ≤BATCH_MAX 條消息,rewind 也細化到單會話——nack 只回退撞壞的那條。
-    for (let bi = 0; bi < batch.length; bi++) {
-      const entry = batch[bi];
-      this.batchId += 1;
-      const k = batchKeys[bi]!; // 水位線鍵(≠ entry.hermesSessionId,salvage 條目用真大小寫 sid)
-      this.rewind.push({ id: this.batchId, prev: k in prev ? { [k]: prev[k]! } : {} });
-      if (this.rewind.length > REWIND_KEEP) this.rewind.shift();
-      this.linkb.send({
-        t: "mirror_append",
-        agentLinkId: this.linkb.agentLinkId,
-        sessions: [entry],
-        batchId: this.batchId,
-      });
-      this.counters.mirrorBatches += 1; // #10
-      this.counters.mirrorMessages += entry.messages?.length ?? 0;
+          };
+      // #152 單會話單幀 + #348 durable：ACK 前不推 offsets。
+      this.sendOne(key, entry, newOffset);
     }
     this.save();
   }
 
   /** #9:offsets 無界增長治理——key 從 sessions.list 消失連續 PRUNE_MS 才裁(短暫缺席回歸即清)。
-   * 安全性:被裁 key 若日後回歸,走「新會話 baseline-to-end」既有語義,不重發不誤丟。 */
+   * 安全性:被裁 key 若日後回歸,走「新會話 baseline-to-end」既有語義,不重發不誤丟。
+   * #348：有 pending durable 批的 key 不裁——否則 ACK 前把待確認水位連同 outbox 一併抹掉 = 靜默跳批。 */
   private prune(liveKeys: Set<string>): void {
     const ma = (this.state.missingAt ??= {});
     const now = Date.now();
     let pruned = 0;
     for (const key of Object.keys(this.state.offsets)) {
-      if (liveKeys.has(key)) {
+      if (liveKeys.has(key) || this.hasPendingMirror(key)) {
         delete ma[key];
         continue;
       }
@@ -1071,6 +1244,37 @@ export class Mirror {
         if (raw.aliasHistoryTrusted === true && fileIdAliases === undefined) {
           throw new Error("trusted alias history requires fileIdAliases");
         }
+        const pendingMirrors: NonNullable<State["pendingMirrors"]> = [];
+        if (raw.pendingMirrors !== undefined) {
+          if (!Array.isArray(raw.pendingMirrors)) {
+            throw new Error("mirror pendingMirrors must be an array");
+          }
+          for (const item of raw.pendingMirrors) {
+            if (
+              !item ||
+              typeof item !== "object" ||
+              typeof item.batchId !== "string" ||
+              !item.batchId ||
+              typeof item.key !== "string" ||
+              !item.key ||
+              typeof item.endOffset !== "number" ||
+              !Number.isFinite(item.endOffset) ||
+              item.endOffset < 0 ||
+              !item.frame ||
+              typeof item.frame !== "object" ||
+              Array.isArray(item.frame)
+            ) {
+              throw new Error("mirror pendingMirrors contains an invalid entry");
+            }
+            pendingMirrors.push({
+              batchId: item.batchId,
+              frame: item.frame as Record<string, unknown>,
+              key: item.key,
+              endOffset: item.endOffset,
+              ...(item.acked === true ? { acked: true } : {}),
+            });
+          }
+        }
         return {
           offsets: record(raw.offsets ?? {}, "number"),
           missingAt: record(raw.missingAt ?? {}, "number"),
@@ -1080,6 +1284,7 @@ export class Mirror {
           ...(raw.aliasHistoryTrusted !== undefined
             ? { aliasHistoryTrusted: raw.aliasHistoryTrusted }
             : {}),
+          pendingMirrors,
         };
       },
       () => ({
@@ -1088,11 +1293,13 @@ export class Mirror {
         fileIds: {},
         fileIdAliases: {},
         aliasHistoryTrusted: false,
+        pendingMirrors: [],
       }),
     );
   }
   private lastSaved = "";
-  private save(): boolean {
+  /** force=true：即使內容未變也 fsync（ACK/NACK 路徑要確保落盤）。 */
+  private save(force = false): boolean {
     try {
       const protectedIds = this.protectedSessionIds();
       const canMigrateAliases = this.canSafelyMigrateAliasHistory(protectedIds);
@@ -1110,8 +1317,17 @@ export class Mirror {
       }
       // #262 dirty 判斷:與上次落盤相同 → 跳過(每輪 poll 無條件雙寫傷 SD 卡)。
       const json = JSON.stringify(this.state);
-      if (json === this.lastSaved) return true;
-      saveStateFile(statePath(), this.state);
+      if (!force && json === this.lastSaved) return true;
+      // durable outbox 裝完整正文 → 0600 + fsync（對齊 CC/Codex #348）。
+      const path = statePath();
+      if (existsSync(path) && this.lastSaved) {
+        try {
+          durableWrite(`${path}.bak`, this.lastSaved);
+        } catch {
+          /* .bak 失敗不阻擋主檔 */
+        }
+      }
+      durableWrite(path, json);
       this.lastSaved = json;
       // 壞/缺 identity 快照後，寫入一個只看見「當前 active 普通會話」的新檔不能證明已重建
       // 歸檔 E2E transcript 的 aliases；本進程保持 fail-closed，待人工恢復或無 E2E 時重建。

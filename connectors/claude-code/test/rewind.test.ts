@@ -109,3 +109,14 @@ describe("#473 rewind(cc / forkSession)", () => {
     expect((m as unknown as MirrorState).state.offsets["99999999-8888-4777-8666-555555555555"]).toBe(0);
   });
 });
+
+/** F-13/#490:hello 宣告 rewind:1 與實現一致(Codex/OpenClaw 不得宣告——見各家護欄/單測)。 */
+describe("#490 hello rewind cap(cc)", () => {
+  it("linkb hello 帶 rewind:1", () => {
+    const src = readFileSync(new URL("../src/linkb/client.ts", import.meta.url), "utf8");
+    const idx = src.search(/t\s*:\s*["']hello["']/);
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const window = src.slice(idx, idx + 900);
+    expect(window).toMatch(/rewind\s*:\s*1\b/);
+  });
+});
