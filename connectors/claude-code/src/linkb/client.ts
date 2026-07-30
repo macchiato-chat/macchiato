@@ -114,7 +114,11 @@ export class LinkBClient {
           e2eKeyVersionBinding: 1,
           e2eQuiesce: 1,
           mirrorDurable: 1, // #348 durable outbox + 懂 mirror_nack.code 終態語義
-          rewind: 1, // #473 能截斷 transcript 回退上下文(關通道 → 截檔 → 尾巴留檔)
+          rewind: 1, // #473 SDK forkSession 按點分叉後重指(原 transcript 不動)
+          fork: 1, // #223 同一 SDK 能力的非破壞性版:分叉新會話,老會話不動
+          // #552 回合中發送三模式:inject=推進 streaming input(CLI 原生排隊注入)、
+          // queue=連接器側排隊回合末投遞、interrupt=打斷接管(歷史默認)。
+          promptModes: ["inject", "queue", "interrupt"],
         }),
       );
     });

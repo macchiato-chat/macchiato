@@ -84,6 +84,12 @@ export class LinkBClient {
   }
 
   /** 連接 + hello + 等首次 ready。 */
+  /** #473:app-server 引擎才有 rewind(thread/fork);exec 回退不宣告。start() 前由 index.ts 設。 */
+  declareRewind = false;
+  /** #552:三模式(inject=turn/steer、queue、interrupt=turn/interrupt)同為 app-server 引擎能力;
+   * exec 回退不宣告 → client 維持舊 UI。start() 前由 index.ts 設。 */
+  declarePromptModes = false;
+
   async start(): Promise<void> {
     this.connect();
     await this.readyOnce;
@@ -113,6 +119,11 @@ export class LinkBClient {
           e2eKeyVersionBinding: 1,
           e2eQuiesce: 1,
           mirrorDurable: 1, // #348 durable outbox + 懂 mirror_nack.code 終態語義
+          // #473 rewind 是**引擎級**能力(app-server thread/fork;exec v1 沒有)——index.ts 在
+          // 引擎選型後、start() 前設 declareRewind。exec 回退不宣告 → server 409、UI 不出入口,
+          // 而不是下達後 30s 超時(F-13 能力誠實原則)。
+          ...(this.declareRewind ? { rewind: 1 } : {}),
+          ...(this.declarePromptModes ? { promptModes: ["inject", "queue", "interrupt"] } : {}),
         }),
       );
     });

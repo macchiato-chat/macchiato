@@ -17,14 +17,14 @@ import { announceImportAvailable, runImport } from "./cc/history-import";
 import { Drive, workDir } from "./cc/drive";
 import { LoginFlow } from "./cc/login";
 import { HealthLoop } from "./health";
+import { CONNECTOR_VERSION } from "./linkb/proto";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 import { cleanupTitlegenResidue } from "./cc/titles";
 
-// §update 連接器發布版本:對齊 packages/protocol CONNECTOR_VERSION。⚠️ 發版必須**五處同步 bump**:
-// 四連接器常量(cc/codex/openclaw 各自 src/index.ts + hermes connector.py)+ protocol link.ts 全局。
-// 全局是 server 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」
-// (本機與公開用戶一起亮,重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-const CONNECTOR_VERSION = "1.5.58";
+// §update 連接器發布版本:單源自 packages/protocol 的 CONNECTOR_VERSION(#526 起 TS 三家不再
+// 各持副本——2026-07-20「bump 漏一家 → 該家永亮更新」與 2026-07-28 三連事故的同類根子都是
+// 手工多份)。公開樹由 sync-public 重寫為 ./linkb/proto(常量再生,不漂移)。bump 用
+// scripts/release/bump-connector-version.mjs(改 protocol + hermes.py + well-known 三處)。
 
 function runSelfUpdate(): void {
   // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。
@@ -90,6 +90,8 @@ async function main(): Promise<void> {
   const projects = new Projects(linkb); // #227 備案目錄:project_op + 回合末惰性版本化
   projects.wire();
   drive = new Drive(linkb, mirror, e2e, commands, projects);
+  const modelsReporter = new ModelsReporter(linkb); // #231/#553 建在 drive 後、start 在 ready 段
+  drive.modelsIndex = modelsReporter; // #553 resolveEffort 兜底 high 的閘(當前 model 支持 effort 才下發)
   drive.wire();
   const startE2EBackfill = (
     sid: string,
@@ -100,6 +102,17 @@ async function main(): Promise<void> {
     });
   };
   const localE2EStatus = () => drive.localSessionE2EStatus();
+
+  // #223 fork ACK:server 在 await,ok 必帶新會話身份。
+  drive.onForkResult = (r) =>
+    linkb.send({
+      t: "fork_result",
+      agentLinkId: linkb.agentLinkId,
+      hermesSessionId: r.hermesSessionId,
+      requestId: r.requestId,
+      ok: r.ok,
+      ...(r.ok ? { forkedHermesSessionId: r.forkedHermesSessionId } : { error: r.error ?? "failed" }),
+    });
 
   // #473 rewind ACK：server 只有收到 ok 才刪自己的消息行，所以這條出口不能少。
   drive.onRewindResult = (r) =>
@@ -274,7 +287,7 @@ async function main(): Promise<void> {
   announceImportAvailable(linkb, localE2EStatus()); // app 的「導入」入口據此顯示
   mirror.start();
   void commands.start(workDir()); // #199 枚舉+上報(短命 CLI;失敗只缺菜單,不阻啟動)
-  void new ModelsReporter(linkb).start(workDir()); // #231 model/effort 清單上報(chip 數據源)
+  void modelsReporter.start(workDir()); // #231 model/effort 清單上報(chip 數據源)
 
   const health = new HealthLoop(linkb, mirror, CONNECTOR_VERSION, drive); // #10:計數上報
   health.start();

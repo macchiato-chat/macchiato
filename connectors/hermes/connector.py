@@ -67,6 +67,8 @@ LINKB_MAX_SESSION_ID_LEN = 256
 LINKB_MAX_TYPE_LEN = 64
 LINKB_MAX_BULK_ARRAY_LEN = 10_000
 PUSH_MAX_LINE_BYTES = 1 * 1024 * 1024
+# #280 主動投遞附件:單次最多帶幾個文件(防炸 Link B 幀 / 濫用);與 live MEDIA: 逐個上送不同,push 一批。
+PUSH_MEDIA_MAX_FILES = 8
 from e2e_keys import E2EKeyStore
 from e2e_control import (
     E2EControlError,
@@ -110,7 +112,7 @@ LINK_B_PROTO = 5  # 對齊 server（packages/protocol：B=5，#348/#368 可靠 A
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.58"
+CONNECTOR_VERSION = "1.5.64"
 E2E_APPROVAL_PLAINTEXT_MAX = 64 * 1024
 # #279 E2E prompt 解密失敗的用戶可見回執(僅提示語,零內容洩漏;四連接器同文案)。
 E2E_DECRYPT_FAIL_WARNING = "無法解密這條消息(設備與連接器的加密密鑰可能失步)——請重試,或重新關閉再開啟本會話的端到端加密。"
@@ -1953,8 +1955,70 @@ class Connector:
         except Exception as exc:
             print(f"[push socket 啟動失敗] {exc!r}", file=sys.stderr)
 
+    def _push_media_payloads(self, raw_files) -> list:
+        """#280 主動投遞附件:plugin 給本地路徑 → 允許根校驗 + 讀盤 → media.attach 同 shape。
+
+        安全(對齊 live MEDIA: 路徑 #372):
+          - 僅本地常規文件、realpath 後落在允許根內(STATE/ATTACH/hermes **媒體子目錄**/env 擴展根)
+          - 大小上限 MEDIA_MAX;symlink 逃逸拒;路徑正文不進日誌
+          - 單次最多 PUSH_MEDIA_MAX_FILES 個(防炸 Link B 幀)
+        任一失敗 silently skip 該檔(文字仍投),不整包拒絕。
+
+        ⚠️ **不把整個 HERMES_HOME 當允許根**:那裡有 `.env`(API key)、`state.db`(全部歷史對話)。
+        路徑來自 agent 調 `send_message_tool(media_files=…)`,即模型輸出可控——而
+        「模型輸出不是可信授權邊界」正是 #372 的前提。整個 home 開放 = prompt injection
+        可以把憑證/對話庫當「圖表」投遞出去(server 的 mime 白名單只是最後一道,
+        改個 .pdf 後綴就能繞)。只認 cron 產物該去的媒體子目錄;真需要別處用
+        MACCHIATO_MEDIA_ALLOW_ROOTS 顯式開,那是用戶的顯式授權,不是模型的。
+        """
+        if not raw_files or not isinstance(raw_files, (list, tuple)):
+            return []
+        # cron 無 session cwd;允許 hermes home **下的媒體子目錄**(cron 產物的常見落點)。
+        hermes_home = ""
+        try:
+            from hermes_constants import get_hermes_home
+
+            hermes_home = str(get_hermes_home())
+        except Exception:
+            hermes_home = (os.environ.get("HERMES_HOME") or "").strip() or os.path.expanduser(
+                "~/.hermes"
+            )
+        extra: list[str] = [
+            os.path.join(hermes_home, sub) for sub in ("media", "outbox", "attachments", "tmp")
+        ]
+        roots = _media_allow_roots(
+            state_dir=STATE_DIR,
+            attach_dir=ATTACH_DIR,
+            extra_roots=extra,
+        )
+        out: list = []
+        seen: set[str] = set()
+        for raw in raw_files:
+            if len(out) >= PUSH_MEDIA_MAX_FILES:
+                print(
+                    f"[push media] cap={PUSH_MEDIA_MAX_FILES} remaining skipped",
+                    file=sys.stderr,
+                )
+                break
+            path = str(raw or "").strip()
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            try:
+                payload = _read_media_file(path, roots)
+            except Exception as exc:
+                print(
+                    f"[push media read failed] path_len={len(path)} err={type(exc).__name__}",
+                    file=sys.stderr,
+                )
+                continue
+            if payload is None:
+                continue
+            out.append(payload)
+        return out
+
     async def _push_handler(self, reader, writer) -> None:
-        """單條請求：讀一行 JSON {chatId,text,...} → 經 Link B 發 connector_push → 回 ack 行。"""
+        """單條請求：讀一行 JSON {chatId,text,mediaFiles?,...} → 經 Link B 發 connector_push → 回 ack 行。"""
         ack: dict = {"ok": False, "error": "unknown"}
         try:
             line = await asyncio.wait_for(reader.readline(), timeout=10)
@@ -1970,12 +2034,16 @@ class Connector:
                 if not chat_id or not text:
                     ack = {"ok": False, "error": "missing chatId/text"}
                 elif self._e2e.is_protected(chat_id) or self._e2e.is_protected(f"macchiato:{chat_id}"):
-                    # connector_push 的 wire shape 只有明文 text。目的會話（含 server 的
-                    # inbox fallback sid）受 E2E 保護時必須在本機拒絕，不能先把正文交給 server。
+                    # connector_push 的 wire shape 只有明文 text(+可選 media base64)。目的會話
+                    # （含 server 的 inbox fallback sid）受 E2E 保護時必須在本機拒絕，
+                    # 不能先把正文/附件交給 server。
                     ack = {"ok": False, "error": "E2E push unsupported"}
                 elif self.ws is None:
                     ack = {"ok": False, "error": "link B down", "retryable": True}
                 else:
+                    # #280 讀本地路徑 → base64 media[](可選);失敗檔跳過,文字照投。
+                    media_raw = req.get("mediaFiles") or req.get("media_files") or []
+                    media = await asyncio.to_thread(self._push_media_payloads, media_raw)
                     self._push_seq += 1
                     pid = self._push_seq
                     msg = {
@@ -1989,9 +2057,15 @@ class Connector:
                         msg["replyTo"] = req["replyTo"]
                     if req.get("metadata"):
                         msg["metadata"] = req["metadata"]
+                    if media:
+                        msg["media"] = media
                     await self._send(msg)
-                    print(f"· 主動投遞 → server（chat={chat_id[:24]}, push {pid}, {len(text)} 字）")
-                    ack = {"ok": True, "messageId": f"push:{pid}"}
+                    media_note = f", media={len(media)}" if media else ""
+                    print(
+                        f"· 主動投遞 → server（chat={chat_id[:24]}, push {pid}, "
+                        f"{len(text)} 字{media_note}）"
+                    )
+                    ack = {"ok": True, "messageId": f"push:{pid}", "mediaCount": len(media)}
         except asyncio.TimeoutError:
             ack = {"ok": False, "error": "read timeout"}
         except Exception as exc:

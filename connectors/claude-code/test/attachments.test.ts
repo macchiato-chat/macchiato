@@ -132,15 +132,34 @@ describe("#249 pinnedLookup(連接時校驗實際 IP,防 rebinding TOCTOU)", () 
   it("解析到私網 IP → 拒(rebinding 換的正是這次連接的 IP)", async () => {
     // localhost 必解析到環回(127.0.0.1/::1)= 私網 → pinnedLookup 應報錯
     await expect(
-      new Promise<string>((resolve, reject) =>
+      new Promise((resolve, reject) =>
         pinnedLookup("localhost", {}, (err, addr) => (err ? reject(err) : resolve(addr))),
       ),
     ).rejects.toThrow(/私網|SSRF/);
   });
   it("解析到公網 IP → 放行(以字面公網 IP 為例,lookup 原樣返回)", async () => {
-    const addr = await new Promise<string>((resolve, reject) =>
+    const addr = await new Promise((resolve, reject) =>
       pinnedLookup("1.1.1.1", {}, (err, a) => (err ? reject(err) : resolve(a))),
     );
     expect(addr).toBe("1.1.1.1");
+  });
+
+  // Node 20+ 的 autoSelectFamily(默認開)就是用 all:true 調 lookup 的,並期待回調給**數組**。
+  // 舊實現強行改寫成 all:false 回字符串 → Node 讀 addresses[0].address 得 undefined,
+  // 拋 `Invalid IP address: undefined`,https 附件下載全掛(本地 dev 走 http 繞開 lookup,故長期沒暴露)。
+  // 這條用例只要退回「覆蓋 all」的寫法就會紅。
+  it("pinnedLookup:調用方要 all:true 時必須回數組,且逐個校驗私網", async () => {
+    const many = await new Promise<unknown>((resolve, reject) =>
+      pinnedLookup("1.1.1.1", { all: true }, (err, a) => (err ? reject(err) : resolve(a))),
+    );
+    expect(Array.isArray(many)).toBe(true);
+    expect(many).toEqual([expect.objectContaining({ address: "1.1.1.1" })]);
+
+    // localhost 在 all:true 下會回 ::1 與 127.0.0.1 兩條,任意一條是私網就得拒。
+    await expect(
+      new Promise((resolve, reject) =>
+        pinnedLookup("localhost", { all: true }, (err, a) => (err ? reject(err) : resolve(a))),
+      ),
+    ).rejects.toThrow(/私網|SSRF/);
   });
 });

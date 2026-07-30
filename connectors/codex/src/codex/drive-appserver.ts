@@ -72,6 +72,8 @@ const E2E_SENSITIVE_METHODS = new Set([
   "session.rename",
   "session.archive",
   "session.retitle",
+  // #473 rewind 是破壞性寫(fork 重指線程),E2E 下不認 server 裸帧(server v1 也直接拒 E2E)。
+  "session.rewind",
 ]);
 
 
@@ -369,6 +371,71 @@ export class AppServerDrive {
       sessionId: sid,
       frame: { jsonrpc: "2.0", method: "event", params: { type, session_id: sid, payload } },
     });
+  }
+
+  /**
+   * #473 把該會話回退到 targetSrcId 這條用戶消息之前。
+   *
+   * codex 的最小回退單位是**回合**(`thread/fork` + `lastTurnId`,inclusive 保留)——同回合裡
+   * 目標之前的消息會被一起截掉,所以把實際截斷起點(`cutSrcId`)回報給 server,讓它把自己的
+   * 刪行對齊到 agent 真正忘掉的位置,否則 UI 留着 AI 已不記得的消息。
+   *
+   * 順序(cc 同款教訓,一步都不能亂):
+   *  1. 回合進行中不動(fork 的 lastTurnId 也不接受 in-progress 回合);
+   *  2. fork 出新 thread 後**立刻** mirror.adoptForked——水位不坐到 EOF,下一輪 poll 會把
+   *     複製過去的整段歷史當新消息重灌;
+   *  3. 舊 thread 記墓碑:它已不代表這個會話,若用戶日後在終端 resume 它,鏡像絕不能把
+   *     「被回退掉的舊世界線」再灌回 app(rollout 檔本身不動,#161 語義);
+   *  4. 最後才重指 map(下個 prompt resume 新 thread)。
+   *
+   * 目標在第一個回合 → 沒有回合可保留(省略 lastTurnId = 全量複製,正好相反)→ 丟映射,
+   * 下個 prompt 自然開全新會話。
+   */
+  private async rewindSession(
+    sid: string,
+    targetSrcId: string,
+  ): Promise<{ ok: boolean; rewound?: number; fromSrcId?: string; error?: "unsupported" | "not_found" | "busy" | "failed" }> {
+    const tid = this.threadFor(sid);
+    if (!tid || !targetSrcId) return { ok: false, error: "not_found" };
+    if (this.active.has(sid)) return { ok: false, error: "busy" };
+    const plan = this.mirror?.rewindPlan?.(tid, targetSrcId) ?? null;
+    if (!plan) return { ok: false, error: "not_found" };
+
+    if (plan.lastTurnId === null) {
+      this.mirror?.tombstone(tid);
+      this.byThread.delete(tid);
+      this.loadedThreads.delete(tid);
+      delete this.map[sid];
+      this.saveMap();
+      console.log(`· session.rewind ${sid} → 目標在首回合,丟映射(下個 prompt 開新會話;舊 thread ${tid} 墓碑)`);
+      return { ok: true, rewound: 0, fromSrcId: plan.cutSrcId };
+    }
+
+    let forked: string;
+    try {
+      const res = await this.client.request("thread/fork", {
+        threadId: tid,
+        lastTurnId: plan.lastTurnId,
+        cwd: this.cwdFor(sid),
+      });
+      forked = String((res as { thread?: { id?: unknown } })?.thread?.id ?? "");
+    } catch (e) {
+      console.error(`[session.rewind ${sid} fork 失敗] ${String(e).slice(0, 200)}`);
+      return { ok: false, error: "failed" };
+    }
+    if (!forked) return { ok: false, error: "failed" };
+
+    this.mirror?.adoptForked?.(forked); // ⚠️ 必須先於 map 落盤:防歷史重灌
+    this.mirror?.tombstone(tid); // 舊世界線永不再撈(rollout 檔不動)
+    this.byThread.delete(tid);
+    this.loadedThreads.delete(tid);
+    this.loadedThreads.delete(forked); // 下個 prompt 走 thread/resume 從磁盤載入,不信 fork 的記憶體態
+    this.map[sid] = forked;
+    this.byThread.set(forked, sid);
+    this.mirror?.markDrivenUuid?.(forked);
+    this.saveMap();
+    console.log(`· session.rewind ${sid} → fork ${forked}(保留至回合 ${plan.lastTurnId};舊 ${tid} 墓碑)`);
+    return { ok: true, fromSrcId: plan.cutSrcId };
   }
 
   private threadFor(sid: string): string | undefined {
@@ -736,6 +803,27 @@ export class AppServerDrive {
           if (tid) this.mirror?.tombstone(tid); // #161 墓碑;不刪 rollout
           return;
         }
+        case "session.rewind": {
+          // #473 回退到某條用戶消息之前。server 在等 ACK——它只有收到 ok 才刪自己的行,
+          // 所以無論成敗都必須回一幀,否則它 30s 超時判失敗、用戶白等。
+          const requestId = typeof params.request_id === "string" ? params.request_id : "";
+          const targetSrcId = typeof params.target_src_id === "string" ? params.target_src_id : "";
+          void this.rewindSession(sid, targetSrcId)
+            .catch(() => ({ ok: false as const, error: "failed" as const }))
+            .then((r) =>
+              this.linkb.send({
+                t: "rewind_result",
+                agentLinkId: this.linkb.agentLinkId,
+                hermesSessionId: sid,
+                requestId,
+                ok: r.ok,
+                ...(r.ok
+                  ? { rewound: r.rewound ?? 0, ...(r.fromSrcId ? { fromSrcId: r.fromSrcId } : {}) }
+                  : { error: r.error ?? "failed" }),
+              }),
+            );
+          return;
+        }
         case "session.rename": {
           // #224 改名回寫:app 改標題 → thread/name/set,codex 本地(TUI /resume 列表)看到同名。
           // 僅 app-server 引擎有此能力(exec drive 無此 case,靜默跳過)。無 thread(尚未建會話)→ 跳過。
@@ -862,21 +950,58 @@ export class AppServerDrive {
     }
     if (attachNotes.length) text = [text, ...attachNotes].filter(Boolean).join("\n\n");
     const input: UserInput[] = [...(text ? [{ type: "text", text } as UserInput] : []), ...images];
-    await this.dispatchInput(sid, input, text);
+    // #552 回合中發送的顯式模式;未知值防禦性忽略(= 歷史默認 inject/steer)。
+    const mode =
+      params.mode === "inject" || params.mode === "queue" || params.mode === "interrupt"
+        ? params.mode
+        : undefined;
+    await this.dispatchInput(sid, input, text, false, mode);
   }
 
+  /** #552 queue/stop&send 排隊的輸入:回合結束由 finishTurn 作為新回合投遞(絕不與 active 併發)。 */
+  private readonly queuedInputs = new Map<string, Array<{ input: UserInput[]; firstText: string }>>();
+
   /**
-   * #132/#317 投遞一回合輸入(prompt.submit 與 command.invoke 共用):
-   * mid-turn steer:回合進行中 → turn/steer 注入(expectedTurnId 防競態);
-   * steer 失敗(回合恰好剛結束/turnId 不匹配)→ 回退起新回合,消息絕不丟。
+   * #132/#317/#552 投遞一回合輸入(prompt.submit 與 command.invoke 共用)。閒置 = 起新回合;
+   * 回合進行中按 mode 分流:
+   *  - `inject` / 缺省(歷史默認):turn/steer 注入(expectedTurnId 防競態);steer 未命中
+   *    (回合恰好剛結束/turnId 不匹配)→ 回退起新回合,消息絕不丟;
+   *  - `queue`:入 queuedInputs,回合結束由 finishTurn 續投,不打斷;
+   *  - `interrupt`(stop & send):排隊 + turn/interrupt(turnId 未到位走 #245 deferral),
+   *    回合定稿 interrupted 後排隊消息接管。
    */
   private async dispatchInput(
     sid: string,
     input: UserInput[],
     firstText: string,
     requireDelivery = false,
+    mode?: "inject" | "queue" | "interrupt",
   ): Promise<void> {
     const running = this.active.get(sid);
+    if (running && (mode === "queue" || mode === "interrupt")) {
+      // get→push 同一 tick(無 await),finishTurn 不可能插隊——排隊後必有一次回合收尾來投遞。
+      const q = this.queuedInputs.get(sid) ?? [];
+      q.push({ input, firstText });
+      this.queuedInputs.set(sid, q);
+      if (mode === "queue") {
+        console.log(`· Queue:排隊等當前回合結束 → ${sid}`);
+        return;
+      }
+      this.interruptedSids.add(sid);
+      if (running.turnId) {
+        try {
+          await this.client.request("turn/interrupt", { threadId: running.threadId, turnId: running.turnId });
+          console.log(`· turn/interrupt(stop&send)→ ${sid}`);
+        } catch (e) {
+          // 回合恰好剛結束等:排隊消息仍由回合收尾/下一回合入口投遞,不丟。
+          console.log(`· stop&send interrupt 未命中(${(e as Error).message.slice(0, 120)})`);
+        }
+      } else {
+        running.interruptPending = true; // #245:turn/start 未返回的窗口,turnId 到位即補發
+        console.log(`· stop&send interrupt 掛起(turnId 未到位,到位即補發)→ ${sid}`);
+      }
+      return;
+    }
     if (running?.turnId) {
       try {
         await this.client.request("turn/steer", { threadId: running.threadId, expectedTurnId: running.turnId, input });
@@ -1156,6 +1281,10 @@ export class AppServerDrive {
     this.mirror?.fastForward(turn.threadId);
     this.mirror?.unsetDriven(turn.threadId);
     this.projects?.checkTurnEnd(); // #227
+    // #552 queue/stop&send 排隊的消息:回合收尾後作為新回合投遞。
+    const next = this.queuedInputs.get(sid)?.shift();
+    if (!this.queuedInputs.get(sid)?.length) this.queuedInputs.delete(sid);
+    if (next) void this.runTurn(sid, next.input, next.firstText);
   }
 
   /**
@@ -1310,6 +1439,13 @@ export class AppServerDrive {
         this.emit(sid, "review.summary", { summary: "⚠️ codex app-server 重啟,這一回合被打斷——請重發一次。" });
       }
       this.mirror?.unsetDriven(turn.threadId);
+    }
+    // #552 排隊的消息沒了投遞時機(引擎死了,不自動重跑防雙投副作用)→ 可見提示,絕不靜默丟。
+    for (const sid of [...this.queuedInputs.keys()]) {
+      this.queuedInputs.delete(sid);
+      const note = "⚠️ 排隊的消息未投遞(codex 引擎重啟),請重發。";
+      if (this.e2e?.isE2E(sid)) this.sendE2ETurn(sid, note);
+      else this.emit(sid, "review.summary", { summary: note });
     }
     this.saveMap();
   }

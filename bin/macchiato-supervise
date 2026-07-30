@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# macchiato-supervise — 進程外最小 bootstrap / supervisor（#528）
+#
+# 背景：連接器進程內 self_update 要先起得來、連上 server 才能收指令。
+# 壞包（如 1.5.56 hermes ModuleNotFoundError）→ systemd 只機械重啟 → 永久掉線。
+#
+# 本腳本由 install.sh 落盤到 ~/.macchiato/bin/macchiato-supervise，作為 systemd/
+# launchd 的 ExecStart。邏輯刻意極小、不 import 連接器樹：
+#   1. 啟動前 probe（import 閉合 / 短存活）
+#   2. 秒退 / 崩潰計數超過閾值 → 拉最新 signed release.json → 驗簽 → 重裝
+#   3. exit 78（#387 解綁）直接透傳，不 heal、不重啟
+#
+# 用法（由 unit 生成）：
+#   macchiato-supervise <kind> -- <real exec args...>
+#   kind ∈ hermes | openclaw | claude-code | codex
+#   hermes profile 時 kind 仍是 hermes；MACCHIATO_HERMES_PROFILE 由 unit env 傳入。
+#
+# 環境：
+#   MACCHIATO_RELEASE_BASE   默認 https://raw.githubusercontent.com/macchiato-chat/macchiato/main
+#   MACCHIATO_SUPERVISE_FAILS / MACCHIATO_SUPERVISE_WINDOW_S / MACCHIATO_SUPERVISE_COOLDOWN_S
+#   MACCHIATO_SUPERVISE_PROBE_S / MACCHIATO_SUPERVISE_STABLE_S
+#   MACCHIATO_SUPERVISE_STATE_DIR  默認 ~/.macchiato
+#   MACCHIATO_SUPERVISE_DISABLE_HEAL=1  關掉自愈（測試/排障）
+set -euo pipefail
+
+# 剝 loader hooks：與 install/self_update 同邊界（本腳本自身也幾乎不能壞）。
+while IFS= read -r inherited_function; do
+  builtin unset -f "$inherited_function"
+done < <(builtin compgen -A function 2>/dev/null || true)
+unset BASH_ENV ENV CDPATH GLOBIGNORE NODE_OPTIONS NODE_PATH \
+  PYTHONPATH PYTHONHOME PYTHONSTARTUP TAR_OPTIONS GZIP BZIP BZIP2 XZ_OPT \
+  RUBYOPT RUBYLIB PERL5OPT PERL5LIB CURL_HOME \
+  LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH \
+  2>/dev/null || true
+export LC_ALL=C
+umask 077
+
+readonly FAIL_THRESHOLD="${MACCHIATO_SUPERVISE_FAILS:-5}"
+readonly WINDOW_S="${MACCHIATO_SUPERVISE_WINDOW_S:-600}"       # 10 min
+readonly COOLDOWN_S="${MACCHIATO_SUPERVISE_COOLDOWN_S:-1800}" # 30 min
+readonly PROBE_S="${MACCHIATO_SUPERVISE_PROBE_S:-20}"
+readonly STABLE_S="${MACCHIATO_SUPERVISE_STABLE_S:-60}"
+readonly STATE_DIR="${MACCHIATO_SUPERVISE_STATE_DIR:-$HOME/.macchiato}"
+readonly RELEASE_BASE="${MACCHIATO_RELEASE_BASE:-https://raw.githubusercontent.com/macchiato-chat/macchiato/main}"
+# 驗簽的公鑰(K0)不在本腳本——它嵌在冷凍的 release_verify.py 裡,由 heal 調用。
+# 這裡刻意不放第二份副本:兩處公鑰遲早漂移,而漂移的那份會顯得「也在把關」。
+
+log() { printf '[macchiato-supervise] %s\n' "$*" >&2; }
+die() { log "FATAL: $*"; exit 1; }
+
+KIND=""
+REAL_CMD=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --) shift; REAL_CMD=("$@"); break ;;
+    -h|--help)
+      cat <<'EOF'
+macchiato-supervise <kind> -- <command...>
+  kind: hermes | openclaw | claude-code | codex
+EOF
+      exit 0
+      ;;
+    *)
+      if [ -z "$KIND" ]; then KIND="$1"; shift
+      else die "unexpected arg: $1 (use -- before real command)"; fi
+      ;;
+  esac
+done
+
+case "$KIND" in
+  hermes|openclaw|claude-code|codex) ;;
+  *) die "unknown kind '$KIND' (want hermes|openclaw|claude-code|codex)" ;;
+esac
+[ "${#REAL_CMD[@]}" -gt 0 ] || die "missing real command after --"
+
+mkdir -p "$STATE_DIR"
+STATE_FILE="$STATE_DIR/supervise-$KIND.state"
+# profile 隔離：多 hermes 實例各自計數
+if [ "$KIND" = "hermes" ] && [ -n "${MACCHIATO_HERMES_PROFILE:-}" ]; then
+  STATE_FILE="$STATE_DIR/supervise-hermes-${MACCHIATO_HERMES_PROFILE}.state"
+fi
+LOG_DIR="$STATE_DIR/logs"
+mkdir -p "$LOG_DIR"
+HEAL_LOG="$LOG_DIR/supervise-heal.log"
+
+now_s() { date +%s; }
+
+read_state() {
+  FAILS=0
+  WINDOW_START=0
+  LAST_HEAL=0
+  if [ -f "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    # 狀態文件只含 FAILS=/WINDOW_START=/LAST_HEAL= 整數行
+    # shellcheck source=/dev/null
+    . "$STATE_FILE" 2>/dev/null || true
+  fi
+  FAILS="${FAILS:-0}"
+  WINDOW_START="${WINDOW_START:-0}"
+  LAST_HEAL="${LAST_HEAL:-0}"
+}
+
+write_state() {
+  local tmp
+  tmp="$(mktemp "${STATE_FILE}.XXXXXX")"
+  printf 'FAILS=%s\nWINDOW_START=%s\nLAST_HEAL=%s\n' "$FAILS" "$WINDOW_START" "$LAST_HEAL" >"$tmp"
+  mv -f "$tmp" "$STATE_FILE"
+}
+
+reset_fails() {
+  FAILS=0
+  WINDOW_START="$(now_s)"
+  write_state
+}
+
+note_failure() {
+  local t
+  t="$(now_s)"
+  read_state
+  if [ "$WINDOW_START" -eq 0 ] || [ $((t - WINDOW_START)) -gt "$WINDOW_S" ]; then
+    FAILS=1
+    WINDOW_START="$t"
+  else
+    FAILS=$((FAILS + 1))
+  fi
+  write_state
+  log "crash/probe fail count=$FAILS/${FAIL_THRESHOLD} (window ${WINDOW_S}s)"
+}
+
+should_heal() {
+  [ "${MACCHIATO_SUPERVISE_DISABLE_HEAL:-0}" = "1" ] && return 1
+  read_state
+  [ "$FAILS" -ge "$FAIL_THRESHOLD" ] || return 1
+  local t
+  t="$(now_s)"
+  if [ "$LAST_HEAL" -gt 0 ] && [ $((t - LAST_HEAL)) -lt "$COOLDOWN_S" ]; then
+    log "heal cooldown active ($((COOLDOWN_S - (t - LAST_HEAL)))s left) — not reinstalling"
+    return 1
+  fi
+  return 0
+}
+
+# ── probe：不連網、不進 main loop；只驗證「包能 import / 入口在」──────────────
+#
+# ⚠️ 設計約束(#528 review):probe 是**啟發式的 heal 觸發器,不是啟動閘**。
+# 本腳本凍結在用戶機器上、升級節奏比連接器慢——任何「寫死當前包長什麼樣」的斷言,
+# 都會在未來某個健康新版上假紅,把全體用戶打成永久掉線(正是 #528 要修的那個形狀)。故:
+#   · 只斷言「入口能不能 import」,不枚舉內部模塊清單;
+#   · probe 紅了也照樣啟動真進程(見 main 的 fail-open),最壞退回今天的行為。
+probe() {
+  case "$KIND" in
+    hermes)
+      # REAL_CMD 形如: /path/to/python /path/to/app/connector.py
+      local py app
+      py="${REAL_CMD[0]}"
+      app="$(dirname "${REAL_CMD[1]:-}")"
+      [ -x "$py" ] || [ -f "$py" ] || { log "probe: python missing: $py"; return 1; }
+      [ -d "$app" ] || { log "probe: app dir missing: $app"; return 1; }
+      [ -f "$app/connector.py" ] || { log "probe: connector.py missing"; return 1; }
+      # 與 1.5.56/57 事故同症狀：ModuleNotFoundError 在 import 時爆炸。
+      # 只 import 入口——它的頂層 import 就是真實依賴閉包,不必(也不該)在此複述模塊清單:
+      # 清單一旦與未來版本漂移,老 supervisor 會把健康新包判死。
+      # connector.py 有 `if __name__ == "__main__"` 護欄,import 不會進 main loop。
+      if ! (cd "$app" && "$py" -c '
+import sys
+try:
+    import connector  # noqa: F401
+except Exception as e:
+    print(f"import connector: {e!r}", file=sys.stderr)
+    sys.exit(1)
+print("ok")
+' ); then
+        log "probe: hermes import closure failed"
+        return 1
+      fi
+      ;;
+    openclaw|claude-code|codex)
+      # REAL_CMD: <app>/node_modules/.bin/tsx src/index.ts ；cwd 由 unit WorkingDirectory 設
+      local tsx_bin entry
+      tsx_bin="${REAL_CMD[0]}"
+      entry="${REAL_CMD[1]:-src/index.ts}"
+      [ -e "$tsx_bin" ] || { log "probe: tsx missing: $tsx_bin"; return 1; }
+      # 關鍵文件：入口 + lock + node_modules（npm ci 半截 = TS 三家壞包的主症狀）
+      local root
+      root="$(cd "$(dirname "$tsx_bin")/../.." && pwd)"
+      [ -f "$root/src/index.ts" ] || [ -f "$entry" ] || { log "probe: entry missing"; return 1; }
+      [ -f "$root/package-lock.json" ] || { log "probe: package-lock.json missing"; return 1; }
+      [ -d "$root/node_modules" ] || { log "probe: node_modules missing"; return 1; }
+      # 只驗「tsx 這個 runtime 起不起得來」,不深挖具體源文件——同上,別把包的內部結構凍進 supervisor。
+      # macOS 常無 GNU timeout；有則限時，無則直接跑（依賴 tsx 自身快失敗）。
+      run_limited() {
+        if command -v timeout >/dev/null 2>&1; then
+          timeout "$PROBE_S" "$@"
+        elif command -v gtimeout >/dev/null 2>&1; then
+          gtimeout "$PROBE_S" "$@"
+        else
+          "$@"
+        fi
+      }
+      if ! MACCHIATO_PROBE=1 run_limited "$tsx_bin" --eval "console.log('ok')" >/dev/null 2>&1; then
+        log "probe: tsx cannot start"
+        return 1
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# ── heal：獨立於連接器樹的驗簽 + 重裝（允許同版；這是 repair 不是升版）────────
+find_release_verify() {
+  # 優先：install 時冷凍到 bin 的副本（與 connector app 樹分離）
+  local c
+  for c in \
+    "$STATE_DIR/bin/release_verify.py" \
+    "$(dirname "$0")/release_verify.py" \
+    "$HOME/.macchiato/app/release_verify.py" \
+    "$HOME/.macchiato/hermes-${MACCHIATO_HERMES_PROFILE:-}/app/release_verify.py"
+  do
+    [ -f "$c" ] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+heal() {
+  log "HEAL: crash loop → pull signed latest and reinstall ($KIND)"
+  local work rv py
+  work="$(mktemp -d "${TMPDIR:-/tmp}/macchiato-heal.XXXXXX")" || die "mktemp failed"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work'" RETURN
+
+  rv="$(find_release_verify || true)"
+  py="$(command -v python3 || command -v python || true)"
+  [ -n "$py" ] || { log "heal: no python3 — cannot verify release"; return 1; }
+  [ -n "$rv" ] || { log "heal: release_verify.py not found under ~/.macchiato/bin — reinstall manually"; return 1; }
+
+  # 下載 release.json + .sig（禁 redirect、限大小）
+  local base manifest_url sig_url
+  base="${RELEASE_BASE%/}"
+  [[ "$base" == https://* ]] || { log "heal: REFUSING non-https RELEASE_BASE"; return 1; }
+  manifest_url="$base/release.json"
+  sig_url="$base/release.json.sig"
+
+  if ! command curl --disable --silent --show-error --fail --proto '=https' --tlsv1.2 \
+      --max-redirs 0 --connect-timeout 15 --max-time 60 --max-filesize 1048576 \
+      --output "$work/release.json" "$manifest_url"; then
+    log "heal: download release.json failed"
+    return 1
+  fi
+  if ! command curl --disable --silent --show-error --fail --proto '=https' --tlsv1.2 \
+      --max-redirs 0 --connect-timeout 15 --max-time 30 --max-filesize 1024 \
+      --output "$work/release.json.sig" "$sig_url"; then
+    log "heal: download release.json.sig failed"
+    return 1
+  fi
+
+  # 驗簽（純 Python 零依賴；與連接器 self_update 同一把 K0）
+  if ! "$py" - "$rv" "$work/release.json" "$work/release.json.sig" <<'PY'
+import sys
+sys.path.insert(0, __import__("os").path.dirname(sys.argv[1]))
+import importlib.util
+spec = importlib.util.spec_from_file_location("release_verify", sys.argv[1])
+rv = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(rv)
+manifest = open(sys.argv[2], "rb").read()
+sig = open(sys.argv[3], "r", encoding="ascii").read().strip()
+m = rv.verify_manifest(manifest, sig)
+# repair：不要求嚴格升版；只要簽名過且有 install.sh 即可
+if "install.sh" not in m.get("files", {}):
+    raise SystemExit("manifest missing install.sh")
+# install.sh 無 MACCHIATO_VERIFIED_ROOT 時走 bridge_to_verified_bootstrap,那條路要求
+# manifest 帶 bootstrapSha256——缺了就會在 install 半路 fail。早失敗好過起一個必死的重裝。
+if not m.get("bootstrapSha256"):
+    raise SystemExit("manifest lacks bootstrapSha256 (v2 bridge unavailable)")
+print(m["version"])
+open(sys.argv[2] + ".ok", "w").write(m["version"])
+PY
+  then
+    log "heal: signature/manifest verification failed"
+    return 1
+  fi
+  local version
+  version="$(cat "$work/release.json.ok")"
+  log "heal: verified release.json v$version"
+
+  # 拉 install.sh 並對 hash
+  if ! command curl --disable --silent --show-error --fail --proto '=https' --tlsv1.2 \
+      --max-redirs 0 --connect-timeout 15 --max-time 120 --max-filesize 2097152 \
+      --output "$work/install.sh" "$base/install.sh"; then
+    log "heal: download install.sh failed"
+    return 1
+  fi
+  local want got
+  want="$("$py" -c 'import json,sys; print(json.load(open(sys.argv[1]))["files"]["install.sh"])' "$work/release.json")"
+  if command -v sha256sum >/dev/null 2>&1; then
+    got="$(sha256sum "$work/install.sh" | awk '{print $1}')"
+  else
+    got="$(shasum -a 256 "$work/install.sh" | awk '{print $1}')"
+  fi
+  [ "$got" = "$want" ] || { log "heal: install.sh sha256 mismatch"; return 1; }
+
+  # 最小 env（與 self_update 白名單同精神）+ MACCHIATO_ONLY + 已驗 manifest
+  # repair 允許同版：manifest 已驗簽即可；install 走 bridge → v2 artifact。
+  local env_args=(
+    env -i
+    "HOME=$HOME"
+    "USER=${USER:-}"
+    "LOGNAME=${LOGNAME:-${USER:-}}"
+    "PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+    "TMPDIR=${TMPDIR:-/tmp}"
+    "LANG=C"
+    "LC_ALL=C"
+    "MACCHIATO_MANIFEST=$work/release.json"
+    "MACCHIATO_ONLY=$KIND"
+    "MACCHIATO_RELEASE_BASE=$base"
+  )
+  [ -n "${MACCHIATO_SERVER_URL:-}" ] && env_args+=("MACCHIATO_SERVER_URL=$MACCHIATO_SERVER_URL")
+  [ -n "${MACCHIATO_HERMES_PROFILE:-}" ] && env_args+=("MACCHIATO_HERMES_PROFILE=$MACCHIATO_HERMES_PROFILE")
+  [ -n "${MACCHIATO_STATE_DIR:-}" ] && env_args+=("MACCHIATO_STATE_DIR=$MACCHIATO_STATE_DIR")
+  [ -n "${MACCHIATO_MIRROR:-}" ] && env_args+=("MACCHIATO_MIRROR=$MACCHIATO_MIRROR")
+  [ -n "${HERMES_HOME:-}" ] && env_args+=("HERMES_HOME=$HERMES_HOME")
+  [ -n "${HERMES_PYTHON:-}" ] && env_args+=("HERMES_PYTHON=$HERMES_PYTHON")
+  [ -n "${MACCHIATO_CLAUDE_BIN:-}" ] && env_args+=("MACCHIATO_CLAUDE_BIN=$MACCHIATO_CLAUDE_BIN")
+  [ -n "${MACCHIATO_CODEX_BIN:-}" ] && env_args+=("MACCHIATO_CODEX_BIN=$MACCHIATO_CODEX_BIN")
+
+  chmod 700 "$work/install.sh"
+  # 把 work 拷到持久位置:本函數 RETURN 會 rm work,脫離出去的安裝進程還要用。
+  local persist
+  persist="$(mktemp -d "${TMPDIR:-/tmp}/macchiato-heal-run.XXXXXX")"
+  cp -f "$work/release.json" "$work/install.sh" "$persist/"
+  chmod 700 "$persist/install.sh"
+  local env_persist=() e
+  for e in "${env_args[@]}"; do
+    case "$e" in
+      MACCHIATO_MANIFEST=*) env_persist+=("MACCHIATO_MANIFEST=$persist/release.json") ;;
+      *) env_persist+=("$e") ;;
+    esac
+  done
+
+  # **真 detach**：install_unit 會 systemctl restart 本服務;而且本進程 exit 後 systemd
+  # 走 stop→restart,會把**本 cgroup 裡殘留的所有進程**一起 SIGTERM/SIGKILL。
+  # `&` + `disown` 只是從 bash job 表摘掉,進程仍在同一 session/cgroup 裡 → 重裝被殺到半截,
+  # 恰好是本函數想避免的事(#528 review 實錘)。故必須真正脫離:
+  #   · systemd-run --user --scope：最強,裝進獨立 unit,完全不受本服務生命週期牽連;
+  #   · setsid：退而求其次,脫離 session(對 launchd/macOS 足夠);
+  #   · nohup：最後兜底。
+  echo "---- heal $(date -u +%Y-%m-%dT%H:%M:%SZ) kind=$KIND version=$version ----" >>"$HEAL_LOG"
+  local runner=()
+  if command -v systemd-run >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ] \
+     && systemd-run --user --quiet --scope true >/dev/null 2>&1; then
+    runner=(systemd-run --user --quiet --collect --unit="macchiato-heal-$KIND-$$" --scope)
+    log "heal: detaching via systemd-run --user --scope"
+  elif command -v setsid >/dev/null 2>&1; then
+    runner=(setsid)
+    log "heal: detaching via setsid"
+  else
+    runner=(nohup)
+    log "heal: detaching via nohup (weakest — install may be killed by a restart)"
+  fi
+  # 生成 runner 腳本(路徑用 %q 轉義後烘進去),避免依賴「子進程能繼承哪些變量」。
+  {
+    printf '#!/bin/bash\n'
+    printf 'set -u\n'
+    printf '%s >>%q 2>&1\n' "$(printf '%q ' "${env_persist[@]}" /bin/bash -p "$persist/install.sh" -y "--agents=$KIND")" "$HEAL_LOG"
+    printf 'st=$?\n'
+    printf 'printf "install exit %%s at %%s\\n" "$st" "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)" >>%q\n' "$HEAL_LOG"
+    printf 'rm -rf %q\n' "$persist"
+    printf 'exit "$st"\n'
+  } >"$persist/heal-run.sh"
+  chmod 700 "$persist/heal-run.sh"
+
+  log "heal: spawning detached verified install.sh (MACCHIATO_ONLY=$KIND)…"
+  "${runner[@]}" /bin/bash -p "$persist/heal-run.sh" </dev/null >>"$HEAL_LOG" 2>&1 &
+  disown 2>/dev/null || true
+
+  read_state
+  FAILS=0
+  WINDOW_START="$(now_s)"
+  LAST_HEAL="$(now_s)"
+  write_state
+  log "heal: reinstall spawned; counters reset (install continues in background)"
+  return 0
+}
+
+# ── 信號轉發：本腳本夾在 init 與連接器之間,必須把終止信號傳下去 ──────────────
+# systemd 默認 KillMode=control-group,會連鍋端整個 cgroup,所以 Linux 上看不出問題;
+# 但 **launchd(macOS) 只給 job 的主進程發信號** → 不轉發的話,`launchctl kickstart -k`
+# / 重啟後舊連接器變孤兒繼續跑,新的又起一個,同一 agent link 兩條 WS 在鏡像。
+CHILD_PID=""
+forward_signal() { # $1=signal name
+  local sig="$1"
+  if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+    log "got SIG$sig — forwarding to child $CHILD_PID"
+    kill "-$sig" "$CHILD_PID" 2>/dev/null || true
+    # 給它一點時間優雅收尾;真賴著不走再由 init 的 SIGKILL 收拾。
+    local i=0
+    while [ "$i" -lt 10 ] && kill -0 "$CHILD_PID" 2>/dev/null; do
+      sleep 1
+      i=$((i + 1))
+    done
+  fi
+  trap - TERM INT HUP
+  exit $((128 + $(kill -l "$sig" 2>/dev/null || echo 15)))
+}
+trap 'forward_signal TERM' TERM
+trap 'forward_signal INT' INT
+trap 'forward_signal HUP' HUP
+
+# ── 主循環：probe → 起子進程；秒退計失敗；達閾 heal ─────────────────────────
+# systemd 自己會 Restart=always；我們 exit 非 78 讓它重拉。
+# 不 exec 而是 wait 子進程,是因為要在它秒退時記賬(exec 掉就沒人記了)。
+# 存活 < STABLE_S 即退 → 計失敗並可能 heal，然後透傳 exit 碼；
+# 存活 ≥ STABLE_S → 清計數，繼續 wait 到它真正退出再透傳（保持 RestartPreventExitStatus=78）。
+
+main() {
+  read_state
+
+  # probe 失敗 **不阻止啟動**（fail-open，見 probe 頭部的設計約束）:
+  # probe 只是 heal 的觸發依據。硬攔啟動會讓一次誤判 = 全體用戶永久掉線,
+  # 那正是 #528 要消滅的故障形狀,不該由本腳本自己再造一個。
+  local probe_failed=0
+  if ! probe; then
+    probe_failed=1
+    note_failure
+    if should_heal; then
+      heal || true
+    fi
+    log "probe failed — starting anyway (fail-open); the process itself is the judge"
+  fi
+
+  log "starting $KIND: ${REAL_CMD[*]}"
+  "${REAL_CMD[@]}" &
+  CHILD_PID=$!
+  local child="$CHILD_PID"
+  local start
+  start="$(now_s)"
+
+  # 等 STABLE_S 或子進程先死
+  while kill -0 "$child" 2>/dev/null; do
+    if [ $(( $(now_s) - start )) -ge "$STABLE_S" ]; then
+      reset_fails
+      log "stable ≥${STABLE_S}s — clearing fail counter; waiting on pid $child"
+      # 穩定後：繼續 wait，把 exit 碼透傳（含 78 解綁）
+      set +e
+      wait "$child"
+      local st=$?
+      set -e
+      exit "$st"
+    fi
+    sleep 1
+  done
+
+  set +e
+  wait "$child"
+  local st=$?
+  set -e
+
+  # 秒退
+  if [ "$st" -eq 78 ]; then
+    log "exit 78 (unpaired) — not healing, not restarting semantics"
+    exit 78
+  fi
+
+  # 本輪 probe 已經記過一筆了就不再記——同一次啟動失敗只該計一次,
+  # 否則 probe 紅的機器會以雙倍速度撞到 heal 閾值。
+  if [ "$probe_failed" -eq 0 ]; then
+    note_failure
+    if should_heal; then
+      heal || true
+    fi
+  fi
+  exit "$st"
+}
+
+main

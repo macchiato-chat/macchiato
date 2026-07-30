@@ -29,6 +29,9 @@ export function toModelOptions(data: unknown[]): ModelOption[] {
       ...(description ? { description: description.slice(0, 200) } : {}),
       ...(efforts.length ? { effortLevels: efforts } : {}),
       ...(def ? { defaultEffort: def } : {}),
+      // #553 model/list 原生標默認(2026-07-30 沙盒探針證實字段存在):client 據此去掉「Default」
+      // 菜單項、session.model 空時顯本行 label。exec 引擎無清單 → 空上報,client 維持自由輸入現狀。
+      ...(m.isDefault === true ? { isDefault: true } : {}),
     });
   }
   return out;

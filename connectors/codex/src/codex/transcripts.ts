@@ -97,3 +97,38 @@ export function readNewMessages(
   }
   return { messages, newOffset: offset + lastNl + 1, lineCount };
 }
+
+/**
+ * #473 rewind 用:全量掃描 rollout,給每條消息附上**所屬回合**(其前最近一條
+ * `event_msg.task_started` 的 turn_id)。ord 計法必須與 `readNewMessages` 逐字節一致
+ * (全文行號,含非消息行)——srcId 哈希含 ord,算歪一格就對不上鏡像發過的身份。
+ * 只讀完整行(尾半行忽略,與增量路徑同容錯)。
+ */
+export function messagesWithTurns(
+  content: string,
+): Array<CodexMessage & { turnId: string | null }> {
+  const buf = Buffer.from(content, "utf8");
+  const lastNl = buf.lastIndexOf(0x0a);
+  if (lastNl < 0) return [];
+  const lines = buf.subarray(0, lastNl).toString("utf8").split("\n");
+  const out: Array<CodexMessage & { turnId: string | null }> = [];
+  let ord = 0;
+  let turnId: string | null = null;
+  for (const line of lines) {
+    const s = line.trim();
+    if (s) {
+      try {
+        const o = JSON.parse(s) as { type?: string; payload?: { type?: string; turn_id?: unknown } };
+        if (o.type === "event_msg" && o.payload?.type === "task_started" && typeof o.payload.turn_id === "string") {
+          turnId = o.payload.turn_id;
+        }
+        const m = lineToMessage(o, ord);
+        if (m) out.push({ ...m, turnId });
+      } catch {
+        /* 壞行跳過 */
+      }
+    }
+    ord += 1;
+  }
+  return out;
+}

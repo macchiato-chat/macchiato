@@ -407,6 +407,7 @@ describe("drive 上行翻譯（chat/lifecycle → tui EVENT）", () => {
     expect(sent.map((m) => m.frame.params.type)).toEqual(["message.start"]); // 回合一開跑就 start
     gw.fire({ event: "chat", payload: { runId: "r1", sessionKey: KEY, state: "delta", deltaText: "部分" } });
     gw.fire({ event: "agent", payload: { stream: "lifecycle", data: { phase: "end" }, runId: "r1", sessionKey: KEY } });
+    await new Promise((r) => setTimeout(r, 40)); // #555 end 先等一個 grace 窗看 final 來不來
     const types = sent.map((m) => m.frame.params.type);
     expect(types).toEqual(["message.start", "message.delta", "message.complete"]); // end 兜底 complete
     expect(sent[2].frame.params.payload.text).toBe("部分"); // 用累積 delta 補全
@@ -426,6 +427,27 @@ describe("drive 上行翻譯（chat/lifecycle → tui EVENT）", () => {
     gw.fire({ event: "agent", payload: { stream: "lifecycle", data: { phase: "end" }, runId: "r1", sessionKey: KEY } });
     const types = sent.map((m) => m.frame.params.type);
     expect(types).toEqual(["message.start", "message.delta", "message.complete"]); // 恰好一次 complete
+  });
+
+  // #555 上游事件亂序防回歸(2026-07-29 狗糧機實測 OpenClaw 2026.7.1-2):lifecycle `end` 會**早於**
+  // 本回合最後一批 chat delta/final 到達。舊碼在 end 立刻定稿 → 尾段 delta 被當新回合另開一條消息,
+  // 同一句回覆在 app 裡裂成兩條氣泡("LIVE" + "_DRIVE_OK")。修法:end 只安排 grace 內的兜底定稿,
+  // final 先到就取消它。
+  it("#555 lifecycle end 早於尾段 delta/final → 仍是一條消息(不裂成兩條)", async () => {
+    const { gw, linkb, sent } = makeDrive();
+    const KEY = `${MACCHIATO_PREFIX}01sid`;
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "hi" }));
+    gw.fire({ event: "agent", payload: { stream: "lifecycle", data: { phase: "start" }, runId: "r1", sessionKey: KEY } });
+    gw.fire({ event: "chat", payload: { runId: "r1", sessionKey: KEY, state: "delta", deltaText: "LIVE" } });
+    // ⚠️ end 先到(上游真實順序)
+    gw.fire({ event: "agent", payload: { stream: "lifecycle", data: { phase: "end" }, runId: "r1", sessionKey: KEY } });
+    gw.fire({ event: "chat", payload: { runId: "r1", sessionKey: KEY, state: "delta", deltaText: "_DRIVE_OK" } });
+    gw.fire({ event: "chat", payload: { runId: "r1", sessionKey: KEY, state: "final", message: { role: "assistant", content: [{ type: "text", text: "LIVE_DRIVE_OK" }] } } });
+    await new Promise((r) => setTimeout(r, 40));
+    const types = sent.map((m) => m.frame.params.type);
+    // 只開一次 message.start / 只定稿一次;尾段 delta 掛在同一條消息上
+    expect(types).toEqual(["message.start", "message.delta", "message.delta", "message.complete"]);
+    expect(sent[3].frame.params.payload.text).toBe("LIVE_DRIVE_OK");
   });
 
   it("final 只認 assistant（user 的 final 不回傳）", async () => {
@@ -885,9 +907,9 @@ describe("#261 live 工具事件(session.tool → tool.start/complete)", () => {
   });
 });
 
-// ── F-09/#486 OpenClaw live 審批橋 ──────────────────────────────────────────
+// ── F-09/#486 · #281 OpenClaw live 審批橋 ──────────────────────────────────
 
-describe("Drive F-09 exec.approval → approval.request", () => {
+describe("Drive F-09/#281 exec.approval → approval.request", () => {
   async function drivenDrive() {
     // makeDrive 已 wire()；勿再 wire，否則 frame handler 雙註冊 → resolve 調兩次。
     const { drive, gw, linkb, calls, sent } = makeDrive();

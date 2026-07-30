@@ -243,10 +243,10 @@ export class Mirror {
   private readonly drivenUuids = new Set<string>();
   /**
    * #318 live 已投遞的 API message.id(按 sid)。回合末 Drive 登記本回合 live 覆蓋的 message.id;
-   * mirror fold 出的 assistant 消息若命中即跳過(一次性移除)——精確吞掉「SDK result 早於 CLI 寫完
-   * transcript 尾巴」逃過 fastForward 的晚落盤殘片,防 live×mirror 雙投(bug:回合末重複最後一塊)。
-   * 有界:每 sid ≤64 個 id、總 ≤64 個 sid(FIFO 淘汰)——殘片落盤窗口很短,淘汰不會誤刪在用的。
-   * 常態下多數 id 被 fastForward 先吃、永不匹配,故必須靠淘汰防洩漏。
+   * mirror fold 出的 assistant 消息若命中即跳過,防 live×mirror 雙投。#348 後 fastForward 不再
+   * 快進水位,回合末鏡像會重讀**整個回合**的 transcript——這個集合是 driven 回合內容不被複讀
+   * 落庫的唯一屏障(#393 srcId 只覆蓋 live 那一條),必須罩住回合全部主線 msgId(#551)。
+   * 有界:每 sid ≤512 個 id、總 ≤64 個 sid(FIFO 淘汰防洩漏)。
    */
   private readonly livePosted = new Map<string, Set<string>>();
   /**
@@ -378,23 +378,20 @@ export class Mirror {
     }
     for (const id of msgIds) {
       if (id) set.add(id);
-      while (set.size > 64) set.delete(set.keys().next().value!); // 每 sid id 上限
+      // #551 上限 64→512:#348 後 fastForward 不再快進,回合末鏡像重讀**整個回合**,集合必須
+      // 罩住回合全部主線 msgId;64 會被超長回合擠掉最老的(=重讀最先遇到的),開頭幾組漏過濾複讀落庫。
+      while (set.size > 512) set.delete(set.keys().next().value!); // 每 sid id 上限
     }
   }
 
-  /** #318 fold 出的消息過濾:命中 live 已投的 message.id → 跳過(一次性移除)。防雙投。 */
+  /** #318 fold 出的消息過濾:命中 live 已投的 message.id → 跳過。防雙投。
+   * #551 非變異(不再一次性 delete):批發送失敗重試、或同一 msgId 的行被字節預算摺分到兩批時,
+   * 一次性消耗會放行第二次。msg id 全局唯一——留在集合裡只會繼續吞對同段的重讀,不會誤吞新內容;
+   * 洩漏由 markLivePosted 的 FIFO 上限兜住。 */
   private dropLivePosted(sid: string, messages: CCMessage[]): CCMessage[] {
     const set = this.livePosted.get(sid);
     if (!set?.size) return messages;
-    const kept = messages.filter((m) => {
-      if (m.msgId && set.has(m.msgId)) {
-        set.delete(m.msgId); // 一次性:吞掉這條殘片後即釋放
-        return false;
-      }
-      return true;
-    });
-    if (!set.size) this.livePosted.delete(sid);
-    return kept;
+    return messages.filter((m) => !(m.msgId && set.has(m.msgId)));
   }
 
   /**

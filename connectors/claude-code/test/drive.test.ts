@@ -21,6 +21,9 @@ let emitScript: Array<Record<string, unknown>> = [];
 let turnScripts: Array<Array<Record<string, unknown>>> = [];
 let queryCalls = 0;
 let lastOptions: any = null;
+/** 全部 query 的 options 流水(lastOptions 是全局的,長測試裡會被前面測試殘留的續投 query 覆蓋——
+ *  需要精確認領自己 query 的測試按 model marker 在這裡找)。 */
+let optionsLog: any[] = [];
 /** #118 input 驅動模式下,mock 消費到的 push 消息(斷言 content 結構用)。 */
 let pushedMessages: any[] = [];
 
@@ -51,6 +54,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   },
   query: (args: { prompt: unknown; options: any }) => {
     lastOptions = args.options;
+    optionsLog.push(args.options);
     queryCalls++;
     const script = [...emitScript];
     return {
@@ -156,6 +160,7 @@ beforeEach(() => {
   turnScripts = [];
   queryCalls = 0;
   pushedMessages = [];
+  optionsLog = [];
   interrupts.length = 0;
   lastOptions = null;
   forkCalls.length = 0;
@@ -244,6 +249,211 @@ describe("Drive", () => {
     fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
     await new Promise((r) => setTimeout(r, 30));
     expect(sent.some((f: any) => f.t === "message_srcid")).toBe(false);
+  });
+
+  it("#551 subagent 轉發消息(parent_tool_use_id 非空)不進 seenMsgIds:回合末只登記主線 msgId", async () => {
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "assistant", message: { id: "msg_main", role: "assistant", content: [{ type: "text", text: "主線" }] } },
+      // SDK 默認轉發 subagent 的 tool_use/tool_result(heartbeat);超長回合裡這些 id 數以百計,
+      // 入集會把主線最老的 id 擠出 markLivePosted 的 FIFO 上限 → 回合末鏡像重讀時開頭幾組複讀落庫。
+      { type: "assistant", parent_tool_use_id: "tu_1", message: { id: "msg_sub1", role: "assistant", content: [{ type: "tool_use", id: "tu_x", name: "Grep", input: {} }] } },
+      { type: "assistant", parent_tool_use_id: "tu_1", message: { id: "msg_sub2", role: "assistant", content: [{ type: "text", text: "subagent 文本" }] } },
+      { type: "result", subtype: "success", result: "主線" },
+    ];
+    const mirror = {
+      setDriven() {},
+      unsetDriven() {},
+      fastForward() {},
+      markDrivenUuid() {},
+      markLivePosted: vi.fn(),
+      srcIdSnapshot: () => [],
+    } as any;
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb, mirror);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(mirror.markLivePosted).toHaveBeenCalledTimes(1);
+    expect([...mirror.markLivePosted.mock.calls[0][1]]).toEqual(["msg_main"]);
+  });
+
+  it("#552 inject:回合中 mode=inject 注入同一輸入流,不打斷、原回合正常定稿,srcId 回填含注入 user(新→舊)", async () => {
+    turnScripts = [[
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { __wait: 120 },
+      { type: "assistant", message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "working" }] } },
+      { type: "result", subtype: "success", result: "done" },
+    ]];
+    const snapshot = [
+      { role: "user", text: "hi", srcId: "u-1" },
+      { role: "user", text: "補充一句", srcId: "u-2" },
+      { role: "agent", text: "done", srcId: "a-1", msgId: "msg_1" },
+    ];
+    const mirror = { setDriven() {}, unsetDriven() {}, fastForward() {}, markDrivenUuid() {}, markLivePosted() {}, srcIdSnapshot: () => snapshot } as any;
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb, mirror);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 40)); // 回合已起,仍在 __wait
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "補充一句", mode: "inject" }));
+    await new Promise((r) => setTimeout(r, 150)); // 等回合結束
+    expect(interrupts).toEqual([]); // 不打斷
+    expect(pushedMessages.length).toBe(2); // 注入消息進了同一條 streaming input
+    const complete = sent.find((f: any) => f.frame?.params?.type === "message.complete") as any;
+    expect(complete.frame.params.payload.status).toBe("complete"); // 原回合非 interrupted
+    // #393 多 user 回填:server 恆取「最新未回填行」,items 必須新→舊(注入的在前)
+    const srcid = sent.find((f: any) => f.t === "message_srcid") as any;
+    expect(srcid.items).toEqual([
+      { role: "agent", srcId: "a-1" },
+      { role: "user", srcId: "u-2" },
+      { role: "user", srcId: "u-1" },
+    ]);
+    d.dispose();
+  });
+
+  it("#552 inject 落到下一回合(真 CLI 對純文字回合的實測行為):srcId 回填跨回合重試,注入 user 行不漏", async () => {
+    turnScripts = [
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 80 },
+        { type: "assistant", message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "回合1" }] } },
+        { type: "result", subtype: "success", result: "回合1" },
+      ],
+      [
+        // CLI 把注入排到下一回合(2026-07-29 真 CLI 驗收:init→result 兩輪):續寫回合無 prompt.submit,
+        // 由 init 的 startContinuationTurn 合成 turn 接住。
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 150 },
+        { type: "assistant", message: { id: "msg_2", role: "assistant", content: [{ type: "text", text: "回合2吸收注入" }] } },
+        { type: "result", subtype: "success", result: "回合2吸收注入" },
+      ],
+    ];
+    const snapshot: Array<Record<string, unknown>> = [
+      { role: "user", text: "hi", srcId: "u-1" },
+      { role: "agent", text: "回合1", srcId: "a-1", msgId: "msg_1" },
+    ];
+    const mirror = { setDriven() {}, unsetDriven() {}, fastForward() {}, markDrivenUuid() {}, markLivePosted() {}, srcIdSnapshot: () => [...snapshot] } as any;
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb, mirror);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "補充", mode: "inject" }));
+    await new Promise((r) => setTimeout(r, 100)); // 回合1收尾:transcript 還沒有注入的 user 行
+    const first = sent.filter((f: any) => f.t === "message_srcid");
+    expect(first).toHaveLength(1);
+    expect((first[0] as any).items).toEqual([
+      { role: "agent", srcId: "a-1" },
+      { role: "user", srcId: "u-1" },
+    ]); // 注入文本配不上 → 留池,不誤配
+    // 下一回合開跑後 user 行才落盤
+    snapshot.push({ role: "user", text: "補充", srcId: "u-2" }, { role: "agent", text: "回合2吸收注入", srcId: "a-2", msgId: "msg_2" });
+    await new Promise((r) => setTimeout(r, 200)); // 等續寫回合收尾
+    const frames = sent.filter((f: any) => f.t === "message_srcid");
+    expect(frames).toHaveLength(2);
+    expect((frames[1] as any).items).toContainEqual({ role: "user", srcId: "u-2" }); // 跨回合配對成功,出池
+    d.dispose();
+  });
+
+  it("#552 queue:回合中 mode=queue 不打斷,回合結束後作為新回合投遞;缺省 mode 仍是打斷接管", async () => {
+    turnScripts = [
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 100 },
+        { type: "result", subtype: "success", result: "one" },
+      ],
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { type: "result", subtype: "success", result: "two" },
+      ],
+    ];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "first" }));
+    await new Promise((r) => setTimeout(r, 30));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "queued", mode: "queue" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(interrupts).toEqual([]); // queue 絕不打斷
+    await new Promise((r) => setTimeout(r, 150)); // 回合1自然結束 → 排隊消息續投為回合2
+    expect(pushedMessages.length).toBe(2);
+    expect(pushedMessages[1].message.content).toBe("queued");
+    const completes = sent.filter((f: any) => f.frame?.params?.type === "message.complete");
+    expect(completes.map((f: any) => f.frame.params.payload.status)).toEqual(["complete", "complete"]);
+    d.dispose();
+  });
+
+  it("#552 缺省 mode(舊 client/舊 server):回合中發送維持歷史默認 = 打斷接管", async () => {
+    turnScripts = [
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 150 },
+        { type: "result", subtype: "error_during_execution" },
+      ],
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { type: "result", subtype: "success", result: "takeover" },
+      ],
+    ];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "first" }));
+    await new Promise((r) => setTimeout(r, 30));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "steer" })); // 無 mode
+    await new Promise((r) => setTimeout(r, 30));
+    expect(interrupts).toEqual(["interrupted"]); // 歷史默認:打斷
+    d.dispose();
+  });
+
+  it("#553 effort 兜底:model 支持 effort → 真下發 high(chip 顯 High = 真下發,所見即所得)", async () => {
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.modelsIndex = { supportsEffort: (m) => m === undefined }; // 連接器默認 model 支持 effort
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOptions.effort).toBe("high");
+    d.dispose();
+  });
+
+  it("#553 effort 兜底:無清單索引(枚舉失敗/舊路徑)→ 不傳,不對未知 model 硬塞", async () => {
+    emitScript = [
+      { type: "system", subtype: "init", session_id: "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeee02" },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb); // 無 modelsIndex
+    d.wire();
+    fire(tuiFrame("bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeee02", "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastOptions.effort).toBeUndefined();
+    d.dispose();
+  });
+
+  it("#553 effort 兜底:用戶顯式選擇(session.create.effort)仍優先於 high", async () => {
+    const sid = "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeee03";
+    emitScript = [
+      { type: "system", subtype: "init", session_id: sid },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.modelsIndex = { supportsEffort: () => true };
+    d.wire();
+    fire(tuiFrame(sid, "session.create", { effort: "low", model: "marker-x" }));
+    await new Promise((r) => setTimeout(r, 10)); // session.create 非串行幀,等落定再發 prompt
+    fire(tuiFrame(sid, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+    // 按 marker 認領本測試的 query(lastOptions 可能被其他測試殘留的續投覆蓋)
+    const mine = optionsLog.find((o) => o.model === "marker-x");
+    expect(mine?.effort).toBe("low");
+    d.dispose();
   });
 
   it("prompt.submit → 流式事件映射成 tui(start/delta/tool/complete),uuid sid 直接 resume", async () => {
@@ -2223,6 +2433,72 @@ describe("#141b turn output tokens", () => {
       },
     };
     expect(await d.sdkOutputTotal({ q: qErr })).toBeNull(); // 報錯絕不拋 → null 兜底
+  });
+});
+
+// #223:session.fork——與 rewind 同錨,但**老會話一個字節不動**:不 adopt(鏡像要 from-0 撿)、
+// 不動 map、不關通道;ACK 帶 forkedHermesSessionId。
+describe("#223 session.fork(非破壞性分叉)", () => {
+  it("中間用戶消息 → forkSession(keepUpToUuid);不 adopt、map 不動、ACK 帶新身份", async () => {
+    const targetUuid = "00000000-0000-4000-8000-000000000003";
+    const keepUuid = "00000000-0000-4000-8000-000000000002";
+    const mirror = {
+      rewindPlan: (sid: string, target: string) => {
+        expect(sid).toBe(CC_SID);
+        expect(target).toBe(targetUuid);
+        return { keepUpToUuid: keepUuid, dropped: 2 };
+      },
+      adoptForked: () => {
+        throw new Error("#223 fork 絕不 adopt——新 transcript 要由鏡像 from-0 全量撿成新會話");
+      },
+    } as any;
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb, mirror);
+    const results: Array<Record<string, unknown>> = [];
+    d.onForkResult = (r) => results.push(r as unknown as Record<string, unknown>);
+    d.wire();
+    fire(
+      tuiFrame(CC_SID, "session.fork", {
+        request_id: "req-fk-1",
+        target_src_id: targetUuid,
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 40));
+    expect(forkCalls).toEqual([{ sid: CC_SID, opts: { upToMessageId: keepUuid } }]);
+    expect(results).toEqual([
+      {
+        hermesSessionId: CC_SID,
+        requestId: "req-fk-1",
+        ok: true,
+        forkedHermesSessionId: forkResultSid,
+      },
+    ]);
+    // 老會話身份原樣(rewind 才換映射,fork 不換)
+    expect((d as any).map[CC_SID]).toBeUndefined();
+    d.dispose();
+  });
+
+  it("錨在首條(keepUpToUuid=null)→ 不 fork,ACK not_found(server 已先擋,這裡兜底)", async () => {
+    const mirror = {
+      rewindPlan: () => ({ keepUpToUuid: null, dropped: 2 }),
+    } as any;
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb, mirror);
+    const results: Array<Record<string, unknown>> = [];
+    d.onForkResult = (r) => results.push(r as unknown as Record<string, unknown>);
+    d.wire();
+    fire(
+      tuiFrame(CC_SID, "session.fork", {
+        request_id: "req-fk-first",
+        target_src_id: "00000000-0000-4000-8000-000000000001",
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 40));
+    expect(forkCalls).toEqual([]);
+    expect(results).toEqual([
+      { hermesSessionId: CC_SID, requestId: "req-fk-first", ok: false, error: "not_found" },
+    ]);
+    d.dispose();
   });
 });
 

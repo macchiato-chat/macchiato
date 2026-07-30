@@ -308,6 +308,38 @@ describe("#132 v2 steer", () => {
   });
 });
 
+describe("#552 prompt mode(queue / stop&send)", () => {
+  it("mode=queue:回合中不 steer 不 interrupt,turn/completed 後排隊消息起新回合", async () => {
+    const { client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "第一條" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    await linkb.deliver(tui("prompt.submit", SID, { text: "排隊的", mode: "queue" }));
+    expect(client.requests.filter((r) => r.method === "turn/steer")).toHaveLength(0);
+    expect(client.requests.filter((r) => r.method === "turn/interrupt")).toHaveLength(0);
+    expect(client.requests.filter((r) => r.method === "turn/start")).toHaveLength(1); // 不打斷不併發
+    client.fire("turn/completed", { threadId: TID, turn: { id: "t1", status: "completed" } });
+    await tick();
+    const starts = client.requests.filter((r) => r.method === "turn/start");
+    expect(starts).toHaveLength(2); // 回合收尾後排隊消息續投
+    expect(starts[1]!.params.input).toEqual([{ type: "text", text: "排隊的" }]);
+  });
+
+  it("mode=interrupt(stop&send):turn/interrupt,回合定稿 interrupted 後排隊消息接管", async () => {
+    const { client, linkb, sent } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "第一條" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    await linkb.deliver(tui("prompt.submit", SID, { text: "接管的", mode: "interrupt" }));
+    expect(client.requests.find((r) => r.method === "turn/interrupt")!.params).toMatchObject({ threadId: TID, turnId: "t1" });
+    expect(client.requests.filter((r) => r.method === "turn/steer")).toHaveLength(0);
+    client.fire("turn/completed", { threadId: TID, turn: { id: "t1", status: "interrupted" } });
+    await tick();
+    expect(events(sent).find((e) => e.type === "message.complete")!.payload.status).toBe("interrupted");
+    const starts = client.requests.filter((r) => r.method === "turn/start");
+    expect(starts).toHaveLength(2);
+    expect(starts[1]!.params.input).toEqual([{ type: "text", text: "接管的" }]);
+  });
+});
+
 describe("#317 command.invoke → SkillUserInput", () => {
   // 注:別用 /home/... 假路徑——sync-public 敏感串掃描含 /home/[a-z]+/(私有路徑防洩),公開樹會中止。
   const SKILL_PATH = "/data/codex-home/skills/.system/imagegen/SKILL.md";

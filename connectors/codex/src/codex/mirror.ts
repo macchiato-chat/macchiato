@@ -28,7 +28,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { LinkBClient } from "../linkb/client";
 import type { E2EKeyStore } from "../e2e/keys";
-import { nextOrdAtEof, readNewMessages, sessionsRoot, type CodexMessage } from "./transcripts";
+import { messagesWithTurns, nextOrdAtEof, readNewMessages, sessionsRoot, type CodexMessage } from "./transcripts";
 
 /**
  * 鏡像狀態檔的耐久寫（0600 + fsync + 原子 rename + 目錄 fsync）。
@@ -356,6 +356,71 @@ export class Mirror {
   /** #350 driven 結束只解除排他；未經 server ACK 絕不快進(明文 live 靠 #393 srcId 去重)。 */
   fastForward(threadId: string): void {
     void threadId;
+  }
+
+  /**
+   * #473 rewind 的**只讀**勘察(對齊 cc mirror.rewindPlan 的角色):在 threadId 的 rollout 裡
+   * 找 targetSrcId,回:
+   *  - `lastTurnId`:要**保留**的最後一個回合(`thread/fork` 的 lastTurnId,inclusive)。
+   *    null = 目標就在第一個回合 → 沒有任何回合可保留,調用方應丟映射開新會話,而不是 fork
+   *    (fork 省略 lastTurnId 是全量複製,正好相反)。
+   *  - `cutSrcId`:目標所屬回合裡**第一條**消息的 srcId。codex 只能按回合切——同回合裡目標
+   *    之前可能還有別的消息會被一起截掉,server 憑這個把自己的截斷點對齊到 agent 實際忘掉
+   *    的位置(rewind_result.fromSrcId),否則 UI 會留下 AI 已經不記得的消息。
+   */
+  rewindPlan(
+    threadId: string,
+    targetSrcId: string,
+  ): { lastTurnId: string | null; cutSrcId: string } | null {
+    if (!threadId || !targetSrcId) return null;
+    const rf = discoverRollouts().rollouts.find((r) => r.threadId === threadId);
+    if (!rf || !existsSync(rf.file)) return null;
+    let msgs: ReturnType<typeof messagesWithTurns>;
+    try {
+      msgs = messagesWithTurns(readFileSync(rf.file, "utf8"));
+    } catch {
+      return null;
+    }
+    const withSrc = msgs.map((m) => ({ ...m, srcId: srcIdFor(threadId, m) }));
+    const target = withSrc.find((m) => m.srcId === targetSrcId);
+    if (!target) return null;
+    // 目標回合(turnId 可能為 null——task_started 前的孤兒消息,視同第一回合)
+    const cut = withSrc.find((m) => m.turnId === target.turnId);
+    // 保留的最後回合 = 目標回合之前、最近一個**不同**的 turnId
+    let lastTurnId: string | null = null;
+    for (const m of withSrc) {
+      if (m === cut) break;
+      if (m.turnId !== null && m.turnId !== target.turnId) lastTurnId = m.turnId;
+    }
+    return { lastTurnId, cutSrcId: (cut ?? target).srcId };
+  }
+
+  /**
+   * #473 認領 fork 出來的新 rollout:登記 driven + 水位(offsets **和 ords**——srcId 哈希含
+   * 全文行號,兩者必須同源同步)直接坐到當前 EOF。
+   *
+   * ⚠️ 這一步漏了就是本功能最壞的 bug:fork 複製過去的整段歷史會被下一輪 poll(5s)當成
+   * 新消息再灌一遍(cc 同款教訓)。檔案還沒落盤 → 水位 0,driven 守衛仍擋住明文落地。
+   */
+  adoptForked(threadId: string): boolean {
+    if (!threadId) return false;
+    this.markDrivenUuid(threadId);
+    let bytes = 0;
+    let ords = 0;
+    const rf = discoverRollouts().rollouts.find((r) => r.threadId === threadId);
+    if (rf && existsSync(rf.file)) {
+      try {
+        const content = readFileSync(rf.file, "utf8");
+        bytes = Buffer.byteLength(content, "utf8");
+        ords = nextOrdAtEof(content);
+      } catch {
+        /* 讀失敗按 0:寧可之後靠 srcId 去重兜,也不能標一個讀不到的水位 */
+      }
+    }
+    this.state.offsets[threadId] = bytes;
+    this.state.ords[threadId] = ords;
+    this.save(true);
+    return true;
   }
 
   /**

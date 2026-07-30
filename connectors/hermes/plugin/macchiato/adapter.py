@@ -86,13 +86,23 @@ async def _push_to_connector(
     content: str,
     reply_to: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    media_files: Optional[list] = None,
 ) -> Dict[str, Any]:
-    """通過 unix socket 把一條投遞請求交給 macchiato 連接器，返回連接器的 ack。"""
+    """通過 unix socket 把一條投遞請求交給 macchiato 連接器，返回連接器的 ack。
+
+    #280 media_files 只傳**本地路徑**(不傳 base64)——socket 行上限 1MiB,大附件由連接器
+    本機讀盤後經 Link B connector_push.media 上送。
+    """
     req: Dict[str, Any] = {"chatId": chat_id, "text": content}
     if reply_to:
         req["replyTo"] = reply_to
     if metadata:
         req["metadata"] = metadata
+    if media_files:
+        # 去空、轉 str;連接器側再做路徑穿越/大小/允許根校驗。
+        paths = [str(f).strip() for f in media_files if f and str(f).strip()]
+        if paths:
+            req["mediaFiles"] = paths
     payload = (json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8")
 
     reader, writer = await asyncio.wait_for(
@@ -178,19 +188,19 @@ async def _standalone_send(
     """無 live adapter 時（cron 獨立進程）的投遞路徑 —— 同樣交給連接器。
 
     被 ``tools/send_message_tool`` 在 gateway runner 不在本進程時調用（cron 常見）。
+    #280 帶圖:路徑經 socket 交給連接器讀盤上送;僅首片帶 mediaFiles(避免分片重複附件)。
     """
-    # #263 帶圖的主動投遞:proactive media 需連接器+server 配合(materialize→media.attach 到投遞
-    # 會話),見 follow-up。此前**靜默丟**——改為顯式日誌,不再無感知丟圖。
-    if media_files:
-        logger.warning(
-            "[macchiato] 主動投遞的 %d 個附件暫不支持(proactive media 待做),僅發文字。files=%r",
-            len(media_files), [str(f)[:80] for f in media_files],
-        )
     meta = {"thread_id": thread_id} if thread_id else None
     last_id = None
     try:
         for i, chunk in enumerate(_chunk_message(message, MacchiatoAdapter.MAX_MESSAGE_LENGTH)):  # #263 分片
-            ack = await _push_to_connector(chat_id, chunk, metadata=meta)
+            # 只有首片帶附件(同 reply_to 錨定首片);force_document 由連接器/server 不區分處理。
+            ack = await _push_to_connector(
+                chat_id,
+                chunk,
+                metadata=meta,
+                media_files=media_files if i == 0 else None,
+            )
             if not ack.get("ok"):
                 return {"error": ack.get("error") or "push rejected"}
             last_id = ack.get("messageId")

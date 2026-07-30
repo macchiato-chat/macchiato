@@ -8,9 +8,16 @@ import type { ModelOption } from "../linkb/proto";
 import type { LinkBClient } from "../linkb/client";
 import { claudeBinIsAbsolute, resolveClaudeBin } from "./claude-bin";
 
-/** SDK ModelInfo[] → 協議 ModelOption[](effortLevels 僅在 supportsEffort 時帶)。 */
+/** #553 CC 的 effort 默認由產品定為 high(SDK ModelInfo 無上游真值;drive.resolveEffort 真下發同值)。 */
+export const CC_DEFAULT_EFFORT = "high";
+
+/** SDK ModelInfo[] → 協議 ModelOption[](effortLevels 僅在 supportsEffort 時帶)。
+ *  #542 帶 resolvedId(=ModelInfo.resolvedModel,client 匹配持久化串的兜底);
+ *  #553 支持 effort 的行帶 defaultEffort=high;並把 value="default" 行的 resolvedModel 對回
+ *  具體別名行標 isDefault——client 據此去掉「Default」菜單項、空 model 顯具體默認。 */
 export function toModelOptions(models: unknown[]): ModelOption[] {
   const out: ModelOption[] = [];
+  let defaultResolved = "";
   for (const raw of models ?? []) {
     const m = (raw ?? {}) as Record<string, unknown>;
     // value = 傳給 session.model 的別名/id(supportedModels 的 value);缺則跳過。
@@ -18,6 +25,8 @@ export function toModelOptions(models: unknown[]): ModelOption[] {
     if (!id) continue;
     const label = String(m.displayName ?? id).trim();
     const description = String(m.description ?? "").trim();
+    const resolved = String(m.resolvedModel ?? "").trim();
+    if (id === "default" && resolved) defaultResolved = resolved;
     const levels = m.supportsEffort === true && Array.isArray(m.supportedEffortLevels)
       ? (m.supportedEffortLevels as unknown[]).map((x) => String(x)).filter(Boolean)
       : undefined;
@@ -25,8 +34,15 @@ export function toModelOptions(models: unknown[]): ModelOption[] {
       id,
       label,
       ...(description ? { description: description.slice(0, 200) } : {}),
-      ...(levels && levels.length ? { effortLevels: levels } : {}),
+      ...(levels && levels.length ? { effortLevels: levels, defaultEffort: CC_DEFAULT_EFFORT } : {}),
+      ...(resolved ? { resolvedId: resolved } : {}),
     });
+  }
+  // default 行解析到的 wire id 對回第一個具體別名行 = 連接器實際默認跑的 model。
+  // 對不上(清單漂移/無 default 行)→ 不標,client 誠實回退保留「Default」項。
+  if (defaultResolved) {
+    const hit = out.find((o) => o.id !== "default" && o.resolvedId === defaultResolved);
+    if (hit) hit.isDefault = true;
   }
   return out;
 }
@@ -65,6 +81,23 @@ export async function enumerateModels(cwd: string): Promise<ModelOption[]> {
 export class ModelsReporter {
   private cache: ModelOption[] | null = null;
   constructor(private readonly linkb: LinkBClient) {}
+
+  /**
+   * #553 當前 model 是否支持 effort(drive.resolveEffort 兜底 high 的閘——不支持的 model 下發
+   * effort 可能報錯,chip 本來也不顯)。匹配層級與 client 一致:id → resolvedId → label 忽略大小寫;
+   * model 空 = 連接器默認 → 看 "default" 行。清單未就緒(枚舉失敗/未完成)→ false(不兜底,舊行為)。
+   */
+  supportsEffort(model: string | undefined): boolean {
+    const list = this.cache;
+    if (!list?.length) return false;
+    const want = (model ?? "").trim();
+    const row = !want
+      ? (list.find((o) => o.id === "default") ?? list.find((o) => o.isDefault))
+      : (list.find((o) => o.id === want) ??
+        list.find((o) => !!o.resolvedId && o.resolvedId === want) ??
+        list.find((o) => o.label.trim().toLowerCase() === want.toLowerCase()));
+    return !!row?.effortLevels?.length;
+  }
 
   async start(cwd: string): Promise<void> {
     this.linkb.onReady(() => this.push());

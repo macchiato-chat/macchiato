@@ -27,13 +27,13 @@ import { SkillsReporter } from "./codex/skills";
 import { AppServerDrive } from "./codex/drive-appserver";
 import { LoginFlow } from "./codex/login";
 import { HealthLoop } from "./health";
+import { CONNECTOR_VERSION } from "./linkb/proto";
 import { runVerifiedSelfUpdate } from "./selfupdate";
 
-// §update 連接器發布版本:對齊 packages/protocol CONNECTOR_VERSION。⚠️ 發版必須**五處同步 bump**:
-// 四連接器常量(cc/codex/openclaw 各自 src/index.ts + hermes connector.py)+ protocol link.ts 全局。
-// 全局是 server 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」
-// (本機與公開用戶一起亮,重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-const CONNECTOR_VERSION = "1.5.58";
+// §update 連接器發布版本:單源自 packages/protocol 的 CONNECTOR_VERSION(#526 起 TS 三家不再
+// 各持副本——2026-07-20「bump 漏一家 → 該家永亮更新」與 2026-07-28 三連事故的同類根子都是
+// 手工多份)。公開樹由 sync-public 重寫為 ./linkb/proto(常量再生,不漂移)。bump 用
+// scripts/release/bump-connector-version.mjs(改 protocol + hermes.py + well-known 三處)。
 
 function runSelfUpdate(): void {
   // #1 供應鏈加固:簽名清單驗證鏈全過才執行(見 selfupdate.ts;舊版是 curl|bash 裸跑)。
@@ -243,6 +243,8 @@ async function main(): Promise<void> {
       skills = new SkillsReporter(linkb, appClient);
       drive = new AppServerDrive(appClient, linkb, mirror, e2e, projects, skills);
       modelsClient = appClient;
+      linkb.declareRewind = true; // #473:thread/fork 在,才對 server 宣告 rewind
+      linkb.declarePromptModes = true; // #552:turn/steer+turn/interrupt 在,三模式才宣告
       // ⚠️ 回歸契約:scripts/regression/run-codex-regression.mjs 斷言「引擎:app-server v2|exec v1」格式,改動需同步
       console.log("· 引擎:app-server v2(#132,握手成功)");
     } catch (e) {

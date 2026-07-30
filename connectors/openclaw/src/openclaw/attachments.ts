@@ -10,6 +10,8 @@
  */
 import { lookup } from "node:dns/promises";
 import { lookup as dnsLookupCb } from "node:dns";
+import type { LookupFunction } from "node:net";
+import type { LookupAddress } from "node:dns";
 import * as http from "node:http";
 import * as https from "node:https";
 import type { IncomingMessage } from "node:http";
@@ -43,19 +45,30 @@ export function _setAttachInflightForTest(n: number): void {
  * 這次連接解析到的 IP,當場被拒;validateDownloadUrl 預解析只是早拒,真正把關在這裡(單次解析、
  * 直接用於 socket,無「校驗解析 ≠ 連接解析」的 TOCTOU 窗口)。
  */
-export function pinnedLookup(
-  hostname: string,
-  options: unknown,
-  cb: (err: NodeJS.ErrnoException | null, address: string, family: number) => void,
-): void {
-  dnsLookupCb(hostname, { ...(options as object), all: false }, (err, address, family) => {
-    if (err) return cb(err, address as unknown as string, family as unknown as number);
-    if (isPrivateIp(address)) {
-      return cb(new Error(`目標 IP ${address} 在私網/保留範圍(防 SSRF DNS-rebinding)`), address, family);
+export const pinnedLookup: LookupFunction = (hostname, options, cb) => {
+  // ⚠️ **不能**覆蓋調用方要的 `all`。Node 20+ 的 autoSelectFamily(默認開)會用 `all: true` 調用
+  // 並期待回調給**數組**;強行 all:false 回一個字符串,Node 讀 `addresses[0].address` 得 undefined,
+  // 於是 net.isIP(undefined) 拋 `Invalid IP address: undefined`——https 附件下載全掛
+  // (本地 dev 走 http 不掛 lookup,所以這個坑一直沒暴露)。
+  //
+  // dns.lookup 的類型按 all:true/false 分兩個重載,而這裡的 all 由調用方給、編譯期不知道是哪個,
+  // 過不了重載解析;運行時兩種形狀都處理了,故收口成一個寬簽名。
+  type RawLookup = (
+    hostname: string,
+    options: object,
+    cb: (err: NodeJS.ErrnoException | null, address: string | LookupAddress[], family?: number) => void,
+  ) => void;
+  (dnsLookupCb as unknown as RawLookup)(hostname, (options ?? {}) as object, (err, address, family) => {
+    if (err) return cb(err, address, family);
+    // 數組形狀要**逐個**校驗:Node 會依次嘗試裡面的地址,只要有一個是私網,SSRF 就成立。
+    const list = Array.isArray(address) ? address.map((a) => a.address) : [address];
+    const bad = list.find((ip) => isPrivateIp(ip));
+    if (bad !== undefined) {
+      return cb(new Error(`目標 IP ${bad} 在私網/保留範圍(防 SSRF DNS-rebinding)`), address, family);
     }
     cb(null, address, family);
   });
-}
+};
 
 /** IPv4/IPv6 私網/環回/link-local/保留段判定(無依賴手寫,覆蓋 SSRF 常用目標)。 */
 export function isPrivateIp(ip: string): boolean {

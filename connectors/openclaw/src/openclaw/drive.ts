@@ -9,7 +9,7 @@
  *   chat state:"delta" {deltaText}        → message.start（首個 delta 補發）+ message.delta
  *   chat state:"final" {message.content}  → message.complete（ingest 對累積/增量雙容）
  *   agent lifecycle start/end             → 回合活躍表 + 結束時讓鏡像快進（防雙投）
- *   exec.approval.requested               → approval.request（F-09/#486 live 審批卡）
+ *   exec.approval.requested               → approval.request（F-09/#486 · #281 live 審批卡）
  * 下行審批：
  *   approval.respond                      → exec.approval.resolve{id, decision}
  *
@@ -43,6 +43,12 @@ import { formatCommandInvokeLog, logContent, safeErr, shortId, textLen } from ".
 
 /** E2E 加密審批明文尺寸閘（與 CC/Codex 對齊；須先於 emit/掛起）。 */
 const E2E_APPROVAL_PLAINTEXT_MAX_BYTES = 64 * 1024;
+
+/**
+ * #555 lifecycle `end` 早於尾段 `chat` delta/final 時,等 final 的 grace 窗(毫秒)。
+ * 實測 final 只晚 ~2ms;真沒 final(錯誤/中斷/靜默回合)才會等滿,再走兜底定稿。
+ */
+const END_GRACE_MS = Number(process.env.MACCHIATO_OPENCLAW_END_GRACE_MS) || 3000;
 
 /** OpenClaw gateway 審批決策（官方 resolve 枚舉）。 */
 type ExecApprovalDecision = "allow-once" | "allow-always" | "deny";
@@ -197,6 +203,13 @@ export class Drive {
   private readonly acc = new Map<string, string>();
   /** 已發 message.complete 的 runId。 */
   private readonly completed = new Set<string>();
+  /**
+   * #555 runId → 「lifecycle end 已到但 chat final 還沒到」的兜底定稿計時器。
+   * 2026-07-29 狗糧機實測(OpenClaw 2026.7.1-2):`agent` lifecycle `end` 會**早於**本回合最後
+   * 一批 `chat` delta/final 到達(同 seq,end 先發)。舊碼在 end 立刻定稿 → 尾段 delta 被當成
+   * 新回合另開一條消息,同一句回覆在 app 裡裂成兩條氣泡("LIVE" + "_DRIVE_OK")。
+   */
+  private readonly endGrace = new Map<string, ReturnType<typeof setTimeout>>();
   /** 本進程驅動過的 key（鏡像跳過 → live 路徑獨佔投遞）。 */
   private readonly driven = new Set<string>();
   /** 小寫 key → server 原始 sid（大寫 ULID）；回傳事件用它找回 server 認識的 sid。 */
@@ -470,6 +483,11 @@ export class Drive {
         console.error(`[#302] gateway 斷開 → 在途回合定稿 error(${sid})`);
       }
       if (runId) {
+        const t = this.endGrace.get(runId); // #555 等 final 的 grace:斷線即作廢
+        if (t) {
+          clearTimeout(t);
+          this.endGrace.delete(runId);
+        }
         this.started.delete(runId);
         this.acc.delete(runId);
         this.completed.delete(runId);
@@ -503,6 +521,8 @@ export class Drive {
     this.started.clear(); // 斷線期的 runId 條目一併作廢(否則只在 lifecycle end 清 → 洩漏)
     this.acc.clear();
     this.completed.clear();
+    for (const t of this.endGrace.values()) clearTimeout(t); // #555 grace 計時器同壽
+    this.endGrace.clear();
     // 斷連窗內審批可能已被別處 resolve 或過期——清空本地掛起,靠 backfill 重掛仍 pending 的。
     this.pendingApprovals.clear();
     this.pendingApprovalOrder.clear();
@@ -988,7 +1008,7 @@ export class Drive {
     }
   }
 
-  // ── F-09/#486 OpenClaw live 審批：exec.approval.* ↔ approval.request/respond ──
+  // ── F-09/#486 · #281 OpenClaw live 審批：exec.approval.* ↔ approval.request/respond ──
 
   /**
    * 官方 client 契約：hello-ok 後 list 回填斷線前已掛起的審批。
@@ -1313,16 +1333,19 @@ export class Drive {
           this.mirror?.fastForward(key); // 明文 .jsonl 快進（E2E 內容只走加密批）
           return;
         }
-        // 回合結束但沒收到 chat final（錯誤/中斷/靜默回合）→ 兜底 complete, 免得 app 卡轉圈
-        if (runId && this.started.has(runId) && !this.completed.has(runId)) {
-          this.emit(sid, "message.complete", { text: this.acc.get(runId) ?? "" });
+        // #555 上游事件亂序:final 已到(或本回合根本沒開消息)→ 照舊立刻收尾;
+        // final 還沒到 → 給一個 grace 窗等它,超時才走「兜底 complete」老路。
+        if (this.completed.has(runId) || !runId || !this.started.has(runId)) {
+          this.endTurn(key, sid, runId);
+        } else if (!this.endGrace.has(runId)) {
+          this.endGrace.set(
+            runId,
+            setTimeout(() => {
+              this.endGrace.delete(runId);
+              this.endTurn(key, sid, runId);
+            }, END_GRACE_MS),
+          );
         }
-        this.started.delete(runId);
-        this.acc.delete(runId);
-        this.completed.delete(runId);
-        this.mirror?.fastForward(key); // live 已投遞 → 鏡像水位線快進到文件末, 防雙投
-        void this.reconcileTurnEnd(key, sid); // #202 回填 srcId + 推水位線(fire-and-forget)
-        void this.flushFollowUps(key); // #162 排隊的帶附件跟進 → chat.send 續投
       }
       return;
     }
@@ -1407,8 +1430,39 @@ export class Drive {
         this.emit(sid, "message.complete", { text });
         this.completed.add(runId);
         this.emitMediaFromText(sid, text); // #158 出站附件(fire-and-forget;E2E 不走本分支)
+        // #555 lifecycle end 先到、被 grace 攔下 → final 落地即真正收尾(不必等滿 grace)
+        const pending = this.endGrace.get(runId);
+        if (pending) {
+          clearTimeout(pending);
+          this.endGrace.delete(runId);
+          this.endTurn(key, sid, runId);
+        }
       }
     }
+  }
+
+  /**
+   * 回合真正收尾:定稿(若 final 沒來就用累積文本兜底)+ 清回合態 + 鏡像快進 + 對賬 + 跟進 flush。
+   * 由 lifecycle end 觸發;#555 上游把 end 排在尾段 delta/final **之前**時,改由 final 觸發。
+   */
+  private endTurn(key: string, sid: string, runId: string): void {
+    // 回合結束但沒收到 chat final（錯誤/中斷/靜默回合）→ 兜底 complete, 免得 app 卡轉圈
+    if (runId && this.started.has(runId) && !this.completed.has(runId)) {
+      this.emit(sid, "message.complete", { text: this.acc.get(runId) ?? "" });
+    }
+    if (runId) {
+      const t = this.endGrace.get(runId);
+      if (t) {
+        clearTimeout(t);
+        this.endGrace.delete(runId);
+      }
+      this.started.delete(runId);
+      this.acc.delete(runId);
+      this.completed.delete(runId);
+    }
+    this.mirror?.fastForward(key); // live 已投遞 → 鏡像水位線快進到文件末, 防雙投
+    void this.reconcileTurnEnd(key, sid); // #202 回填 srcId + 推水位線(fire-and-forget)
+    void this.flushFollowUps(key); // #162 排隊的帶附件跟進 → chat.send 續投
   }
 
   /**

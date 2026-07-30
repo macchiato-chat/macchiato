@@ -181,6 +181,38 @@ ensure_linger() {
   return 0
 }
 
+# #528: 進程外 supervisor——壞包秒崩時自動拉最新 signed release 重裝,斷掉「永久掉線」。
+# 從已驗 artifact 落盤到 ~/.macchiato/bin/(與 connector app 樹分離,自身幾乎不會壞)。
+install_supervisor() {
+  [ -n "${TMP:-}" ] && [ -d "$TMP" ] || return 0
+  [ -d "$TMP/bin" ] || return 0   # 老 artifact 無 bin/ → 直跑,不是錯誤
+  # bin/macchiato-supervise 會成為每個 unit 的 ExecStart(開機即以用戶身份執行),
+  # 是本安裝腳本裡權限最高的一份拷貝——必須和其它子樹一樣過 manifest 逐檔校驗,
+  # 不能只靠 artifact 整包 hash 兜底。
+  verify_tree "$TMP/bin" "bin"
+  mkdir -p "$HOME/.macchiato/bin"
+  if [ -f "$TMP/bin/macchiato-supervise" ]; then
+    cp "$TMP/bin/macchiato-supervise" "$HOME/.macchiato/bin/macchiato-supervise"
+    chmod 755 "$HOME/.macchiato/bin/macchiato-supervise"
+  fi
+  if [ -f "$TMP/bin/release_verify.py" ]; then
+    cp "$TMP/bin/release_verify.py" "$HOME/.macchiato/bin/release_verify.py"
+  elif [ -f "$TMP/connectors/hermes/release_verify.py" ]; then
+    cp "$TMP/connectors/hermes/release_verify.py" "$HOME/.macchiato/bin/release_verify.py"
+  fi
+}
+
+# wrap real ExecStart: macchiato-supervise <kind> -- <orig...>
+# 純字符串拼接、**無副作用**:它跑在 $( ) 命令替換裡,那裡的 fail/exit 只殺得掉子 shell,
+# 外層會拿著空 ExecStart 若無其事地裝下去。落盤(和它的驗簽)因此放在 install_supervisor,
+# 由頂層在 TMP 就緒後調用一次。
+supervised() { # $1=kind  rest=real command words
+  local kind="$1"; shift
+  local sup="$HOME/.macchiato/bin/macchiato-supervise"
+  [ -x "$sup" ] || { printf '%s' "$*"; return 0; }  # 老 artifact 無 supervise → 直跑
+  printf '%s' "$sup $kind -- $*"
+}
+
 install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
   if ! have_systemd; then
     if have_launchd; then
@@ -398,6 +430,9 @@ if [ "${MACCHIATO_SELFTEST:-0}" != 1 ]; then
   TMP="$MACCHIATO_VERIFIED_ROOT"
 fi
 
+# #528: supervisor 落盤(逐檔驗簽)。放頂層——驗簽失敗必須中止安裝,不能只死在子 shell。
+install_supervisor
+
 # ═════════════════════════════ Hermes ═══════════════════════════════════════
 find_hermes_python() {
   if [ -n "${HERMES_PYTHON:-}" ]; then echo "$HERMES_PYTHON"; return; fi
@@ -466,7 +501,7 @@ MACCHIATO_HERMES_PROFILE=$PROFILE"
   fi
   rm -f "$CRED.revoked"   # #387 重新配對成功,清掉舊解綁標記
   MACCHIATO_UNIT_EXTRA_ENV="$PROFILE_ENV
-$(mirror_env_for "$UNIT" "$WHAT")" install_unit "$UNIT" "$PY $APP/connector.py"
+$(mirror_env_for "$UNIT" "$WHAT")" install_unit "$UNIT" "$(supervised hermes "$PY" "$APP/connector.py")"
   # Platform plugin: lets Hermes proactively deliver to Macchiato (best effort).
   # Installed into THIS profile's home — its gateway loads it, and the plugin derives the
   # per-profile push socket from its own HERMES_HOME (same rule as the connector).
@@ -499,7 +534,7 @@ install_openclaw() {
     say "OpenClaw credentials found, skipping pairing"
   fi
   rm -f "$CRED.revoked"   # #387 重新配對成功,清掉舊解綁標記
-  MACCHIATO_UNIT_EXTRA_ENV="$(mirror_env_for macchiato-openclaw-connector OpenClaw)" install_unit "macchiato-openclaw-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
+  MACCHIATO_UNIT_EXTRA_ENV="$(mirror_env_for macchiato-openclaw-connector OpenClaw)" install_unit "macchiato-openclaw-connector" "$(supervised openclaw "$APP/node_modules/.bin/tsx" src/index.ts)" "$APP"
   # Channel plugin: lets OpenClaw proactively deliver to Macchiato (best effort)
   if command -v openclaw >/dev/null 2>&1; then
     if openclaw plugins install --force "$APP/plugin" >/dev/null 2>&1 && openclaw plugins enable macchiato >/dev/null 2>&1; then
@@ -544,7 +579,7 @@ install_claude_code() {
   # PATH: user systemd units often miss ~/.local/bin → the connector could not find the claude CLI.
   MACCHIATO_UNIT_EXTRA_ENV="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 MACCHIATO_CLAUDE_BIN=$CLAUDE
-$(mirror_env_for macchiato-claude-code-connector "Claude Code")"     install_unit "macchiato-claude-code-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
+$(mirror_env_for macchiato-claude-code-connector "Claude Code")"     install_unit "macchiato-claude-code-connector" "$(supervised claude-code "$APP/node_modules/.bin/tsx" src/index.ts)" "$APP"
 }
 
 # ═════════════════════════════ Codex ════════════════════════════════════════
@@ -580,7 +615,7 @@ install_codex() {
   rm -f "$CRED.revoked"   # #387 重新配對成功,清掉舊解綁標記
   MACCHIATO_UNIT_EXTRA_ENV="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 MACCHIATO_CODEX_BIN=$CODEX
-$(mirror_env_for macchiato-codex-connector Codex)"     install_unit "macchiato-codex-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
+$(mirror_env_for macchiato-codex-connector Codex)"     install_unit "macchiato-codex-connector" "$(supervised codex "$APP/node_modules/.bin/tsx" src/index.ts)" "$APP"
 }
 
 # ── detect installed agents ─────────────────────────────────────────────────
@@ -839,6 +874,8 @@ do_uninstall() {
   rm -rf "$HOME/.macchiato/app" "$HOME/.macchiato/openclaw-app" "$HOME/.macchiato/claude-code-app" \
     "$HOME/.macchiato/codex-app" "$HOME/.macchiato/logs" "$HOME/.macchiato/attachments" \
     "$HOME/.macchiato/cc-attachments" "$HOME/.macchiato/codex-attachments"
+  rm -f "$HOME/.macchiato/bin/macchiato-supervise" "$HOME/.macchiato/bin/release_verify.py"
+  rmdir "$HOME/.macchiato/bin" 2>/dev/null || true
   rm -rf "$HOME/.macchiato"/hermes-*/
   local f
   for f in mirror.json sessions.json health.json hermes-projects.json push.sock \

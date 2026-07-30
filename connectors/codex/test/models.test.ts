@@ -41,3 +41,15 @@ describe("#231 codex ModelsReporter", () => {
     expect(f2.sent[0].models).toEqual([]);
   });
 });
+
+describe("#553 isDefault 透傳", () => {
+  it("model/list 標 isDefault 的行透傳;未標的不帶字段", async () => {
+    const { toModelOptions } = await import("../src/codex/models");
+    const out = toModelOptions([
+      { id: "gpt-5.6-sol", displayName: "GPT-5.6-Sol", isDefault: true, defaultReasoningEffort: "low", supportedReasoningEfforts: [{ reasoningEffort: "low" }] },
+      { id: "gpt-5.6-terra", displayName: "GPT-5.6-Terra" },
+    ]);
+    expect(out[0]).toMatchObject({ id: "gpt-5.6-sol", isDefault: true, defaultEffort: "low" });
+    expect("isDefault" in out[1]!).toBe(false);
+  });
+});

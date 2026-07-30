@@ -150,6 +150,42 @@ describe("Mirror", () => {
     expect(texts).toContain("終端回答");
   });
 
+  it("#551 driven 回合末重讀整回合:主線 msgId 超過 64 組也全被吞(舊 64 上限會放行開頭幾組複讀)", () => {
+    setupEnv();
+    // 2026-07-29 生產實錄的最小復現:16 分鐘 7-subagent 長回合,#348 後 fastForward 不快進,
+    // 回合末鏡像從回合開頭重讀;livePosted 罩不住全部主線 msgId 時,開頭幾組以新行落庫複讀。
+    const WIRE = "01TESTWIREULID0000000000AA";
+    let body = userLine("開場問題");
+    const ids: string[] = [];
+    for (let i = 1; i <= 70; i++) {
+      ids.push(`msg_${i}`);
+      body += assistantLineWithId(`第${i}組`, `msg_${i}`);
+    }
+    writeFileSync(file, body);
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb, undefined, (local) => (local === SID ? WIRE : undefined));
+    m.markDrivenUuid(SID);
+    m.setDriven(SID);
+    (m as any).doPoll(); // 回合中:driven 讓路,不投
+    expect(appends(sent)).toEqual([]);
+    // 回合末(finishTurn 順序):登記 live 覆蓋的全部主線 msgId → 解除 driven → 鏡像重讀
+    m.markLivePosted(SID, ids);
+    m.unsetDriven(SID);
+    (m as any).doPoll();
+    const texts = appends(sent).flatMap((f: any) => f.sessions[0].messages.map((x: any) => x.text));
+    expect(texts).toEqual(["開場問題"]); // user 行由 #393 srcId 撞索引去重;assistant 一組都不得重投
+  });
+
+  it("#551 dropLivePosted 非一次性:同 msgId 兩批重讀都被吞(批重試/字節摺分不放行第二次)", () => {
+    setupEnv();
+    const { linkb } = fakeLinkb();
+    const m = new Mirror(linkb);
+    m.markLivePosted(SID, ["msg_x"]);
+    const batch = [{ role: "agent", text: "殘片", msgId: "msg_x" }];
+    expect((m as any).dropLivePosted(SID, batch)).toEqual([]);
+    expect((m as any).dropLivePosted(SID, batch)).toEqual([]); // 一次性 delete 的舊實現在這裡放行
+  });
+
   it("#393 srcIdSnapshot 折出尾段消息帶 srcId(=行 uuid)+ msgId,與鏡像發的 srcId 收斂同鍵", () => {
     setupEnv();
     writeFileSync(file, userLine("問題") + assistantLineWithId("回答", "msg_abc"));

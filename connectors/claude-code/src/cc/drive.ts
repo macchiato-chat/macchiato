@@ -11,7 +11,8 @@
  *   - 每回合一個 system/init（streaming 模式特性），據此 setDriven/存映射。
  *
  * 下行（server → 連接器, t:"tui" 幀）：
- *   prompt.submit     → 通道 push 一回合；回合進行中 → steer(#75:打斷當前回合+新消息接管)
+ *   prompt.submit     → 通道 push 一回合；回合進行中按 mode 分流(#552:steer 注入 / queue 排隊 /
+ *                       stop&send 打斷接管;缺省=打斷接管。steering 一詞自 2026-07-29 專指注入)
  *   session.interrupt → channel.q.interrupt()
  *   session.create    → 登記（首次 prompt 才真建 CC 會話, init 事件回 session_id）；cwd 變更 → 閒置通道重建
  *   approval.respond  → 解掛 canUseTool（request_id 精準配對,缺省 FIFO）
@@ -46,6 +47,7 @@ import { type CwdResolution, defaultWorkDir, resolveCwd } from "./cwd";
 import { claudeBinIsAbsolute, resolveClaudeBin } from "./claude-bin";
 import { sdkEnv } from "./sdk-env";
 import type { CommandsReporter } from "./commands";
+import { CC_DEFAULT_EFFORT } from "./models";
 import { generateTitle } from "./titles";
 import type { LinkBClient } from "../linkb/client";
 import type { E2EKeyStore } from "../e2e/keys";
@@ -97,6 +99,8 @@ const E2E_SENSITIVE_METHODS = new Set([
   "session.retitle",
   // #473 rewind 會**改寫本機 transcript**,E2E 下更不能認 server 的裸帧(server 側 v1 也直接拒 E2E)。
   "session.rewind",
+  // #223 fork 會把歷史複製成新明文會話,E2E 下同禁(server 側也直接拒 E2E)。
+  "session.fork",
 ]);
 
 function mapPath(): string {
@@ -495,6 +499,11 @@ export class Drive {
   private readonly clarifies = new Map<string, PendingClarify>();
   /** #102 sid → 本回合被 session.interrupt 中斷(result 定性 interrupted 而非 error)。 */
   private readonly interruptedSids = new Set<string>();
+  /** #552 sid → inject 注入的 user 文本池(trim 後,時序,capped)。**不掛 TurnCtx**:真 CLI 對
+   * 純文字回合會把注入排到**下一回合**(2026-07-29 真 CLI 驗收實測,init→result 兩輪),transcript
+   * 的 user 行到下回合才落盤——srcId 回填必須跨回合重試,配對成功才出池,否則注入的 user 行沒
+   * dedup_key,回合末鏡像重讀雙投用戶氣泡。 */
+  private readonly injectedTexts = new Map<string, string[]>();
   /** #102 未處理 SDK 消息類型一次性日誌去重(`type/subtype`)——37 種 SDKMessage 只處理一小撮,靜默丟=升級漂移無感知。 */
   private readonly loggedUnknown = new Set<string>();
   /** #238 sid → 「總是允許」累積的**窄規則**串(settings 格式,如 "Bash(git status:*)")。
@@ -584,22 +593,45 @@ export class Drive {
   }
 
   /**
-   * #75/#199 投遞一回合內容(prompt.submit 與 command.invoke 共用):
-   * 回合進行中 = steer(硬轉向,2026-07-11 用戶拍板默認行為)——打斷當前回合(定稿 interrupted,
-   * 已生成部分保留)+ 新內容進隊由 finishTurn 續投(同通道帶完整上下文)。SDK 無「邊生成邊融合」
-   * (探測結論 3),打斷+接管是唯一真 steer;與 OpenClaw 在 Macchiato 的 steer 行為對齊。
-   * 閒置 = 直接開新回合。
+   * #75/#199/#552 投遞一回合內容(prompt.submit 與 command.invoke 共用)。閒置 = 直接開新回合;
+   * 回合進行中按 mode 分流:
+   *  - `inject`(= UI 的 Send 主鈕;**steering 自 2026-07-29 專指此模式**):消息直接推進活通道的
+   *    streaming input——CLI 原生排隊、在下個邊界注入**當前回合**,不打斷不丟已生成內容(#551 事故
+   *    的教訓:用戶只想補一句約束,不想殺回合)。注入文本記進 turn.injectedTexts 供 #393 srcId
+   *    回填(否則回合末鏡像重讀雙投該 user 行)。
+   *  - `queue`:入 queued,回合結束由 finishTurn 作為新回合續投,不打斷。
+   *  - `interrupt` / 缺省(舊 server/舊 client):歷史默認——打斷當前回合(定稿 interrupted,
+   *    已生成部分保留)+ 新內容進隊接管(2026-07-11 用戶拍板;SDK 探測結論 3 時代的唯一選擇)。
    */
   private async dispatchContent(
     sid: string,
     content: TurnContent,
     requireDelivery = false,
+    mode?: "inject" | "queue" | "interrupt",
   ): Promise<void> {
     const busy = this.channels.get(sid);
     if (busy?.turn) {
+      if (mode === "inject" && !busy.turn.completed) {
+        const injected = this.injectedTexts.get(sid) ?? [];
+        injected.push(contentText(content).trim());
+        while (injected.length > 8) injected.shift(); // 有界:配不上的陳舊項防洩漏
+        this.injectedTexts.set(sid, injected);
+        busy.input.push({
+          type: "user",
+          message: { role: "user", content },
+          parent_tool_use_id: null,
+          session_id: "",
+        });
+        console.log(`· Steer:消息注入當前回合 → ${sid}`);
+        return;
+      }
       const q = this.queued.get(sid) ?? [];
       q.push(content);
       this.queued.set(sid, q);
+      if (mode === "queue") {
+        console.log(`· Queue:排隊等當前回合結束 → ${sid}`);
+        return;
+      }
       if (!busy.turn.completed) {
         this.interruptedSids.add(sid);
         try {
@@ -607,8 +639,9 @@ export class Drive {
         } catch {
           /* 回合恰好剛結束 → interrupt 空打,排隊消息由 finishTurn 正常續投 */
         }
-        // ⚠️ 回歸契約:scripts/regression/run-cc-regression.mjs 斷言「Steer:打斷當前回合」,改動需同步
-        console.log(`· Steer:打斷當前回合,新消息接管 → ${sid}`);
+        // ⚠️ 回歸契約:scripts/regression/run-cc-regression.mjs 斷言「Stop&Send:打斷當前回合」,改動需同步
+        // (2026-07-29 正名:這路徑曾叫 Steer——當年 SDK 無注入手段;steering 現專指上面的注入)
+        console.log(`· Stop&Send:打斷當前回合,新消息接管 → ${sid}`);
       }
       return;
     }
@@ -642,13 +675,20 @@ export class Drive {
     return env || undefined;
   }
 
-  /** #231 該會話 reasoning effort:per-session 優先,回退 env MACCHIATO_CC_EFFORT;都無 → undefined(模型默認)。 */
+  /** #553 model 清單索引(index.ts 注入 ModelsReporter):resolveEffort 兜底 high 的閘。 */
+  modelsIndex?: { supportsEffort(model: string | undefined): boolean };
+
+  /** #231 該會話 reasoning effort:per-session 優先,回退 env MACCHIATO_CC_EFFORT;都無 → #553 起
+   * 當前 model 支持 effort 則產品默認 **high**(真下發——chip 顯 High 才所見即所得);
+   * 清單未知/model 不支持 → undefined(舊行為,不對不支持的 model 硬塞 effort)。 */
   private resolveEffort(sid: string): string | undefined {
-    return this.efforts[sid] || process.env.MACCHIATO_CC_EFFORT || undefined;
+    const explicit = this.efforts[sid] || process.env.MACCHIATO_CC_EFFORT || undefined;
+    if (explicit) return explicit;
+    return this.modelsIndex?.supportsEffort(this.resolveModel(sid)) ? CC_DEFAULT_EFFORT : undefined;
   }
 
   /** #266 sid → 內容型幀(prompt.submit/command.invoke)的串行鏈。附件下載(await materialize)慢時,
-   * 後到的純文本此前會超車 startTurn、附件幀反被 steer 打斷 → 順序反轉。串行保序。 */
+   * 後到的純文本此前會超車 startTurn、附件幀反被打斷接管 → 順序反轉。串行保序。 */
   private readonly frameChain = new Map<string, Promise<void>>();
   /** #368 wire sid → 当前 E2E 模式切换 barrier；存在时新回合不得启动。 */
   private readonly e2eQuiescing = new Map<
@@ -1294,7 +1334,12 @@ export class Drive {
           const content: TurnContent = imageBlocks.length
             ? [...(text ? [{ type: "text", text }] : []), ...imageBlocks]
             : text;
-          await this.dispatchContent(sid, content);
+          // #552 回合中發送的顯式模式;未知值防禦性忽略(= 歷史默認 interrupt)。
+          const mode =
+            params.mode === "inject" || params.mode === "queue" || params.mode === "interrupt"
+              ? params.mode
+              : undefined;
+          await this.dispatchContent(sid, content, false, mode);
           return;
         }
         case "command.invoke": {
@@ -1428,6 +1473,16 @@ export class Drive {
           // 不該能燒掉主機的歷史)。server 側行已刪,這裡防「刪了又冒回來」。
           const cc = this.ccSidFor(sid) ?? (CC_UUID_RE.test(sid) ? sid : undefined);
           if (cc) this.mirror?.tombstone(cc);
+          return;
+        }
+        case "session.fork": {
+          // #223 非破壞性分叉:錨點語義與 rewind 一致,但**老會話一個字節不動**——不關通道、
+          // 不動水位、不動映射。無論成敗必回 ACK(server 在 await)。
+          const requestId = typeof params.request_id === "string" ? params.request_id : "";
+          const targetUuid = typeof params.target_src_id === "string" ? params.target_src_id : "";
+          void this.forkFromMessage(sid, targetUuid)
+            .catch(() => ({ ok: false as const, error: "failed" as const }))
+            .then((r) => this.onForkResult?.({ hermesSessionId: sid, requestId, ...r }));
           return;
         }
         case "session.rewind": {
@@ -1968,7 +2023,10 @@ export class Drive {
     if (m.type === "assistant") {
       if (!turn || turn.completed) return;
       // #318 記本回合 live 覆蓋的 API message.id(mirror 據此吞晚落盤殘片,防雙投)。
-      if (typeof m.message?.id === "string") turn.seenMsgIds.add(m.message.id);
+      // #551 subagent 轉發消息(parent_tool_use_id 非空;SDK 默認轉發其 tool_use/tool_result)
+      // 不得入集:它們的 id 永不出現在主 transcript,只會把集合灌爆、經 markLivePosted 的
+      // FIFO 上限把主線最老的 id 擠掉 → 回合末鏡像重讀時開頭幾組漏過濾、複讀落庫。
+      if (typeof m.message?.id === "string" && !m.parent_tool_use_id) turn.seenMsgIds.add(m.message.id);
       // #102 API 級錯誤分類(authentication_failed/billing_error/rate_limit/overloaded…)留給失敗行
       if (typeof m.error === "string") turn.lastError = m.error;
       // #141 子消息完成:把其最終 output_tokens 折進 base、清 live(下個子消息 message_delta 重新累)。
@@ -2186,11 +2244,31 @@ export class Drive {
         .reverse()
         .find((m) => m.role === "agent" && !!m.msgId && turn.seenMsgIds.has(m.msgId));
       if (agent?.srcId) items.push({ role: "agent", srcId: agent.srcId });
-      const want = contentText(turn.content).trim();
-      const user = want
-        ? [...msgs].reverse().find((m) => m.role === "user" && m.text.trim() === want)
-        : undefined;
-      if (user?.srcId) items.push({ role: "user", srcId: user.srcId });
+      // #552 本回合可能有多條 user(開場 prompt + inject 注入)。server 側 backfillDedupKey 恆取
+      // 「最新一條 dedup 為空的 user 行」,故 items 必須**新→舊**排列才配對正確:注入的(倒序)在前,
+      // 開場 prompt 最後。同文本重複時 used 集保證各配一行(反向找 = 先配最新)。
+      // 注入池是 per-sid 跨回合的:純文字回合的注入被真 CLI 排到下一回合,user 行下回合才落盤——
+      // 本次配上的出池,配不上的留給下一次回合收尾再試(池有界,見 dispatchContent)。
+      const injected = this.injectedTexts.get(sid) ?? [];
+      const wants: Array<{ text: string; fromPool: boolean }> = [
+        ...[...injected].reverse().map((t) => ({ text: t, fromPool: true })),
+        { text: contentText(turn.content).trim(), fromPool: false },
+      ];
+      const used = new Set<string>();
+      const rev = [...msgs].reverse();
+      for (const want of wants) {
+        if (!want.text) continue;
+        const user = rev.find((m) => m.role === "user" && m.text.trim() === want.text && !!m.srcId && !used.has(m.srcId));
+        if (user?.srcId) {
+          used.add(user.srcId);
+          items.push({ role: "user", srcId: user.srcId });
+          if (want.fromPool) {
+            const at = injected.lastIndexOf(want.text);
+            if (at >= 0) injected.splice(at, 1);
+          }
+        }
+      }
+      if (!injected.length) this.injectedTexts.delete(sid);
       if (items.length) {
         this.linkb.send({ t: "message_srcid", agentLinkId: this.linkb.agentLinkId, sessionId: sid, items });
       }
@@ -2257,6 +2335,43 @@ export class Drive {
   }
 
   /** #118 關通道:回收 CLI 進程(閒置/變更 cwd/dispose)。consume 循環隨後自然結束。 */
+  /** #223 fork ACK 出口(index.ts 注入):走 Link B 頂層幀 `fork_result`。 */
+  onForkResult?: (r: {
+    hermesSessionId: string;
+    requestId: string;
+    ok: boolean;
+    forkedHermesSessionId?: string;
+    error?: "unsupported" | "not_found" | "busy" | "failed";
+  }) => void;
+
+  /**
+   * #223 以 targetUuid 這條用戶消息為錨,把它**之前**的歷史分叉成新會話。
+   * 與 rewind 的關鍵差異:**老會話完全不動**——不關通道(它可能正閒着等下個 prompt,fork 是
+   * 只讀操作)、不動鏡像水位、不動 map。fork 出的新 transcript 由鏡像按「新發現會話」from-0
+   * 全量鏡像(#154 seeded 語義),server 側行已由 REST 同步建好,鏡像按 uuid 收斂到同一行。
+   * 回合進行中拒絕:transcript 正被追寫,fork 出的快照會是半截回合。
+   */
+  private async forkFromMessage(
+    sid: string,
+    targetUuid: string,
+  ): Promise<{ ok: boolean; forkedHermesSessionId?: string; error?: "unsupported" | "not_found" | "busy" | "failed" }> {
+    const cc = this.ccSidFor(sid) ?? (CC_UUID_RE.test(sid) ? sid : undefined);
+    if (!cc || !targetUuid) return { ok: false, error: "not_found" };
+    if (this.channels.get(sid)?.turn) return { ok: false, error: "busy" };
+    const plan = this.mirror?.rewindPlan(cc, targetUuid) ?? null;
+    if (!plan) return { ok: false, error: "not_found" };
+    if (plan.keepUpToUuid === null) return { ok: false, error: "not_found" }; // 錨在首條=空分叉,server 已擋,這裡兜底
+    try {
+      const { sessionId: forked } = await forkSession(cc, { upToMessageId: plan.keepUpToUuid });
+      if (!forked) return { ok: false, error: "failed" };
+      console.log(`· session.fork ${cc} → ${forked}(錨及其後 ${plan.dropped} 行不帶走;老會話不動)`);
+      return { ok: true, forkedHermesSessionId: String(forked) };
+    } catch (error) {
+      console.error(`[session.fork ${cc} 失敗] ${String(error).slice(0, 200)}`);
+      return { ok: false, error: "failed" };
+    }
+  }
+
   /**
    * #473 rewind ACK 出口（index.ts 注入）：走 Link B **頂層幀** `rewind_result`，不是 tui 事件。
    */
