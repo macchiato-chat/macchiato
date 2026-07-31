@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { announceImportAvailable, runImport } from "../src/openclaw/history-import";
 import { keyForSid, Mirror } from "../src/openclaw/mirror";
 import { applyReadyE2EIdentityState, Drive } from "../src/openclaw/drive";
-import { E2EKeyStore } from "../src/e2e/keys";
+import { E2EKeyStore } from "../src/_core/e2e/keys";
 
 // 渠道用戶消息（帶 OpenClaw 的 metadata wrapper）
 function metaUser(channelId: string, channelName: string, text: string, ts = 1): string {

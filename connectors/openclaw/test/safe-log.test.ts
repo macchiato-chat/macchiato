@@ -7,7 +7,7 @@ import {
   safeErr,
   shortId,
   textLen,
-} from "../src/safe-log";
+} from "../src/_core/safe-log";
 
 const CANARY = "CANARY-SECRET-sk-live-OPENCLAW-args-path-/Users/private/repo";
 
@@ -39,14 +39,17 @@ describe("#381 safe-log", () => {
 
   it("formatCommandInvokeLog 不含 args 正文", () => {
     const line = formatCommandInvokeLog({
-      tag: "#199",
+      tag: "#0",
       name: "weather",
       argsLen: CANARY.length,
       sid: "01OCCMDLOGTEST000000000000",
+      extra: "fallback=$name",
     });
     expect(line).toContain("command.invoke");
     expect(line).toContain("name=weather");
     expect(line).toContain(`argsLen=${CANARY.length}`);
+    expect(line).toContain("#0");
+    expect(line).toContain("fallback=$name");
     expect(line).not.toContain(CANARY);
   });
 

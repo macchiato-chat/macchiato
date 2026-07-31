@@ -112,7 +112,7 @@ LINK_B_PROTO = 5  # 對齊 server（packages/protocol：B=5，#348/#368 可靠 A
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.64"
+CONNECTOR_VERSION = "1.5.69"
 E2E_APPROVAL_PLAINTEXT_MAX = 64 * 1024
 # #279 E2E prompt 解密失敗的用戶可見回執(僅提示語,零內容洩漏;四連接器同文案)。
 E2E_DECRYPT_FAIL_WARNING = "無法解密這條消息(設備與連接器的加密密鑰可能失步)——請重試,或重新關閉再開啟本會話的端到端加密。"
@@ -891,6 +891,17 @@ class Connector:
         # #13:server_sid → prompt.submit 時的全庫 max 行 id。回合結束後,> 它的行即本回合
         # 寫進 state.db 的行——其 id 回填給 server 作 live 消息的 dedup_key(與鏡像 srcId 同鍵)。
         self._turn_floor: dict = {}
+        # #601 server_sid → 這個會話在 state.db 裡的 id（運行時，_ensure_session 解析出來就記）。
+        # 與持久的 `_stored` 分工：`_stored` 只存**自驅**會話那份「server_sid ≠ state.db id」的映射
+        # （鏡像靠 `_stored_rev` 據此跳過 live 獨佔的會話）；而鏡像來源的會話（Discord/終端起的，
+        # server_sid **就是** state.db id）不能寫進 `_stored`——那會讓鏡像連它也跳過，用戶在
+        # Discord/終端那邊說的話就再也進不來了。但 srcId 回填**兩種都要**，故單開這張運行時表。
+        self._dbsid: dict = {}
+        # #601 srcId 回填在途的 state.db 會話。Hermes 在 message.complete **之後**才把回合消息
+        # 批量寫庫,回填與鏡像輪詢因此同時看見這批新行——鏡像先到就把同一條 user 行再投一遍,
+        # 而 server 的 backfillDedupKey 撞唯一索引只會靜默 return false(live 行的 dedup_key
+        # 永遠補不上了)。回填在途期間讓鏡像跳過該會話,把「誰先到」的競態變成確定順序。
+        self._srcid_pending: set = set()
         self._sdb = None  # 懶加載的 Hermes SessionDB（session.archive 用，寫 state.db.archived）
         self._mirror_task = None  # §15 持續鏡像 tailer 任務
         self._health_task = None  # 健康上報任務
@@ -992,6 +1003,9 @@ class Connector:
                     loop.create_task(self._emit_media_from_text(server_sid, text))
                 # #13:回合結束 → 回填本回合消息的源身份(state.db 行 id → live dedup_key)
                 if server_sid in self._turn_floor:
+                    db_sid = self._db_sid(server_sid)
+                    if db_sid:
+                        self._srcid_pending.add(db_sid)  # #601 回填在途,鏡像先讓一讓
                     loop.create_task(self._backfill_srcids(server_sid))
                 self._projects_check_turn_end()  # #227 agent 可能在本回合改了備案目錄的 AGENTS.md
 
@@ -1699,6 +1713,15 @@ class Connector:
                 continue
         return {}
 
+    def _db_sid(self, server_sid: str):
+        """#601 這個會話在 state.db 裡的 id（srcId 回填要拿它讀 turn_rows）。
+
+        自驅會話走持久映射 `_stored`（重啟後仍在）；鏡像來源的會話 server_sid 本身就是
+        state.db id，由 `_ensure_session` 記進運行時 `_dbsid`（重啟後首個 prompt 會重記）。
+        兩張表都沒有 = 這個會話還沒解析過，本回合不回填（照舊靜默跳過）。
+        """
+        return self._stored.get(server_sid) or self._dbsid.get(server_sid)
+
     def _record_stored(self, server_sid: str, stored) -> None:
         """記住自驅會話的 state.db id（create 返回的 stored_session_id）。冪等、原子持久化 + .bak 輪替。"""
         if not stored or stored == server_sid or self._stored.get(server_sid) == stored:
@@ -1793,6 +1816,11 @@ class Connector:
             try:
                 res = await self.gw.request("session.resume", {"session_id": target})
                 real = (res or {}).get("session_id") or target
+                # #601 續聊路徑也要記住 state.db id——此前只有 create 分支記（`_record_stored`），
+                # 於是「鏡像來源的會話在 app 裡續聊」永遠拿不到 floor、srcId 回填整條靜默跳過
+                # （`_backfill_srcids` 首行 `not stored` 就 return），live 行的 dedup_key 恆為空，
+                # 鏡像隨後把同一行再投一遍 = 用戶消息在對話裡出現兩次。
+                self._dbsid[server_sid] = (res or {}).get("stored_session_id") or target
                 print(f"· resumed hermes session {real}（帶上下文續聊，target={target}）")
                 break
             except GatewayDied:
@@ -1823,6 +1851,8 @@ class Connector:
             real = res.get("session_id")
             stored = (res or {}).get("stored_session_id")
             self._record_stored(server_sid, stored)
+            if stored:
+                self._dbsid[server_sid] = stored  # #601 同上，回填用
             print(f"· created hermes session {real} ← server {server_sid}（state.db={stored}）")
         self._fwd[server_sid] = real
         self._rev[real] = server_sid
@@ -1882,10 +1912,10 @@ class Connector:
         (gateway 重啟水位線競態 / nack 重試)被唯一索引吃掉,live × mirror 不再雙份。
         Hermes 在 message.complete **之後**才把回合消息批量寫庫 → 輪詢等行出現(≤10s)。"""
         floor = self._turn_floor.get(server_sid)
-        stored = self._stored.get(server_sid)
-        if floor is None or not stored:
-            return
+        stored = self._db_sid(server_sid)  # #601 自驅走持久映射,鏡像來源的會話 server_sid 即 state.db id
         try:
+            if floor is None or not stored:
+                return
             deadline = time.monotonic() + float(os.environ.get("MACCHIATO_SRCID_WAIT_S", "10"))
             rows: list = []
             while True:
@@ -1902,7 +1932,8 @@ class Connector:
                 items.append({"role": "agent", "srcId": str(last_assistant)})
             if not items:
                 return
-            self._turn_floor[server_sid] = max(r[0] for r in rows)  # 下回合 floor 順勢推進
+            max_row = max(r[0] for r in rows)
+            self._turn_floor[server_sid] = max_row  # 下回合 floor 順勢推進
             await self._send({
                 "t": "message_srcid",
                 "agentLinkId": self.agent_link_id,
@@ -1910,8 +1941,26 @@ class Connector:
                 "items": items,
             })
             self._count("srcidBackfills")  # #10
+            # #614 回填即推鏡像水位:到這裡,≤max_row 的行「已 live 投遞 + 已回填 dedup_key」,
+            # 鏡像永遠不需要再投它們。此前這只靠運行時 _rev/_fwd 跳過——連接器一重啟就失憶,
+            # 鏡像從凍結的舊水位把整段歷史重放(2026-07-22 12:15Z 實錘:28 對重複 = 重啟分鐘級吻合)。
+            # E2E 不推(其內容只有加密鏡像一條路,原守衛不變;E2E live 被抑制,常態也到不了這裡)。
+            if (
+                self._mirror_st is not None
+                and not self._e2e.is_protected(server_sid)
+                and not self._e2e.is_protected(stored)
+            ):
+                wm = self._mirror_st["sessions"]
+                if max_row > wm.get(stored, 0):
+                    wm[stored] = max_row
+                    self._save_mirror_state(self._mirror_st)
         except Exception as exc:
             print(f"[#13 srcid 回填失敗(忽略) {server_sid}] {exc!r}", file=sys.stderr)
+        finally:
+            # #601 無論成敗、包括上面那條提前 return,都要放行:回填有 10s 上限,
+            # 不能讓一次失敗/跳過把該會話的鏡像永久卡住。
+            if stored:
+                self._srcid_pending.discard(stored)
 
     async def _send(self, msg: dict) -> bool:
         """斷線期間**緩衝**、ready 後按序補發(此前直接丟——server 部署重啟撞上進行中回合,
@@ -2680,6 +2729,10 @@ class Connector:
                 # 持久化 id 下、鏡像看到的是它，故連 _fwd 一起查,否則重複投遞。macchiato 新建會話
                 # （source=tui，_stored_rev 鍵）由 live 路徑獨佔投遞，同樣跳過。
                 continue
+            if sid in self._srcid_pending:
+                # #601 該會話的 srcId 回填在途(≤10s):此刻投出去會和 live 行撞成兩條。
+                # 不推水位、不入 batch,下一輪(2s)再看——回填落地後同源行被唯一索引吃掉。
+                continue
             floor = wm[sid] if sid in wm else default_floor
             has_new = maxid is not None and maxid > floor
             job = cron_feed_target(source, title)
@@ -2704,7 +2757,11 @@ class Connector:
                 continue
             # §19：E2E 自驅會話 source=tui，會被 keepable 的 SKIP_SOURCES 濾掉——但它的內容
             # **只有**加密鏡像這一條路（live 被抑制），必須豁免；非 E2E 照常過濾。
-            if not e2e and not keepable(source, title):
+            # #592 豁免只給**已建立**的會話(自驅映射 pid≠sid / 已鏡像過 sid in wm)——E2E 下
+            # 新冒出來的 skip 源(subagent 子會話/system…)不因加密而獲得建會話權,否則父會話
+            # 每跑一次子代理就多一個獨立會話(2026-07-31 實踩,兩個 subagent = 兩個殭屍會話)。
+            established = (pid != sid) or (sid in wm)
+            if not keepable(source, title) and not (e2e and established):
                 continue
             if has_new:
                 msgs, new_wm = await tail_session(sid, floor)
@@ -2955,7 +3012,7 @@ class Connector:
         assert self.gw is not None
         # #13:記回合 floor——此後 > floor 的 state.db 行即本回合所寫,
         # 回合結束(message.complete)按它定位行 id 回填 live 消息身份。
-        if self._stored.get(server_sid) and not self._e2e.is_protected(server_sid):
+        if self._db_sid(server_sid) and not self._e2e.is_protected(server_sid):
             try:
                 self._turn_floor[server_sid] = await current_max_id()
             except Exception:

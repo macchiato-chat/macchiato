@@ -8,7 +8,7 @@ import type { ConnectorHealthState } from "./linkb/proto";
 import { gcAttachments } from "./codex/attachments";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import type { LinkBClient } from "./linkb/client";
+import type { LinkBClient } from "./_core/linkb/client";
 import type { Mirror } from "./codex/mirror";
 import { sessionsRoot } from "./codex/transcripts";
 import { checkCompat } from "./codex/compat";

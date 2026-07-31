@@ -7,7 +7,7 @@
  * 形狀對齊 `ConnectorHealthState` core+optional（#492）——不發 Hermes 專屬觀測字段。
  */
 import type { ConnectorHealthState } from "./linkb/proto";
-import type { LinkBClient } from "./linkb/client";
+import type { LinkBClient } from "./_core/linkb/client";
 import type { OpenClawGateway } from "./openclaw/gateway";
 import type { Drive } from "./openclaw/drive";
 import type { Mirror } from "./openclaw/mirror";

@@ -41,7 +41,7 @@ import {
   E2EControlVerifier,
   type E2EControlEnvelopeV1,
   type E2EControlKind,
-} from "../src/e2e/control";
+} from "../src/_core/e2e/control";
 
 const CONTROL_KEY = Buffer.from([...Array(32).keys()]);
 

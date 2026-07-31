@@ -2,10 +2,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { E2EKeyStore, E2EKeyStoreStateError, deviceKeyFingerprint } from "../src/e2e/keys";
-import * as ec from "../src/e2e/crypto";
+import { E2EKeyStore, E2EKeyStoreStateError, deviceKeyFingerprint } from "../src/_core/e2e/keys";
+import * as ec from "../src/_core/e2e/crypto";
 import { handleE2EControlFrame } from "../src/index";
-import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/e2e/control";
+import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/_core/e2e/control";
 
 function disableIntent(sid: string, key: Buffer): E2EControlEnvelopeV1 {
   return {

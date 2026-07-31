@@ -7,8 +7,8 @@ import { existsSync, unlinkSync, chmodSync, mkdirSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { E2EKeyStore } from "../e2e/keys";
-import type { LinkBClient } from "../linkb/client";
+import type { E2EKeyStore } from "../_core/e2e/keys";
+import type { LinkBClient } from "../_core/linkb/client";
 import { keyForSid } from "../openclaw/mirror";
 
 export function pushSockPath(): string {

@@ -47,6 +47,8 @@ One line installs and pairs any of these. Run several at once — each shows up 
 | **[Claude Code](https://claude.com/claude-code)** | |
 | **[Codex](https://developers.openai.com/codex)** | |
 
+> **Building your own connector?** If your agent is not in the table, you can still talk Link B to Macchiato — see [Building a connector](docs/building-a-connector.md).
+
 ## Quick start
 
 On the machine where your agent runs:

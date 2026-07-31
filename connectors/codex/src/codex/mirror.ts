@@ -26,8 +26,8 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import type { LinkBClient } from "../linkb/client";
-import type { E2EKeyStore } from "../e2e/keys";
+import type { LinkBClient } from "../_core/linkb/client";
+import type { E2EKeyStore } from "../_core/e2e/keys";
 import { messagesWithTurns, nextOrdAtEof, readNewMessages, sessionsRoot, type CodexMessage } from "./transcripts";
 
 /**

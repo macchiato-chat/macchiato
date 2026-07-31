@@ -4,21 +4,23 @@
  * 跑：pnpm --filter @macchiato/claude-code-connector start
  */
 import { spawn } from "node:child_process";
-import { loadCreds, quarantineCreds } from "./linkb/creds";
-import { LinkBClient } from "./linkb/client";
-import { runPairing } from "./linkb/pairing";
-import { E2EKeyStore, E2EKeyStoreStateError, settleE2EBackfillAck } from "./e2e/keys";
-import { authorizeE2EDisableResume } from "./e2e/control";
+import { loadCreds, quarantineCreds } from "./_core/linkb/creds";
+import { LinkBClient } from "./_core/linkb/client";
+import { runPairing } from "./_core/linkb/pairing";
+import { E2EKeyStore, E2EKeyStoreStateError, settleE2EBackfillAck } from "./_core/e2e/keys";
+import { e2eStorePath } from "./_core/identity";
+import { authorizeE2EDisableResume } from "./_core/e2e/control";
 import { isCommittedE2EBackfillResult, Mirror } from "./cc/mirror";
 import { CommandsReporter } from "./cc/commands";
 import { ModelsReporter } from "./cc/models";
-import { Projects } from "./cc/projects";
+import { Projects } from "./_core/projects";
 import { announceImportAvailable, runImport } from "./cc/history-import";
 import { Drive, workDir } from "./cc/drive";
 import { LoginFlow } from "./cc/login";
 import { HealthLoop } from "./health";
 import { CONNECTOR_VERSION } from "./linkb/proto";
-import { runVerifiedSelfUpdate } from "./selfupdate";
+import { runVerifiedSelfUpdate } from "./_core/selfupdate";
+import { KIND } from "./identity";
 import { cleanupTitlegenResidue } from "./cc/titles";
 
 // §update 連接器發布版本:單源自 packages/protocol 的 CONNECTOR_VERSION(#526 起 TS 三家不再
@@ -35,10 +37,10 @@ function runSelfUpdate(): void {
 
 async function main(): Promise<void> {
   cleanupTitlegenResidue(); // #346 清掉舊版異常退出後遺留的 titlegen 認證副本
-  let creds = loadCreds();
+  let creds = loadCreds(KIND);
   if (!creds) {
     console.log("Not paired — starting pairing (enter the code below at macchiato.chat):");
-    creds = await runPairing();
+    creds = await runPairing({ kind: KIND });
   }
   if (process.env.MACCHIATO_PAIR_ONLY) {
     console.log("Pairing complete (MACCHIATO_PAIR_ONLY) — exiting; start the service to run.");
@@ -46,7 +48,7 @@ async function main(): Promise<void> {
   }
 
   // #347 先加载/校验本地密钥；Link B ready 必须套 server E2E 快照后才能 flush 出站缓冲。
-  const e2e = new E2EKeyStore();
+  const e2e = new E2EKeyStore(e2eStorePath(KIND));
   let drive!: Drive;
   const linkb = new LinkBClient(
     creds,
@@ -66,11 +68,15 @@ async function main(): Promise<void> {
     undefined,
     (sid) => e2e.isE2E(sid),
   );
+  // CC：SDK 固定具備 rewind/fork/三模式——hello 誠實宣告。
+  linkb.declareRewind = true;
+  linkb.declareFork = true;
+  linkb.declarePromptModes = true;
   // #387 app 解綁(revoked)→ 隔離憑證 + exit 78(EX_CONFIG):新版 unit 憑
   // RestartPreventExitStatus=78 停止拉起;舊 unit 重啟後無憑證進入等待配對,不再空轉。
   linkb.onFatal = (kind) => {
     if (kind === "revoked") {
-      const q = quarantineCreds();
+      const q = quarantineCreds(KIND);
       console.error(
         `✗ Unpaired from the Macchiato app — local credentials retired${q ? ` (${q})` : ""}. ` +
           "Re-run the install command to pair again.",
@@ -87,7 +93,7 @@ async function main(): Promise<void> {
     (localSid) => drive.plaintextLocalMirrorAllowed(localSid),
   );
   const commands = new CommandsReporter(linkb); // #199 命令/技能清單上報(/菜單數據源)
-  const projects = new Projects(linkb); // #227 備案目錄:project_op + 回合末惰性版本化
+  const projects = new Projects(linkb, KIND); // #227 備案目錄:project_op + 回合末惰性版本化
   projects.wire();
   drive = new Drive(linkb, mirror, e2e, commands, projects);
   const modelsReporter = new ModelsReporter(linkb); // #231/#553 建在 drive 後、start 在 ready 段

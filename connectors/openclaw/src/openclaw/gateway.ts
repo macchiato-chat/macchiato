@@ -3,7 +3,7 @@
  * 握手/方法/事件均以 scripts/probe-gateway.ts 的活測為準, 見 docs/ARCHITECTURE.md「活測確認的協議」。
  */
 import WebSocket from "ws";
-import { backoffMs, shouldAlert } from "../backoff";
+import { backoffMs, shouldAlert } from "../_core/backoff";
 import { resolveGatewayConfig, type GatewayConfig } from "./config";
 
 export interface GatewayEvent {

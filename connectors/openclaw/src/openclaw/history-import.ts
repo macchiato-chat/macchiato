@@ -9,8 +9,8 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import type { E2EKeyStore } from "../e2e/keys";
-import type { LinkBClient } from "../linkb/client";
+import type { E2EKeyStore } from "../_core/e2e/keys";
+import type { LinkBClient } from "../_core/linkb/client";
 import type { OpenClawGateway } from "./gateway";
 import {
   deriveSource,

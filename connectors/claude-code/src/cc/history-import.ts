@@ -4,8 +4,8 @@
  *  - 標題：custom-title（全文最後一條）> 首條 user 消息截斷。
  *  - server 端按會話冪等（重導 = 刪重插），tools 走 ImportToolCall 形狀。
  */
-import type { LinkBClient } from "../linkb/client";
-import type { E2EKeyStore } from "../e2e/keys";
+import type { LinkBClient } from "../_core/linkb/client";
+import type { E2EKeyStore } from "../_core/e2e/keys";
 import { foldEntries, readEntries, type CCMessage } from "./transcripts";
 import { discoverSessions, toImportMessage } from "./mirror";
 
@@ -19,6 +19,11 @@ interface BuiltSession {
   messages: ReturnType<typeof toImportMessage>[];
   /** #154 所屬 project(transcript 條目的 cwd;拿不到回退目錄 slug)——按 project 導入的分組鍵。 */
   project: string;
+  /**
+   * #602 真實工作目錄：僅 transcript 條目的 cwd（絕對路徑 / ~）。
+   * 回退 slug 只當 project 分組鍵，不寫 cwd（server normalize 也會拒）。
+   */
+  cwd?: string;
 }
 
 type E2EStatus = Pick<E2EKeyStore, "isE2E">;
@@ -44,6 +49,7 @@ export function collectImportSessions(): BuiltSession[] {
         source: "claude-code",
         messages: messages.map(toImportMessage),
         project: cwd || file.split("/").at(-2) || "(unknown)",
+        ...(cwd ? { cwd } : {}), // #602
       });
     } catch (e) {
       console.error(`[import] skip ${sid}: ${(e as Error).message}`);

@@ -29,9 +29,9 @@ import {
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join, basename } from "node:path";
-import type { LinkBClient } from "../linkb/client";
-import type { E2EKeyStore } from "../e2e/keys";
-import type { E2EDisableReceiptV1 } from "../e2e/control";
+import type { LinkBClient } from "../_core/linkb/client";
+import type { E2EKeyStore } from "../_core/e2e/keys";
+import type { E2EDisableReceiptV1 } from "../_core/e2e/control";
 import { foldEntries, projectsDir, readEntries, type CCMessage } from "./transcripts";
 
 /**

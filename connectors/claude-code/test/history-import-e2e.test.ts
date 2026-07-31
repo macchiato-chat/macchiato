@@ -106,6 +106,9 @@ describe("#347 history import E2E wire boundary", () => {
     expect(batches).toHaveLength(1);
     expect(batches[0].done).toBe(true);
     expect(batches[0].sessions.map((session: any) => session.hermesSessionId)).toEqual([PLAIN_SID]);
+    // #602 導入批必須帶真實 cwd，server 才能落到 chat_sessions.cwd → 側欄文件夾。
+    expect(batches[0].sessions[0].cwd).toBe("/plain-project");
+    expect(batches[0].sessions[0].project).toBe("/plain-project");
     expect(JSON.stringify(sent)).not.toContain("绝密问题");
     expect(JSON.stringify(sent)).not.toContain("/secret-project");
   });

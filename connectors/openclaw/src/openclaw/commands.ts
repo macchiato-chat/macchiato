@@ -9,7 +9,7 @@
  */
 import type { CommandInfo } from "../linkb/proto";
 import type { OpenClawGateway } from "./gateway";
-import type { LinkBClient } from "../linkb/client";
+import type { LinkBClient } from "../_core/linkb/client";
 
 const DESC_MAX = 200;
 

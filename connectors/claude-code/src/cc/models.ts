@@ -5,7 +5,7 @@
  */
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { ModelOption } from "../linkb/proto";
-import type { LinkBClient } from "../linkb/client";
+import type { LinkBClient } from "../_core/linkb/client";
 import { claudeBinIsAbsolute, resolveClaudeBin } from "./claude-bin";
 
 /** #553 CC 的 effort 默認由產品定為 high(SDK ModelInfo 無上游真值;drive.resolveEffort 真下發同值)。 */

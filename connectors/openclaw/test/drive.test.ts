@@ -10,7 +10,7 @@ import {
   E2EControlVerifier,
   type E2EControlEnvelopeV1,
   type E2EControlKind,
-} from "../src/e2e/control";
+} from "../src/_core/e2e/control";
 
 const CONTROL_KEY = Buffer.from([...Array(32).keys()]);
 
@@ -146,6 +146,37 @@ describe("drive 下行分派", () => {
     const { linkb, calls } = makeDrive();
     await linkb.deliver(tui("session.interrupt", "agent:main:discord:channel:9"));
     expect(calls[0]).toMatchObject({ method: "sessions.abort", params: { key: "agent:main:discord:channel:9" } });
+  });
+
+  // #552/#613:OpenClaw 不宣告 promptModes(hello-caps.test.ts 已釘死),但**一定會收到 mode**——
+  // web 的本地隊列自動投遞恆帶 `mode:"queue"`,而 server 有意不按 caps 裁剪下行(見
+  // services/server/test/prompt-mode.test.ts 的分層說明)。所以這裡要釘的是:未知字段被安靜
+  // 忽略,行為與沒有它時**逐字節相同**。壞掉的樣子是消息靜默消失或被誤當成控制指令。
+  it("#552 帶 mode 的 prompt 對本家是無害字段:三種模式與缺省走完全同一條路", async () => {
+    for (const mode of [undefined, "queue", "inject", "interrupt", "telepathy"]) {
+      const { linkb, calls } = makeDrive();
+      await linkb.deliver(
+        tui("prompt.submit", "01SID", { text: "你好", ...(mode ? { mode } : {}) }),
+      );
+      expect(calls.map((c) => c.method), `mode=${mode}`).toEqual(["chat.send"]);
+      expect(calls[0].params.message, `mode=${mode}`).toBe("你好");
+    }
+  });
+
+  it("#552 回合進行中帶 mode 也不改變本家語義:仍是 sessions.steer 注入(不打斷、不排隊)", async () => {
+    for (const mode of ["queue", "interrupt"]) {
+      const { gw, linkb, calls } = makeDrive();
+      await linkb.deliver(tui("prompt.submit", "01SID", { text: "第一條" }));
+      gw.fire({ event: "agent", payload: { stream: "lifecycle", data: { phase: "start" }, runId: "r1", sessionKey: `${MACCHIATO_PREFIX}01sid` } });
+      await linkb.deliver(tui("prompt.submit", "01SID", { text: "追加", mode }));
+      // 本家只有「注入」一種語義;收到 queue/interrupt 也不會憑空長出排隊或中止能力,
+      // 但**消息必須送達**——這正是「未宣告 = 維持歷史行為」的契約。
+      expect(calls[1], `mode=${mode}`).toMatchObject({
+        method: "sessions.steer",
+        params: { key: `${MACCHIATO_PREFIX}01sid`, message: "追加" },
+      });
+      expect(calls.some((c) => c.method === "sessions.abort"), `mode=${mode}`).toBe(false);
+    }
   });
 
   it("#368 quiesce 等在途回合结束，并拒绝屏障后的新内容", async () => {
@@ -555,7 +586,7 @@ describe("drive E2E（§19 方案 A）", () => {
     const { join } = await import("node:path");
     process.env.MACCHIATO_OPENCLAW_TITLED = join(mkdtempSync(join(tmpdir(), "oc-titled-")), "titled.json");
     process.env.MACCHIATO_OPENCLAW_TITLE_MODE = "off"; // #113 E2E 測試不摻標題
-    const { E2EKeyStore } = await import("../src/e2e/keys");
+    const { E2EKeyStore } = await import("../src/_core/e2e/keys");
     const store = new E2EKeyStore(join(mkdtempSync(join(tmpdir(), "occ-de2e-")), "e2e.json"));
     const calls: any[] = [];
     const gw: any = { handlers: [] as any[], onEvent(h: any) { this.handlers.push(h); },
@@ -875,7 +906,7 @@ describe("#261 live 工具事件(session.tool → tool.start/complete)", () => {
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     process.env.MACCHIATO_OPENCLAW_TITLE_MODE = "off";
-    const { E2EKeyStore } = await import("../src/e2e/keys");
+    const { E2EKeyStore } = await import("../src/_core/e2e/keys");
     const store = new E2EKeyStore(join(mkdtempSync(join(tmpdir(), "occ-tool-e2e-")), "e2e.json"));
     const calls: any[] = [];
     const gw: any = { handlers: [] as any[], onEvent(h: any) { this.handlers.push(h); },

@@ -10,7 +10,7 @@
  */
 import type { CommandInfo } from "../linkb/proto";
 import type { AppServerClient } from "./appserver";
-import type { LinkBClient } from "../linkb/client";
+import type { LinkBClient } from "../_core/linkb/client";
 import { workDir } from "./drive";
 
 const DESC_MAX = 200;

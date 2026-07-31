@@ -6,7 +6,7 @@ import {
   parseStrictSemver,
   semverLt,
   verifyManifest,
-} from "../src/selfupdate";
+} from "../src/_core/selfupdate";
 
 /** 一次性測試密鑰對(與生產公鑰無關)。 */
 function testKeys() {

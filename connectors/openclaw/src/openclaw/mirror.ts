@@ -23,9 +23,9 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import type { LinkBClient } from "../linkb/client";
+import type { LinkBClient } from "../_core/linkb/client";
 import type { OpenClawGateway } from "./gateway";
-import type { E2EKeyStore } from "../e2e/keys";
+import type { E2EKeyStore } from "../_core/e2e/keys";
 
 const POLL_MS = Number(process.env.MACCHIATO_OPENCLAW_POLL_MS) || 5000;
 /** #9:水位線條目從 sessions.list 消失多久後裁掉(默認 7 天)。 */

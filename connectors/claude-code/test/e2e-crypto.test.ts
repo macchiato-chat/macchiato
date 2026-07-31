@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import * as ec from "../src/e2e/crypto";
+import * as ec from "../src/_core/e2e/crypto";
 
 /**
  * 跨平台向量：由 **Python 連接器** services/hermes-connector/e2e_crypto.py 產出。

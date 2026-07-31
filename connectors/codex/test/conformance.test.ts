@@ -21,7 +21,7 @@ vi.mock("../src/codex/attachments", async (importOriginal) => {
 });
 
 import { AppServerDrive } from "../src/codex/drive-appserver";
-import { credPath } from "../src/linkb/creds";
+import { credPath } from "../src/_core/identity";
 
 const SID = "01CONFCODEX000000000000000";
 const TID = "bbbbbbbb-0000-4000-8000-000000000099";
@@ -98,7 +98,7 @@ beforeEach(() => {
 
 it("#303 hermetic: Codex credPath 落在沙箱 HOME", () => {
   delete process.env.MACCHIATO_CODEX_CRED;
-  const p = credPath();
+  const p = credPath("codex");
   expect(p.startsWith(getSandboxHome())).toBe(true);
   assertPathIsSandboxed(p);
 });

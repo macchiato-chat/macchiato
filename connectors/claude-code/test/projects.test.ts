@@ -1,8 +1,9 @@
+import { KIND } from "../src/identity";
 import { describe, it, expect, beforeEach } from "vitest";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, symlinkSync, linkSync, unlinkSync, lstatSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Projects, memHash } from "../src/cc/projects";
+import { Projects, memHash } from "../src/_core/projects";
 
 /** #227:register/mem_read/mem_write/registry + 安全紀律 + 回合末惰性版本化。 */
 
@@ -20,7 +21,7 @@ function setup() {
       return () => {};
     },
   };
-  const p = new Projects(linkb);
+  const p = new Projects(linkb, KIND);
   p.wire();
   const op = (msg: any) => {
     handlers.forEach((h) => h({ t: "project_op", ...msg }));
@@ -143,7 +144,7 @@ describe("#227 mem 讀寫 + 安全紀律", () => {
     const sent2: any[] = [];
     const handlers2: any[] = [];
     const linkb2: any = { agentLinkId: "al1", isReady: true, send: (m: any) => sent2.push(m), onFrame: (h: any) => (handlers2.push(h), () => {}) };
-    const p2 = new Projects(linkb2);
+    const p2 = new Projects(linkb2, KIND);
     p2.wire();
     handlers2.forEach((h) => h({ t: "project_op", reqId: 9, op: "mem_read", path: workdir }));
     expect(sent2.at(-1).ok).toBe(true);

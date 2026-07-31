@@ -17,13 +17,13 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { AppServerClient, AppServerDied } from "./appserver";
-import { type CwdResolution, resolveCwd } from "./cwd";
+import { type CwdResolution, resolveCwd } from "../_core/cwd";
 import { loadDriveState, saveDriveState, codexPermsFor, CODEX_AUTH_ERR_RE } from "./state";
 import { deriveMeta, discoverRollouts } from "./mirror";
 import { fallbackTitle, titleMode } from "./titles";
 import { materializeAttachment } from "./attachments";
-import type { LinkBClient } from "../linkb/client";
-import type { E2EKeyStore } from "../e2e/keys";
+import type { LinkBClient } from "../_core/linkb/client";
+import type { E2EKeyStore } from "../_core/e2e/keys";
 import {
   canonicalE2EApprovalDisplay,
   dispatchForE2EControl,
@@ -33,9 +33,11 @@ import {
   immutableE2EApprovalSnapshot,
   type E2EControlEnvelopeV1,
   type E2EControlKind,
-} from "../e2e/control";
+} from "../_core/e2e/control";
+import { e2eControlStorePath } from "../_core/identity";
+import { KIND } from "../identity";
 import type { Mirror } from "./mirror";
-import { formatCommandInvokeLog, logContent, safeErr, shortId, textLen } from "../safe-log";
+import { formatCommandInvokeLog, logContent, safeErr, shortId, textLen } from "../_core/safe-log";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** 必须与 iOS E2EControlCrypto.maxPayloadBytes 一致；设备会拒绝更大的解密 JSON。 */
@@ -264,7 +266,7 @@ export class AppServerDrive {
     this.identityStateTrusted = st.identityStateTrusted;
     this.abandonedTurns = st.pending;
     this.pending = new Set();
-    this.e2eControl = e2eControl ?? (e2e ? new E2EControlVerifier(e2e) : undefined);
+    this.e2eControl = e2eControl ?? (e2e ? new E2EControlVerifier(e2e, e2eControlStorePath(KIND)) : undefined);
     // 影子兜底:啟動時把既有 wire→local 映射的 thread uuid 全灌給鏡像(跨重啟持久),鏡像據此
     // 永不給這些「被驅動過」的 thread 單獨建明文會話(重啟後內存態丟失也不復發)。
     for (const localSid of Object.values(this.map)) this.mirror?.markDrivenUuid?.(localSid);
@@ -515,7 +517,7 @@ export class AppServerDrive {
 
   /** #377 解析+校驗會話工作目錄(realpath/存在性/目錄/可選 allowlist;見 cwd.ts)。 */
   private resolveSessionCwd(sid: string): CwdResolution {
-    return resolveCwd(this.cwds[sid]);
+    return resolveCwd(KIND, this.cwds[sid]);
   }
 
   /** ok 時回 realpath 規範路徑,否則回嘗試路徑(供提示/比對)。 */
@@ -960,6 +962,10 @@ export class AppServerDrive {
 
   /** #552 queue/stop&send 排隊的輸入:回合結束由 finishTurn 作為新回合投遞(絕不與 active 併發)。 */
   private readonly queuedInputs = new Map<string, Array<{ input: UserInput[]; firstText: string }>>();
+  /** #623 turn/steer 注入的 user 文本池(per-sid,trim 後,時序,capped)。**不掛 ActiveTurn**:
+   * 注入可能被引擎排到下一回合,rollout 的 user 行到下回合才落盤——srcId 回填必須跨回合重試,
+   * 配對成功才出池,否則注入的 user 行沒 dedup_key,鏡像重讀雙投用戶氣泡(cc 同款,#552/#601 家族)。 */
+  private readonly injectedTexts = new Map<string, string[]>();
 
   /**
    * #132/#317/#552 投遞一回合輸入(prompt.submit 與 command.invoke 共用)。閒置 = 起新回合;
@@ -984,6 +990,7 @@ export class AppServerDrive {
       q.push({ input, firstText });
       this.queuedInputs.set(sid, q);
       if (mode === "queue") {
+        // ⚠️ 回歸契約:scripts/regression/run-codex-regression.mjs 斷言「Queue:排隊等當前回合結束」,改動需同步
         console.log(`· Queue:排隊等當前回合結束 → ${sid}`);
         return;
       }
@@ -991,6 +998,7 @@ export class AppServerDrive {
       if (running.turnId) {
         try {
           await this.client.request("turn/interrupt", { threadId: running.threadId, turnId: running.turnId });
+          // ⚠️ 回歸契約:run-codex-regression.mjs + localchain(agents/codex.mjs modeStopSend)均斷言此串
           console.log(`· turn/interrupt(stop&send)→ ${sid}`);
         } catch (e) {
           // 回合恰好剛結束等:排隊消息仍由回合收尾/下一回合入口投遞,不丟。
@@ -1006,6 +1014,13 @@ export class AppServerDrive {
       try {
         await this.client.request("turn/steer", { threadId: running.threadId, expectedTurnId: running.turnId, input });
         this.counters.steers += 1;
+        // #623 注入文本入池(srcId 回填跨回合配對用)
+        if (firstText.trim()) {
+          const injected = this.injectedTexts.get(sid) ?? [];
+          injected.push(firstText.trim());
+          while (injected.length > 8) injected.shift(); // 有界防洩漏
+          this.injectedTexts.set(sid, injected);
+        }
         // ⚠️ 回歸契約:scripts/regression/run-codex-regression.mjs 斷言「turn/steer 注入跟進消息」,改動需同步
         console.log(`· turn/steer 注入跟進消息 → ${sid}`);
         return;
@@ -1305,12 +1320,29 @@ export class AppServerDrive {
       // agent:rollout 最後一條 agent_message(= 本回合剛畢的回覆;append-only,尾行即本回合)。
       const agent = [...msgs].reverse().find((m) => m.role === "agent");
       if (agent?.srcId) items.push({ role: "agent", srcId: agent.srcId });
-      // user:文本匹配本回合 prompt(對齊 OpenClaw sentTexts 語義)的最後一條 user 行。
-      const want = turn.userText.trim();
-      const user = want
-        ? [...msgs].reverse().find((m) => m.role === "user" && m.text.trim() === want)
-        : undefined;
-      if (user?.srcId) items.push({ role: "user", srcId: user.srcId });
+      // user:文本匹配。#623 本回合可能有多條 user(開場 prompt + turn/steer 注入)——server 側
+      // backfillDedupKey 恆取「最新一條 dedup 為空的 user 行」,items 必須**新→舊**:注入的(倒序)
+      // 在前,開場 prompt 最後。注入池跨回合:本次配不上的留給下一次回合收尾再試。
+      const injected = this.injectedTexts.get(sid) ?? [];
+      const wants: Array<{ text: string; fromPool: boolean }> = [
+        ...[...injected].reverse().map((t) => ({ text: t, fromPool: true })),
+        { text: turn.userText.trim(), fromPool: false },
+      ];
+      const used = new Set<string>();
+      const rev = [...msgs].reverse();
+      for (const want of wants) {
+        if (!want.text) continue;
+        const user = rev.find((m) => m.role === "user" && m.text.trim() === want.text && !!m.srcId && !used.has(m.srcId));
+        if (user?.srcId) {
+          used.add(user.srcId);
+          items.push({ role: "user", srcId: user.srcId });
+          if (want.fromPool) {
+            const at = injected.lastIndexOf(want.text);
+            if (at >= 0) injected.splice(at, 1);
+          }
+        }
+      }
+      if (!injected.length) this.injectedTexts.delete(sid);
       if (items.length) {
         this.linkb.send({ t: "message_srcid", agentLinkId: this.linkb.agentLinkId, sessionId: sid, items });
       }

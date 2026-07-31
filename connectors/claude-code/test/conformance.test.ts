@@ -28,7 +28,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 }));
 
 import { Drive } from "../src/cc/drive";
-import { credPath } from "../src/linkb/creds";
+import { credPath } from "../src/_core/identity";
 
 const CC_SID = "6966afc5-2dca-477d-a987-848421d25124";
 
@@ -67,7 +67,7 @@ beforeEach(() => {
 // 本家特有：默認憑證路徑必須落沙箱（共享 suite 的 hermetic 斷言的實例化）
 it("#303 hermetic: CC credPath 落在沙箱 HOME", () => {
   delete process.env.MACCHIATO_CLAUDE_CODE_CRED;
-  const p = credPath();
+  const p = credPath("claude-code");
   expect(p.startsWith(getSandboxHome())).toBe(true);
   assertPathIsSandboxed(p);
 });

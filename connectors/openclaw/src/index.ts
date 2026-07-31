@@ -3,21 +3,23 @@
  *   憑證（未配對則先配對）→ 連 OpenClaw gateway + Macchiato Link B → 啟動鏡像。
  * 跑：pnpm --filter @macchiato/openclaw-connector start
  */
-import { loadCreds, quarantineCreds } from "./linkb/creds";
-import { LinkBClient } from "./linkb/client";
-import { runPairing } from "./linkb/pairing";
+import { loadCreds, quarantineCreds } from "./_core/linkb/creds";
+import { LinkBClient } from "./_core/linkb/client";
+import { runPairing } from "./_core/linkb/pairing";
 import { resolveGatewayConfig } from "./openclaw/config";
 import { applyReadyE2EIdentityState, Drive } from "./openclaw/drive";
 import { OpenClawGateway } from "./openclaw/gateway";
 import { announceImportAvailable, runImport } from "./openclaw/history-import";
 import { isCommittedE2EBackfillResult, Mirror } from "./openclaw/mirror";
 import { PushHandler } from "./push/handler";
-import { E2EKeyStore, E2EKeyStoreStateError, settleE2EBackfillAck } from "./e2e/keys";
-import { authorizeE2EDisableResume } from "./e2e/control";
+import { E2EKeyStore, E2EKeyStoreStateError, settleE2EBackfillAck } from "./_core/e2e/keys";
+import { e2eStorePath } from "./_core/identity";
+import { authorizeE2EDisableResume } from "./_core/e2e/control";
 import { CommandsReporter } from "./openclaw/commands";
 import { HealthLoop } from "./health";
 import { CONNECTOR_VERSION } from "./linkb/proto";
-import { runVerifiedSelfUpdate } from "./selfupdate";
+import { runVerifiedSelfUpdate } from "./_core/selfupdate";
+import { KIND } from "./identity";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -37,10 +39,10 @@ function runSelfUpdate(): void {
 
 async function main(): Promise<void> {
   // 1. 憑證 / 配對
-  let creds = loadCreds();
+  let creds = loadCreds(KIND);
   if (!creds) {
     console.log("Not paired — starting pairing (enter the code below at macchiato.chat):");
-    creds = await runPairing();
+    creds = await runPairing({ kind: KIND });
   }
   if (process.env.MACCHIATO_PAIR_ONLY) {
     console.log("Pairing complete (MACCHIATO_PAIR_ONLY) — exiting; start the service to run.");
@@ -48,7 +50,7 @@ async function main(): Promise<void> {
   }
 
   // #347 密鑰檔先於任何 agent/gateway 事件校驗；損壞時直接離線退出，沒有明文退化窗口。
-  const e2e = new E2EKeyStore();
+  const e2e = new E2EKeyStore(e2eStorePath(KIND));
 
   // 2. OpenClaw gateway（驅動 + 索引）
   const gw = new OpenClawGateway(resolveGatewayConfig());
@@ -68,7 +70,7 @@ async function main(): Promise<void> {
   // RestartPreventExitStatus=78 停止拉起;舊 unit 重啟後無憑證進入等待配對,不再空轉。
   linkb.onFatal = (kind) => {
     if (kind === "revoked") {
-      const q = quarantineCreds();
+      const q = quarantineCreds(KIND);
       console.error(
         `✗ Unpaired from the Macchiato app — local credentials retired${q ? ` (${q})` : ""}. ` +
           "Re-run the install command to pair again.",

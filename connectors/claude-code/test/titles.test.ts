@@ -75,20 +75,21 @@ afterEach(() => {
 });
 
 describe("titleMode (env 開關)", () => {
-  it("默認/非法值走本地 firstmsg，summary/off 只在顯式指定時生效", async () => {
+  it("#590 默認/非法值走 summary(真生成);firstmsg/off 顯式指定時生效", async () => {
     const { titleMode } = await fresh();
-    expect(titleMode()).toBe("firstmsg");
-    process.env.MACCHIATO_CC_TITLE_MODE = "summary";
     expect(titleMode()).toBe("summary");
+    process.env.MACCHIATO_CC_TITLE_MODE = "firstmsg";
+    expect(titleMode()).toBe("firstmsg");
     process.env.MACCHIATO_CC_TITLE_MODE = "off";
     expect(titleMode()).toBe("off");
     process.env.MACCHIATO_CC_TITLE_MODE = "garbage";
-    expect(titleMode()).toBe("firstmsg");
+    expect(titleMode()).toBe("summary");
   });
 });
 
 describe("generateTitle", () => {
-  it("默認本地截斷，不啟動第二個 agent 回合", async () => {
+  it("顯式 firstmsg 本地截斷，不啟動第二個 agent 回合", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "firstmsg";
     const { generateTitle } = await fresh();
     const long = "幫我抓取30papers這個網站的30篇論文有些在本站有些要去原網站".repeat(3);
     const title = await generateTitle(long);
@@ -98,6 +99,7 @@ describe("generateTitle", () => {
   });
 
   it("fallback 按碼點截斷:emoji 跨在 56 邊界不產生孤代理項", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "firstmsg";
     const { generateTitle } = await fresh();
     const input = "a".repeat(55) + "😀😀"; // 第 56 個碼點是增補面 emoji(2 個 UTF-16 單元)
     const title = await generateTitle(input);
@@ -115,7 +117,7 @@ describe("generateTitle", () => {
     expect(sdk.calls).toHaveLength(0);
   });
 
-  it("顯式 summary 仍禁用工具、隔離 cwd/設定且不寫死模型", async () => {
+  it("summary 禁用工具、隔離 cwd/設定;#590 標題固定輕量檔 haiku(可 env 覆蓋),不帶 effort", async () => {
     vi.useFakeTimers();
     process.env.MACCHIATO_CC_TITLE_MODE = "summary";
     const canonicalConfig = join(testTmp, "canonical-config");
@@ -144,7 +146,8 @@ describe("generateTitle", () => {
     expect(options.mcpServers).toEqual({});
     expect(options.skills).toEqual([]);
     expect(options.plugins).toEqual([]);
-    expect(options).not.toHaveProperty("model");
+    expect(options.model).toBe("haiku"); // #590:標題輕量檔;env MACCHIATO_CC_TITLE_MODEL 可換
+    expect(options).not.toHaveProperty("effort"); // Brian 拍板不帶(haiku 不宣告 effort 檔位)
     expect(options).not.toHaveProperty("env");
     expect(options.cwd).not.toBe(process.cwd());
     expect(options.cwd).not.toBe(canonicalConfig);
@@ -154,7 +157,7 @@ describe("generateTitle", () => {
     expect(readFileSync(fakeCredential, "utf8")).toBe(fakeCredentialBody);
     expect(sdk.closeCalls).toBe(1);
     expect(options.abortController.signal.aborted).toBe(false);
-    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.advanceTimersByTimeAsync(20_000);
     expect(options.abortController.signal.aborted).toBe(false);
   });
 
@@ -189,7 +192,7 @@ describe("generateTitle", () => {
     const pending = generateTitle("不要卡住標題熱路徑");
     const options = sdk.calls[0]!.options;
 
-    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.advanceTimersByTimeAsync(20_000);
     await expect(pending).resolves.toBe("不要卡住標題熱路徑");
     expect(options.abortController.signal.aborted).toBe(true);
     expect(sdk.closeCalls).toBe(1);

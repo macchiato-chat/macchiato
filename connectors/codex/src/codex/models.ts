@@ -5,7 +5,7 @@
  */
 import type { ModelOption } from "../linkb/proto";
 import type { AppServerClient } from "./appserver";
-import type { LinkBClient } from "../linkb/client";
+import type { LinkBClient } from "../_core/linkb/client";
 
 /** codex Model[] → ModelOption[]。 */
 export function toModelOptions(data: unknown[]): ModelOption[] {

@@ -8,19 +8,21 @@
  * #383:Content-Length 早拒;並發下載上限;流式計數 + 超限即 destroy(不整塊無界緩衝)。
  * OpenClaw 需 base64 內聯給 gateway,仍在上限內拼 buffer——關鍵是早拒 + 流式上限 + 失敗丟棄。
  */
-import { lookup } from "node:dns/promises";
-import { lookup as dnsLookupCb } from "node:dns";
-import type { LookupFunction } from "node:net";
-import type { LookupAddress } from "node:dns";
 import * as http from "node:http";
 import * as https from "node:https";
 import type { IncomingMessage } from "node:http";
+import {
+  isPrivateIp,
+  isAllowedLocalHttp,
+  validateDownloadUrl,
+  pinnedLookup,
+} from "../_core/attachments/ssrf";
+export { isPrivateIp, isAllowedLocalHttp, validateDownloadUrl, pinnedLookup };
 
 /** OpenClaw chat 附件默認上限(resolveChatAttachmentMaxBytes:mediaMaxMb 未配=20MB)。 */
 export const DOWNLOAD_MAX = 20 * 1024 * 1024;
 /** 並發下載默認 3(env `MACCHIATO_OPENCLAW_ATTACH_MAX_INFLIGHT` 可調)。 */
 export const ATTACH_MAX_INFLIGHT_DEFAULT = 3;
-const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
 export function attachMaxInflight(): number {
   const n = Number(process.env.MACCHIATO_OPENCLAW_ATTACH_MAX_INFLIGHT ?? ATTACH_MAX_INFLIGHT_DEFAULT);
@@ -38,123 +40,6 @@ export function _resetAttachInflightForTest(): void {
 /** @internal 測試佔位 in-flight。 */
 export function _setAttachInflightForTest(n: number): void {
   inflightDownloads = Math.max(0, Math.floor(n));
-}
-
-/**
- * #249 pin-IP 解析:socket 連接時用它做 DNS——校驗**實際要連的那個 IP**。DNS-rebinding 換的正是
- * 這次連接解析到的 IP,當場被拒;validateDownloadUrl 預解析只是早拒,真正把關在這裡(單次解析、
- * 直接用於 socket,無「校驗解析 ≠ 連接解析」的 TOCTOU 窗口)。
- */
-export const pinnedLookup: LookupFunction = (hostname, options, cb) => {
-  // ⚠️ **不能**覆蓋調用方要的 `all`。Node 20+ 的 autoSelectFamily(默認開)會用 `all: true` 調用
-  // 並期待回調給**數組**;強行 all:false 回一個字符串,Node 讀 `addresses[0].address` 得 undefined,
-  // 於是 net.isIP(undefined) 拋 `Invalid IP address: undefined`——https 附件下載全掛
-  // (本地 dev 走 http 不掛 lookup,所以這個坑一直沒暴露)。
-  //
-  // dns.lookup 的類型按 all:true/false 分兩個重載,而這裡的 all 由調用方給、編譯期不知道是哪個,
-  // 過不了重載解析;運行時兩種形狀都處理了,故收口成一個寬簽名。
-  type RawLookup = (
-    hostname: string,
-    options: object,
-    cb: (err: NodeJS.ErrnoException | null, address: string | LookupAddress[], family?: number) => void,
-  ) => void;
-  (dnsLookupCb as unknown as RawLookup)(hostname, (options ?? {}) as object, (err, address, family) => {
-    if (err) return cb(err, address, family);
-    // 數組形狀要**逐個**校驗:Node 會依次嘗試裡面的地址,只要有一個是私網,SSRF 就成立。
-    const list = Array.isArray(address) ? address.map((a) => a.address) : [address];
-    const bad = list.find((ip) => isPrivateIp(ip));
-    if (bad !== undefined) {
-      return cb(new Error(`目標 IP ${bad} 在私網/保留範圍(防 SSRF DNS-rebinding)`), address, family);
-    }
-    cb(null, address, family);
-  });
-};
-
-/** IPv4/IPv6 私網/環回/link-local/保留段判定(無依賴手寫,覆蓋 SSRF 常用目標)。 */
-export function isPrivateIp(ip: string): boolean {
-  if (ip.includes(".") && !ip.toLowerCase().startsWith("::ffff:")) {
-    const p = ip.split(".").map(Number);
-    if (p.length !== 4 || p.some((x) => Number.isNaN(x))) return true; // 解析不了按危險處理
-    const [a, b] = p as [number, number, number, number];
-    return (
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      (a === 100 && b! >= 64 && b! <= 127) || // CGNAT
-      (a === 169 && b === 254) || // link-local / 雲元數據
-      (a === 172 && b! >= 16 && b! <= 31) ||
-      (a === 192 && b === 168) ||
-      a >= 224 // multicast + 保留
-    );
-  }
-  const low = ip.toLowerCase();
-  if (low.startsWith("::ffff:")) return isPrivateIp(low.slice(7)); // v4-mapped
-  return (
-    low === "::1" ||
-    low === "::" ||
-    low.startsWith("fc") ||
-    low.startsWith("fd") || // ULA fc00::/7
-    low.startsWith("fe8") ||
-    low.startsWith("fe9") ||
-    low.startsWith("fea") ||
-    low.startsWith("feb") || // link-local fe80::/10
-    low.startsWith("ff") // multicast
-  );
-}
-
-/** 下載前校驗 url(拋錯=拒絕)。 */
-export function isAllowedLocalHttp(u: URL): boolean {
-  if (process.env.MACCHIATO_ATTACH_ALLOW_LOCALHOST !== "1") return false;
-  if (u.protocol !== "http:") return false;
-  // Node 部分版本 hostname 對 IPv6 帶方括號（[::1]）；WHATWG 則不帶——兩邊都接。
-  const host = (u.hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
-  if (!LOCAL_HOSTS.has(host)) return false;
-  // userinfo 混淆(http://evil@127.0.0.1/…)一律拒
-  if (u.username || u.password) return false;
-  const portRaw = process.env.MACCHIATO_ATTACH_LOCAL_PORT;
-  const wantPort =
-    portRaw === undefined || portRaw === ""
-      ? 8080
-      : Number(portRaw);
-  if (!Number.isInteger(wantPort) || wantPort < 1 || wantPort > 65535) return false;
-  const gotPort = u.port ? Number(u.port) : 80; // http 默認 80；dev-disk 是 8080，必須顯式帶端口
-  if (gotPort !== wantPort) return false;
-  // 空字串=不限 path（測試用）；未設默認 /attachments（對齊 dev-disk）
-  const prefix =
-    process.env.MACCHIATO_ATTACH_LOCAL_PATH_PREFIX === undefined
-      ? "/attachments"
-      : process.env.MACCHIATO_ATTACH_LOCAL_PATH_PREFIX;
-  if (prefix) {
-    const path = u.pathname || "/";
-    if (path !== prefix && !path.startsWith(prefix.endsWith("/") ? prefix : `${prefix}/`)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-export async function validateDownloadUrl(url: string): Promise<void> {
-  let u: URL;
-  try {
-    u = new URL(url);
-  } catch {
-    throw new Error(`無效 url`);
-  }
-  if (isAllowedLocalHttp(u)) return; // #379 顯式 dev 才放行 http→loopback
-  if (u.protocol !== "https:") {
-    throw new Error(
-      `不允許的 scheme:${u.protocol}(只允許 https；本地 dev-disk 需 MACCHIATO_ATTACH_ALLOW_LOCALHOST=1)`,
-    );
-  }
-  const host = (u.hostname || "").toLowerCase();
-  if (!host) throw new Error("url 缺主機名");
-  if (u.username || u.password) throw new Error("url 不得含 userinfo(防混淆)");
-  const addrs = await lookup(host, { all: true }).catch((e) => {
-    throw new Error(`解析主機失敗:${(e as Error).message}`);
-  });
-  for (const { address } of addrs) {
-    if (isPrivateIp(address)) throw new Error(`目標 IP ${address} 在私網/環回/保留範圍(防 SSRF)`);
-  }
 }
 
 function sanitizeName(name: string): string {

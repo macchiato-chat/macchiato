@@ -43,15 +43,15 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { imageBlockFor, materializeAttachment } from "./attachments";
-import { type CwdResolution, defaultWorkDir, resolveCwd } from "./cwd";
+import { type CwdResolution, defaultWorkDir, resolveCwd } from "../_core/cwd";
 import { claudeBinIsAbsolute, resolveClaudeBin } from "./claude-bin";
 import { sdkEnv } from "./sdk-env";
 import type { CommandsReporter } from "./commands";
 import { CC_DEFAULT_EFFORT } from "./models";
 import { generateTitle } from "./titles";
-import type { LinkBClient } from "../linkb/client";
-import type { E2EKeyStore } from "../e2e/keys";
-import { formatCommandInvokeLog, logContent, safeErr, shortId, textLen } from "../safe-log";
+import type { LinkBClient } from "../_core/linkb/client";
+import type { E2EKeyStore } from "../_core/e2e/keys";
+import { formatCommandInvokeLog, logContent, safeErr, shortId, textLen } from "../_core/safe-log";
 import {
   canonicalE2EApprovalDisplay,
   dispatchForE2EControl,
@@ -61,7 +61,9 @@ import {
   immutableE2EApprovalSnapshot,
   type E2EControlEnvelopeV1,
   type E2EControlKind,
-} from "../e2e/control";
+} from "../_core/e2e/control";
+import { e2eControlStorePath } from "../_core/identity";
+import { KIND } from "../identity";
 import { discoverSessions, type Mirror } from "./mirror";
 import { foldEntries, readEntries } from "./transcripts";
 
@@ -248,7 +250,7 @@ function parseDriveState(raw: string, identityStateTrusted: boolean): PersistedD
 
 /** 新會話的默認工作目錄:`MACCHIATO_CC_WORKDIR` 覆蓋,否則 HOME(見 cwd.ts)。 */
 export function workDir(): string {
-  return defaultWorkDir();
+  return defaultWorkDir(KIND);
 }
 
 /** #118 閒置回收:回合結束後這麼久無新 prompt → close 通道回收 CLI 進程(resume 重建零丟失)。 */
@@ -455,6 +457,12 @@ interface Channel {
   closing: boolean;
 }
 
+/** #601 池裡的一項：一條 live 投遞過的 user 文本 + 已為它認領的 transcript 行 id（首個為主 id）。 */
+interface SrcIdWant {
+  text: string;
+  srcIds: string[];
+}
+
 export class Drive {
   /** #10:累計計數(進程生命週期),健康上報帶出。 */
   readonly counters: Record<string, number> = { driveErrors: 0, turnErrors: 0 };
@@ -499,11 +507,26 @@ export class Drive {
   private readonly clarifies = new Map<string, PendingClarify>();
   /** #102 sid → 本回合被 session.interrupt 中斷(result 定性 interrupted 而非 error)。 */
   private readonly interruptedSids = new Set<string>();
-  /** #552 sid → inject 注入的 user 文本池(trim 後,時序,capped)。**不掛 TurnCtx**:真 CLI 對
-   * 純文字回合會把注入排到**下一回合**(2026-07-29 真 CLI 驗收實測,init→result 兩輪),transcript
-   * 的 user 行到下回合才落盤——srcId 回填必須跨回合重試,配對成功才出池,否則注入的 user 行沒
-   * dedup_key,回合末鏡像重讀雙投用戶氣泡。 */
-  private readonly injectedTexts = new Map<string, string[]>();
+  /** #552/#601 sid → **live 投遞過、srcId 還沒配上**的 user 文本池(trim 後,時序,capped)。
+   * **不掛 TurnCtx**:真 CLI 對純文字回合會把注入排到**下一回合**(2026-07-29 真 CLI 驗收實測,
+   * init→result 兩輪),transcript 的 user 行到下回合才落盤——srcId 回填必須跨回合重試,配對
+   * 成功才出池,否則那條 user 行沒 dedup_key,回合末鏡像重讀雙投用戶氣泡。
+   *
+   * #601 起**開場 prompt 也進池**(原先只有 inject 進,開場 prompt 配不上就直接丟)。生產實錄
+   * 01KYS5WKDS98FQX5NT13VN1GWN seq 42:回合 02:23:52 秒殺結束(空 agent 消息),CLI 02:23:53
+   * 才把 user 行寫進 transcript——回填快照早了 1 秒,錯過就再也不試,dedup_key 永久為空,
+   * 鏡像隨後把同一句再投一遍。池按**時序**存,回填時整體 reverse = 新→舊,配對順序天然正確。 */
+  private readonly injectedTexts = new Map<string, SrcIdWant[]>();
+
+  /** #601 記一條「live 投遞過、待配 srcId」的 user 文本(開場 prompt 與 inject 同池)。 */
+  private notePendingSrcIdText(sid: string, text: string): void {
+    const t = text.trim();
+    if (!t) return;
+    const pool = this.injectedTexts.get(sid) ?? [];
+    pool.push({ text: t, srcIds: [] });
+    while (pool.length > 8) pool.shift(); // 有界:配不上的陳舊項防洩漏
+    this.injectedTexts.set(sid, pool);
+  }
   /** #102 未處理 SDK 消息類型一次性日誌去重(`type/subtype`)——37 種 SDKMessage 只處理一小撮,靜默丟=升級漂移無感知。 */
   private readonly loggedUnknown = new Set<string>();
   /** #238 sid → 「總是允許」累積的**窄規則**串(settings 格式,如 "Bash(git status:*)")。
@@ -533,7 +556,7 @@ export class Drive {
     this.efforts = state.efforts;
     this.identityStateTrusted = state.identityStateTrusted;
     this.aliasHistoryTrusted = state.aliasHistoryTrusted;
-    this.e2eControl = e2eControl ?? (e2e ? new E2EControlVerifier(e2e) : undefined);
+    this.e2eControl = e2eControl ?? (e2e ? new E2EControlVerifier(e2e, e2eControlStorePath(KIND)) : undefined);
     // 影子兜底:啟動時把既有 ULID→CLI 映射的 CLI uuid 全灌給鏡像(跨重啟持久),鏡像據此永不給
     // 這些「被驅動過」的 CLI 會話單獨建會話(防重啟後污染態丟失又復發)。
     for (const localSids of Object.values(this.aliases)) {
@@ -612,16 +635,14 @@ export class Drive {
     const busy = this.channels.get(sid);
     if (busy?.turn) {
       if (mode === "inject" && !busy.turn.completed) {
-        const injected = this.injectedTexts.get(sid) ?? [];
-        injected.push(contentText(content).trim());
-        while (injected.length > 8) injected.shift(); // 有界:配不上的陳舊項防洩漏
-        this.injectedTexts.set(sid, injected);
+        this.notePendingSrcIdText(sid, contentText(content));
         busy.input.push({
           type: "user",
           message: { role: "user", content },
           parent_tool_use_id: null,
           session_id: "",
         });
+        // ⚠️ 回歸契約:scripts/regression/run-cc-regression.mjs 斷言「Steer:消息注入當前回合」,改動需同步
         console.log(`· Steer:消息注入當前回合 → ${sid}`);
         return;
       }
@@ -1635,7 +1656,7 @@ export class Drive {
 
   /** #392 解析+校驗會話工作目錄(realpath/存在性/目錄/可選 allowlist;見 cwd.ts)。 */
   private resolveSessionCwd(sid: string): CwdResolution {
-    return resolveCwd(this.cwds[sid]);
+    return resolveCwd(KIND, this.cwds[sid]);
   }
 
   /** #105 會話工作目錄：ok 時回 realpath 規範路徑,否則回嘗試路徑(供提示/比對)。 */
@@ -1734,6 +1755,9 @@ export class Drive {
         `failed to persist Claude Code E2E turn identity before delivery (${sid})`,
       );
     }
+    // #601 開場 prompt 進待配池:配不上就留到下回合再試(見 notePendingSrcIdText)。
+    // 送達重投不重記——同一條 user 消息只該配一個 srcId。
+    if (!opts?.retriedDelivery) this.notePendingSrcIdText(sid, contentText(content));
     ch.input.push({
       type: "user",
       message: { role: "user", content },
@@ -1745,6 +1769,9 @@ export class Drive {
   /** #118 開通道:長活 query(streaming-input)+ 後台 consume 循環。 */
   private openChannel(sid: string, cwd: string): Channel {
     const resume = this.ccSidFor(sid);
+    // ⚠️ 回歸契約:scripts/regression/run-cc-regression.mjs 斷言「Channel open … mode=resume|new」
+    // (#584:閒置/重啟後 resume 路徑的確定性信號,取代依賴模型複述的 RECALL=<word>)。
+    console.log(`· Channel open ${shortId(sid)} mode=${resume ? "resume" : "new"}`);
     // 權限模式:MACCHIATO_CC_PERMISSION_MODE 設 bypassPermissions(全放行,不彈審批卡)/
     // acceptEdits 等 → 傳給 SDK(通道創建參數;#116:bypass 只能啟動時給,中途切換=重建通道)。
     // 提供 canUseTool 時 default/plan 的審批走它(#116 e/f:回調覆蓋 acceptEdits 自動批;bypass 不調)。
@@ -2239,36 +2266,59 @@ export class Drive {
     try {
       const msgs = this.mirror?.srcIdSnapshot(cc) ?? [];
       if (!msgs.length) return;
-      const items: Array<{ role: "user" | "agent"; srcId: string }> = [];
+      const items: Array<{ role: "user" | "agent"; srcId: string; alsoFor?: string }> = [];
       const agent = [...msgs]
         .reverse()
         .find((m) => m.role === "agent" && !!m.msgId && turn.seenMsgIds.has(m.msgId));
       if (agent?.srcId) items.push({ role: "agent", srcId: agent.srcId });
-      // #552 本回合可能有多條 user(開場 prompt + inject 注入)。server 側 backfillDedupKey 恆取
-      // 「最新一條 dedup 為空的 user 行」,故 items 必須**新→舊**排列才配對正確:注入的(倒序)在前,
-      // 開場 prompt 最後。同文本重複時 used 集保證各配一行(反向找 = 先配最新)。
-      // 注入池是 per-sid 跨回合的:純文字回合的注入被真 CLI 排到下一回合,user 行下回合才落盤——
-      // 本次配上的出池,配不上的留給下一次回合收尾再試(池有界,見 dispatchContent)。
-      const injected = this.injectedTexts.get(sid) ?? [];
-      const wants: Array<{ text: string; fromPool: boolean }> = [
-        ...[...injected].reverse().map((t) => ({ text: t, fromPool: true })),
-        { text: contentText(turn.content).trim(), fromPool: false },
-      ];
+      // #552/#601 本回合可能有多條 user(開場 prompt + inject 注入),全在 `injectedTexts` 池裡
+      // 按**時序**排。server 側 backfillDedupKey 恆取「最新一條 dedup 為空的 user 行」,故 items
+      // 必須**新→舊**——整池 reverse 即得(池本身是時序:開場 prompt 先進、注入後進)。
+      // 同文本重複時 used 集保證各配一行(反向找 = 先配最新)。
+      // 池是 per-sid 跨回合的:配上的出池,配不上的留給下一次回合收尾再試(池有界,見
+      // notePendingSrcIdText)——#601 起開場 prompt 也吃這條重試,不再「快照早了一秒就永久沒有」。
+      const pool = this.injectedTexts.get(sid) ?? [];
       const used = new Set<string>();
       const rev = [...msgs].reverse();
-      for (const want of wants) {
+      for (const want of [...pool].reverse()) {
         if (!want.text) continue;
-        const user = rev.find((m) => m.role === "user" && m.text.trim() === want.text && !!m.srcId && !used.has(m.srcId));
-        if (user?.srcId) {
-          used.add(user.srcId);
-          items.push({ role: "user", srcId: user.srcId });
-          if (want.fromPool) {
-            const at = injected.lastIndexOf(want.text);
-            if (at >= 0) injected.splice(at, 1);
+        // 這條文本在池裡是否唯一。不唯一 = 用戶真的把同一句發了兩次 → 只認領主 id,不做
+        // #601 的 alsoFor 續認領(兩條消息搶同一批 transcript 行,連錯比重複更糟)。
+        const unique = pool.filter((w) => w.text === want.text).length === 1;
+        for (const m of rev) {
+          if (m.role !== "user" || m.text.trim() !== want.text || !m.srcId) continue;
+          if (used.has(m.srcId) || want.srcIds.includes(m.srcId)) continue;
+          if (!want.srcIds.length) {
+            // 主 id:server 認領「最新一條 dedup 為空的 user 消息」。
+            used.add(m.srcId);
+            want.srcIds.push(m.srcId);
+            items.push({ role: "user", srcId: m.srcId });
+            if (!unique) break; // 同文本多條待配 → 一人一行,不搶
+            continue;
           }
+          // #601 同一條 live 消息的**第二個** transcript 行(CC 對注入消息寫兩次:排隊時 +
+          // 回合邊界被消費時,兩個 uuid)。掛側表,別再認領成一條新消息。
+          if (!unique) break;
+          used.add(m.srcId);
+          want.srcIds.push(m.srcId);
+          items.push({ role: "user", srcId: m.srcId, alsoFor: want.srcIds[0]! });
         }
       }
-      if (!injected.length) this.injectedTexts.delete(sid);
+      // #624(真 CLI 實測):同窗口的多條注入會被 CLI **合併成一條 user 行**(text/image 塊
+      // 無分隔拼接)——上面的精確等值對合併行必然落空。補一趟「包含」配對:某未使用 user 行
+      // **包含** ≥1 個未認領池項、且不等於任何單項文本時,該行認領為這些池項的共同主 id。
+      // 合併行只有一個 srcId:配到任一 live 行即可讓鏡像重放撞唯一索引;其餘 live 行沒有
+      // 對應 transcript 行,無從被重放(不追求逐行精準配對——那對合併行在結構上不可能)。
+      for (const m of rev) {
+        if (m.role !== "user" || !m.srcId || used.has(m.srcId)) continue;
+        const line = m.text.trim();
+        const contained = pool.filter((w) => !w.srcIds.length && !!w.text && w.text !== line && line.includes(w.text));
+        if (!contained.length) continue;
+        used.add(m.srcId);
+        items.push({ role: "user", srcId: m.srcId });
+        for (const w of contained) w.srcIds.push(m.srcId); // 視同已認領(後續 alsoFor 語義照舊)
+      }
+      if (!pool.length) this.injectedTexts.delete(sid);
       if (items.length) {
         this.linkb.send({ t: "message_srcid", agentLinkId: this.linkb.agentLinkId, sessionId: sid, items });
       }

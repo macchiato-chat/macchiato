@@ -22,13 +22,13 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import type { LinkBClient } from "../linkb/client";
+import type { LinkBClient } from "../_core/linkb/client";
 import { fetchChatAttachment, type ChatAttachment } from "./attachments";
 import type { OpenClawGateway, GatewayEvent } from "./gateway";
 import { keyForSid, sidForKey, type Mirror } from "./mirror";
 import { generateTitle, loadTitled, saveTitled } from "./titles";
 import { extractMediaPaths, readMediaFile, resolveMediaAllowRoots } from "./media";
-import type { E2EKeyStore, ServerE2EStateV1 } from "../e2e/keys";
+import type { E2EKeyStore, ServerE2EStateV1 } from "../_core/e2e/keys";
 import {
   canonicalE2EApprovalDisplay,
   dispatchForE2EControl,
@@ -38,8 +38,10 @@ import {
   immutableE2EApprovalSnapshot,
   type E2EControlEnvelopeV1,
   type E2EControlKind,
-} from "../e2e/control";
-import { formatCommandInvokeLog, logContent, safeErr, shortId, textLen } from "../safe-log";
+} from "../_core/e2e/control";
+import { e2eControlStorePath } from "../_core/identity";
+import { KIND } from "../identity";
+import { formatCommandInvokeLog, logContent, safeErr, shortId, textLen } from "../_core/safe-log";
 
 /** E2E 加密審批明文尺寸閘（與 CC/Codex 對齊；須先於 emit/掛起）。 */
 const E2E_APPROVAL_PLAINTEXT_MAX_BYTES = 64 * 1024;
@@ -303,7 +305,7 @@ export class Drive {
       this.sidByKey.set(key, sid);
       this.mirror?.setDriven(key, sid);
     }
-    this.e2eControl = e2eControl ?? (e2e ? new E2EControlVerifier(e2e) : undefined);
+    this.e2eControl = e2eControl ?? (e2e ? new E2EControlVerifier(e2e, e2eControlStorePath(KIND)) : undefined);
     this.mirror?.setDriveIdentityResolver?.(
       (identity) => this.wireSessionIdForLocalIdentity(identity),
       () => this.plaintextLocalIdentityAllowed(),

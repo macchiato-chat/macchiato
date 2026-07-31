@@ -7,7 +7,7 @@ import {
   safeErr,
   shortId,
   textLen,
-} from "../src/safe-log";
+} from "../src/_core/safe-log";
 
 const CANARY = "CANARY-SECRET-sk-live-CODEX-args-path-/Users/private/repo";
 
@@ -39,7 +39,7 @@ describe("#381 safe-log", () => {
 
   it("formatCommandInvokeLog 不含 args 正文", () => {
     const line = formatCommandInvokeLog({
-      tag: "#317",
+      tag: "#0",
       name: "imagegen",
       argsLen: CANARY.length,
       sid: "01CODEXCMDLOGTEST000000000",
@@ -48,6 +48,8 @@ describe("#381 safe-log", () => {
     expect(line).toContain("command.invoke");
     expect(line).toContain("name=imagegen");
     expect(line).toContain(`argsLen=${CANARY.length}`);
+    expect(line).toContain("#0");
+    expect(line).toContain("fallback=$name");
     expect(line).not.toContain(CANARY);
   });
 

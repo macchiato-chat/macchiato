@@ -8,7 +8,7 @@ import type { ConnectorHealthState } from "./linkb/proto";
 import { gcAttachments } from "./cc/attachments";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import type { LinkBClient } from "./linkb/client";
+import type { LinkBClient } from "./_core/linkb/client";
 import type { Drive } from "./cc/drive";
 import type { Mirror } from "./cc/mirror";
 import { projectsDir } from "./cc/transcripts";

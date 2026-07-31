@@ -30,7 +30,12 @@ vi.mock("node:child_process", () => ({
     return p;
   },
 }));
-vi.mock("../src/backoff", () => ({ backoffMs: () => 1, shouldAlert: () => false }));
+// 必須與被測代碼實際 import 的說明符逐字一致(#572 起是 @macchiato/connector-core/backoff),
+// 否則 vitest 靜默不命中 → 真 backoff(3s 起 + 抖動)生效、時序斷言掛。
+vi.mock("../src/_core/backoff", () => ({
+  backoffMs: () => 1,
+  shouldAlert: () => false,
+}));
 
 import { AppServerClient, AppServerDied } from "../src/codex/appserver";
 

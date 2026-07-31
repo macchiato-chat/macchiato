@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { backoffMs, RECONNECT_BASE_MS, RECONNECT_MAX_MS, shouldAlert } from "../src/backoff";
+import { backoffMs, RECONNECT_BASE_MS, RECONNECT_MAX_MS, shouldAlert } from "../src/_core/backoff";
 
 describe("#3 重連指數退避", () => {
   it("指數增長、封頂 60s;抖動落在 [50%,100%] 檔內", () => {

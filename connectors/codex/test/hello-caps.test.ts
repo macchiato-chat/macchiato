@@ -10,15 +10,9 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
+// 「缺省不宣告 / 開了才宣告」的注入邏輯由 connector-core 的 test/hello-caps.test.ts 抓真實
+// hello 幀斷言(#633);這裡只管本家接線——唯一開啟點必須在 app-server 握手成功之後。
 describe("#473 hello rewind cap(codex,引擎級)", () => {
-  it("hello 按 declareRewind 條件宣告(缺省 false = exec 回退不宣告)", () => {
-    const src = readFileSync(new URL("../src/linkb/client.ts", import.meta.url), "utf8");
-    expect(src).toMatch(/declareRewind = false/); // 缺省安全:沒人設就是不宣告
-    const idx = src.search(/t\s*:\s*["']hello["']/);
-    expect(idx).toBeGreaterThanOrEqual(0);
-    expect(src.slice(idx, idx + 1200)).toMatch(/this\.declareRewind \? \{ rewind: 1 \}/);
-  });
-
   it("只有 app-server 引擎分支開宣告(exec 強制/探活回退兩條路都不開)", () => {
     const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
     const marks = [...src.matchAll(/linkb\.declareRewind = true/g)];

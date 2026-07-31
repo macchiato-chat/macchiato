@@ -86,7 +86,7 @@ import {
   E2EControlVerifier,
   type E2EControlEnvelopeV1,
   type E2EControlKind,
-} from "../src/e2e/control";
+} from "../src/_core/e2e/control";
 
 const CONTROL_KEY = Buffer.from([...Array(32).keys()]);
 
@@ -356,6 +356,167 @@ describe("Drive", () => {
     d.dispose();
   });
 
+  it("#601 開場 prompt 的 user 行晚一步落盤:srcId 回填跨回合重試,不再永久漏配", async () => {
+    // 生產實錄 01KYS5WKDS98FQX5NT13VN1GWN seq 42:回合 02:23:52 秒殺結束(空 agent 消息),
+    // CLI 02:23:53 才把 user 行寫進 transcript——回填快照早了 1 秒。此前開場 prompt 配不上
+    // 就直接丟(只有 inject 進池重試),dedup_key 永久為空,鏡像隨後把同一句再投一遍 =
+    // 用戶消息在對話裡出現兩次。
+    turnScripts = [
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 40 },
+        { type: "result", subtype: "success", result: "" }, // 回合秒殺結束,transcript 還沒寫 user 行
+      ],
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 60 },
+        { type: "assistant", message: { id: "msg_2", role: "assistant", content: [{ type: "text", text: "第二回合" }] } },
+        { type: "result", subtype: "success", result: "第二回合" },
+      ],
+    ];
+    const snapshot: Array<Record<string, unknown>> = [
+      { role: "agent", text: "舊回合", srcId: "a-0", msgId: "msg_0" },
+    ];
+    const mirror = { setDriven() {}, unsetDriven() {}, fastForward() {}, markDrivenUuid() {}, markLivePosted() {}, srcIdSnapshot: () => [...snapshot] } as any;
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb, mirror);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "放進 github" }));
+    await new Promise((r) => setTimeout(r, 120)); // 回合1收尾:快照裡還沒有這條 user 行
+    const first = sent.filter((f: any) => f.t === "message_srcid");
+    for (const f of first) expect((f as any).items).not.toContainEqual(expect.objectContaining({ role: "user" }));
+    // CLI 隨後才把 user 行寫進 transcript
+    snapshot.push({ role: "user", text: "放進 github", srcId: "u-late" });
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "下一句" }));
+    await new Promise((r) => setTimeout(r, 200));
+    snapshot.push({ role: "user", text: "下一句", srcId: "u-2" }, { role: "agent", text: "第二回合", srcId: "a-2", msgId: "msg_2" });
+    await new Promise((r) => setTimeout(r, 200));
+    const users = sent
+      .filter((f: any) => f.t === "message_srcid")
+      .flatMap((f: any) => f.items as Array<{ role: string; srcId: string }>)
+      .filter((i) => i.role === "user")
+      .map((i) => i.srcId);
+    expect(users).toContain("u-late"); // 遲到的開場 prompt 被下一輪收尾補上
+    d.dispose();
+  });
+
+  it("#601 注入消息在 transcript 裡有兩個 uuid:第二個帶 alsoFor 掛同一條消息", async () => {
+    // 生產實錄 01KYS5WKDS98FQX5NT13VN1GWN seq 38/40:回合中注入的那句話,CLI 在 transcript 裡
+    // 寫了兩次——排隊時一個 uuid、回合邊界被消費時又一個(相隔 1 秒)。回填只認領了第一個,
+    // 鏡像重讀第二個時 (session, dedup_key) 唯一索引攔不住 → 同一句話兩條氣泡。
+    turnScripts = [
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 80 },
+        { type: "assistant", message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "回合1" }] } },
+        { type: "result", subtype: "success", result: "回合1" },
+      ],
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 80 },
+        { type: "assistant", message: { id: "msg_2", role: "assistant", content: [{ type: "text", text: "回合2" }] } },
+        { type: "result", subtype: "success", result: "回合2" },
+      ],
+    ];
+    const snapshot: Array<Record<string, unknown>> = [
+      { role: "user", text: "hi", srcId: "u-1" },
+      { role: "agent", text: "回合1", srcId: "a-1", msgId: "msg_1" },
+      { role: "user", text: "補充一句", srcId: "uuid-queued" }, // 排隊時寫的那行
+    ];
+    const mirror = { setDriven() {}, unsetDriven() {}, fastForward() {}, markDrivenUuid() {}, markLivePosted() {}, srcIdSnapshot: () => [...snapshot] } as any;
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb, mirror);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "補充一句", mode: "inject" }));
+    await new Promise((r) => setTimeout(r, 120)); // 回合1收尾:認領主 id
+    const round1 = sent.filter((f: any) => f.t === "message_srcid").flatMap((f: any) => f.items);
+    expect(round1).toContainEqual({ role: "user", srcId: "uuid-queued" });
+    expect(round1.every((i: any) => !i.alsoFor)).toBe(true); // 第一次只認領主 id
+
+    // 回合邊界:CLI 把同一句又寫了一行
+    snapshot.push({ role: "user", text: "補充一句", srcId: "uuid-consumed" });
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "下一輪" }));
+    await new Promise((r) => setTimeout(r, 200));
+    const all = sent.filter((f: any) => f.t === "message_srcid").flatMap((f: any) => f.items);
+    expect(all).toContainEqual({ role: "user", srcId: "uuid-consumed", alsoFor: "uuid-queued" });
+    // 主 id 不重複認領
+    expect(all.filter((i: any) => i.srcId === "uuid-queued")).toHaveLength(1);
+    d.dispose();
+  });
+
+  it("#601 用戶真的把同一句發了兩次 → 只認主 id,不做 alsoFor 續認領(連錯比重複更糟)", async () => {
+    turnScripts = [
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 60 },
+        { type: "assistant", message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "一" }] } },
+        { type: "result", subtype: "success", result: "一" },
+      ],
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 60 },
+        { type: "assistant", message: { id: "msg_2", role: "assistant", content: [{ type: "text", text: "二" }] } },
+        { type: "result", subtype: "success", result: "二" },
+      ],
+    ];
+    const snapshot: Array<Record<string, unknown>> = [
+      { role: "user", text: "同一句", srcId: "s-1" },
+      { role: "user", text: "同一句", srcId: "s-2" },
+      { role: "agent", text: "一", srcId: "a-1", msgId: "msg_1" },
+    ];
+    const mirror = { setDriven() {}, unsetDriven() {}, fastForward() {}, markDrivenUuid() {}, markLivePosted() {}, srcIdSnapshot: () => [...snapshot] } as any;
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb, mirror);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "同一句" }));
+    await new Promise((r) => setTimeout(r, 30));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "同一句", mode: "inject" }));
+    await new Promise((r) => setTimeout(r, 250));
+    const items = sent.filter((f: any) => f.t === "message_srcid").flatMap((f: any) => f.items);
+    expect(items.filter((i: any) => i.alsoFor)).toEqual([]); // 兩條各配一行,誰都不多吃
+    expect(items.filter((i: any) => i.role === "user").map((i: any) => i.srcId).sort()).toEqual(["s-1", "s-2"]);
+    d.dispose();
+  });
+
+  it("#624 CLI 合併同窗口多條注入成一條 user 行:包含匹配認領,一行吞多個池項", async () => {
+    turnScripts = [[
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { __wait: 100 },
+      { type: "assistant", message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "ok" }] } },
+      { type: "result", subtype: "success", result: "ok" },
+    ]];
+    // 真 CLI 實測形狀:兩條注入合併成一行,fold 無分隔拼接文本(附件註記完整保留)
+    const merged = "另外看看這張圖再補一句\n\n[The user attached 1 file(s), read them with the Read tool: /tmp/x.pdf]";
+    const snapshot = [
+      { role: "user", text: "hi", srcId: "u-1" },
+      { role: "user", text: merged, srcId: "u-merged" },
+      { role: "agent", text: "ok", srcId: "a-1", msgId: "msg_1" },
+    ];
+    const mirror = { setDriven() {}, unsetDriven() {}, fastForward() {}, markDrivenUuid() {}, markLivePosted() {}, srcIdSnapshot: () => snapshot } as any;
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb, mirror);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "hi" }));
+    await new Promise((r) => setTimeout(r, 30));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "另外看看這張圖", mode: "inject" }));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "再補一句\n\n[The user attached 1 file(s), read them with the Read tool: /tmp/x.pdf]", mode: "inject" }));
+    await new Promise((r) => setTimeout(r, 150));
+    const srcid = sent.find((f: any) => f.t === "message_srcid") as any;
+    // 順序:精確配對(開場)在前、包含配對(合併行)在後。合併場景下 server 側「最新空行優先」
+    // 的逐行精準配對在結構上不可能(3 條 live 行只有 2 條 transcript 行),但防雙投的碰撞語義
+    // 不受影響:兩個 srcId 各自落在某條 live 行上,鏡像重放兩條行都撞索引。
+    expect(srcid.items).toEqual([
+      { role: "agent", srcId: "a-1" },
+      { role: "user", srcId: "u-1" },      // 開場精確等值
+      { role: "user", srcId: "u-merged" }, // 合併行由包含配對認領(兩個池項都被它吞掉)
+    ]);
+    const pool = (d as any).injectedTexts.get(CC_SID) as Array<{ text: string; srcIds: string[] }>;
+    expect(pool.every((w) => w.srcIds.length > 0)).toBe(true); // 全部已認領(留池供 alsoFor 二寫配對)
+    d.dispose();
+  });
+
   it("#552 queue:回合中 mode=queue 不打斷,回合結束後作為新回合投遞;缺省 mode 仍是打斷接管", async () => {
     turnScripts = [
       [
@@ -404,6 +565,125 @@ describe("Drive", () => {
     fire(tuiFrame(CC_SID, "prompt.submit", { text: "steer" })); // 無 mode
     await new Promise((r) => setTimeout(r, 30));
     expect(interrupts).toEqual(["interrupted"]); // 歷史默認:打斷
+    d.dispose();
+  });
+
+  // ── #552 邊界態:三種 mode × 會話不在回合中 ──────────────────────────────────
+  // 這裡是**最容易寫錯又最難發現**的一格:dispatchContent 先看 `busy?.turn` 再分流,閒置時
+  // 三種 mode 都必須落到同一個 startTurn。寫成「mode==='queue' 就入隊」的話,web 本地隊列的
+  // 每一條自動投遞(#613 恆帶 mode:"queue")都會靜靜躺在隊裡永不發出——用戶看到消息消失,
+  // 連接器日誌乾乾淨淨。
+  it("#552/#613 閒置 + mode=queue → 立刻起新回合(本地隊列自動投遞的主路徑,絕不能靜靜入隊)", async () => {
+    turnScripts = [[
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "delivered" },
+    ]];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "排隊到期投遞", mode: "queue" }));
+    await new Promise((r) => setTimeout(r, 60));
+
+    expect(pushedMessages).toHaveLength(1);
+    expect(pushedMessages[0].message.content).toBe("排隊到期投遞");
+    expect((d as any).queued.get(CC_SID) ?? []).toEqual([]); // 沒有滯留
+    const completes = sent.filter((f: any) => f.frame?.params?.type === "message.complete");
+    expect(completes.map((f: any) => f.frame.params.payload.status)).toEqual(["complete"]);
+    d.dispose();
+  });
+
+  it("#552 閒置 + mode=inject → 起新回合(沒有可注入的回合時退化為普通發送,不丟消息)", async () => {
+    turnScripts = [[
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "ok" },
+    ]];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "注入但沒有回合", mode: "inject" }));
+    await new Promise((r) => setTimeout(r, 60));
+
+    expect(pushedMessages).toHaveLength(1);
+    expect(pushedMessages[0].message.content).toBe("注入但沒有回合");
+    expect(interrupts).toEqual([]);
+    d.dispose();
+  });
+
+  it("#552 未知 mode(新 client 打老連接器)→ 回退歷史默認打斷接管,消息絕不丟", async () => {
+    turnScripts = [
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 150 },
+        { type: "result", subtype: "error_during_execution" },
+      ],
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { type: "result", subtype: "success", result: "takeover" },
+      ],
+    ];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "first" }));
+    await new Promise((r) => setTimeout(r, 30));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "未來模式", mode: "telepathy" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(interrupts).toEqual(["interrupted"]); // 未知 = 缺省 = 歷史默認
+    expect((d as any).queued.get(CC_SID)).toEqual(["未來模式"]); // 排隊待接管,沒被丟掉
+
+    await new Promise((r) => setTimeout(r, 200)); // 等打斷後的接管回合真的跑完
+    expect(pushedMessages.map((m: any) => m.message.content)).toEqual(["first", "未來模式"]);
+    d.dispose();
+  });
+
+  it("#552 回合中連排兩條 queue → 按 FIFO 續投,不合併不亂序", async () => {
+    turnScripts = [
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 120 },
+        { type: "result", subtype: "success", result: "one" },
+      ],
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { type: "result", subtype: "success", result: "two" },
+      ],
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { type: "result", subtype: "success", result: "three" },
+      ],
+    ];
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "first" }));
+    await new Promise((r) => setTimeout(r, 30));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "排隊甲", mode: "queue" }));
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "排隊乙", mode: "queue" }));
+    await new Promise((r) => setTimeout(r, 250));
+
+    expect(interrupts).toEqual([]);
+    expect(pushedMessages.map((m: any) => m.message.content)).toEqual(["first", "排隊甲", "排隊乙"]);
+    d.dispose();
+  });
+
+  it("#552 回合已定稿但通道未收:inject 退回排隊(不對已完結的回合空打 interrupt)", async () => {
+    const { linkb, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    // 直接構造「turn 存在但 completed」的窄窗(真環境 = result 已到、finishTurn 還在跑)
+    let interrupted = 0;
+    (d as any).channels.set(CC_SID, {
+      sid: CC_SID,
+      turn: { completed: true },
+      input: [],
+      q: { interrupt: async () => void interrupted++ },
+    });
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "擦邊注入", mode: "inject" }));
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(interrupted).toBe(0); // 已完結的回合不該再打斷
+    expect((d as any).queued.get(CC_SID)).toEqual(["擦邊注入"]); // 交給 finishTurn 續投
+    expect((d as any).interruptedSids.has(CC_SID)).toBe(false); // 也不該把回合誤標成 interrupted
     d.dispose();
   });
 
@@ -546,6 +826,7 @@ describe("Drive", () => {
   });
 
   it("#389 通道帶 env:聲明 entrypoint=macchiato(終端 /resume 可見)且展開了 process.env", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "off"; // #590 默認 summary 會偷跑一個 title query 蓋掉 lastOptions
     const { linkb, fire } = fakeLinkb();
     const d = new Drive(linkb);
     d.wire();
@@ -1410,6 +1691,10 @@ describe("#118 streaming-input 長活通道", () => {
   it("閒置回收:超時關通道回收;下個 prompt 新通道 resume 續上", async () => {
     // #427 假時鐘:不依賴真實 1s 窗（整包並行時 wall-clock 會被擠）
     vi.useFakeTimers();
+    const logs: string[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+      logs.push(a.map(String).join(" "));
+    });
     try {
       process.env.MACCHIATO_CC_IDLE_S = "1"; // 1s idle
       turnScripts = [[init, { type: "result", subtype: "success", result: "one" }]];
@@ -1419,15 +1704,22 @@ describe("#118 streaming-input 長活通道", () => {
       fire(tuiFrame(CC_SID, "prompt.submit", { text: "t1" }));
       await flushDriveTimers();
       expect((d as any).channels.size).toBe(1);
+      // #584 回歸契約:openChannel 必打 Channel open … mode=…
+      // (本測 sid=CC uuid → 首開即 resume;Macchiato ULID 首開才是 new——由 cc-regr 覆蓋)
+      expect(logs.filter((l) => /Channel open \S+ mode=(new|resume)/.test(l)).length).toBe(1);
       await vi.advanceTimersByTimeAsync(1000); // 恰好 idle 窗
       expect((d as any).channels.size).toBe(0); // 已回收
+      const logsAfterIdle = logs.length;
       turnScripts = [[init, { type: "result", subtype: "success", result: "two" }]];
       fire(tuiFrame(CC_SID, "prompt.submit", { text: "t2" }));
       await flushDriveTimers();
       expect(queryCalls).toBe(2); // 新通道
       expect(lastOptions.resume).toBe(CC_SID); // resume 續上下文
+      // #584:閒置回收後**新增**一條 mode=resume(cc-regr 用 fromLen 切新增輸出斷言同一串)
+      expect(logs.slice(logsAfterIdle).some((l) => /Channel open \S+ mode=resume/.test(l))).toBe(true);
       d.dispose();
     } finally {
+      logSpy.mockRestore();
       vi.useRealTimers();
     }
   });

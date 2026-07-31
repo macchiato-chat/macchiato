@@ -24,7 +24,7 @@ import {
   immutableE2EApprovalSnapshot,
   type E2EControlEnvelopeV1,
   type E2EControlKind,
-} from "../src/e2e/control";
+} from "../src/_core/e2e/control";
 
 const KEY = Buffer.from([...Array(32).keys()]);
 const PUBLIC_SID = "01PUBLICSESSION00000000000001";

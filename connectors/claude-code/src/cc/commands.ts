@@ -9,7 +9,7 @@
  */
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { CommandInfo } from "../linkb/proto";
-import type { LinkBClient } from "../linkb/client";
+import type { LinkBClient } from "../_core/linkb/client";
 import { claudeBinIsAbsolute, resolveClaudeBin } from "./claude-bin";
 
 const DESC_MAX = 200;

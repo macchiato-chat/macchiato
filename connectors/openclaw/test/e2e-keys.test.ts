@@ -16,13 +16,16 @@ import { join } from "node:path";
 import {
   E2EKeyStore,
   E2EKeyStoreError,
+  E2EKeyStoreLoadError,
+  E2EKeyStorePersistenceError,
+  E2EKeyStorePoisonedError,
   E2EKeyStoreStateError,
   deviceKeyFingerprint,
   settleE2EBackfillAck,
-} from "../src/e2e/keys";
-import * as ec from "../src/e2e/crypto";
-import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/e2e/control";
-import { withE2EKeyStoreLock } from "../src/e2e/file-lock";
+} from "../src/_core/e2e/keys";
+import * as ec from "../src/_core/e2e/crypto";
+import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/_core/e2e/control";
+import { withE2EKeyStoreLock } from "../src/_core/e2e/file-lock";
 
 function disableIntent(sid: string, key: Buffer): E2EControlEnvelopeV1 {
   return {
@@ -182,7 +185,7 @@ describe("E2EKeyStore（持鑰/封裝/加解密/持久化）", () => {
   it("主檔與 backup 都損壞時拒絕啟動並給可操作錯誤", () => {
     writeFileSync(path, "{");
     writeFileSync(`${path}.bak`, JSON.stringify({ d1: "bad" }));
-    expect(() => new E2EKeyStore(path)).toThrow(/拒絕啟動.*fail-closed.*恢復/s);
+    expect(() => new E2EKeyStore(path)).toThrow(E2EKeyStoreLoadError);
   });
 
   it("非 ENOENT 的讀取錯誤不能當首次初始化", () => {
@@ -202,8 +205,9 @@ describe("E2EKeyStore（持鑰/封裝/加解密/持久化）", () => {
     s.createForEnable("d1");
     chmodSync(dir, 0o500);
     try {
-      expect(() => s.createForEnable("d2")).toThrow(/fail-closed/);
-      expect(() => s.isE2E("d1")).toThrow(/fail-closed/);
+      // #572 合并后 core 有明确的错误层级：写盘失败抛 Persistence，此后实例 poison。
+      expect(() => s.createForEnable("d2")).toThrow(E2EKeyStorePersistenceError);
+      expect(() => s.isE2E("d1")).toThrow(E2EKeyStorePoisonedError);
     } finally {
       chmodSync(dir, 0o700);
     }
@@ -456,7 +460,7 @@ describe("E2EKeyStore（持鑰/封裝/加解密/持久化）", () => {
     const readyA = join(dir, "ready-a");
     const readyB = join(dir, "ready-b");
     const tsx = new URL("../node_modules/.bin/tsx", import.meta.url).pathname;
-    const keysModule = new URL("../src/e2e/keys.ts", import.meta.url).href;
+    const keysModule = new URL("../src/_core/e2e/keys.ts", import.meta.url).href;
     const run = (sid: string, ready: string) =>
       new Promise<void>((resolve, reject) => {
         const script = [

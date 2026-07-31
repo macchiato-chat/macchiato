@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { EventEmitter } from "node:events";
 import { WebSocketServer } from "ws";
-import { LinkBClient } from "../src/linkb/client";
+import { LinkBClient } from "../src/_core/linkb/client";
 
 class FakeSocket extends EventEmitter {
   readyState = 1;

@@ -10,7 +10,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { resolveCodexBin } from "./codex-bin";
-import { backoffMs, shouldAlert } from "../backoff";
+import { backoffMs, shouldAlert } from "../_core/backoff";
 
 export class AppServerDied extends Error {
   constructor(msg = "codex app-server died") {

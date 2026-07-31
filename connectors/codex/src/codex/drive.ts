@@ -20,23 +20,25 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { type CwdResolution, defaultWorkDir, resolveCwd } from "./cwd";
+import { type CwdResolution, defaultWorkDir, resolveCwd } from "../_core/cwd";
 import { loadDriveState, saveDriveState, codexPermsFor, CODEX_AUTH_ERR_RE } from "./state";
 import { resolveCodexBin } from "./codex-bin";
 import { deriveMeta, discoverRollouts } from "./mirror";
 import { generateTitle } from "./titles";
 import { materializeAttachment } from "./attachments";
-import type { LinkBClient } from "../linkb/client";
-import type { E2EKeyStore } from "../e2e/keys";
+import type { LinkBClient } from "../_core/linkb/client";
+import type { E2EKeyStore } from "../_core/e2e/keys";
 import {
   dispatchForE2EControl,
   E2EControlError,
   E2EControlVerifier,
   type E2EControlEnvelopeV1,
   type E2EControlKind,
-} from "../e2e/control";
+} from "../_core/e2e/control";
+import { e2eControlStorePath } from "../_core/identity";
+import { KIND } from "../identity";
 import type { Mirror } from "./mirror";
-import { logContent, safeErr, shortId, textLen } from "../safe-log";
+import { logContent, safeErr, shortId, textLen } from "../_core/safe-log";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -75,7 +77,7 @@ const E2E_SENSITIVE_METHODS = new Set([
 
 /** 新會話的默認工作目錄:`MACCHIATO_CODEX_WORKDIR` 覆蓋,否則 HOME(見 cwd.ts)。 */
 export function workDir(): string {
-  return defaultWorkDir();
+  return defaultWorkDir(KIND);
 }
 /** 沙箱模式:read-only / workspace-write / danger-full-access。默認 workspace-write。 */
 function sandboxMode(): string {
@@ -201,7 +203,7 @@ export class Drive {
     this.identityStateTrusted = st.identityStateTrusted;
     this.abandonedTurns = st.pending;
     this.pending = new Set();
-    this.e2eControl = e2eControl ?? (e2e ? new E2EControlVerifier(e2e) : undefined);
+    this.e2eControl = e2eControl ?? (e2e ? new E2EControlVerifier(e2e, e2eControlStorePath(KIND)) : undefined);
     // 影子兜底:啟動時把既有 wire→local 映射的 thread uuid 全灌給鏡像(跨重啟持久),鏡像據此
     // 永不給這些「被驅動過」的 thread 單獨建明文會話(重啟後內存態丟失也不復發)。
     for (const localSid of Object.values(this.map)) this.mirror?.markDrivenUuid?.(localSid);
@@ -410,7 +412,7 @@ export class Drive {
 
   /** #377 解析+校驗會話工作目錄(realpath/存在性/目錄/可選 allowlist;見 cwd.ts)。 */
   private resolveSessionCwd(sid: string): CwdResolution {
-    return resolveCwd(this.cwds[sid]);
+    return resolveCwd(KIND, this.cwds[sid]);
   }
 
   /** ok 時回 realpath 規範路徑,否則回嘗試路徑(供提示/比對)。 */

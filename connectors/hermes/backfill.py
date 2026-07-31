@@ -29,7 +29,8 @@ STALE_TURN_S = float(os.environ.get("MACCHIATO_STALE_TURN_S", "600"))  # 末行 
 # 用戶本機終端的 tui 會話也一併不鏡像（終端是本地、非外部消息平台）。結構化識別，取代舊的
 # _rev/_fwd id 映射跳過——後者在 Hermes 0.18+ 失效：create_session 返回的 gateway 句柄 ≠ state.db
 # 會話 id，mirror 看的是後者，永遠匹配不上。
-SKIP_SOURCES = {"cron", "scheduled", "system", "tui"}
+# #592 "subagent":hermes 子代理的子會話——父會話的內部執行細節,絕不成為獨立會話(import 與鏡像同用)。
+SKIP_SOURCES = {"cron", "scheduled", "system", "tui", "subagent"}
 # Belt-and-suspenders title filter (cron markers + our own test sessions).
 TITLE_SKIP_RE = re.compile(
     r"running as a scheduled cron|scheduled cron|^\[?\s*IMPORTANT: ?You are running|\btest\b|測試|用一句話|用一句话",

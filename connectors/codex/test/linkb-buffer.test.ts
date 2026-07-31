@@ -4,8 +4,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocketServer } from "ws";
-import { E2EKeyStore } from "../src/e2e/keys";
-import { LinkBClient } from "../src/linkb/client";
+import { E2EKeyStore } from "../src/_core/e2e/keys";
+import { LinkBClient } from "../src/_core/linkb/client";
 
 class FakeSocket extends EventEmitter {
   readyState = 1;

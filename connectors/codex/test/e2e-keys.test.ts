@@ -20,10 +20,10 @@ import {
   E2EKeyStoreStateError,
   deviceKeyFingerprint,
   settleE2EBackfillAck,
-} from "../src/e2e/keys";
-import * as ec from "../src/e2e/crypto";
-import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/e2e/control";
-import { withE2EKeyStoreLock } from "../src/e2e/file-lock";
+} from "../src/_core/e2e/keys";
+import * as ec from "../src/_core/e2e/crypto";
+import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/_core/e2e/control";
+import { withE2EKeyStoreLock } from "../src/_core/e2e/file-lock";
 
 function disableIntent(
   sid: string,
@@ -481,7 +481,7 @@ describe("E2EKeyStore（持鑰/封裝/加解密/持久化）", () => {
     const readyA = join(dir, "ready-a");
     const readyB = join(dir, "ready-b");
     const tsx = new URL("../node_modules/.bin/tsx", import.meta.url).pathname;
-    const keysModule = new URL("../src/e2e/keys.ts", import.meta.url).href;
+    const keysModule = new URL("../src/_core/e2e/keys.ts", import.meta.url).href;
     const run = (sid: string, ready: string) =>
       new Promise<void>((resolve, reject) => {
         const script = [
@@ -658,12 +658,12 @@ describe("#144 keystore 路徑隔離(fork 殘留回歸)", () => {
   it("默認路徑是 codex 專屬,絕不與 CC 共用(兩常駐進程整檔重寫會互相覆蓋 K_S)", async () => {
     const prev = process.env.MACCHIATO_CODEX_E2E_STORE;
     delete process.env.MACCHIATO_CODEX_E2E_STORE;
-    const { e2eStorePath } = await import("../src/e2e/keys");
-    expect(e2eStorePath()).toContain("codex-e2e.json");
-    expect(e2eStorePath()).not.toContain("claude-code-e2e.json");
+    const { e2eStorePath } = await import("../src/_core/identity");
+    expect(e2eStorePath("codex")).toContain("codex-e2e.json");
+    expect(e2eStorePath("codex")).not.toContain("claude-code-e2e.json");
     // env 覆蓋走 codex 專屬變量
     process.env.MACCHIATO_CODEX_E2E_STORE = "/x/custom.json";
-    expect(e2eStorePath()).toBe("/x/custom.json");
+    expect(e2eStorePath("codex")).toBe("/x/custom.json");
     if (prev === undefined) delete process.env.MACCHIATO_CODEX_E2E_STORE;
     else process.env.MACCHIATO_CODEX_E2E_STORE = prev;
   });

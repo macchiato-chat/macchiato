@@ -35,7 +35,7 @@ import { createServer, type Server } from "node:https";
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { verifyManifest } from "../src/selfupdate";
+import { verifyManifest } from "../src/_core/selfupdate";
 
 const FIXTURES = new URL("./fixtures/", import.meta.url).pathname;
 const REAL_MANIFEST = readFileSync(join(FIXTURES, "release.json"));
@@ -48,7 +48,12 @@ const DECOY_INSTALL_SH = Buffer.from(
 );
 
 const TSX = new URL("../node_modules/.bin/tsx", import.meta.url).pathname;
-const SELFUPDATE_MODULE = new URL("../src/selfupdate.ts", import.meta.url).href;
+// #572 起實現搬到 packages/connector-core;子進程用 tsx 直接按文件 URL 加載(該模塊只依賴
+// node 內建,不需要走包解析),故這裡指真實文件而非 "../src/_core/selfupdate"。
+const SELFUPDATE_MODULE = new URL(
+  "../src/_core/selfupdate.ts",
+  import.meta.url,
+).href;
 
 /** 自簽 localhost 證書(抄 scripts/release/bootstrap-e2e.mjs 的已驗證寫法)。 */
 function makeCertificate(work: string) {

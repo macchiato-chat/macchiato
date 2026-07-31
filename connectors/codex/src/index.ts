@@ -6,29 +6,31 @@
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadCreds, quarantineCreds } from "./linkb/creds";
-import { LinkBClient } from "./linkb/client";
-import { runPairing } from "./linkb/pairing";
+import { loadCreds, quarantineCreds } from "./_core/linkb/creds";
+import { LinkBClient } from "./_core/linkb/client";
+import { runPairing } from "./_core/linkb/pairing";
 import {
   E2EKeyStore,
   E2EKeyStoreStateError,
   settleE2EBackfillAck,
   type WrappedDeviceKey,
-} from "./e2e/keys";
-import { authorizeE2EDisableResume } from "./e2e/control";
+} from "./_core/e2e/keys";
+import { authorizeE2EDisableResume } from "./_core/e2e/control";
+import { e2eStorePath } from "./_core/identity";
 import { Mirror } from "./codex/mirror";
 import { announceImportAvailable, runImport } from "./codex/history-import";
 import { Drive, workDir } from "./codex/drive";
 import { gcTitlegenResidue } from "./codex/titles";
 import { AppServerClient } from "./codex/appserver";
-import { Projects } from "./codex/projects";
+import { Projects } from "./_core/projects";
 import { ModelsReporter } from "./codex/models";
 import { SkillsReporter } from "./codex/skills";
 import { AppServerDrive } from "./codex/drive-appserver";
 import { LoginFlow } from "./codex/login";
 import { HealthLoop } from "./health";
 import { CONNECTOR_VERSION } from "./linkb/proto";
-import { runVerifiedSelfUpdate } from "./selfupdate";
+import { runVerifiedSelfUpdate } from "./_core/selfupdate";
+import { KIND } from "./identity";
 
 // §update 連接器發布版本:單源自 packages/protocol 的 CONNECTOR_VERSION(#526 起 TS 三家不再
 // 各持副本——2026-07-20「bump 漏一家 → 該家永亮更新」與 2026-07-28 三連事故的同類根子都是
@@ -170,17 +172,17 @@ export function handleE2EControlFrame(
 }
 
 async function main(): Promise<void> {
-  let creds = loadCreds();
+  let creds = loadCreds(KIND);
   if (!creds) {
     console.log("Not paired — starting pairing (enter the code below at macchiato.chat):");
-    creds = await runPairing();
+    creds = await runPairing({ kind: KIND });
   }
   if (process.env.MACCHIATO_PAIR_ONLY) {
     console.log("Pairing complete (MACCHIATO_PAIR_ONLY) — exiting; start the service to run.");
     process.exit(0);
   }
 
-  const e2e = new E2EKeyStore();
+  const e2e = new E2EKeyStore(e2eStorePath(KIND));
   let drive!: Drive | AppServerDrive;
   const linkb = new LinkBClient(
     creds,
@@ -204,7 +206,7 @@ async function main(): Promise<void> {
   // RestartPreventExitStatus=78 停止拉起;舊 unit 重啟後無憑證進入等待配對,不再空轉。
   linkb.onFatal = (kind) => {
     if (kind === "revoked") {
-      const q = quarantineCreds();
+      const q = quarantineCreds(KIND);
       console.error(
         `✗ Unpaired from the Macchiato app — local credentials retired${q ? ` (${q})` : ""}. ` +
           "Re-run the install command to pair again.",
@@ -222,7 +224,7 @@ async function main(): Promise<void> {
   // #132 引擎選擇:默認 app-server v2(token delta/遠程審批/steer/原生圖片),initialize 握手
   // 探活失敗(老 codex 無此子命令/experimental 漂移)→ 回退 exec v1(功能同 1.5.x,不斷服務)。
   // env MACCHIATO_CODEX_ENGINE=exec 強制走 v1(逃生門)。
-  const projects = new Projects(linkb); // #227 備案目錄:project_op + 回合末惰性版本化
+  const projects = new Projects(linkb, KIND); // #227 備案目錄:project_op + 回合末惰性版本化
   projects.wire();
   let modelsClient: AppServerClient | undefined; // #231 app-server 才有 model/list
   let skills: SkillsReporter | undefined; // #317 app-server 才有 skills/list;exec/降級 → 空上報清緩存

@@ -19,13 +19,13 @@ import {
   E2EKeyStoreStateError,
   deviceKeyFingerprint,
   settleE2EBackfillAck,
-} from "../src/e2e/keys";
-import * as ec from "../src/e2e/crypto";
+} from "../src/_core/e2e/keys";
+import * as ec from "../src/_core/e2e/crypto";
 import {
   e2eControlKeyId,
   type E2EControlEnvelopeV1,
-} from "../src/e2e/control";
-import { withE2EKeyStoreLock } from "../src/e2e/file-lock";
+} from "../src/_core/e2e/control";
+import { withE2EKeyStoreLock } from "../src/_core/e2e/file-lock";
 
 type DiskSnapshot = Record<string, string>;
 
@@ -538,7 +538,7 @@ describe("E2EKeyStore（fail-closed 持鑰/封裝/加解密/持久化）", () =>
     const readyA = join(dir, "ready-a");
     const readyB = join(dir, "ready-b");
     const tsx = new URL("../node_modules/.bin/tsx", import.meta.url).pathname;
-    const keysModule = new URL("../src/e2e/keys.ts", import.meta.url).href;
+    const keysModule = new URL("../src/_core/e2e/keys.ts", import.meta.url).href;
     const run = (sid: string, ready: string) =>
       new Promise<void>((resolve, reject) => {
         const script = [

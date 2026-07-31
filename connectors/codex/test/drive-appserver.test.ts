@@ -20,7 +20,7 @@ import {
   E2EControlVerifier,
   type E2EControlEnvelopeV1,
   type E2EControlKind,
-} from "../src/e2e/control";
+} from "../src/_core/e2e/control";
 
 const SID = "01CXV2TESTSID0000000000000";
 const TID = "aaaaaaaa-0000-4000-8000-000000000001";
@@ -204,6 +204,43 @@ describe("#132 v2 回合生命週期", () => {
     expect(srcid.items).toContainEqual({ role: "user", srcId: "sid-user" });
   });
 
+  it("#623 turn/steer 注入的 user 也回填 srcId(新→舊排序);快照晚落盤 → 跨回合重試出池", async () => {
+    const { client, linkb, sent, mirror } = make();
+    // 回合1:開場 + 注入;快照裡注入的 user 行**尚未落盤**(引擎可能把注入排到下一回合)
+    const snapshot: Array<Record<string, unknown>> = [
+      { role: "user", text: "開場", srcId: "u-1" },
+      { role: "agent", text: "回覆一", srcId: "a-1" },
+    ];
+    mirror.srcIdSnapshot = () => [...snapshot];
+    await linkb.deliver(tui("prompt.submit", SID, { text: "開場" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    await linkb.deliver(tui("prompt.submit", SID, { text: "補一句" })); // 缺省 mode = inject(turn/steer)
+    expect(client.requests.some((r) => r.method === "turn/steer")).toBe(true);
+    client.fire("item/completed", { threadId: TID, item: { type: "agentMessage", id: "m1", text: "回覆一" } });
+    client.fire("turn/completed", { threadId: TID, turn: { id: "t1", status: "completed" } });
+    await tick();
+    const first = sent.filter((f: any) => f.t === "message_srcid");
+    expect(first).toHaveLength(1);
+    // 注入的配不上 → 留池不誤配;只回填開場與 agent
+    expect((first[0] as any).items).toEqual([
+      { role: "agent", srcId: "a-1" },
+      { role: "user", srcId: "u-1" },
+    ]);
+    // 回合2:注入的 user 行此時落盤 → 跨回合配對成功,新→舊排序(注入在前)
+    snapshot.push({ role: "user", text: "補一句", srcId: "u-2" }, { role: "agent", text: "回覆二", srcId: "a-2" });
+    await linkb.deliver(tui("prompt.submit", SID, { text: "第二輪" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t2" } });
+    client.fire("item/completed", { threadId: TID, item: { type: "agentMessage", id: "m2", text: "回覆二" } });
+    client.fire("turn/completed", { threadId: TID, turn: { id: "t2", status: "completed" } });
+    await tick();
+    const frames = sent.filter((f: any) => f.t === "message_srcid");
+    expect(frames).toHaveLength(2);
+    const items = (frames[1] as any).items as Array<{ role: string; srcId: string }>;
+    expect(items[0]).toEqual({ role: "agent", srcId: "a-2" });
+    expect(items.slice(1).map((i) => i.srcId)).toEqual(["u-2"]); // 池中注入項配對成功出池;
+    // 「第二輪」在快照無對應行不誤配;u-1 回合1已回填,本輪不重複。
+  });
+
   it("#393 快照無匹配消息 → 不發 message_srcid(不回填錯行)", async () => {
     const { client, linkb, sent, mirror } = make();
     mirror.srcIdSnapshot = () => []; // 尾行尚未落盤等
@@ -337,6 +374,73 @@ describe("#552 prompt mode(queue / stop&send)", () => {
     const starts = client.requests.filter((r) => r.method === "turn/start");
     expect(starts).toHaveLength(2);
     expect(starts[1]!.params.input).toEqual([{ type: "text", text: "接管的" }]);
+  });
+
+  // ── 邊界態:mode × 會話不在回合中 ─────────────────────────────────────────────
+  // dispatchInput 先看有沒有 active turn 再分流。閒置時三種 mode 都必須落到同一個 turn/start;
+  // 寫成「queue 就入 queuedInputs」的話,web 本地隊列的每一條自動投遞(#613 恆帶 mode:"queue")
+  // 都會躺在隊裡等一個永遠不會到來的 turn/completed——消息從用戶視角就是消失了。
+  it("閒置 + mode=queue → 立刻 turn/start(本地隊列自動投遞的主路徑,不能靜靜入隊)", async () => {
+    const { client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "排隊到期投遞", mode: "queue" }));
+    await tick();
+    const starts = client.requests.filter((r) => r.method === "turn/start");
+    expect(starts).toHaveLength(1);
+    expect(starts[0]!.params.input).toEqual([{ type: "text", text: "排隊到期投遞" }]);
+  });
+
+  it("閒置 + mode=inject → 起新回合而非 turn/steer(沒有可注入的回合時退化為普通發送)", async () => {
+    const { client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "注入但沒有回合", mode: "inject" }));
+    await tick();
+    expect(client.requests.filter((r) => r.method === "turn/steer")).toHaveLength(0);
+    expect(client.requests.filter((r) => r.method === "turn/start")).toHaveLength(1);
+  });
+
+  it("閒置 + mode=interrupt(Stop & Send)→ 不對不存在的回合發 turn/interrupt,直接起新回合", async () => {
+    const { client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "停了再說", mode: "interrupt" }));
+    await tick();
+    expect(client.requests.filter((r) => r.method === "turn/interrupt")).toHaveLength(0);
+    expect(client.requests.filter((r) => r.method === "turn/start")).toHaveLength(1);
+  });
+
+  it("未知 mode(新 client 打老連接器)→ 回退 codex 歷史默認 = turn/steer 注入,消息不丟", async () => {
+    const { client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "第一條" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    await linkb.deliver(tui("prompt.submit", SID, { text: "未來模式", mode: "telepathy" }));
+    const steer = client.requests.find((r) => r.method === "turn/steer");
+    expect(steer!.params).toMatchObject({ input: [{ type: "text", text: "未來模式" }] });
+    expect(client.requests.filter((r) => r.method === "turn/interrupt")).toHaveLength(0);
+  });
+
+  it("回合中連排兩條 queue → 收尾後按 FIFO 各起一回合,不合併不亂序", async () => {
+    const { client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "第一條" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    await linkb.deliver(tui("prompt.submit", SID, { text: "排隊甲", mode: "queue" }));
+    await linkb.deliver(tui("prompt.submit", SID, { text: "排隊乙", mode: "queue" }));
+    client.fire("turn/completed", { threadId: TID, turn: { id: "t1", status: "completed" } });
+    await tick();
+    client.fire("turn/completed", { threadId: TID, turn: { id: "t2", status: "completed" } });
+    await tick();
+    const texts = client.requests
+      .filter((r) => r.method === "turn/start")
+      .map((r) => (r.params.input as Array<{ text?: string }>)[0]!.text);
+    expect(texts).toEqual(["第一條", "排隊甲", "排隊乙"]);
+  });
+
+  it("steer 失敗時 mode=inject 同樣回退起新回合(注入未命中絕不等於丟消息)", async () => {
+    const { client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "第一條" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    client.queueResponse("turn/steer", new Error("expectedTurnId mismatch"));
+    await linkb.deliver(tui("prompt.submit", SID, { text: "注入但沒趕上", mode: "inject" }));
+    await tick();
+    const starts = client.requests.filter((r) => r.method === "turn/start");
+    expect(starts).toHaveLength(2);
+    expect(starts[1]!.params.input).toEqual([{ type: "text", text: "注入但沒趕上" }]);
   });
 });
 

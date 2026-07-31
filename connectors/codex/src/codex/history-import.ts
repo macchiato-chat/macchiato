@@ -3,8 +3,8 @@
  * 標題/cwd 從 rollout 自身派生。.jsonl.zst(壓縮的舊會話)v1 跳過並記數(不靜默丟)。
  */
 import { readFileSync } from "node:fs";
-import type { E2EKeyStore } from "../e2e/keys";
-import type { LinkBClient } from "../linkb/client";
+import type { E2EKeyStore } from "../_core/e2e/keys";
+import type { LinkBClient } from "../_core/linkb/client";
 import { deriveMeta, discoverRollouts } from "./mirror";
 import { readNewMessages } from "./transcripts";
 
@@ -17,6 +17,11 @@ interface BuiltSession {
   messages: Record<string, unknown>[];
   /** #154 所屬 project(rollout session_meta.cwd)——按 project 導入的分組鍵。 */
   project: string;
+  /**
+   * #602 真實工作目錄：有 session_meta.cwd 才帶，落到 server chat_sessions.cwd。
+   * 與 project 分離——project 可為 "(unknown)"（分組 UI），cwd 只在有絕對路徑時寫入。
+   */
+  cwd?: string;
 }
 
 type E2EStatus = Pick<E2EKeyStore, "isE2E">;
@@ -44,6 +49,7 @@ export function collectImportSessions(): { built: BuiltSession[]; compressed: nu
       source: "codex",
       messages: messages.map((m) => ({ role: m.role, text: m.text })),
       project: cwd || "(unknown)", // #154
+      ...(cwd ? { cwd } : {}), // #602
     });
   }
   return { built, compressed };

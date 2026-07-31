@@ -11,7 +11,7 @@ import { defineConformanceSuite } from "./_hermetic/conformance/index";
 import { assertPathIsSandboxed, getSandboxHome } from "./_hermetic/index";
 import { Drive } from "../src/openclaw/drive";
 import { MACCHIATO_PREFIX } from "../src/openclaw/mirror";
-import { credPath } from "../src/linkb/creds";
+import { credPath } from "../src/_core/identity";
 
 function makeDrive() {
   process.env.MACCHIATO_OPENCLAW_TITLED = join(mkdtempSync(join(tmpdir(), "oc-conf-t-")), "titled.json");
@@ -67,7 +67,7 @@ const tui = (method: string, sessionId: string, params: Record<string, unknown> 
 
 it("#303 hermetic: OpenClaw credPath 落在沙箱 HOME", () => {
   delete process.env.MACCHIATO_OPENCLAW_CRED;
-  const p = credPath();
+  const p = credPath("openclaw");
   expect(p.startsWith(getSandboxHome())).toBe(true);
   assertPathIsSandboxed(p);
 });

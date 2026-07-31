@@ -7,10 +7,10 @@ import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { deviceKeyFingerprint, E2EKeyStore } from "../src/e2e/keys";
-import { decrypt, genDeviceKeypair, unwrapKey } from "../src/e2e/crypto";
+import { deviceKeyFingerprint, E2EKeyStore } from "../src/_core/e2e/keys";
+import { decrypt, genDeviceKeypair, unwrapKey } from "../src/_core/e2e/crypto";
 import { isCommittedE2EBackfillResult } from "../src/cc/mirror";
-import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/e2e/control";
+import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/_core/e2e/control";
 
 const SID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 

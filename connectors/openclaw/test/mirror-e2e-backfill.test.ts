@@ -4,8 +4,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isCommittedE2EBackfillResult, Mirror, keyForSid, srcIdFor } from "../src/openclaw/mirror";
-import { E2EKeyStore } from "../src/e2e/keys";
-import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/e2e/control";
+import { E2EKeyStore } from "../src/_core/e2e/keys";
+import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/_core/e2e/control";
 
 const SID = "01ABCDEF"; // server ULID（大寫）；OpenClaw key 為小寫 macchiato 前綴
 const KEY = keyForSid(SID);
