@@ -566,6 +566,37 @@ export class LinkBClient {
       : raw.error === "control_rejected" || raw.error === "side_effect_failed";
   }
 
+  /**
+   * #634 / #368：`e2e_quiesce_result` 是 disable 屏障的唯一回執。
+   * enable 時會話還不是 protected（先 quiesce 再 markSessionE2E），結果能出去；
+   * disable 時會話已是 E2E → 若本閘不放行，server 永遠等不到 barrier、關密死鎖。
+   * 嚴格 shape：無正文、error 僅兩個字面量。
+   */
+  private safeE2EQuiesceResult(raw: Record<string, unknown>): boolean {
+    if (
+      !LinkBClient.onlyKeys(raw, [
+        "t",
+        "agentLinkId",
+        "hermesSessionId",
+        "requestId",
+        "mode",
+        "ok",
+        "error",
+      ]) ||
+      raw.t !== "e2e_quiesce_result" ||
+      raw.agentLinkId !== this.creds.agentLinkId ||
+      typeof raw.hermesSessionId !== "string" ||
+      !raw.hermesSessionId ||
+      typeof raw.requestId !== "string" ||
+      !raw.requestId ||
+      (raw.mode !== "enable" && raw.mode !== "disable") ||
+      typeof raw.ok !== "boolean"
+    ) return false;
+    return raw.ok
+      ? raw.error === undefined
+      : raw.error === "busy_timeout" || raw.error === "quiesce_failed";
+  }
+
   private static outboundSessionIds(raw: Record<string, any>): string[] {
     const ids = [raw.sessionId, raw.hermesSessionId, raw.chatId, raw.frame?.params?.session_id];
     if (Array.isArray(raw.sessions)) {
@@ -582,6 +613,10 @@ export class LinkBClient {
       // 也不允许异常详情借 error 字段成为 server 可见侧信道。
       if (raw.t === "e2e_control_result") {
         return this.safeE2EControlResult(raw) ? msg : null;
+      }
+      // #634：disable 路徑上會話已是 protected；不放行 = 關密永遠卡在 quiesce。
+      if (raw.t === "e2e_quiesce_result") {
+        return this.safeE2EQuiesceResult(raw) ? msg : null;
       }
       if ((raw.t === "import_batch" || raw.t === "mirror_append") && Array.isArray(raw.sessions)) {
         const sessions = raw.sessions.filter((session: unknown) => {

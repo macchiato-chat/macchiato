@@ -205,6 +205,72 @@ describe("Mirror", () => {
     expect(snapAgent?.msgId).toBe("msg_abc"); // Drive 據 seenMsgIds(=API message.id)匹配本回合 agent 組
   });
 
+  it("#655 單回合寫超 1MB:fromByte=回合起點把開場 user 行拉回窗內(固定尾窗會漏 → 雙投根因)", () => {
+    setupEnv();
+    // 2026-08-01 生產實測形態:開場 user 行在檔頭,其後 >1MB 的 sidechain 洪流(subagent 狂寫),
+    // 尾部才是主鏈 assistant 收尾。sidechain 行 fold 會跳過,但佔字節——正是把 user 行擠出
+    // 固定 1MB 尾窗的元兇。
+    const opening = userLine("開場問題");
+    const pad =
+      JSON.stringify({
+        type: "assistant",
+        isSidechain: true,
+        uuid: uuid(),
+        sessionId: SID,
+        message: { id: "sub", role: "assistant", content: [{ type: "text", text: "y".repeat(4096) }] },
+      }) + "\n";
+    const flood = pad.repeat(Math.ceil((1200 * 1024) / pad.length));
+    writeFileSync(file, opening + flood + assistantLineWithId("尾部回答", "msg_tail"));
+    const { linkb } = fakeLinkb();
+    const m = new Mirror(linkb);
+    // 舊語義(無 fromByte,固定尾窗):user 行在窗外 → srcId 回填必落空
+    expect(m.srcIdSnapshot(SID).find((x) => x.role === "user")).toBeUndefined();
+    // 新語義:fromByte=回合起點(新會話=0)→ user 行回到窗內;agent 尾組照常可取
+    const snap = m.srcIdSnapshot(SID, undefined, 0);
+    expect(snap.find((x) => x.role === "user")?.text).toBe("開場問題");
+    expect(snap.find((x) => x.role === "agent")?.msgId).toBe("msg_tail");
+  });
+
+  it("#658 待配 user 文本扣留:池命中不發不推水位;回填完成(池排空)後放行整批", () => {
+    setupEnv();
+    writeFileSync(file, userLine("待配的那句"));
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb);
+    let pend = ["待配的那句"];
+    m.pendingUserTexts = () => pend;
+    (m as any).doPoll();
+    expect(appends(sent)).toHaveLength(0); // 扣留:不發
+    pend = []; // srcId 回填完成 → 池排空
+    (m as any).doPoll();
+    const texts = appends(sent).flatMap((f: any) => f.sessions[0].messages).map((x: any) => x.text);
+    expect(texts).toEqual(["待配的那句"]); // 放行,水位此前未被推走
+  });
+
+  it("#658 扣留有界(5 輪):池項始終配不上 → 放行交 server 兜底,不永久卡鏡像", () => {
+    setupEnv();
+    writeFileSync(file, userLine("永遠配不上的句子"));
+    const { linkb, sent } = fakeLinkb();
+    const m = new Mirror(linkb);
+    m.pendingUserTexts = () => ["永遠配不上的句子"];
+    for (let i = 0; i < 5; i++) (m as any).doPoll();
+    expect(appends(sent)).toHaveLength(0); // 前 5 輪扣留
+    (m as any).doPoll();
+    expect(appends(sent)).toHaveLength(1); // 第 6 輪強制放行
+  });
+
+  it("#655 回合小:fromByte 晚於 size−1MB 時仍維持 1MB 尾窗(上回合晚落盤行的重試配對語義不變)", () => {
+    setupEnv();
+    // 上回合的 user 行已在檔內;本回合起點=檔末。窗口下沿取 min(fromByte, size−1MB)=0 →
+    // 上回合內容仍在窗內,池內舊項下回合收尾重試(#601)照舊能配上。
+    writeFileSync(file, userLine("上回合的話") + assistantLineWithId("上回合回答", "msg_prev"));
+    const from = statSync(file).size;
+    const { linkb } = fakeLinkb();
+    const m = new Mirror(linkb);
+    const snap = m.srcIdSnapshot(SID, undefined, from);
+    expect(snap.find((x) => x.role === "user")?.text).toBe("上回合的話");
+    expect(snap.find((x) => x.role === "agent")?.msgId).toBe("msg_prev");
+  });
+
   it("大會話分批發:每帧單會話 ≤ BATCH_MAX 條", () => {
     setupEnv();
     process.env.MACCHIATO_CC_BATCH_MAX = "10";

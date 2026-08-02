@@ -173,6 +173,7 @@ beforeEach(() => {
   delete process.env.MACCHIATO_CC_IDLE_S;
   delete process.env.MACCHIATO_CC_MODEL; // #143 防測試間污染(連接器服務設了它)
   delete process.env.MACCHIATO_CC_TITLE_MODE; // 同上:個別用例設 off 防偷跑 turnScript,不清會順著污染後面
+  delete process.env.MACCHIATO_CC_SRCID_RETRY_MS; // #658 個別用例調小快速重試,防污染
   vi.useRealTimers(); // #427 防上一用例假時鐘洩漏
 });
 
@@ -398,6 +399,76 @@ describe("Drive", () => {
       .map((i) => i.srcId);
     expect(users).toContain("u-late"); // 遲到的開場 prompt 被下一輪收尾補上
     d.dispose();
+  });
+
+  it("#658 掐點 steer 快速重試:回合末配不上,短延時後(無在途回合)自動補發 user srcId,不必等下回合", async () => {
+    process.env.MACCHIATO_CC_SRCID_RETRY_MS = "60";
+    turnScripts = [
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 40 },
+        { type: "result", subtype: "success", result: "" },
+      ],
+    ];
+    const snapshot: Array<Record<string, unknown>> = [];
+    const mirror = { setDriven() {}, unsetDriven() {}, fastForward() {}, markDrivenUuid() {}, markLivePosted() {}, srcIdSnapshot: () => [...snapshot] } as any;
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb, mirror);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "掐點的那句" }));
+    await new Promise((r) => setTimeout(r, 100)); // 回合已結束,快照還沒有 user 行,重試已排(60ms)
+    expect(
+      sent.filter((f: any) => f.t === "message_srcid").flatMap((f: any) => f.items).filter((i: any) => i.role === "user"),
+    ).toHaveLength(0);
+    snapshot.push({ role: "user", text: "掐點的那句", srcId: "u-race" }); // CLI 這才落盤
+    await new Promise((r) => setTimeout(r, 120)); // 等快速重試觸發——無需任何新回合
+    const users = sent
+      .filter((f: any) => f.t === "message_srcid")
+      .flatMap((f: any) => f.items as Array<{ role: string; srcId: string }>)
+      .filter((i) => i.role === "user")
+      .map((i) => i.srcId);
+    expect(users).toContain("u-race");
+    d.dispose();
+  });
+
+  it("#658 srcId 待配池跨進程持久:重啟不失憶,新進程回合收尾照樣補上", async () => {
+    turnScripts = [
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 40 },
+        { type: "result", subtype: "success", result: "" }, // 回合秒殺結束,user 行未落盤 → 配不上,池留存並已隨 saveMap 落盤
+      ],
+    ];
+    const snapshot: Array<Record<string, unknown>> = [];
+    const mirror = { setDriven() {}, unsetDriven() {}, fastForward() {}, markDrivenUuid() {}, markLivePosted() {}, srcIdSnapshot: () => [...snapshot] } as any;
+    const first = fakeLinkb();
+    const d = new Drive(first.linkb, mirror);
+    d.wire();
+    first.fire(tuiFrame(CC_SID, "prompt.submit", { text: "重啟前那句" }));
+    await new Promise((r) => setTimeout(r, 100));
+    d.dispose(); // 「進程死了」(dispose 清掉快速重試計時器,#655 前的舊路徑等價於這裡)
+
+    // 新進程:同一 state 檔重建 → 池恢復;CLI 早已把那行落盤
+    snapshot.push({ role: "user", text: "重啟前那句", srcId: "u-restart" });
+    turnScripts = [
+      [
+        { type: "system", subtype: "init", session_id: CC_SID },
+        { __wait: 40 },
+        { type: "result", subtype: "success", result: "" },
+      ],
+    ];
+    const second = fakeLinkb();
+    const d2 = new Drive(second.linkb, mirror);
+    d2.wire();
+    second.fire(tuiFrame(CC_SID, "prompt.submit", { text: "重啟後下一句" }));
+    await new Promise((r) => setTimeout(r, 150));
+    const users = second.sent
+      .filter((f: any) => f.t === "message_srcid")
+      .flatMap((f: any) => f.items as Array<{ role: string; srcId: string }>)
+      .filter((i) => i.role === "user")
+      .map((i) => i.srcId);
+    expect(users).toContain("u-restart"); // 舊進程的待配項在新進程被補上 → 鏡像重投撞唯一索引
+    d2.dispose();
   });
 
   it("#601 注入消息在 transcript 裡有兩個 uuid:第二個帶 alsoFor 掛同一條消息", async () => {
@@ -1315,6 +1386,104 @@ describe("#97→#104 background task 結構化事件 + 停止", () => {
     await new Promise((r) => setTimeout(r, 30));
     const taskFrames = sent.filter((f: any) => String(f.frame?.params?.type ?? "").startsWith("task."));
     expect(taskFrames).toHaveLength(0); // ambient 隐藏
+  });
+
+  it("#654 skip_transcript 任务同样隐藏(SDK 0.3.x 把 ambient 改叫这个名字)", async () => {
+    // 只認舊名的後果:壓縮/記憶這類 housekeeping 任務全冒到對話裡,和真子代理擠成一排無名「Agent」。
+    // 這條和上面那條並存 = 新舊兩個名字都認,換 SDK 不回退。
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "system", subtype: "task_started", task_id: "amb2", description: "housekeeping", skip_transcript: true },
+      { type: "system", subtype: "task_notification", task_id: "amb2", status: "completed", summary: "done" },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "go" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(sent.filter((f: any) => String(f.frame?.params?.type ?? "").startsWith("task."))).toHaveLength(0);
+  });
+});
+
+/**
+ * #654 子代理跑起來之後,用戶到底能看見什麼。
+ *
+ * 現場(2026-08-01 探針,SDK 0.3.201)實測的事件形狀——這幾條的判據全部照抄探針輸出:
+ *   task_started    description="Read three text files sequentially"  ← 任務標題,全程不變
+ *   task_progress   description="Reading a.txt"  last_tool_name="Read"   +2.4s
+ *   task_progress   description="Reading b.txt"  last_tool_name="Read"   +2.6s
+ *   task_progress   description="Reading c.txt"  last_tool_name="Read"   +2.8s
+ * 兩件事一眼可見:①`description` 是逐步變化的人話,`last_tool_name` 三步都是 "Read";
+ * ②三步只隔 200ms——舊的 5s 純時間節流會把後兩步全吃掉,用戶看到的是「Read」定格不動。
+ */
+describe("#654 子代理進度:看得見它在幹嘛", () => {
+  const progress = (task_id: string, description: string, tool_uses: number) => ({
+    type: "system",
+    subtype: "task_progress",
+    task_id,
+    description,
+    last_tool_name: "Read",
+    usage: { total_tokens: 1000 * tool_uses, tool_uses, duration_ms: 200 * tool_uses },
+  });
+  const runTask = async (steps: Record<string, unknown>[]) => {
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "system", subtype: "task_started", task_id: "sub1", tool_use_id: "tu1", description: "順序讀三個文件", subagent_type: "Explore", prompt: "讀 a.txt、b.txt、c.txt 並匯報" },
+      ...steps,
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame(CC_SID, "prompt.submit", { text: "go" }));
+    await new Promise((r) => setTimeout(r, 30));
+    return {
+      starts: sent.filter((f: any) => f.frame?.params?.type === "task.start").map((f: any) => f.frame.params.payload),
+      updates: sent.filter((f: any) => f.frame?.params?.type === "task.update").map((f: any) => f.frame.params.payload),
+    };
+  };
+
+  it("活動文案取 progress.description(人話),不再是三步都一樣的工具名", async () => {
+    const { updates } = await runTask([progress("sub1", "Reading a.txt", 1)]);
+    expect(updates).toHaveLength(1);
+    expect(updates[0].last_activity).toBe("Reading a.txt"); // 不是 "Read"
+  });
+
+  it("文案每變一次都放行 —— 200ms 三連步不能被 5s 節流吃掉", async () => {
+    const { updates } = await runTask([
+      progress("sub1", "Reading a.txt", 1),
+      progress("sub1", "Reading b.txt", 2),
+      progress("sub1", "Reading c.txt", 3),
+    ]);
+    expect(updates.map((u: any) => u.last_activity)).toEqual(["Reading a.txt", "Reading b.txt", "Reading c.txt"]);
+  });
+
+  it("文案沒變就仍然受 5s 節流(心跳不刷屏)", async () => {
+    const { updates } = await runTask([
+      progress("sub1", "Reading a.txt", 1),
+      progress("sub1", "Reading a.txt", 2), // 同一句話,只有數字在動
+      progress("sub1", "Reading a.txt", 3),
+    ]);
+    expect(updates).toHaveLength(1);
+  });
+
+  it("沒有 description 的老 CLI 退回 last_tool_name(不許退成空)", async () => {
+    const { updates } = await runTask([
+      { type: "system", subtype: "task_progress", task_id: "sub1", last_tool_name: "Grep", usage: { tool_uses: 1, total_tokens: 10 } },
+    ]);
+    expect(updates[0].last_activity).toBe("Grep");
+  });
+
+  it("task.start 帶齊子代理身份(類型 + 指令全文)—— 行內與 Details 全靠它,input 要等結束才到", async () => {
+    const { starts } = await runTask([]);
+    expect(starts[0]).toMatchObject({
+      kind: "subagent",
+      subagent_type: "Explore",
+      desc: "順序讀三個文件",
+      prompt: "讀 a.txt、b.txt、c.txt 並匯報",
+      tool_use_id: "tu1",
+    });
   });
 
   it("#212 E2E 会话不展示 task，但内部仍跟踪生命周期供 idle 保护", () => {

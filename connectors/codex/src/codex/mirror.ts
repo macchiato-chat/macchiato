@@ -458,12 +458,17 @@ export class Mirror {
     if (this.e2e?.isE2E(targetSid) || this.e2e?.isE2E(localThreadId)) return false;
     if (!wireSid && !mappedWire && this.plaintextLocalAllowed?.() === false) return false;
 
-    const { title } = deriveMeta(content);
+    // #659 cwd 一直是算出來就扔（deriveMeta 的簽名本來就是 {title, cwd}）——鏡像三處
+    // 全只解構 title，於是終端側 codex 會話一律沒有文件夾。cwd 是元數據不是正文，
+    // E2E 批也照常帶明文路徑（server 用靜態層 KEK 加密落庫），否則加密會話永遠無文件夾。
+    const { title, cwd } = deriveMeta(content);
+    const folder = cwd?.trim() ? { cwd: cwd.trim() } : {};
     // 投到 wire sid（app ULID）而非本地 threadId，掛回原會話
     const entry = {
       hermesSessionId: targetSid,
       title,
       source: "codex",
+      ...folder,
       messages: agents.map((m) => ({
         role: m.role,
         text: m.text,
@@ -749,7 +754,8 @@ export class Mirror {
       const all = readNewMessages(content, startOff, ordBase);
       const { messages } = all;
       if (messages.length) {
-        const { title } = deriveMeta(content);
+        const { title, cwd } = deriveMeta(content); // #659 文件夾：rollout 的 session_meta.cwd
+        const folder = cwd?.trim() ? { cwd: cwd.trim() } : {};
         // app-driven E2E 的 key/session identity 掛在 wire ULID，rollout 則以本地 UUID 命名。
         // unsetDriven 後 terminal 續聊必須仍回到 wire session 並用 wire key 加密，不能另建
         // local UUID 的 plaintext shadow session。
@@ -761,6 +767,7 @@ export class Mirror {
             hermesSessionId: e2eSid,
             title: this.e2e!.encryptText(e2eSid, title),
             source: "codex",
+            ...folder,
             e2e: true,
             messages: picked.map((m) => ({
               role: m.role,
@@ -773,6 +780,7 @@ export class Mirror {
             hermesSessionId: threadId,
             title,
             source: "codex",
+            ...folder,
             messages: picked.map((m) => ({
               role: m.role,
               text: m.text,
@@ -921,11 +929,13 @@ export class Mirror {
     }
     const { messages } = readNewMessages(content, 0, 0);
     if (!messages.length) return notFound();
-    const { title } = deriveMeta(content);
+    const { title, cwd } = deriveMeta(content); // #659 E2E 開關回灌同樣帶文件夾
+    const folder = cwd?.trim() ? { cwd: cwd.trim() } : {};
     const session: {
       hermesSessionId: string;
       title: string;
       source: string;
+      cwd?: string;
       e2e?: true;
       messages: Array<Record<string, unknown>>;
     } =
@@ -934,6 +944,7 @@ export class Mirror {
             hermesSessionId: wireSid,
             title: this.e2e.encryptText(wireSid, title),
             source: "codex",
+            ...folder,
             e2e: true,
             messages: messages.map((m) => ({
               role: m.role,
@@ -945,6 +956,7 @@ export class Mirror {
             hermesSessionId: wireSid,
             title,
             source: "codex",
+            ...folder,
             messages: messages.map((m) => ({
               role: m.role,
               text: m.text,

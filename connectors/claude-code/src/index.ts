@@ -96,6 +96,8 @@ async function main(): Promise<void> {
   const projects = new Projects(linkb, KIND); // #227 備案目錄:project_op + 回合末惰性版本化
   projects.wire();
   drive = new Drive(linkb, mirror, e2e, commands, projects);
+  // #658 掐點 steer 扣留:鏡像發批前查 Drive 待配池,命中的 user 行有界扣留給 srcId 回填讓路。
+  mirror.pendingUserTexts = (localSid) => drive.pendingUserTextsForLocal(localSid);
   const modelsReporter = new ModelsReporter(linkb); // #231/#553 建在 drive 後、start 在 ready 段
   drive.modelsIndex = modelsReporter; // #553 resolveEffort 兜底 high 的閘(當前 model 支持 effort 才下發)
   drive.wire();

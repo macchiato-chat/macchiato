@@ -116,11 +116,11 @@ export function allowedRootsEnvName(kind: CwdKind): string {
 }
 
 /**
- * Attach **落盘根**（claude-code / codex 同构；openclaw 走内存 base64，没有这个目录）。
+ * Attach **落盘**（claude-code / codex 同构；openclaw 走内存 base64，没有这个目录）。
  *
- * 只放路径：配额 / 并发上限 / TTL 那几个 env 各家读法与默认值本就不同，且 openclaw 的
- * 那份这里根本建模不了——放进来会变成「看着单源、实际只覆盖两家」的假单源。
- * materialize / gc 也仍在各家（产品形态分叉，见 README 的「刻意不进本包」）。
+ * 路径 + 配额/并发/TTL 的 **env 名** 在这里单源（#631：materialize/gc 已抽进
+ * `attachments/store`，按 `AttachKind` 读这些 env）。OpenClaw 仍不进这条路径。
+ * CC 独有的 `imageBlockFor` 留在 CC（原生图片 block；Codex exec 无图片输入）。
  */
 export type AttachKind = "claude-code" | "codex";
 
@@ -133,8 +133,42 @@ const ATTACH_DIR_FILE: Record<AttachKind, string> = {
   codex: "codex-attachments",
 };
 
+const ATTACH_QUOTA_ENV: Record<AttachKind, string> = {
+  "claude-code": "MACCHIATO_CC_ATTACH_QUOTA_BYTES",
+  codex: "MACCHIATO_CODEX_ATTACH_QUOTA_BYTES",
+};
+const ATTACH_MAX_INFLIGHT_ENV: Record<AttachKind, string> = {
+  "claude-code": "MACCHIATO_CC_ATTACH_MAX_INFLIGHT",
+  codex: "MACCHIATO_CODEX_ATTACH_MAX_INFLIGHT",
+};
+const ATTACH_TTL_ENV: Record<AttachKind, string> = {
+  "claude-code": "MACCHIATO_CC_ATTACH_TTL_S",
+  codex: "MACCHIATO_CODEX_ATTACH_TTL_S",
+};
+/** 下载请求的 User-Agent（两家历史上就不同，冻结成身份常量）。 */
+const ATTACH_USER_AGENT: Record<AttachKind, string> = {
+  "claude-code": "macchiato-cc-connector",
+  codex: "macchiato-codex-connector",
+};
+
 export function attachDir(kind: AttachKind): string {
   const env = process.env[ATTACH_DIR_ENV[kind]];
   if (env) return env;
   return join(homedir(), ".macchiato", ATTACH_DIR_FILE[kind]);
+}
+
+export function attachQuotaEnvName(kind: AttachKind): string {
+  return ATTACH_QUOTA_ENV[kind];
+}
+
+export function attachMaxInflightEnvName(kind: AttachKind): string {
+  return ATTACH_MAX_INFLIGHT_ENV[kind];
+}
+
+export function attachTtlEnvName(kind: AttachKind): string {
+  return ATTACH_TTL_ENV[kind];
+}
+
+export function attachUserAgent(kind: AttachKind): string {
+  return ATTACH_USER_AGENT[kind];
 }

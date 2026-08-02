@@ -109,6 +109,8 @@ interface ImportSession {
   hermesSessionId: string;
   title?: string;
   source?: string;
+  /** #659 會話工作目錄（transcript 條目的 cwd）；server 落 chat_sessions.cwd → 側欄文件夾。 */
+  cwd?: string;
   e2e?: boolean;
   messages: ImportMessage[];
 }
@@ -378,9 +380,9 @@ export class Mirror {
     }
     for (const id of msgIds) {
       if (id) set.add(id);
-      // #551 上限 64→512:#348 後 fastForward 不再快進,回合末鏡像重讀**整個回合**,集合必須
-      // 罩住回合全部主線 msgId;64 會被超長回合擠掉最老的(=重讀最先遇到的),開頭幾組漏過濾複讀落庫。
-      while (set.size > 512) set.delete(set.keys().next().value!); // 每 sid id 上限
+      // #551 上限 64→512;#658 再 →4096:幾小時的怪獸回合主線 assistant 消息可破 512,
+      // 擠掉最老的 = 重讀時開頭幾組漏過濾複讀落庫。4096 × 64 sid × ~30B ≈ 8MB 上界,可負擔。
+      while (set.size > 4096) set.delete(set.keys().next().value!); // 每 sid id 上限
     }
   }
 
@@ -473,13 +475,20 @@ export class Mirror {
    * srcId 是行 uuid(位置無關),故讀尾段窗口即可覆蓋剛結束的回合;窗口起點可能截斷首行(壞 JSON
    * 跳過)、或截斷某 assistant 組首行(該組 srcId 取窗內首行,不影響「取最後一組」的目標)。
    * 純只讀:不推水位線、不 emit、不改狀態。E2E 會話由加密批攜 srcId,不走這裡(調用方已隔離)。
+   *
+   * fromByte(#655):**本回合起點**的字節位(Drive 在 prompt 注入前快照 transcript 尺寸)。
+   * 單回合寫超 windowBytes(長 agentic 回合,subagent 狂寫)時,固定尾窗會把**開場 user 行**
+   * 擠出窗外 → user srcId 永遠回填不上 → 回合末鏡像整段重讀時把用戶的話再投一遍(2026-08-01
+   * 生產實測:1.45MB 回合,用戶氣泡雙份)。窗口下沿取 min(fromByte, size-windowBytes):
+   * 回合小 → 維持 1MB 尾窗(兼顧上一回合晚落盤行的重試配對);回合大 → 延伸到回合起點。
    */
-  srcIdSnapshot(sid: string, windowBytes = 1024 * 1024): CCMessage[] {
+  srcIdSnapshot(sid: string, windowBytes = 1024 * 1024, fromByte?: number): CCMessage[] {
     const f = this.fileForSid(sid);
     if (!f) return [];
     try {
       const size = statSync(f).size;
-      const from = Math.max(0, size - windowBytes);
+      const tail = Math.max(0, size - windowBytes);
+      const from = fromByte === undefined ? tail : Math.max(0, Math.min(fromByte, tail));
       const { entries, endOffset } = readEntries(f, from);
       if (!entries.length) return [];
       // now=MAX 強制結算尾部 in-flight 組,回合剛畢的 assistant 組也能取到 srcId。
@@ -492,6 +501,21 @@ export class Mirror {
   /** #200/#348：回合結束不再未經 ACK 快進；plaintext live 靠 srcId 去重(#393)，E2E 交 durable mirror。 */
   fastForward(sid: string): void {
     void sid;
+  }
+
+  /** #658 掐點 steer 扣留:待配 user 文本查詢(Drive 注入,見 index.ts 接線)+ 每 sid 已扣留輪數。 */
+  pendingUserTexts?: (localSid: string) => string[];
+  private readonly srcIdDeferPolls = new Map<string, number>();
+
+  /** #655 當前 transcript 尺寸(回合起點快照用;無檔/讀失敗 = 0)。 */
+  transcriptSize(sid: string): number {
+    const f = this.fileForSid(sid);
+    if (!f) return 0;
+    try {
+      return statSync(f).size;
+    } catch {
+      return 0;
+    }
   }
 
   /**
@@ -526,6 +550,7 @@ export class Mirror {
 
     const { entries, endOffset } = readEntries(file, off);
     if (!entries.length) return false;
+    this.noteCwd(localSid, entries); // #659：崩潰補撈的批同樣帶文件夾
     // force-settle 尾部 in-flight（now=MAX），把半截 agent 文本/工具也撈出來
     const folded = foldEntries(entries, endOffset, Number.MAX_SAFE_INTEGER);
     const agents = folded.messages.filter(
@@ -548,7 +573,7 @@ export class Mirror {
     // 水位推過後常規 poll 不再重讀；agent 帶 srcId，server 冪等索引兜底可見重複。
     const sent = this.sendOne(
       localSid,
-      this.entry(targetSid, title, agents),
+      this.entry(targetSid, title, agents, this.cwdBySid.get(localSid)),
       folded.consumedUpTo,
       undefined,
     );
@@ -867,6 +892,7 @@ export class Mirror {
         if (size <= off) break;
         const { entries, endOffset } = readEntries(file, off);
         if (!entries.length) break;
+        this.noteCwd(sid, entries); // #659 文件夾：CC 每行都帶 cwd，靠後的批靠緩存兜底
         // 自適應縮批(#268 二期):同一 sid 連續被 NACK 就對半縮條數上限(下限 1)。server 端的
         // 失敗常見於「這一批太大」(聚合條數/總字節撞限額),原樣重發同一批只會一直撞同一堵牆;
         // 縮到能過為止,ACK 後由 successShrink 逐步恢復。
@@ -890,6 +916,21 @@ export class Mirror {
         // #318 先濾掉 live 已投的殘片(回合末晚落盤、逃過 fastForward)——防重複最後一塊。濾空的批次
         // 照常推進水位線(下方 consumedUpTo),只是不 emit;不影響「無 user 不建會話」等既有守衛。
         const messages = this.dropLivePosted(sid, folded.messages);
+        // #658 掐點 steer 扣留:批內 user 行文本仍在 Drive 待配池(= live 對應消息尚無
+        // dedup_key,server 唯一索引攔不住這次重投)→ 本輪不發、不推水位,給 srcId 回填的
+        // 快速重試(drive settleLiveDedup,默認 2.5s)讓路。有界(5 輪 poll):池項若始終
+        // 配不上,放行交 server 兜底——寧可小概率重複,不永久卡住該會話的鏡像。
+        {
+          const pendTexts = this.pendingUserTexts?.(sid);
+          if (pendTexts?.length && messages.some((m) => m.role === "user" && pendTexts.includes(m.text.trim()))) {
+            const deferred = (this.srcIdDeferPolls.get(sid) ?? 0) + 1;
+            if (deferred <= 5) {
+              this.srcIdDeferPolls.set(sid, deferred);
+              break;
+            }
+          }
+          this.srcIdDeferPolls.delete(sid);
+        }
         // 「無真人消息就別建會話」判定：鏡像從未建過此會話（`!titles[sid]`）時,只有含 user 的批次
         // 才允許**創建**它;沒有一條 user 的批次一律跳過。涵蓋三類 driven/fork 殘片,都會冒影子會話:
         //   (1) 內部 fork 檔（subagent/後台任務，繼承標題無真人行）;
@@ -939,7 +980,7 @@ export class Mirror {
           } else {
             const sent = this.sendOne(
               sid,
-              this.entry(targetSid, newTitle ?? knownTitle ?? "Claude Code", messages),
+              this.entry(targetSid, newTitle ?? knownTitle ?? "Claude Code", messages, this.cwdBySid.get(sid)),
               consumedUpTo,
               newTitle,
             );
@@ -1013,13 +1054,38 @@ export class Mirror {
   }
 
   /** 構造批次條目；E2E 會話走加密（標題+內容盲存，srcId 是元數據保留）。 */
-  private entry(sid: string, title: string, messages: CCMessage[]): Record<string, unknown> {
+  /**
+   * #659 會話工作目錄：CC 的 transcript **每行都帶 cwd**，鏡像此前一直沒往上帶
+   * （只有一次性歷史導入 #602 帶了）。結果是終端側新建的會話一律沒有文件夾——
+   * 2026-08-01 生產庫 864 個會話只有 5 個有 cwd，這是主因。
+   *
+   * 按 localSid（transcript 的 uuid）緩存：批次是按偏移增量讀的，靠後的批可能一行 cwd
+   * 都沒有；緩存讓同一會話的後續批也帶得上。進程級即可——重啟後下一批自然重新填。
+   */
+  private readonly cwdBySid = new Map<string, string>();
+
+  /** 從一批 transcript 條目裡取 cwd（取第一個看得見的），並記進緩存。 */
+  private noteCwd(localSid: string, entries: Array<{ obj?: Record<string, unknown> }>): void {
+    const found = entries.find((e) => typeof e.obj?.cwd === "string" && (e.obj.cwd as string).trim());
+    if (found) this.cwdBySid.set(localSid, (found.obj!.cwd as string).trim());
+  }
+
+  private entry(
+    sid: string,
+    title: string,
+    messages: CCMessage[],
+    cwd?: string,
+  ): Record<string, unknown> {
     const mapped = messages.map((m) => toImportMessage(m));
+    // cwd 是**元數據不是正文**（同 source/archived）：E2E 會話也照常帶明文路徑，否則
+    // 加密會話永遠沒有文件夾。server 用靜態層 KEK 加密落庫，側欄分組讀得出來。
+    const folder = cwd?.trim() ? { cwd: cwd.trim() } : {};
     if (this.e2e?.isE2E(sid)) {
       return {
         hermesSessionId: sid,
         title: this.e2e.encryptText(sid, title),
         source: "claude-code",
+        ...folder,
         e2e: true,
         messages: mapped.map((m) => ({
           role: m.role,
@@ -1029,7 +1095,7 @@ export class Mirror {
         })),
       };
     }
-    return { hermesSessionId: sid, title, source: "claude-code", messages: mapped };
+    return { hermesSessionId: sid, title, source: "claude-code", ...folder, messages: mapped };
   }
 
   /** §19 D2：E2E 開啟/關閉時全量歷史回灌（enable=密文、disable=明文；ACK 后才删 K_S）。 */

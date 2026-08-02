@@ -112,7 +112,7 @@ LINK_B_PROTO = 5  # 對齊 server（packages/protocol：B=5，#348/#368 可靠 A
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.69"
+CONNECTOR_VERSION = "1.5.70"
 E2E_APPROVAL_PLAINTEXT_MAX = 64 * 1024
 # #279 E2E prompt 解密失敗的用戶可見回執(僅提示語,零內容洩漏;四連接器同文案)。
 E2E_DECRYPT_FAIL_WARNING = "無法解密這條消息(設備與連接器的加密密鑰可能失步)——請重試,或重新關閉再開啟本會話的端到端加密。"
@@ -3017,6 +3017,25 @@ class Connector:
                 self._turn_floor[server_sid] = await current_max_id()
             except Exception:
                 pass  # 拿不到 floor → 本回合不回填,會話級跳過照舊兜底
+        # #559:Hermes 0.19 起 tui_gateway **不再**對回合中的 prompt.submit 回 4009,而是按
+        # `display.busy_input_mode`(默認 `interrupt`)自行處置——掛在 4009 上的 steer 分支成了
+        # 死代碼,語義悄悄從「注入同一回合」變成由上游決定的 redirect/硬打斷,且狗糧機 2026-07-31
+        # 實測到跟進消息**整條消失**(用戶按了發送、氣泡也上去了,agent 沒收到,無任何一層報錯)。
+        # 改為**連接器自己判回合中**(openclaw 同款,不依賴上游錯誤碼):`_live_inflight` 由
+        # message.start/complete 維護,本就是簽封 interrupt 判「正在運行」用的同一份本地事實。
+        # steer 未命中(回合恰好剛結束 / 上游不支持)→ 回退 submit_prompt,消息絕不丟。
+        # 純附件無文字無法 steer(steer 只吃文本)→ 也走 submit_prompt。
+        if final_text and server_sid in self._live_inflight:
+            try:
+                res = await self.gw.steer(real, final_text)
+                # ⚠️ 回歸契約:scripts/regression/README.md 掛號,run-live-smoke.mjs hermes 斷言此串
+                print(f"· 回合進行中 → steer 注入跟進消息（status={(res or {}).get('status')}）")
+                return
+            except Exception as exc:
+                print(
+                    f"[#559 steer 未命中 → 回退 submit_prompt {server_sid}] {exc!r}",
+                    file=sys.stderr,
+                )
         try:
             await self.gw.submit_prompt(real, final_text)
         except GatewayDied:
@@ -3027,8 +3046,9 @@ class Connector:
                 self._retry_prompt(server_sid, final_text, retry_refs)
             )
         except GatewayError as exc:
-            # 回合進行中（4009 session busy）→ steer 把跟進消息注入正在跑的回合（方案 D），
-            # 不丟、不打斷；模型在下一次工具迭代時看到。純圖無文字無法 steer → 照舊上拋記日誌。
+            # 舊 Hermes(< 0.19)兜底:那時回合中的 submit 會回 4009 session busy,據此 steer 注入
+            # (#75 方案 D)。0.19 起主路徑已改為上面的 `_live_inflight` 前置判定(#559),此分支只
+            # 覆蓋「回合剛開始、message.start 還沒到」的窄窗與舊版本。純圖無文字無法 steer → 上拋。
             if exc.code == 4009 and final_text:
                 res = await self.gw.steer(real, final_text)
                 print(f"· 回合進行中 → steer 注入跟進消息（status={(res or {}).get('status')}）")

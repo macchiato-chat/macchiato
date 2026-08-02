@@ -1,6 +1,7 @@
 /**
  * 附件下载 SSRF 护栏（#12 / #249 / #379）——TS 三家同构安全原语。
- * materialize / gc / image block 仍在各家（产品路径不同）。
+ * CC/Codex 的 materialize / gc 在 `attachments/store`（#631）；OpenClaw 仍走内存 base64；
+ * CC 独有 image block 留在 CC。
  */
 import { lookup } from "node:dns/promises";
 import { lookup as dnsLookupCb } from "node:dns";

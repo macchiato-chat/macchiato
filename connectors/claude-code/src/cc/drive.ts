@@ -118,12 +118,40 @@ interface PersistedDriveState {
   models: Record<string, string>;
   efforts: Record<string, string>;
   pending: string[];
+  /** #658 srcId 待配池(#601 injectedTexts)持久化:進程死在「live 投遞後、回合末回填前」
+   * 不再失憶——重啟後池仍在,下一次回合收尾(或快速重試)照樣配對,封掉重啟型雙投窗口。 */
+  srcIdPools: Record<string, SrcIdWant[]>;
   identityStateTrusted: boolean;
   /**
    * aliases 是否能證明涵蓋所有歷史 fork。舊 schema 即使能從 current map 補一項，
    * 也無法證明過去沒有別的 uuid，故與 current-map trust 分開。
    */
   aliasHistoryTrusted: boolean;
+}
+
+/** #658 srcIdPools 解析:自己寫的檔,壞形狀直接拋(走 loadState 的候選回退)。 */
+function srcIdPoolRecord(value: unknown, field: string): Record<string, SrcIdWant[]> {
+  if (value === undefined) return {};
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${field} must be an object`);
+  }
+  const out: Record<string, SrcIdWant[]> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (!key || !Array.isArray(item)) throw new Error(`${field} contains an invalid entry`);
+    out[key] = item.map((w) => {
+      if (
+        w === null ||
+        typeof w !== "object" ||
+        typeof (w as SrcIdWant).text !== "string" ||
+        !Array.isArray((w as SrcIdWant).srcIds) ||
+        (w as SrcIdWant).srcIds.some((s) => typeof s !== "string")
+      ) {
+        throw new Error(`${field} contains an invalid want`);
+      }
+      return { text: (w as SrcIdWant).text, srcIds: [...(w as SrcIdWant).srcIds] };
+    });
+  }
+  return out;
 }
 
 function stringRecord(value: unknown, field: string): Record<string, string> {
@@ -226,6 +254,7 @@ function parseDriveState(raw: string, identityStateTrusted: boolean): PersistedD
       models: stringRecord(parsed.models ?? {}, "models"),
       efforts: stringRecord(parsed.efforts ?? {}, "efforts"),
       pending: pending as string[],
+      srcIdPools: srcIdPoolRecord(parsed.srcIdPools, "srcIdPools"), // #658 舊檔無此鍵 = {}
       identityStateTrusted,
       aliasHistoryTrusted:
         identityStateTrusted &&
@@ -243,6 +272,7 @@ function parseDriveState(raw: string, identityStateTrusted: boolean): PersistedD
     models: {},
     efforts: {},
     pending: [],
+    srcIdPools: {},
     identityStateTrusted,
     aliasHistoryTrusted: false,
   };
@@ -282,6 +312,12 @@ export function bypassAllowed(): boolean {
   const v = process.env.MACCHIATO_CC_ALLOW_BYPASS;
   if (v && /^(1|true|yes|on)$/i.test(v.trim())) return true;
   return permissionMode() === "bypassPermissions";
+}
+
+/** #658 掐點 steer 的 srcId 回填快速重試延時(見 settleLiveDedup);測試調小。 */
+function srcIdRetryMs(): number {
+  const v = Number(process.env.MACCHIATO_CC_SRCID_RETRY_MS);
+  return Number.isFinite(v) && v > 0 ? v : 2500;
 }
 
 /** #253 回合看門狗:回合內連續**無任何 SDK 事件**達此毫秒數 → 判定卡死、強制收尾。
@@ -435,6 +471,10 @@ interface TurnCtx {
   lastSdkPollAt: number;
   /** #253 回合看門狗:最近一次 SDK 事件的時間戳(活動式判卡——續期靠它,而非硬 deadline)。 */
   lastActivityAt: number;
+  /** #655 回合起點的 transcript 字節位(prompt 注入前快照;新會話無檔=0)。srcIdSnapshot 讀窗
+   * 下沿取 min(此值, size-1MB)——單回合寫超 1MB 時開場 user 行才不會被固定尾窗擠出、
+   * 導致 srcId 回填落空 → 鏡像重讀雙投用戶氣泡(2026-08-01 生產實測)。 */
+  srcIdFromByte: number;
 }
 
 /** #118 一條長活通道(每活躍會話一條;閒置回收,resume 重建)。 */
@@ -524,9 +564,33 @@ export class Drive {
     if (!t) return;
     const pool = this.injectedTexts.get(sid) ?? [];
     pool.push({ text: t, srcIds: [] });
-    while (pool.length > 8) pool.shift(); // 有界:配不上的陳舊項防洩漏
+    // #658 上限 8→64:單回合 steer >8 次時最早的被擠出=失去回填資格 → 雙投。64 遠超
+    // 真人單回合輸入密度;配上的會出池,這裡只兜「永遠配不上」的陳舊項防洩漏。
+    while (pool.length > 64) pool.shift();
     this.injectedTexts.set(sid, pool);
+    // sid 總數有界(#658 起池隨 saveMap 持久化,不能無界長):FIFO 淘汰最老的會話。
+    while (this.injectedTexts.size > 256) {
+      this.injectedTexts.delete(this.injectedTexts.keys().next().value!);
+    }
   }
+  /** #658 每 sid 至多一個在途的 srcId 回填快速重試計時器(見 settleLiveDedup)。 */
+  private readonly srcIdRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /**
+   * #658 給 mirror 的待配 user 文本查詢(以 CLI transcript uuid 為鍵):批內 user 行文本
+   * 命中 = 該行的 live 對應消息還沒拿到 dedup_key,mirror 應有界扣留、給回填讓路。
+   */
+  pendingUserTextsForLocal(localSid: string): string[] {
+    // wire sid 本身就是 CLI uuid 的會話(終端建的)map 可能無條目 → 先直查。
+    const wire =
+      (this.injectedTexts.has(localSid) && localSid) ||
+      Object.entries(this.map).find(
+        ([wireSid, cur]) => cur === localSid || this.aliases[wireSid]?.includes(localSid),
+      )?.[0];
+    if (!wire) return [];
+    return (this.injectedTexts.get(wire) ?? []).filter((w) => !w.srcIds.length).map((w) => w.text);
+  }
+
   /** #102 未處理 SDK 消息類型一次性日誌去重(`type/subtype`)——37 種 SDKMessage 只處理一小撮,靜默丟=升級漂移無感知。 */
   private readonly loggedUnknown = new Set<string>();
   /** #238 sid → 「總是允許」累積的**窄規則**串(settings 格式,如 "Bash(git status:*)")。
@@ -556,6 +620,11 @@ export class Drive {
     this.efforts = state.efforts;
     this.identityStateTrusted = state.identityStateTrusted;
     this.aliasHistoryTrusted = state.aliasHistoryTrusted;
+    // #658 恢復 srcId 待配池:上個進程死在「live 投遞後、回合末回填前」→ 池仍在,
+    // 下一次回合收尾照樣配對,重啟不再導致該回合 user 行永遠無 dedup_key。
+    for (const [sid, wants] of Object.entries(state.srcIdPools)) {
+      if (wants.length) this.injectedTexts.set(sid, wants);
+    }
     this.e2eControl = e2eControl ?? (e2e ? new E2EControlVerifier(e2e, e2eControlStorePath(KIND)) : undefined);
     // 影子兜底:啟動時把既有 ULID→CLI 映射的 CLI uuid 全灌給鏡像(跨重啟持久),鏡像據此永不給
     // 這些「被驅動過」的 CLI 會話單獨建會話(防重啟後污染態丟失又復發)。
@@ -636,6 +705,7 @@ export class Drive {
     if (busy?.turn) {
       if (mode === "inject" && !busy.turn.completed) {
         this.notePendingSrcIdText(sid, contentText(content));
+        this.saveMap(); // #658 注入即落盤池,進程死在回合中不失憶
         busy.input.push({
           type: "user",
           message: { role: "user", content },
@@ -810,6 +880,8 @@ export class Drive {
   /** #118 關停:回收全部通道(CLI 進程),供 index.ts shutdown 調用。 */
   dispose(): void {
     for (const ch of [...this.channels.values()]) this.closeChannel(ch);
+    for (const t of this.srcIdRetryTimers.values()) clearTimeout(t); // #658
+    this.srcIdRetryTimers.clear();
   }
 
   private emit(sid: string, type: string, payload: Record<string, unknown>): void {
@@ -989,6 +1061,10 @@ export class Drive {
   private readonly sessionTasks = new Map<string, Set<string>>();
   /** task_id → 上次 progress 上報時刻(節流)。 */
   private readonly taskProgressAt = new Map<string, number>();
+  /** #654 task_id → 上次已上報的活動文案 + 已因「文案變了」放行的次數(見 handleTaskEvent 的節流)。 */
+  private readonly taskActivity = new Map<string, { text: string; sent: number }>();
+  /** #654 ambient/skip_transcript 的 housekeeping 任務 id:標記只掛在 started 上,後續事件靠它認人。 */
+  private readonly hiddenTasks = new Set<string>();
   /** #384 task_id → 後台任務 output 文件路徑(從啟動回執解析;task_notification 讀真輸出作 report)。 */
   private readonly taskOutputFiles = new Map<string, string>();
   /** #384 report 上限:與 server TASK_REPORT_CAP 對齊(超長取尾——結局比開頭有用)。 */
@@ -1021,6 +1097,14 @@ export class Drive {
   }
   /** #104 進度改原地更新(不再刷屏),節流可比文本行時代(15s)更密。 */
   private static readonly PROGRESS_THROTTLE_MS = 5_000;
+  /**
+   * #654 「活動文案變了」可以繞過上面的 5s 節流,但每個任務最多繞 N 次——之後回落純時間節流。
+   * 定這個界的理由:5s 節流是給**數字**(tokens/步數)用的,對**文案**是災難——實測子代理三步
+   * (Reading a.txt → b.txt → c.txt)只隔 200ms,節流後用戶只看得到第一步,剩下全程假裝沒動。
+   * 反過來全放行又把上限交給了子代理的工具調用速率,故留這個上界兜底(每次 = 一條 task.update →
+   * server 一次 touchBlock + 一次扇出)。
+   */
+  private static readonly ACTIVITY_BURST_CAP = 120;
 
   private hasRunningTasks(sid: string): boolean {
     return (this.sessionTasks.get(sid)?.size ?? 0) > 0;
@@ -1070,6 +1154,12 @@ export class Drive {
       this.emit(sid, "message.complete", { text: turn.acc || "", status: "error", usage: {} });
       this.emit(sid, "review.summary", { summary: "⚠️ 回合長時間無響應,已判定卡死並收尾——請重試。" });
     }
+    // #655 強殺收尾也做 live×mirror 收斂衛生(closeChannel → onChannelEnd 會解 driven、
+    // 鏡像隨後整回合重讀;不回填 = 用戶氣泡雙投的同款口子)。
+    {
+      const cc = this.ccSidFor(sid);
+      if (cc) this.settleLiveDedup(sid, cc, turn);
+    }
     for (const p of this.approvals.get(sid) ?? []) p.resolve(false, false);
     this.approvals.delete(sid);
     ch.turn = undefined;
@@ -1102,7 +1192,24 @@ export class Drive {
    */
   private handleTaskEvent(sid: string, m: Record<string, any>, visible: boolean): void {
     const taskId: string = String(m.task_id ?? "");
-    if (!taskId || m.ambient === true) return; // ambient/housekeeping 任務隱藏
+    // ambient/housekeeping 任務隱藏。#654:SDK 0.3.x 把這個標記改名成 `skip_transcript`
+    // (`ambient` 在 0.3.201 的類型裡已不存在)——只認舊名的後果是壓縮/記憶這類後台任務
+    // 全冒到對話裡,和真子代理擠成一排無名「Agent」。兩個名字都認,舊 CLI 不回退。
+    if (!taskId) return;
+    const hidden = m.ambient === true || m.skip_transcript === true;
+    if (hidden) {
+      // 正常路徑靠 notification 出集;沒等到收尾就消失的(CLI 崩/會話棄)會留一個字符串在這。
+      // 連接器是長活進程,給個上界:滿了整體清空——最壞後果只是某個 housekeeping 任務的收尾
+      // 事件漏過濾一次,遠好過無界增長。
+      if (this.hiddenTasks.size > 500) this.hiddenTasks.clear();
+      this.hiddenTasks.add(taskId);
+    }
+    // 標記只保證掛在 task_started 上,後續 progress/notification 未必再帶——只看當前這條的話,
+    // 被藏起來的任務照樣會從 task.end 冒出來(生產上就是一條沒頭沒尾的完成行)。認 id。
+    if (hidden || this.hiddenTasks.has(taskId)) {
+      if (m.subtype === "task_notification") this.hiddenTasks.delete(taskId);
+      return;
+    }
     if (m.subtype === "task_started") {
       const set = this.sessionTasks.get(sid) ?? new Set();
       set.add(taskId);
@@ -1128,12 +1235,20 @@ export class Drive {
     } else if (m.subtype === "task_progress") {
       if (!visible) return;
       const now = Date.now();
-      if (now - (this.taskProgressAt.get(taskId) ?? 0) < Drive.PROGRESS_THROTTLE_MS) return; // 節流
+      // #654 活動文案優先用 progress 的 `description`——實測它是**逐步變化的人話**
+      // (Reading a.txt → Reading b.txt → Reading c.txt),而 `last_tool_name` 三步都是 "Read"。
+      // 這是目前唯一能看見「子代理正在幹嘛」的信號,退回工具名只是兜底。
+      // ⚠️ 別跟 task_started.description 搞混:那個是任務標題(「順序讀三個文本文件」),全程不變。
+      const activity = String(m.description ?? m.last_tool_name ?? "").slice(0, 120);
+      const prev = this.taskActivity.get(taskId);
+      const changed = !!activity && activity !== prev?.text && (prev?.sent ?? 0) < Drive.ACTIVITY_BURST_CAP;
+      if (!changed && now - (this.taskProgressAt.get(taskId) ?? 0) < Drive.PROGRESS_THROTTLE_MS) return; // 節流
       this.taskProgressAt.set(taskId, now);
+      if (activity) this.taskActivity.set(taskId, { text: activity, sent: (prev?.sent ?? 0) + (changed ? 1 : 0) });
       // #222:步數/token 也是進度——沒有新工具名照樣上報(節流已擋頻率)。
       const usage = (m.usage ?? {}) as Record<string, unknown>;
       const update = {
-        ...(m.last_tool_name ? { last_activity: String(m.last_tool_name) } : {}),
+        ...(activity ? { last_activity: activity } : {}),
         ...(typeof usage.tool_uses === "number" ? { tool_uses: usage.tool_uses } : {}),
         ...(typeof usage.total_tokens === "number" ? { total_tokens: usage.total_tokens } : {}),
       };
@@ -1144,6 +1259,7 @@ export class Drive {
       set?.delete(taskId);
       if (set?.size === 0) this.sessionTasks.delete(sid);
       this.taskProgressAt.delete(taskId);
+      this.taskActivity.delete(taskId);
       const status = m.status === "completed" ? "completed" : m.status === "stopped" ? "stopped" : "error";
       // notification 的 desc 不回退 summary(否則兩者相同時 summary 被誤判重複而丟——
       // 後台 bash 常只帶 summary 不帶 description)。desc 供 server 錯過 start 時兜底建行。
@@ -1738,10 +1854,16 @@ export class Drive {
       usageInFlight: false,
       lastSdkPollAt: 0,
       lastActivityAt: Date.now(), // #253
+      // #655 prompt 尚未注入 → 此刻的檔尺寸必 ≤ 本回合 user 行的落盤位置(新會話無檔=0)。
+      srcIdFromByte: hadCc ? (this.mirror?.transcriptSize?.(this.ccSidFor(sid)!) ?? 0) : 0,
     };
     // #141b 回合起始快照 SDK session 累計 output 作基線(此刻本回合尚未產出 → 乾淨)。E2E 跳過。
     if (!isE2E) void this.snapshotUsageBaseline(ch, ch.turn);
     this.armTurnWatchdog(ch); // #253 起看門狗
+    // #601 開場 prompt 進待配池:配不上就留到下回合再試(見 notePendingSrcIdText)。
+    // 送達重投不重記——同一條 user 消息只該配一個 srcId。
+    // #658 在 saveMap **之前**入池:池隨同一次落盤持久,進程死在 input.push 前後都不失憶。
+    if (!opts?.retriedDelivery) this.notePendingSrcIdText(sid, contentText(content));
     this.pending.add(sid); // #200 在途回合登記(進程死在此後 → 下次啟動提示重發)
     if (!this.saveMap() && isE2E) {
       // E2E 首回合若在 input.push 前連 pending 身份快照都落不了盤，CLI 一旦收件並換
@@ -1755,9 +1877,6 @@ export class Drive {
         `failed to persist Claude Code E2E turn identity before delivery (${sid})`,
       );
     }
-    // #601 開場 prompt 進待配池:配不上就留到下回合再試(見 notePendingSrcIdText)。
-    // 送達重投不重記——同一條 user 消息只該配一個 srcId。
-    if (!opts?.retriedDelivery) this.notePendingSrcIdText(sid, contentText(content));
     ch.input.push({
       type: "user",
       message: { role: "user", content },
@@ -2152,6 +2271,8 @@ export class Drive {
       usageInFlight: false,
       lastSdkPollAt: 0,
       lastActivityAt: Date.now(), // #253
+      // #655 續寫回合無自己的 user prompt;取當前尺寸 → 快照維持 ≥1MB 尾窗(池內舊項重試靠它)。
+      srcIdFromByte: this.mirror?.transcriptSize?.(this.ccSidFor(sid) ?? "") ?? 0,
     };
     if (!ch.turn.isE2E) void this.snapshotUsageBaseline(ch, ch.turn); // #141b 基線快照
     this.armTurnWatchdog(ch); // #253 合成回合也上看門狗(無後續內容 → 判卡收尾,不永久卡 pending)
@@ -2216,12 +2337,9 @@ export class Drive {
       // 前登記,確保解除 driven 後恢復鏡像時集合已就位。
       // E2E live 路徑不投正文，transcript mirror 是唯一可靠内容源；不得把 assistant id
       // 登记成“已 live 投递”后从 durable 批里删掉。明文仍用精确 id 吞掉晚落盘残片。
-      if (!turn.isE2E && turn.seenMsgIds.size) {
-        this.mirror?.markLivePosted(cc, turn.seenMsgIds);
-      }
       // #393 回合末把本回合 live 消息回填 srcId(=transcript 行 uuid)作 server dedup_key——
       // 跨進程重啟後鏡像重投同一行撞 (session,dedup_key) 唯一索引被吃掉,不再雙份。E2E 走加密批(自帶 srcId)。
-      if (!turn.isE2E) this.backfillLiveSrcIds(sid, cc, turn);
+      this.settleLiveDedup(sid, cc, turn);
       this.mirror?.fastForward(cc); // #200/#348 仅保留兼容调用，未 ACK 不推进
       this.mirror?.unsetDriven(cc); // 僅回合級跳過：解除後終端側活動恢復鏡像（CC 無 gateway,鏡像是唯一路）
     }
@@ -2250,6 +2368,38 @@ export class Drive {
   }
 
   /**
+   * #655 live×mirror 收斂衛生(回合收尾統一入口):markLivePosted(agent 靠它擋鏡像重讀)+
+   * srcId 回填(user 靠 server 唯一索引擋)。此前只有 finishTurn 做——watchdog 強殺
+   * (forceFinalizeStuck)與通道崩潰(onChannelEnd)兩條收尾路一樣會解除 driven、觸發鏡像
+   * 整回合重讀,漏做 = 同樣的雙投口子。E2E 走加密批(自帶 srcId),不經此。
+   */
+  private settleLiveDedup(sid: string, cc: string, turn: TurnCtx): void {
+    if (turn.isE2E) return;
+    if (turn.seenMsgIds.size) this.mirror?.markLivePosted(cc, turn.seenMsgIds);
+    this.backfillLiveSrcIds(sid, cc, turn);
+    // #658 掐點 steer 封口:回合結束前最後一瞬注入的消息,CLI 往往還沒把該行落盤 →
+    // 上面快照配不上。原設計等下回合收尾重試,但鏡像的下一輪 poll(幾秒後,行已落盤)
+    // 會搶先把它補投成重複——所以這裡再排**一次**短延時重試(默認 2.5s,配合 mirror 的
+    // 有界扣留)。約束:僅 user 項(agent 已配過;seenMsgIds 傳空)、且觸發時 sid 無在途
+    // 回合才發——server 的 backfillDedupKey 取「最新 dedup 空行」,撞上下一回合的新行會錯認。
+    if (
+      typeof this.mirror?.srcIdSnapshot === "function" && // 無鏡像(或殘缺樁)= 無可配對,不空轉
+      (this.injectedTexts.get(sid) ?? []).some((w) => !w.srcIds.length) &&
+      !this.srcIdRetryTimers.has(sid)
+    ) {
+      const fromByte = turn.srcIdFromByte;
+      const timer = setTimeout(() => {
+        this.srcIdRetryTimers.delete(sid);
+        if (this.channels.get(sid)?.turn) return; // 新回合已開 → 交它的收尾重試
+        this.backfillLiveSrcIds(sid, cc, { seenMsgIds: new Set(), srcIdFromByte: fromByte });
+        this.saveMap(); // 池可能剛排空,持久化跟上
+      }, srcIdRetryMs());
+      timer.unref?.();
+      this.srcIdRetryTimers.set(sid, timer);
+    }
+  }
+
+  /**
    * #393 回合末:把本回合 live 投遞的 user/agent 消息回填 transcript 行 uuid 作 server dedup_key
    * (message_srcid,#13 同款,Hermes/OpenClaw 驗過的模式)。CC 無常駐 gateway,live×mirror 收斂
    * 全靠此:server 的 (session_id,dedup_key) 唯一索引此後對 CC 生效,跨進程重啟鏡像重投同一 transcript
@@ -2262,9 +2412,14 @@ export class Drive {
    * 拆多 assistant 組而 live 只投一條合併消息,僅最後一組能收斂(中間組跨重啟仍可能重投)——與 OpenClaw
    * 「只回填 lastAssistant」同限。純只讀快照,失敗吞掉(去重是加固,不該影響主回合)。
    */
-  private backfillLiveSrcIds(sid: string, cc: string, turn: TurnCtx): void {
+  private backfillLiveSrcIds(
+    sid: string,
+    cc: string,
+    turn: Pick<TurnCtx, "seenMsgIds" | "srcIdFromByte">, // #658 快速重試只需這兩件
+  ): void {
     try {
-      const msgs = this.mirror?.srcIdSnapshot(cc) ?? [];
+      // #655 讀窗下沿延伸到回合起點:單回合寫超 1MB 時開場 user 行仍在窗內(否則回填必落空)。
+      const msgs = this.mirror?.srcIdSnapshot(cc, undefined, turn.srcIdFromByte) ?? [];
       if (!msgs.length) return;
       const items: Array<{ role: "user" | "agent"; srcId: string; alsoFor?: string }> = [];
       const agent = [...msgs]
@@ -2374,6 +2529,7 @@ export class Drive {
       }
       const cc = this.ccSidFor(sid);
       if (cc) {
+        this.settleLiveDedup(sid, cc, turn); // #655 崩潰收尾同樣要收斂,防鏡像重讀雙投
         this.mirror?.fastForward(cc);
         this.mirror?.unsetDriven(cc);
       }
@@ -2793,6 +2949,7 @@ export class Drive {
       models: {},
       efforts: {},
       pending: [],
+      srcIdPools: {},
       identityStateTrusted: false,
       aliasHistoryTrusted: false,
     };
@@ -2819,6 +2976,8 @@ export class Drive {
         models: this.models,
         efforts: this.efforts, // #231
         pending: [...this.pending], // #200 在途回合
+        // #658 srcId 待配池(只存非空,有界:64 項/sid × 256 sid,見 notePendingSrcIdText)
+        srcIdPools: Object.fromEntries([...this.injectedTexts].filter(([, w]) => w.length)),
       });
       writeFileSync(tmp, snapshot);
       renameSync(tmp, mapPath());
