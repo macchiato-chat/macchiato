@@ -22,6 +22,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type CwdResolution, defaultWorkDir, resolveCwd } from "../_core/cwd";
 import { loadDriveState, saveDriveState, codexPermsFor, CODEX_AUTH_ERR_RE } from "./state";
+import { formatCodexTurnError, parseModelNeedsNewerCli } from "./turn-errors";
 import { resolveCodexBin } from "./codex-bin";
 import { deriveMeta, discoverRollouts } from "./mirror";
 import { generateTitle } from "./titles";
@@ -152,6 +153,15 @@ export class Drive {
   readonly counters: Record<string, number> = { driveErrors: 0 };
   /** #310 認證失效持續態:auth 類回合失敗置 true(health 上報 authOk=false),成功回合恢復。 */
   authFailed = false;
+  /** #669 心跳:有進行中回合(在途 sid 集非空)。為「閒時更新」預留,本階段只寫進 health.json。 */
+  get busy(): boolean {
+    return this.pending.size > 0;
+  }
+  /** #669 心跳:Codex 連接器沒有掛起式審批(沙箱策略由 codex 自己裁決,不回傳 UI)→ 恆 false。
+   * 誠實地報 false,而不是省略字段:supervisor 側「字段缺失」要留給「連接器太舊」。 */
+  get hasPendingApproval(): boolean {
+    return false;
+  }
   /** serverSid → codex thread uuid(跨重啟持久)。 */
   private map: Record<string, string>;
   /** serverSid → 會話工作目錄。 */
@@ -358,11 +368,16 @@ export class Drive {
 
   /**
    * Link B ready / 在線 E2E 控制幀的硬閘：wire ULID 需要持久 local UUID 映射。
-   * 主檔缺失/壞檔（含只從可能過期的 .bak 恢復）時整個連接器退出，不能讓任何 live、
-   * mirror、history 路徑猜成 plaintext。UUID 原生鏡像會話身份相同，不依賴此映射。
+   * UUID 原生鏡像會話身份相同，不依賴此映射。
+   *
+   * `allowMissingSids`：pending-enable bootstrap 白名單（#687，對齊 CC/OpenClaw）。
+   * App ULID 在首次 thread 映射前 map 為空是常態；不得因此 onFatal 殺進程。
+   * 內容面仍走無參 strict assert。
    */
-  assertE2EIdentitySafe(): void {
-    const requiringMap = this.protectedWireSids().filter((sid) => !UUID_RE.test(sid));
+  assertE2EIdentitySafe(allowMissingSids: ReadonlySet<string> = new Set()): void {
+    const requiringMap = this.protectedWireSids().filter(
+      (sid) => !allowMissingSids.has(sid) && !UUID_RE.test(sid),
+    );
     if (!requiringMap.length) return;
     const missing = requiringMap.filter((sid) => !UUID_RE.test(this.map[sid] ?? ""));
     if (!this.identityStateTrusted || missing.length) {
@@ -844,14 +859,28 @@ export class Drive {
     const authErr = err && CODEX_AUTH_ERR_RE.test(stderr);
     if (authErr) this.authFailed = true;
     else if (status === "complete") this.authFailed = false;
+    // 模型需更新 CLI → 清粘滯 + 黑名單(exec 引擎不自動重試:每回合 spawn,用戶重發即可用新 model)
+    if (err && !finalText) {
+      const need = parseModelNeedsNewerCli(stderr || turn.usage.error);
+      if (need) {
+        if (this.models[sid] === need.model) {
+          delete this.models[sid];
+          this.saveMap();
+        }
+      }
+    }
     if (turn.isE2E) {
       this.sendE2ETurn(sid, finalText);
     } else {
       if (err && !finalText) {
+        // 人話 + 可行動下一步(與 v2 同 formatCodexTurnError;stderr 空則帶 exit code)
+        const raw = stderr?.trim()
+          ? stderr
+          : turn.usage.error
+            ? String(turn.usage.error)
+            : `codex exit ${code}`;
         this.emit(sid, "review.summary", {
-          summary: authErr
-            ? "❌ Codex 登錄已失效——請在連接器主機終端跑 `codex login` 重新登錄後重試"
-            : `❌ 回合失敗(codex exit ${code}${stderr ? ": " + stderr.slice(0, 200) : ""})`,
+          summary: formatCodexTurnError(raw),
         });
       }
       this.startMsg(sid, turn);

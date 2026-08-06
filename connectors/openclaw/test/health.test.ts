@@ -1,4 +1,5 @@
-import { beforeEach, describe, it, expect } from "vitest";
+import { afterEach, beforeEach, describe, it, expect } from "vitest";
+import { handleInstallerExit, resetSelfUpdateState } from "../src/_core/selfupdate";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -127,5 +128,29 @@ describe("#112 深度兼容自檢", () => {
     expect(h.lastError).toContain("7 次重連失敗");
     const gw2: any = { isConnected: true, helloOk: { protocol: 4 }, reconnectFailures: 7 };
     expect(buildHealth(gw2, mirror, "0.1.0").lastError).toBeNull();
+  });
+});
+
+/**
+ * #773 installer 裝成功、退出 0，而真正在跑的進程沒被替換 → 寬限期後放閂並掛一句人話。
+ * 這裡驗最後一段接線：那句話真的走進了 health 上報體，且**排在所有真錯誤之後**。
+ * （閂本身的行為在 selfupdate.test.ts 的「#773 裝完沒重啟」，四家同構。）
+ */
+describe("#773 更新已裝好但沒重啟 → health 說人話(不是失敗)", () => {
+  afterEach(() => resetSelfUpdateState());
+
+  it("沒有真錯誤時上浮「已下載,重啟後生效」;有真錯誤時真錯誤優先", async () => {
+    const { gw, mirror } = fakes(1000);
+    resetSelfUpdateState();
+    // 正控:這一步之前 lastError 本來就是 null——下面那句確實是由 #773 這條路帶進來的
+    expect(buildHealth(gw, mirror, "0.1.0").lastError).toBeNull();
+    handleInstallerExit(0, "1.5.70", 0);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const notice = buildHealth(gw, mirror, "0.1.0").lastError!;
+    expect(notice).toContain("1.5.70");
+    expect(notice).toMatch(/重啟/);
+    expect(notice).not.toMatch(/失敗|失败|fail/i); // 🚨 手動跑不重啟是正常的,說成失敗就是撒謊
+    mirror.lastError = "別的錯"; // 真錯誤永遠壓過信息位(#348 靜默凍結的教訓)
+    expect(buildHealth(gw, mirror, "0.1.0").lastError).toBe("別的錯");
   });
 });

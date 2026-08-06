@@ -8,10 +8,12 @@
  */
 import type { ConnectorHealthState } from "./linkb/proto";
 import type { LinkBClient } from "./_core/linkb/client";
+import type { HeartbeatWriter } from "./_core/heartbeat";
 import type { OpenClawGateway } from "./openclaw/gateway";
 import type { Drive } from "./openclaw/drive";
 import type { Mirror } from "./openclaw/mirror";
 import { smokeParseLatest } from "./openclaw/history-import";
+import { selfUpdatePendingRestartNotice } from "./_core/selfupdate";
 
 const HEALTH_INTERVAL_MS = Number(process.env.MACCHIATO_HEALTH_INTERVAL_MS) || 60_000;
 const MIRROR_STUCK_MS = Number(process.env.MACCHIATO_MIRROR_STUCK_MS) || 120_000;
@@ -67,7 +69,13 @@ export function buildHealth(gw: OpenClawGateway, mirror: Mirror, version: string
     compatOk: compat.ok,
     // #308 mirror off:輪詢本來就不跑,恆報 0——否則 server 60s 後誤判 degraded、tick 看門狗無限「自愈」。
     mirrorLastPollAgeS: mirror.disabled ? 0 : Math.round((Date.now() - mirror.lastPollAt) / 1000),
-    lastError: stale ?? gwDown ?? (compat.ok ? mirror.lastError : (compat.reason ?? "兼容自檢失敗")),
+    // #773 尾部再兜一句「新版已裝好、等重啟」——僵屍 gateway / gateway 連不上 / 兼容失敗 /
+    // 鏡像錯誤都排在它前面,信息位絕不蓋掉真問題(#348 靜默凍結的教訓)。
+    lastError:
+      stale ??
+      gwDown ??
+      (compat.ok ? mirror.lastError : (compat.reason ?? "兼容自檢失敗")) ??
+      selfUpdatePendingRestartNotice(),
     kind: "openclaw",
     connectorVersion: version,
     stt: false,
@@ -84,6 +92,8 @@ export class HealthLoop {
     private readonly mirror: Mirror,
     private readonly version: string,
     private readonly drive?: Drive, // #10:重投/驅動錯誤計數來源
+    /** #669 本地心跳(自帶時鐘、早於 linkb.start());這裡只餵最新上報體。 */
+    private readonly heartbeat?: HeartbeatWriter,
   ) {}
 
   start(): void {
@@ -103,6 +113,9 @@ export class HealthLoop {
       this.mirror.restart();
       h.lastError = `mirror stuck ${h.mirrorLastPollAgeS}s → restarted`;
     }
+    // #669 把最新上報體餵給心跳文件(它自己有時鐘,連不上 server 時照樣寫)。
+    // 只擴文件、不擴 wire:下面發出去的 connector_health 形狀一個字節都沒動。
+    this.heartbeat?.setSnapshot(h as unknown as Record<string, unknown>);
     if (this.linkb.isReady) {
       this.linkb.send({ t: "connector_health", agentLinkId: this.linkb.agentLinkId, health: h });
     }

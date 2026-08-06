@@ -9,10 +9,12 @@ import { gcAttachments } from "./codex/attachments";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { LinkBClient } from "./_core/linkb/client";
+import type { HeartbeatWriter } from "./_core/heartbeat";
 import type { Mirror } from "./codex/mirror";
 import { sessionsRoot } from "./codex/transcripts";
 import { checkCompat } from "./codex/compat";
 import { resolveCodexBin } from "./codex/codex-bin";
+import { selfUpdatePendingRestartNotice } from "./_core/selfupdate";
 
 const HEALTH_INTERVAL_MS = Number(process.env.MACCHIATO_HEALTH_INTERVAL_MS) || 60_000;
 const MIRROR_STUCK_MS = Number(process.env.MACCHIATO_MIRROR_STUCK_MS) || 120_000;
@@ -46,9 +48,17 @@ export class HealthLoop {
     private readonly linkb: LinkBClient,
     private readonly mirror: Mirror,
     private readonly version: string,
-    private readonly drive?: { counters: Record<string, number>; authFailed?: boolean }, // #10 計數 + #310 登錄態(v1/v2 皆可)
+    private readonly drive?: {
+      counters: Record<string, number>;
+      authFailed?: boolean;
+      /** #669 心跳活體信號(v1/v2 皆可;缺省按不忙處理)。 */
+      readonly busy?: boolean;
+      readonly hasPendingApproval?: boolean;
+    }, // #10 計數 + #310 登錄態(v1/v2 皆可)
     /** #260 app-server v2 引擎狀態(exec v1 為 undefined)——重啟風暴/死活上浮 health。 */
     private readonly appServer?: { readonly restartFailures: number; readonly isReady: boolean },
+    /** #669 本地心跳(自帶時鐘、早於 linkb.start());這裡只餵最新上報體。 */
+    private readonly heartbeat?: HeartbeatWriter,
   ) {}
 
   start(): void {
@@ -87,11 +97,14 @@ export class HealthLoop {
       gatewayAlive: this.cliFound && existsSync(sessionsRoot()) && appOk,
       compatOk: this.cliFound && compat.ok,
       mirrorLastPollAgeS: ageS,
-      lastError: compat.ok
-        ? this.appServer && !this.appServer.isReady
-          ? `app-server 未就緒(重啟失敗 ${this.appServer.restartFailures} 次)`
-          : (this.mirror.lastError ?? compat.advisory ?? null) // #258 無錯時把升版告警上浮
-        : (compat.reason ?? "兼容自檢失敗"),
+      // #773 尾部再兜一句「新版已裝好、等重啟」——真錯誤(app-server 未就緒、鏡像卡住、兼容失敗)
+      // 與 #258 升版告警都排在它前面,信息位絕不蓋掉真問題(#348 靜默凍結的教訓)。
+      lastError:
+        (compat.ok
+          ? this.appServer && !this.appServer.isReady
+            ? `app-server 未就緒(重啟失敗 ${this.appServer.restartFailures} 次)`
+            : (this.mirror.lastError ?? compat.advisory ?? null) // #258 無錯時把升版告警上浮
+          : (compat.reason ?? "兼容自檢失敗")) ?? selfUpdatePendingRestartNotice(),
       kind: "codex",
       connectorVersion: this.version,
       stt: false,
@@ -106,6 +119,9 @@ export class HealthLoop {
       this.mirror.restart();
       h.lastError = `mirror stuck ${ageS}s → restarted`;
     }
+    // #669 把最新上報體餵給心跳文件(它自己有時鐘,連不上 server 時照樣寫)。
+    // 只擴文件、不擴 wire:下面發出去的 connector_health 形狀一個字節都沒動。
+    this.heartbeat?.setSnapshot(h as unknown as Record<string, unknown>);
     if (this.linkb.isReady) {
       this.linkb.send({ t: "connector_health", agentLinkId: this.linkb.agentLinkId, health: h });
     }

@@ -273,6 +273,15 @@ export class Drive {
     approvalsResolved: 0,
   };
 
+  /** #669 心跳:有進行中回合(key → runId 映射非空)。為「閒時更新」預留,本階段只寫進 health.json。 */
+  get busy(): boolean {
+    return this.active.size > 0;
+  }
+  /** #669 心跳:有掛起的 exec 審批(F-09/#486)。 */
+  get hasPendingApproval(): boolean {
+    return this.pendingApprovals.size > 0;
+  }
+
   /**
    * F-09/#486:gateway 掛起的 exec 審批（id → pending）。
    * request_id 精確配對；缺省時按 sid FIFO（舊 server 兼容）。

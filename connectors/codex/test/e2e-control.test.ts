@@ -299,6 +299,53 @@ describe("#347 E2E 控制 roundtrip", () => {
     expect(missing.isE2E("missing")).toBe(true);
   });
 
+  it("#687 enable 時 identity assert 失敗只軟拒、不上拋 onFatal", () => {
+    const sid = "01K0CODEX687ENABLEOFFLINE01";
+    const e2e = new E2EKeyStore(path);
+    const sent: Record<string, any>[] = [];
+    const linkb = { agentLinkId: "al", send: (msg: Record<string, unknown>) => sent.push(msg) };
+    const mirror = { backfillE2E: async () => {}, handleE2EBackfillResult: () => {} };
+    const sessions = { localSessionIdFor: () => undefined };
+    const device = ec.genDeviceKeypair();
+    let assertCalls = 0;
+
+    expect(() =>
+      handleE2EControlFrame(
+        {
+          t: "e2e_wrap_request",
+          hermesSessionId: sid,
+          backfill: true,
+          devices: [
+            {
+              deviceId: "phone",
+              pubKey: device.pubB64,
+              keyFingerprint: deviceKeyFingerprint(device.pubB64),
+            },
+          ],
+        },
+        linkb,
+        e2e,
+        mirror,
+        sessions,
+        (allow) => {
+          assertCalls += 1;
+          // 模擬「另有穩定態 E2E 會話 map 壞了」——即使 pending-enable 已白名單本 sid，
+          // 身份閘仍可能 throw；必須軟拒，不得冒泡 process.exit。
+          if (allow?.has(sid)) {
+            throw new Error(
+              "Codex E2E identity map unavailable/incomplete (trusted=true, missing=other); refusing plaintext fallback",
+            );
+          }
+          throw new Error("unexpected strict assert");
+        },
+      ),
+    ).not.toThrow();
+    expect(assertCalls).toBe(1);
+    expect(sent).toEqual([]);
+    // beginEnable 已落盤 protection floor；軟拒後進程仍活，ready 可再 bootstrap。
+    expect(e2e.isE2E(sid)).toBe(true);
+  });
+
   it("#366 畸形 devices 幀被軟拒絕:不上拋(不觸發 onFatal)、不回 e2e_key、既有 K_S 不動", () => {
     const sid = "dos";
     const e2e = new E2EKeyStore(path);

@@ -44,6 +44,7 @@ export function defineConformanceSuite(adapter: ConformanceAdapter): void {
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
         "DEMO_STT_API_KEY",
+        "STT_API_KEY",
       ];
       for (const k of hostLeaks) {
         expect(process.env[k], `${k} should be scrubbed by hermetic setup`).toBeUndefined();

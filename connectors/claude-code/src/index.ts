@@ -4,10 +4,11 @@
  * 跑：pnpm --filter @macchiato/claude-code-connector start
  */
 import { spawn } from "node:child_process";
-import { loadCreds, quarantineCreds } from "./_core/linkb/creds";
+import { loadCreds, quarantineCreds, saveCreds } from "./_core/linkb/creds";
 import { LinkBClient } from "./_core/linkb/client";
 import { runPairing } from "./_core/linkb/pairing";
 import { E2EKeyStore, E2EKeyStoreStateError, settleE2EBackfillAck } from "./_core/e2e/keys";
+import { deviceAuthConfigFromCreds } from "./_core/e2e/device-auth";
 import { e2eStorePath } from "./_core/identity";
 import { authorizeE2EDisableResume } from "./_core/e2e/control";
 import { isCommittedE2EBackfillResult, Mirror } from "./cc/mirror";
@@ -18,6 +19,7 @@ import { announceImportAvailable, runImport } from "./cc/history-import";
 import { Drive, workDir } from "./cc/drive";
 import { LoginFlow } from "./cc/login";
 import { HealthLoop } from "./health";
+import { HeartbeatWriter } from "./_core/heartbeat";
 import { CONNECTOR_VERSION } from "./linkb/proto";
 import { runVerifiedSelfUpdate } from "./_core/selfupdate";
 import { KIND } from "./identity";
@@ -49,20 +51,46 @@ async function main(): Promise<void> {
 
   // #347 先加载/校验本地密钥；Link B ready 必须套 server E2E 快照后才能 flush 出站缓冲。
   const e2e = new E2EKeyStore(e2eStorePath(KIND));
+  // #731 設備授權：有配對 secret 才 enforce wrap proof；舊配對降級。
+  e2e.configureDeviceAuth(
+    deviceAuthConfigFromCreds({
+      ...creds,
+      persist: (authorized) => {
+        const latest = loadCreds(KIND) ?? creds;
+        saveCreds(KIND, { ...latest, authorizedDevices: authorized });
+      },
+    }),
+  );
   let drive!: Drive;
   const linkb = new LinkBClient(
     creds,
     (state) => {
       const blocked = e2e.applyServerState(state);
-      drive.applyE2EQuiesceState(
+      const sessions =
         (state as {
           sessions?: Array<{
             hermesSessionId: string;
             pendingOp: "enable" | "disable" | null;
           }>;
-        }).sessions ?? [],
+        }).sessions ?? [];
+      drive.applyE2EQuiesceState(sessions);
+      // #687 pending-enable 可暫缺 wire↔CC map（App ULID 在首次 init 前本來就沒映射）。
+      // 不得因此拒絕整條 ready——否則 onFatal 殺進程後 e2e floor 已落盤 → 永久 Offline。
+      const pendingEnables = new Set(
+        sessions
+          .filter((session) => session.pendingOp === "enable")
+          .map((session) => session.hermesSessionId),
       );
-      drive.assertE2EIdentitySafe();
+      try {
+        drive.assertE2EIdentitySafe(pendingEnables);
+      } catch (error) {
+        // 穩定態身份壞了：隔離保護會話、連上 server 讓用戶能更新/重配；內容面仍 fail-closed。
+        console.error(
+          `[E2E identity] ready continuing with isolation — ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
       return blocked;
     },
     undefined,
@@ -218,17 +246,35 @@ async function main(): Promise<void> {
         if (enabling) {
           drive.beginE2ETransition(sid, "enable");
           e2e.beginEnable(sid, msg.disableReceipt);
-          drive.assertE2EIdentitySafe();
+          // #687：pending-enable 允許該 sid 暫缺 map；不得 strict assert → onFatal。
+          // wrap/backfill 不依賴 map；無本地 transcript 時 backfill 回 found:false（server #604 可回滾）。
+          drive.assertE2EIdentitySafe(new Set([sid]));
         }
         const wrapped = enabling
           ? e2e.wrapForEnable(sid, (msg.devices as any[]) ?? [])
           : e2e.wrapExistingForDevices(sid, (msg.devices as any[]) ?? []);
-        linkb.send({ t: "e2e_key", agentLinkId: linkb.agentLinkId, hermesSessionId: sid, wrapped });
+        // #731 未授權設備要讓用戶知道:跳過本身是靜默的,不回報就只剩一個永遠轉圈的 Updating。
+        const deviceAuthRejected = e2e.takeDeviceAuthRejections();
+        linkb.send({
+          t: "e2e_key",
+          agentLinkId: linkb.agentLinkId,
+          hermesSessionId: sid,
+          wrapped,
+          ...(deviceAuthRejected.length ? { deviceAuthRejected } : {}),
+        });
         console.log(`· E2E: session ${sid} — wrapped K_S for ${wrapped.length} device(s)`);
         if (enabling) startE2EBackfill(sid, "enable");
       } catch (error) {
-        if (!(error instanceof E2EKeyStoreStateError)) throw error;
-        console.error(`[E2E wrap rejected ${sid}] ${(error as Error).message}`);
+        // StateError + 身份閘：只軟拒本幀。#687 前身份 Error 會冒泡 onFatal → 永久 Offline。
+        if (
+          error instanceof E2EKeyStoreStateError ||
+          (error instanceof Error &&
+            /identity map unavailable|identity persistence is poisoned/i.test(error.message))
+        ) {
+          console.error(`[E2E wrap rejected ${sid}] ${(error as Error).message}`);
+          return;
+        }
+        throw error;
       }
     } else if (msg.t === "e2e_disable_request" && typeof msg.hermesSessionId === "string") {
       const sid = msg.hermesSessionId;
@@ -239,7 +285,17 @@ async function main(): Promise<void> {
         }
         drive.beginE2ETransition(sid, "disable");
         e2e.markServerE2E(sid, "disable");
-        drive.assertE2EIdentitySafe();
+        // disable 需要本地 transcript 身份；缺 map 時軟拒絕本幀，絕不 onFatal 殺整條 link。
+        try {
+          drive.assertE2EIdentitySafe();
+        } catch (identityError) {
+          console.error(
+            `[E2E disable rejected ${sid}] identity unsafe: ${
+              identityError instanceof Error ? identityError.message : String(identityError)
+            }`,
+          );
+          return;
+        }
         startE2EBackfill(sid, "disable");
       } catch (error) {
         if (!(error instanceof E2EKeyStoreStateError)) throw error;
@@ -289,6 +345,17 @@ async function main(): Promise<void> {
       linkb.onFatal();
     }
   });
+  // #669 心跳必須在 `linkb.start()` **之前**起：那個 await 只在首次 ready 才返回，連不上 server
+  // 的機器會永遠停在這行——而那恰好是本心跳唯一要觀測的故障（#210 同形狀）。
+  const heartbeat = new HeartbeatWriter(KIND, () => ({
+    version: CONNECTOR_VERSION,
+    linkConnected: linkb.isReady,
+    lastConnectedAtMs: linkb.lastConnectedAtMs,
+    busy: drive?.busy ?? false,
+    pendingApproval: drive?.hasPendingApproval ?? false,
+  }));
+  heartbeat.start();
+
   await linkb.start();
 
   drive.flushAbandonedTurns(); // #200+#489 F-12:優先只讀補撈已落盤 agent;失敗才「請重發」(絕不自動重跑)
@@ -297,7 +364,7 @@ async function main(): Promise<void> {
   void commands.start(workDir()); // #199 枚舉+上報(短命 CLI;失敗只缺菜單,不阻啟動)
   void modelsReporter.start(workDir()); // #231 model/effort 清單上報(chip 數據源)
 
-  const health = new HealthLoop(linkb, mirror, CONNECTOR_VERSION, drive); // #10:計數上報
+  const health = new HealthLoop(linkb, mirror, CONNECTOR_VERSION, drive, heartbeat); // #10:計數上報 + #669 心跳
   health.start();
 
   console.log(`✓ Claude Code connector running (workdir for new sessions: ${workDir()})`);

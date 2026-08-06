@@ -1,9 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import {
+  acquireSelfUpdateHandoff,
   assertSelfUpdateAllowed,
   buildInstallerEnv,
+  handleInstallerExit,
+  isSelfUpdateHandedOff,
   parseStrictSemver,
+  resetSelfUpdateState,
+  runVerifiedSelfUpdate,
+  selfUpdatePendingRestartNotice,
   semverLt,
   verifyManifest,
 } from "../src/_core/selfupdate";
@@ -90,6 +96,9 @@ describe("#1 self_update 供應鏈驗證", () => {
         HTTPS_PROXY: "https://proxy.example",
         LC_ALL: "C",
         MACCHIATO_HERMES_PROFILE: "coder",
+        // #767 外部托管：漏了它 self_update 拉起的 installer 就会去装 user unit，
+        // 更新写进磁盘、真正在跑的进程纹丝不动，用户点 Update 永远失败。
+        MACCHIATO_SKIP_UNIT: "1",
         MACCHIATO_MANIFEST: "/tmp/fake",
         MACCHIATO_VERIFIED_ROOT: "/tmp/evil",
         MACCHIATO_BOOTSTRAP_TESTING: "1",
@@ -111,6 +120,7 @@ describe("#1 self_update 供應鏈驗證", () => {
       HTTPS_PROXY: "https://proxy.example",
       LC_ALL: "C",
       MACCHIATO_HERMES_PROFILE: "coder",
+      MACCHIATO_SKIP_UNIT: "1",
       MACCHIATO_ONLY: "codex",
       MACCHIATO_MANIFEST: "/private/update/release.json",
     });
@@ -151,5 +161,46 @@ describe("#1 self_update 供應鏈驗證", () => {
       const sig = sign(null, bytes, privateKey).toString("base64");
       expect(() => verifyManifest(bytes, sig, pubHex)).toThrow(/結構/);
     }
+  });
+});
+
+/**
+ * #773 生產真機:installer 裝成功、退出 0,而真正在跑的進程沒被替換(system unit 托管 /
+ * MACCHIATO_SKIP_UNIT / 手動跑)——交棒閂只在退出非 0 時才清,於是永久置位,之後每次點
+ * 「更新」都只打印 `[self_update ignored]`,連下載都不做,用戶永遠爬不出來。
+ */
+describe("#773 裝完沒重啟:更新閂不許永久鎖死", () => {
+  beforeEach(() => resetSelfUpdateState());
+
+  it("installer 退非 0(裝失敗)→ 立刻放閂,且不掛「等重啟」通知", () => {
+    expect(acquireSelfUpdateHandoff()).toBe(true); // 正控:閂真的被拿住了
+    expect(acquireSelfUpdateHandoff()).toBe(false); // 正控:守衛真的在擋
+    handleInstallerExit(1, "1.5.70", 10_000);
+    expect(isSelfUpdateHandedOff()).toBe(false);
+    expect(selfUpdatePendingRestartNotice()).toBeNull();
+    expect(acquireSelfUpdateHandoff()).toBe(true); // 下一次更新能真的再裝
+  });
+
+  it("installer 退 0 且本進程活過寬限期 → 放閂 + 一句「已下載,重啟後生效」(絕不是失敗)", async () => {
+    expect(acquireSelfUpdateHandoff()).toBe(true);
+    handleInstallerExit(0, "1.5.70", 20);
+    // 到點之前不許放閂:真重啟正在進行時放閂 = 同時跑兩個 installer,比本 bug 更糟。
+    expect(isSelfUpdateHandedOff()).toBe(true);
+    expect(selfUpdatePendingRestartNotice()).toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(isSelfUpdateHandedOff()).toBe(false);
+    const notice = selfUpdatePendingRestartNotice();
+    expect(notice).toContain("1.5.70"); // 裝的是哪版,話裡帶着
+    expect(notice).toMatch(/重啟/); // 給下一步,不是死胡同
+    expect(notice).not.toMatch(/失敗|失败|fail/i); // 🚨 手動跑不重啟是正常的,說成失敗就是撒謊
+  });
+
+  it("寬限期內再來一次 self_update 仍被拒(防並發安裝這條不許被本次改動破壞)", async () => {
+    expect(acquireSelfUpdateHandoff()).toBe(true);
+    handleInstallerExit(0, "1.5.70", 10_000); // 整個用例都落在計時期內
+    await expect(runVerifiedSelfUpdate("codex", "1.0.0")).rejects.toThrow(
+      /已在本进程启动/,
+    );
+    expect(isSelfUpdateHandedOff()).toBe(true);
   });
 });

@@ -49,10 +49,6 @@
 #   MACCHIATO_MANIFEST     (path to a connector-preverified legacy manifest, or the
 #                           bootstrap-verified v2 manifest)
 #   MACCHIATO_VERIFIED_ROOT (private extracted v2 artifact root; bootstrap only)
-#   MACCHIATO_SKIP_UNIT    ("1" when the service is supervised outside this installer —
-#                           a system-wide systemd unit, a container, an appliance image.
-#                           Connector files and the Hermes plugin still install; no user
-#                           unit is written or started, so restart it yourself afterwards.)
 
 set -euo pipefail
 
@@ -185,102 +181,7 @@ ensure_linger() {
   return 0
 }
 
-# #528: 進程外 supervisor——壞包秒崩時自動拉最新 signed release 重裝,斷掉「永久掉線」。
-# 從已驗 artifact 落盤到 ~/.macchiato/bin/(與 connector app 樹分離,自身幾乎不會壞)。
-#
-# #669 原子就位:supervisor(以及它依賴的冷凍驗簽器)是整條自愈鏈的最後一道防線,
-# 而此前它們是被**直接覆蓋寫**的——安裝中途被殺/斷電就在盤上留下半個腳本,那台機器
-# 從此永久掉線、連自愈都救不回來,是全鏈唯一「壞了沒救」的點。
-# 兩個具體窗口:① 安裝被中斷 → 截斷的檔案;② heal 重裝時 install.sh 是**由正在跑的
-# supervisor 自己拉起**的,原地覆蓋會讓 bash 讀到自己被改掉的後半段。
-# 做法:同目錄臨時檔(必須同一檔案系統,mv 才是原子的)→ 語法自檢 → chmod 700 →
-# 舊版留一份 .prev → mv 原子換入。自動更新打開後 install.sh 執行頻率會大漲,先關掉這個窗口。
-supervisor_selfcheck() { # $1=staged file  $2=bash|python
-  case "$2" in
-    bash) bash -n "$1" >/dev/null 2>&1 ;;
-    python)
-      local py
-      py="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
-      # 純 TS 連接器的機器可能根本沒有 python:沒有編譯器就不判死刑——檔案已過
-      # verify_tree 的逐檔 sha256,這裡只是額外一道「別把截斷的半截檔換上去」探測。
-      [ -n "$py" ] || return 0
-      # 用 compile() 而非 py_compile:不寫 __pycache__、不挑副檔名(.new)。
-      "$py" -c 'import sys; compile(open(sys.argv[1], "rb").read(), sys.argv[1], "exec")' "$1" \
-        >/dev/null 2>&1
-      ;;
-    *) return 1 ;;
-  esac
-}
-
-# 自檢不過 = 整個放棄替換(舊版原封不動)並**中止安裝**:寧可停在「舊 supervisor 還在跑」,
-# 也不能把用戶換成半個 supervisor;更不能讓安裝其餘部分靜默報成功(那才是真的沒救)。
-install_bin_atomic() { # $1=src  $2=dest  $3=bash|python
-  local src="$1" dest="$2" kind="$3" staged
-  staged="$dest.new"
-  rm -f "$staged"
-  cp "$src" "$staged" || fail "cannot stage $dest — is ~/.macchiato writable? disk full?"
-  if ! supervisor_selfcheck "$staged" "$kind"; then
-    rm -f "$staged"
-    fail "staged $dest failed its $kind self-check — existing copy left untouched, install aborted"
-  fi
-  chmod 700 "$staged" || fail "cannot chmod staged $dest"
-  if [ -f "$dest" ]; then
-    cp "$dest" "$dest.prev" 2>/dev/null || warn "could not keep a .prev backup of $dest"
-  fi
-  mv -f "$staged" "$dest" || fail "cannot atomically move $staged into place"
-}
-
-install_supervisor() {
-  [ -n "${TMP:-}" ] && [ -d "$TMP" ] || return 0
-  [ -d "$TMP/bin" ] || return 0   # 老 artifact 無 bin/ → 直跑,不是錯誤
-  # bin/macchiato-supervise 會成為每個 unit 的 ExecStart(開機即以用戶身份執行),
-  # 是本安裝腳本裡權限最高的一份拷貝——必須和其它子樹一樣過 manifest 逐檔校驗,
-  # 不能只靠 artifact 整包 hash 兜底。
-  verify_tree "$TMP/bin" "bin"
-  mkdir -p "$HOME/.macchiato/bin"
-  if [ -f "$TMP/bin/macchiato-supervise" ]; then
-    install_bin_atomic "$TMP/bin/macchiato-supervise" \
-      "$HOME/.macchiato/bin/macchiato-supervise" bash
-  fi
-  if [ -f "$TMP/bin/release_verify.py" ]; then
-    install_bin_atomic "$TMP/bin/release_verify.py" \
-      "$HOME/.macchiato/bin/release_verify.py" python
-  elif [ -f "$TMP/connectors/hermes/release_verify.py" ]; then
-    install_bin_atomic "$TMP/connectors/hermes/release_verify.py" \
-      "$HOME/.macchiato/bin/release_verify.py" python
-  fi
-  # #669 階段 4:決策層(update_decider.py)與驗簽器同樣凍結到 bin/。理由相同——supervisor
-  # 用它決定「該不該升」,而連接器 app 樹壞掉正是它要處理的情形之一,決策層不能跟着一起壞。
-  # 老 artifact 沒有這個檔就跳過(自動更新自然不啟用,不是錯誤)。
-  if [ -f "$TMP/bin/update_decider.py" ]; then
-    install_bin_atomic "$TMP/bin/update_decider.py" \
-      "$HOME/.macchiato/bin/update_decider.py" python
-  elif [ -f "$TMP/connectors/hermes/update_decider.py" ]; then
-    install_bin_atomic "$TMP/connectors/hermes/update_decider.py" \
-      "$HOME/.macchiato/bin/update_decider.py" python
-  fi
-}
-
-# wrap real ExecStart: macchiato-supervise <kind> -- <orig...>
-# 純字符串拼接、**無副作用**:它跑在 $( ) 命令替換裡,那裡的 fail/exit 只殺得掉子 shell,
-# 外層會拿著空 ExecStart 若無其事地裝下去。落盤(和它的驗簽)因此放在 install_supervisor,
-# 由頂層在 TMP 就緒後調用一次。
-supervised() { # $1=kind  rest=real command words
-  local kind="$1"; shift
-  local sup="$HOME/.macchiato/bin/macchiato-supervise"
-  [ -x "$sup" ] || { printf '%s' "$*"; return 0; }  # 老 artifact 無 supervise → 直跑
-  printf '%s' "$sup $kind -- $*"
-}
-
 install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
-  # #767: 服務由外部托管時,裝一個 user unit 只會製造「更新寫進了磁盤,真正在跑的進程紋絲不動」
-  # ——連接器一直上報舊版本,用戶點 Update 永遠失敗且無法自救。置位則只裝文件(本函數之後的
-  # Hermes plugin 照裝),重啟交給外部托管方。
-  case "${MACCHIATO_SKIP_UNIT:-}" in
-    1 | true | yes)
-      say "$1: supervised outside this installer (MACCHIATO_SKIP_UNIT=1) — files updated, no user service written; restart your own service to load the new code"
-      return 0 ;;
-  esac
   if ! have_systemd; then
     if have_launchd; then
       install_launchd_unit "$@"
@@ -304,9 +205,7 @@ install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
     # #387: 78 = EX_CONFIG — the connector exits 78 when this agent is unpaired from the
     # Macchiato app (credentials revoked). Don't flap-restart a service that can never auth.
     echo "RestartPreventExitStatus=78"
-    # #767: 鍵名是 SuccessExitStatus——systemd 沒有 SuccessfulExitStatus,寫錯只換來
-    # journal 裡一行 "Unknown key … ignoring",解綁後的 78 仍被記成失敗退出。
-    echo "SuccessExitStatus=78"
+    echo "SuccessfulExitStatus=78"
     echo "Environment=PYTHONUNBUFFERED=1"
     if [ -n "${MACCHIATO_UNIT_EXTRA_ENV:-}" ]; then
       while IFS= read -r kv; do [ -n "$kv" ] && echo "Environment=$kv"; done <<< "$MACCHIATO_UNIT_EXTRA_ENV"
@@ -320,10 +219,7 @@ install_unit() { # $1=unit-name $2=ExecStart $3=WorkingDirectory(optional)
   systemctl --user enable "$1.service"
   # restart (not just start) so re-running the installer to UPDATE actually loads the
   # freshly-downloaded code — an already-running service ignores `start`.
-  # #767: 重啟失敗絕不能退出 0——連接器的一次性更新闩只有 installer 非 0 才清,
-  # 帶著「新代碼在磁盤、舊進程還在跑」退出 0 會把它永久鎖死(此後點 Update 連下載都不做)。
-  systemctl --user restart "$1.service" \
-    || fail "systemctl --user restart $1.service failed — the new code is on disk but the running service was NOT replaced (see: journalctl --user -u $1 -n 50)"
+  systemctl --user restart "$1.service"
   say "Service $1 running ✓   Update anytime by re-running this installer. Logs: journalctl --user -u $1 -f"
 }
 
@@ -502,9 +398,6 @@ if [ "${MACCHIATO_SELFTEST:-0}" != 1 ]; then
   TMP="$MACCHIATO_VERIFIED_ROOT"
 fi
 
-# #528: supervisor 落盤(逐檔驗簽)。放頂層——驗簽失敗必須中止安裝,不能只死在子 shell。
-install_supervisor
-
 # ═════════════════════════════ Hermes ═══════════════════════════════════════
 find_hermes_python() {
   if [ -n "${HERMES_PYTHON:-}" ]; then echo "$HERMES_PYTHON"; return; fi
@@ -573,7 +466,7 @@ MACCHIATO_HERMES_PROFILE=$PROFILE"
   fi
   rm -f "$CRED.revoked"   # #387 重新配對成功,清掉舊解綁標記
   MACCHIATO_UNIT_EXTRA_ENV="$PROFILE_ENV
-$(mirror_env_for "$UNIT" "$WHAT")" install_unit "$UNIT" "$(supervised hermes "$PY" "$APP/connector.py")"
+$(mirror_env_for "$UNIT" "$WHAT")" install_unit "$UNIT" "$PY $APP/connector.py"
   # Platform plugin: lets Hermes proactively deliver to Macchiato (best effort).
   # Installed into THIS profile's home — its gateway loads it, and the plugin derives the
   # per-profile push socket from its own HERMES_HOME (same rule as the connector).
@@ -606,7 +499,7 @@ install_openclaw() {
     say "OpenClaw credentials found, skipping pairing"
   fi
   rm -f "$CRED.revoked"   # #387 重新配對成功,清掉舊解綁標記
-  MACCHIATO_UNIT_EXTRA_ENV="$(mirror_env_for macchiato-openclaw-connector OpenClaw)" install_unit "macchiato-openclaw-connector" "$(supervised openclaw "$APP/node_modules/.bin/tsx" src/index.ts)" "$APP"
+  MACCHIATO_UNIT_EXTRA_ENV="$(mirror_env_for macchiato-openclaw-connector OpenClaw)" install_unit "macchiato-openclaw-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
   # Channel plugin: lets OpenClaw proactively deliver to Macchiato (best effort)
   if command -v openclaw >/dev/null 2>&1; then
     if openclaw plugins install --force "$APP/plugin" >/dev/null 2>&1 && openclaw plugins enable macchiato >/dev/null 2>&1; then
@@ -651,7 +544,7 @@ install_claude_code() {
   # PATH: user systemd units often miss ~/.local/bin → the connector could not find the claude CLI.
   MACCHIATO_UNIT_EXTRA_ENV="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 MACCHIATO_CLAUDE_BIN=$CLAUDE
-$(mirror_env_for macchiato-claude-code-connector "Claude Code")"     install_unit "macchiato-claude-code-connector" "$(supervised claude-code "$APP/node_modules/.bin/tsx" src/index.ts)" "$APP"
+$(mirror_env_for macchiato-claude-code-connector "Claude Code")"     install_unit "macchiato-claude-code-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
 }
 
 # ═════════════════════════════ Codex ════════════════════════════════════════
@@ -687,7 +580,7 @@ install_codex() {
   rm -f "$CRED.revoked"   # #387 重新配對成功,清掉舊解綁標記
   MACCHIATO_UNIT_EXTRA_ENV="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 MACCHIATO_CODEX_BIN=$CODEX
-$(mirror_env_for macchiato-codex-connector Codex)"     install_unit "macchiato-codex-connector" "$(supervised codex "$APP/node_modules/.bin/tsx" src/index.ts)" "$APP"
+$(mirror_env_for macchiato-codex-connector Codex)"     install_unit "macchiato-codex-connector" "$APP/node_modules/.bin/tsx src/index.ts" "$APP"
 }
 
 # ── detect installed agents ─────────────────────────────────────────────────
@@ -773,26 +666,17 @@ pick_agents() {
 
     if ! IFS= read -rsn1 key </dev/tty 2>/dev/null; then key="__quit__"; fi
     case "$key" in
-      # #689: CSI/SS3 one byte at a time, integer timeouts only (bash 3.2: -t 0.N → 0).
-      # Old rsn2+frac timeout left residual A/B — A hit a|A (all/none), B was a no-op.
-      $'\033')
-        local c1="" c2=""
-        IFS= read -rsn1 -t 1 c1 </dev/tty 2>/dev/null || true
-        case "$c1" in
-          '[' | O)
-            c2=""; IFS= read -rsn1 -t 1 c2 </dev/tty 2>/dev/null || true
-            case "$c2" in
-              A) cur=$(((cur - 1 + n) % n)) ;;
-              B) cur=$(((cur + 1) % n)) ;;
-            esac
-            ;;
-        esac
-        ;;
+      $'\033')  # escape sequence — arrow keys send ESC [ A/B (or ESC O A/B)
+        rest=""; IFS= read -rsn2 -t 0.05 rest </dev/tty 2>/dev/null || true
+        case "$rest" in
+          '[A' | 'OA') cur=$(((cur - 1 + n) % n)) ;;
+          '[B' | 'OB') cur=$(((cur + 1) % n)) ;;
+          *) : ;;  # bare ESC / unknown — ignore (only `q` quits, to dodge the ESC-vs-arrow race)
+        esac ;;
       k) cur=$(((cur - 1 + n) % n)) ;;
       j) cur=$(((cur + 1) % n)) ;;
       ' ') on[cur]=$((1 - on[cur])) ;;
-      # #689: lowercase only — uppercase A is the CSI final for ↑; never all/none on residual A.
-      a)
+      a | A)
         local allon=1
         for ((i = 0; i < n; i++)); do [ "${on[i]}" = 1 ] || allon=0; done
         for ((i = 0; i < n; i++)); do on[i]=$((allon == 1 ? 0 : 1)); done ;;
@@ -955,16 +839,6 @@ do_uninstall() {
   rm -rf "$HOME/.macchiato/app" "$HOME/.macchiato/openclaw-app" "$HOME/.macchiato/claude-code-app" \
     "$HOME/.macchiato/codex-app" "$HOME/.macchiato/logs" "$HOME/.macchiato/attachments" \
     "$HOME/.macchiato/cc-attachments" "$HOME/.macchiato/codex-attachments"
-  # #679: N-1 快照與回退中斷殘留(app 樹同級兄弟)——不識 .n-1 會留下整份副本(claude-code ~292 MB)。
-  rm -rf "$HOME/.macchiato"/*-app.n-1 "$HOME/.macchiato/app.n-1" \
-    "$HOME/.macchiato"/*-app.n-1.tmp "$HOME/.macchiato/app.n-1.tmp" \
-    "$HOME/.macchiato"/*-app.next "$HOME/.macchiato/app.next" \
-    "$HOME/.macchiato"/*-app.bad "$HOME/.macchiato/app.bad"
-  rm -f "$HOME/.macchiato/bin/macchiato-supervise" "$HOME/.macchiato/bin/release_verify.py" \
-    "$HOME/.macchiato/bin/update_decider.py"
-  # #669 原子就位留下的舊版備份與(中斷才會殘留的)暫存檔——不清掉 rmdir 永遠清不空 bin/。
-  rm -f "$HOME/.macchiato/bin"/*.prev "$HOME/.macchiato/bin"/*.new
-  rmdir "$HOME/.macchiato/bin" 2>/dev/null || true
   rm -rf "$HOME/.macchiato"/hermes-*/
   local f
   for f in mirror.json sessions.json health.json hermes-projects.json push.sock \

@@ -6,7 +6,7 @@
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadCreds, quarantineCreds } from "./_core/linkb/creds";
+import { loadCreds, quarantineCreds, saveCreds } from "./_core/linkb/creds";
 import { LinkBClient } from "./_core/linkb/client";
 import { runPairing } from "./_core/linkb/pairing";
 import {
@@ -15,6 +15,7 @@ import {
   settleE2EBackfillAck,
   type WrappedDeviceKey,
 } from "./_core/e2e/keys";
+import { deviceAuthConfigFromCreds } from "./_core/e2e/device-auth";
 import { authorizeE2EDisableResume } from "./_core/e2e/control";
 import { e2eStorePath } from "./_core/identity";
 import { Mirror } from "./codex/mirror";
@@ -28,6 +29,7 @@ import { SkillsReporter } from "./codex/skills";
 import { AppServerDrive } from "./codex/drive-appserver";
 import { LoginFlow } from "./codex/login";
 import { HealthLoop } from "./health";
+import { HeartbeatWriter } from "./_core/heartbeat";
 import { CONNECTOR_VERSION } from "./linkb/proto";
 import { runVerifiedSelfUpdate } from "./_core/selfupdate";
 import { KIND } from "./identity";
@@ -74,7 +76,7 @@ export function handleE2EControlFrame(
   e2e: E2EKeyStore,
   mirror: E2EBackfiller,
   sessions: E2ELocalSessionResolver,
-  assertIdentitySafe: () => void = () => {},
+  assertIdentitySafe: (allowMissingSids?: ReadonlySet<string>) => void = () => {},
 ): boolean {
   const sid = typeof msg.hermesSessionId === "string" ? msg.hermesSessionId : undefined;
 
@@ -91,18 +93,35 @@ export function handleE2EControlFrame(
         // 首次 enable 是唯一允許建 K_S 的路徑。
         sessions.beginE2ETransition?.(sid, "enable");
         e2e.beginEnable(sid, msg.disableReceipt);
-        assertIdentitySafe();
+        // #687 pending-enable 允許該 sid 暫缺 ULID→UUID map，不得 strict assert → onFatal。
+        assertIdentitySafe(new Set([sid]));
         wrapped = e2e.wrapForEnable(sid, devices);
       } else {
         // 新設備補封必須沿用既有 K_S，缺鑰時 fail closed，絕不生成 K₂。
         wrapped = e2e.wrapExistingForDevices(sid, devices);
       }
-      linkb.send({ t: "e2e_key", agentLinkId: linkb.agentLinkId, hermesSessionId: sid, wrapped });
+      // #731 未授權設備要讓用戶知道:跳過本身是靜默的,不回報就只剩一個永遠轉圈的 Updating。
+      const deviceAuthRejected = e2e.takeDeviceAuthRejections();
+      linkb.send({
+        t: "e2e_key",
+        agentLinkId: linkb.agentLinkId,
+        hermesSessionId: sid,
+        wrapped,
+        ...(deviceAuthRejected.length ? { deviceAuthRejected } : {}),
+      });
       console.log(`· E2E: session ${sid} — wrapped K_S for ${wrapped.length} device(s)`);
       if (isEnable) startE2EBackfill(mirror, sessions, sid, "enable");
     } catch (error) {
-      if (!(error instanceof E2EKeyStoreStateError)) throw error;
-      console.error(`[E2E wrap rejected ${sid}] ${(error as Error).message}`);
+      // StateError + 身份閘：只軟拒本幀（#687；身份 Error 不得 onFatal 殺進程）。
+      if (
+        error instanceof E2EKeyStoreStateError ||
+        (error instanceof Error &&
+          /identity map unavailable|identity persistence is poisoned/i.test(error.message))
+      ) {
+        console.error(`[E2E wrap rejected ${sid}] ${(error as Error).message}`);
+        return true;
+      }
+      throw error;
     }
     return true;
   }
@@ -117,7 +136,17 @@ export function handleE2EControlFrame(
       }
       sessions.beginE2ETransition?.(sid, "disable");
       e2e.markServerE2E(sid, "disable");
-      assertIdentitySafe();
+      // 缺 map 時軟拒絕本幀，絕不 onFatal（#687）。
+      try {
+        assertIdentitySafe();
+      } catch (identityError) {
+        console.error(
+          `[E2E disable rejected ${sid}] identity unsafe: ${
+            identityError instanceof Error ? identityError.message : String(identityError)
+          }`,
+        );
+        return true;
+      }
       startE2EBackfill(mirror, sessions, sid, "disable");
     } catch (error) {
       if (!(error instanceof E2EKeyStoreStateError)) throw error;
@@ -183,20 +212,44 @@ async function main(): Promise<void> {
   }
 
   const e2e = new E2EKeyStore(e2eStorePath(KIND));
+  // #731 設備授權：有配對 secret 才 enforce wrap proof；舊配對降級。
+  e2e.configureDeviceAuth(
+    deviceAuthConfigFromCreds({
+      ...creds,
+      persist: (authorized) => {
+        const latest = loadCreds(KIND) ?? creds;
+        saveCreds(KIND, { ...latest, authorizedDevices: authorized });
+      },
+    }),
+  );
   let drive!: Drive | AppServerDrive;
   const linkb = new LinkBClient(
     creds,
     (state) => {
       const blocked = e2e.applyServerState(state);
-      drive.applyE2EQuiesceState(
+      const sessions =
         (state as {
           sessions?: Array<{
             hermesSessionId: string;
             pendingOp: "enable" | "disable" | null;
           }>;
-        }).sessions ?? [],
+        }).sessions ?? [];
+      drive.applyE2EQuiesceState(sessions);
+      // #687 pending-enable 可暫缺 ULID→thread map；不得因此拒絕 ready → 永久 Offline。
+      const pendingEnables = new Set(
+        sessions
+          .filter((session) => session.pendingOp === "enable")
+          .map((session) => session.hermesSessionId),
       );
-      drive.assertE2EIdentitySafe();
+      try {
+        drive.assertE2EIdentitySafe(pendingEnables);
+      } catch (error) {
+        console.error(
+          `[E2E identity] ready continuing with isolation — ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
       return blocked;
     },
     undefined,
@@ -349,6 +402,17 @@ async function main(): Promise<void> {
     else if (msg.t === "self_update") runSelfUpdate();
     else if (msg.t === "auth_login_start") login.start(loginEvents);
   });
+  // #669 心跳必須在 `linkb.start()` **之前**起：那個 await 只在首次 ready 才返回，連不上 server
+  // 的機器會永遠停在這行——而那恰好是本心跳唯一要觀測的故障（#210 同形狀）。
+  const heartbeat = new HeartbeatWriter(KIND, () => ({
+    version: CONNECTOR_VERSION,
+    linkConnected: linkb.isReady,
+    lastConnectedAtMs: linkb.lastConnectedAtMs,
+    busy: drive?.busy ?? false,
+    pendingApproval: drive?.hasPendingApproval ?? false,
+  }));
+  heartbeat.start();
+
   await linkb.start();
 
   drive.flushAbandonedTurns(); // #200+#489 F-12:優先只讀補撈已落盤 agent;失敗才「請重發」(絕不自動重跑)
@@ -357,7 +421,7 @@ async function main(): Promise<void> {
   announceImportAvailable(linkb, localE2EStatus()); // app 的「導入」入口據此顯示
   mirror.start();
 
-  const health = new HealthLoop(linkb, mirror, CONNECTOR_VERSION, drive, modelsClient); // #10 計數 + #260 v2 引擎狀態
+  const health = new HealthLoop(linkb, mirror, CONNECTOR_VERSION, drive, modelsClient, heartbeat); // #10 計數 + #260 v2 引擎狀態 + #669 心跳
   health.start();
 
   console.log(`✓ Codex connector running (workdir for new sessions: ${workDir()})`);

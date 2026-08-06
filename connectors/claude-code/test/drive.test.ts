@@ -1169,11 +1169,121 @@ describe("#109 AskUserQuestion → clarify 問答", () => {
     expect(r.updatedInput.answers).toBeUndefined();
   });
 
-  it("E2E 會話本地跳過，不把 question/choices 以 clarify.request 明文送 server", async () => {
+  it("#273 E2E：AskUserQuestion 加密出站 + answerEnc 回程解掛", async () => {
+    const store = new Map<string, string>();
+    const e2e = {
+      isE2E: (id: string) => id === CC_SID,
+      encryptContent: (_sid: string, obj: unknown) => {
+        const b = `enc#${store.size}`;
+        store.set(b, JSON.stringify(obj));
+        return b;
+      },
+      decryptText: (_sid: string, blob: string) => {
+        if (!blob.startsWith("ans:")) throw new Error("bad answerEnc");
+        return blob.slice(4);
+      },
+      requireKey: () => Buffer.from(CONTROL_KEY),
+      // #273 能力協商:模擬「已有帶客戶端側的設備拿到 K_S」。不宣告則走本地 skip（下面另有一條專測）。
+      deviceSupports: () => true,
+    } as any;
     const { linkb, sent } = fakeLinkb();
-    const d = new Drive(linkb, undefined, { isE2E: () => true } as any);
-    const r = await (d as any).requestAnswers(CC_SID, INPUT, "toolu_e2e");
+    const replayPath = join(mkdtempSync(join(tmpdir(), "cc-clarify-e2e-")), "control.json");
+    const d = new Drive(
+      linkb,
+      undefined,
+      e2e,
+      undefined,
+      undefined,
+      new E2EControlVerifier(e2e, replayPath),
+    );
+    d.wire();
+    const p = (d as any).requestAnswers(CC_SID, INPUT, "toolu_e2e");
+    const reqs = sent.filter((f: any) => f.frame?.params?.type === "clarify.request") as any[];
+    expect(reqs.length).toBe(2);
+    const p0 = reqs[0].frame.params.payload;
+    expect(p0.question).toBe("🔒 Encrypted question");
+    expect(p0.choices).toEqual({});
+    expect(p0.request_id).toBe("toolu_e2e#0");
+    expect(p0.request_digest).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(typeof p0.enc).toBe("string");
+    // 問題/選項全文不得出現在明文 wire 字段
+    expect(JSON.stringify(p0).includes("Which color?")).toBe(false);
+    expect(JSON.stringify(p0).includes("Red")).toBe(false);
+    const plain = JSON.parse(store.get(p0.enc)!);
+    expect(plain).toMatchObject({
+      question: "Which color?",
+      requestId: "toolu_e2e#0",
+      requestDigest: p0.request_digest,
+    });
+    expect(plain.choices.options[0].label).toBe("Red");
 
+    // 舊明文 respond 必須 fail closed（不提前解掛）。
+    let settled = false;
+    void p.finally(() => {
+      settled = true;
+    });
+    d.onServerFrame(
+      tuiFrame(CC_SID, "clarify.respond", { request_id: "toolu_e2e#0", answer: "Blue" }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    expect(settled).toBe(false);
+
+    // 認證 answerEnc 回程
+    const env0 = signedControl(CC_SID, "clarify.respond", {
+      blockId: "b0",
+      requestId: "toolu_e2e#0",
+      requestDigest: p0.request_digest,
+      answerEnc: "ans:Blue",
+    });
+    await d.onServerFrame(tuiFrame(CC_SID, "e2e.control", { envelope: env0 }));
+    const p1 = reqs[1].frame.params.payload;
+    const env1 = signedControl(
+      CC_SID,
+      "clarify.respond",
+      {
+        blockId: "b1",
+        requestId: "toolu_e2e#1",
+        requestDigest: p1.request_digest,
+        answerEnc: "ans:L",
+      },
+      "2",
+    );
+    await d.onServerFrame(tuiFrame(CC_SID, "e2e.control", { envelope: env1 }));
+    const r = await p;
+    expect(r.behavior).toBe("allow");
+    expect(r.updatedInput.answers).toEqual({ "Which color?": "Blue", "Which size?": "L" });
+    d.dispose();
+  });
+
+  it("#273 能力協商：無設備宣告可解密 → 本地跳過，且**絕不**降級成明文 clarify", async () => {
+    const { linkb, sent } = fakeLinkb();
+    // 老 client（沒有 #273 客戶端側）註冊的設備不會宣告 e2eCaps → deviceSupports 恆 false。
+    // 這條守的是方向:回退必須是「本地跳過」而不是「發明文」——後者會把問題/選項旁路送往
+    // server，是比「回合掛起」嚴重得多的洩漏。
+    const d = new Drive(linkb, undefined, {
+      isE2E: () => true,
+      deviceSupports: () => false,
+      requireKey: () => Buffer.from(CONTROL_KEY),
+      encryptContent: () => "enc-should-not-be-used",
+    } as any);
+    const r = await (d as any).requestAnswers(CC_SID, INPUT, "toolu_caps_off");
+    expect(r.behavior).toBe("allow");
+    expect(r.updatedInput.answers).toBeUndefined();
+    const frames = sent.filter((f: any) => f.frame?.params?.type === "clarify.request");
+    expect(frames.length).toBe(0); // 一幀都不許發:明文會洩漏，密文設備也解不開
+    // 正控:問題原文絕不出現在任何發出去的幀裡
+    expect(JSON.stringify(sent).includes("Which color?")).toBe(false);
+  });
+
+  it("#273 E2E：無加密能力時 fail closed 本地跳過，不發明文 clarify.request", async () => {
+    const { linkb, sent } = fakeLinkb();
+    // isE2E + 設備已宣告能力，但缺 requireKey/encrypt → 加密路徑拋錯，逐題當跳過，絕不旁路明文。
+    // （deviceSupports 必須為 true，否則會被下面那條能力閘提前短路，就測不到本用例的原意了。）
+    const d = new Drive(linkb, undefined, {
+      isE2E: () => true,
+      deviceSupports: () => true,
+    } as any);
+    const r = await (d as any).requestAnswers(CC_SID, INPUT, "toolu_e2e_broken");
     expect(r.behavior).toBe("allow");
     expect(r.updatedInput.answers).toBeUndefined();
     expect(sent.some((f: any) => f.frame?.params?.type === "clarify.request")).toBe(false);
@@ -1750,6 +1860,8 @@ describe("#102 審批 request_id + always 持久化", () => {
         return b;
       },
       requireKey: () => Buffer.from(CONTROL_KEY),
+      // #273 能力協商:模擬「已有帶客戶端側的設備拿到 K_S」。不宣告則走本地 skip（下面另有一條專測）。
+      deviceSupports: () => true,
     } as any;
     const { linkb, sent, fire } = fakeLinkb();
     const replayPath = join(mkdtempSync(join(tmpdir(), "cc-control-drive-")), "control.json");
@@ -1811,6 +1923,8 @@ describe("#102 審批 request_id + always 持久化", () => {
       isE2E: (sid: string) => sid === CC_SID,
       encryptContent,
       requireKey: () => Buffer.from(CONTROL_KEY),
+      // #273 能力協商:模擬「已有帶客戶端側的設備拿到 K_S」。不宣告則走本地 skip（下面另有一條專測）。
+      deviceSupports: () => true,
     } as any;
     const { linkb, sent } = fakeLinkb();
     const drive = new Drive(linkb, undefined, e2e);
@@ -2245,6 +2359,8 @@ describe("#370 E2E control ingress", () => {
       isE2E: (sid: string) => sid === wireSid,
       protectedSessionIds: () => [wireSid],
       requireKey: () => Buffer.from(CONTROL_KEY),
+      // #273 能力協商:模擬「已有帶客戶端側的設備拿到 K_S」。不宣告則走本地 skip（下面另有一條專測）。
+      deviceSupports: () => true,
     } as any;
     const replayPath = join(mkdtempSync(join(tmpdir(), "cc-alias-guard-")), "control.json");
     const { linkb } = fakeLinkb();
@@ -2277,6 +2393,8 @@ describe("#370 E2E control ingress", () => {
     const e2e = {
       isE2E: (sid: string) => sid === CC_SID,
       requireKey: () => Buffer.from(CONTROL_KEY),
+      // #273 能力協商:模擬「已有帶客戶端側的設備拿到 K_S」。不宣告則走本地 skip（下面另有一條專測）。
+      deviceSupports: () => true,
     } as any;
     const replayPath = join(mkdtempSync(join(tmpdir(), "cc-control-ingress-")), "control.json");
     const { linkb, sent } = fakeLinkb();
@@ -2332,6 +2450,8 @@ describe("#370 E2E control ingress", () => {
     const e2e = {
       isE2E: (sid: string) => sid === CC_SID,
       requireKey: () => Buffer.from(CONTROL_KEY),
+      // #273 能力協商:模擬「已有帶客戶端側的設備拿到 K_S」。不宣告則走本地 skip（下面另有一條專測）。
+      deviceSupports: () => true,
       markServerE2E: vi.fn(),
       beginDisable: vi.fn(),
     } as any;
@@ -2388,6 +2508,8 @@ describe("#370 E2E control ingress", () => {
     const e2e = {
       isE2E: (sid: string) => sid === CC_SID,
       requireKey: () => Buffer.from(CONTROL_KEY),
+      // #273 能力協商:模擬「已有帶客戶端側的設備拿到 K_S」。不宣告則走本地 skip（下面另有一條專測）。
+      deviceSupports: () => true,
     } as any;
     const replayPath = join(mkdtempSync(join(tmpdir(), "cc-control-canary-")), "control.json");
     const { linkb, sent } = fakeLinkb();
@@ -2426,6 +2548,8 @@ describe("#370 E2E control ingress", () => {
     const e2e = {
       isE2E: (sid: string) => sid === CC_SID,
       requireKey: () => Buffer.from(CONTROL_KEY),
+      // #273 能力協商:模擬「已有帶客戶端側的設備拿到 K_S」。不宣告則走本地 skip（下面另有一條專測）。
+      deviceSupports: () => true,
       decryptText,
     } as any;
     const replayPath = join(mkdtempSync(join(tmpdir(), "cc-control-clarify-")), "control.json");

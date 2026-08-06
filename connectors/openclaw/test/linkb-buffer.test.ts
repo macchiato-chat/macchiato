@@ -397,7 +397,12 @@ describe("#247 Link B 半開連接偵測", () => {
     const port = (wss.address() as { port: number }).port;
     const c = new LinkBClient({ serverUrl: `ws://127.0.0.1:${port}`, connectorToken: "t", agentLinkId: "al" } as any);
     void c.start().catch(() => {});
-    await new Promise((r) => setTimeout(r, 250)); // > 80ms liveness:半開連接被 terminate
+    // ⚠️ 別改回「固定 sleep 250ms」：那只給 80ms 的探活計時器留 170ms 調度餘量,
+    // 在滿載機器上(公開樹隔離驗證是 450 個測試並發跑)Node 定時器滑幾百毫秒是常態
+    // ——2026-08-06 它就是這樣把一次生產發版的 sync-public 攔停的。改成輪詢等待:
+    // 斷言本身沒放鬆(仍要求 liveness 真的把半開連接 terminate 掉),只是不再賭調度。
+    const deadline = Date.now() + 5_000;
+    while (closed < 1 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
     expect(closed).toBeGreaterThanOrEqual(1); // 半開連接被判死關閉(而非幀發黑洞永不重連)
     expect((c as any).ready).toBe(false);
     c.close();

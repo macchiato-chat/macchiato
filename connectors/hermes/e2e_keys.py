@@ -8,8 +8,10 @@ import base64
 import binascii
 import fcntl
 import hashlib
+import hmac
 import json
 import os
+import re
 import stat
 import sys
 import threading
@@ -18,6 +20,19 @@ import uuid
 from copy import deepcopy
 
 import e2e_crypto as ec
+
+# #731 設備授權（與 packages/connector-core/src/e2e/device-auth.ts 對齊）。
+_DEVICE_AUTH_MAC_INFO = "macchiato-e2e-device-auth-v1"
+_DEVICE_AUTH_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
+
+
+class DeviceUnauthorizedError(ValueError):
+    """#731 設備授權未通過（缺/錯 authProof）。
+
+    刻意與「公鑰畸形」分開:前者要回報給用戶(可修——重新掃碼/貼完整配對碼),
+    後者用戶做不了什麼。繼承 ValueError 以保持既有 except 的行為不變。
+    鏡像 packages/connector-core/src/e2e/keys.ts 的 E2EDeviceUnauthorizedError。
+    """
 
 # #309 多 profile 實例:落在每實例 STATE_DIR 下(K_S 各實例獨立;默認 ~/.macchiato 零遷移)。
 _STATE_DIR = os.path.expanduser(os.environ.get("MACCHIATO_STATE_DIR", "").strip() or "~/.macchiato")
@@ -268,6 +283,57 @@ def device_key_fingerprint(pub_key: str) -> str:
     return base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).decode("ascii").rstrip("=")
 
 
+def _b64url_decode(s: str) -> bytes:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _is_canonical_device_auth_secret(value: object) -> bool:
+    if not isinstance(value, str) or not _DEVICE_AUTH_SECRET_RE.match(value):
+        return False
+    try:
+        return len(_b64url_decode(value)) == 32
+    except Exception:
+        return False
+
+
+def make_device_auth_proof(
+    secret_b64url: str,
+    agent_link_id: str,
+    device_id: str,
+    key_fingerprint: str,
+) -> str:
+    key = _b64url_decode(secret_b64url)
+    if len(key) != 32:
+        raise ValueError("device auth secret must decode to 32 bytes")
+    msg = f"{_DEVICE_AUTH_MAC_INFO}\0{agent_link_id}\0{device_id}\0{key_fingerprint}".encode("utf-8")
+    return _b64url_encode(hmac.new(key, msg, hashlib.sha256).digest())
+
+
+def verify_device_auth_proof(
+    secret_b64url: str,
+    agent_link_id: str,
+    device_id: str,
+    key_fingerprint: str,
+    proof_b64url: object,
+) -> bool:
+    if not isinstance(proof_b64url, str) or not proof_b64url:
+        return False
+    try:
+        expected = make_device_auth_proof(secret_b64url, agent_link_id, device_id, key_fingerprint)
+    except Exception:
+        return False
+    a = expected.encode("utf-8")
+    b = proof_b64url.encode("utf-8")
+    if len(a) != len(b):
+        return False
+    return hmac.compare_digest(a, b)
+
+
 class E2EKeyStore:
     def __init__(self, path: str = E2E_STORE):
         self._path = path
@@ -279,7 +345,56 @@ class E2EKeyStore:
         self._protected: set[str] = set()
         self._disk_snapshot = b"{}"
         self._poisoned = False
+        # #731 設備授權（None = 舊配對無 secret，wrap 降級）。
+        self._device_auth_secret: str | None = None
+        self._device_auth_agent_link_id: str | None = None
+        self._authorized_devices: dict[str, str] = {}
+        # #273 每會話「已拿到 K_S 的設備」自報的交互能力並集（進程內；見 device_supports）。
+        self._session_device_caps: dict[str, set] = {}
+        self._persist_authorized = None  # optional callable(dict)
+        self._device_auth_legacy_warned = False
+        self._device_auth_rejected: list[str] = []
         self._load()
+
+    def configure_device_auth(
+        self,
+        secret: str | None,
+        agent_link_id: str | None,
+        authorized_devices: dict | None = None,
+        persist_authorized=None,
+    ) -> None:
+        """#731：注入配對 secret。secret 非法 → 降級為無授權校驗。"""
+        if not secret or not agent_link_id or not _is_canonical_device_auth_secret(secret):
+            if secret:
+                print(
+                    "[E2E device-auth] secret/agentLinkId 無效 → 降級為無設備授權",
+                    file=sys.stderr,
+                )
+            self._device_auth_secret = None
+            self._device_auth_agent_link_id = None
+            self._authorized_devices = {}
+            self._persist_authorized = None
+            return
+        self._device_auth_secret = secret
+        self._device_auth_agent_link_id = agent_link_id
+        self._authorized_devices = {
+            str(k): str(v)
+            for k, v in (authorized_devices or {}).items()
+            if isinstance(k, str) and isinstance(v, str) and k and v
+        }
+        self._persist_authorized = persist_authorized
+
+    def has_device_auth(self) -> bool:
+        return self._device_auth_secret is not None
+
+    def take_device_auth_rejections(self) -> list:
+        """#731:取走並清空「上一次 wrap 因設備授權被跳過」的 deviceId。
+
+        連接器掛進 ``e2e_key.deviceAuthRejected``,server 據此告訴那台設備「你沒被授權」。
+        """
+        out = self._device_auth_rejected
+        self._device_auth_rejected = []
+        return out
 
     def _load(self) -> None:
         process_lock = self._acquire_process_lock()
@@ -731,14 +846,53 @@ class E2EKeyStore:
                 raise ValueError("invalid or duplicate device wrap target")
             seen.add(dev_id)
 
+    def _assert_device_authorized(self, d: dict, fingerprint: str) -> None:
+        """#731：有 secret 時要求 proof 或本地已授權同一指紋。"""
+        secret = self._device_auth_secret
+        agent_link_id = self._device_auth_agent_link_id
+        if not secret or not agent_link_id:
+            if not self._device_auth_legacy_warned:
+                self._device_auth_legacy_warned = True
+                print(
+                    "[E2E device-auth] 本連接器無配對 secret（舊配對）→ wrap 不校驗設備授權；"
+                    "重新配對後新碼會帶 secret。e2eKeyVersionBinding ≠ 設備授權。",
+                    file=sys.stderr,
+                )
+            return
+        dev_id = d.get("deviceId")
+        prior = self._authorized_devices.get(dev_id) if isinstance(dev_id, str) else None
+        if prior and prior == fingerprint:
+            return
+        if verify_device_auth_proof(
+            secret,
+            agent_link_id,
+            dev_id if isinstance(dev_id, str) else "",
+            fingerprint,
+            d.get("authProof"),
+        ):
+            self._authorized_devices[dev_id] = fingerprint
+            if self._persist_authorized is not None:
+                try:
+                    self._persist_authorized(dict(self._authorized_devices))
+                except Exception as exc:
+                    print(
+                        f"[E2E device-auth] 持久化授權表失敗（本進程內仍生效）: {exc}",
+                        file=sys.stderr,
+                    )
+            return
+        raise DeviceUnauthorizedError(
+            "device not authorized (missing/invalid authProof; refusing wrap for unknown fingerprint)"
+        )
+
     def wrap_for_devices(self, sid: str, devices: list) -> list:
         """把 K_S 封裝給已绑定 fingerprint 的設備。
 
-        畸形幀整批拒絕（且不生成 K_S）；單台壞公鑰只跳過該台、其餘照封。
+        畸形幀整批拒絕（且不生成 K_S）；單台壞公鑰/未授權只跳過該台、其餘照封。
         """
         self._assert_wrap_targets_well_formed(devices)  # 畸形幀不得觸發 K_S 生成
         k_s = self.get_or_create_key(sid)
         out = []
+        self._device_auth_rejected = []
         for d in devices or []:
             dev_id, pub = d.get("deviceId"), d.get("pubKey")
             fingerprint = d.get("keyFingerprint")
@@ -750,15 +904,36 @@ class E2EKeyStore:
                 # 自算即可，絕不因對端沒宣告版本就跳過該設備。帶了就必須對得上。
                 if fingerprint and computed != fingerprint:
                     raise ValueError("device public key fingerprint mismatch")
+                # #731 設備授權：封 K_S 前校驗。
+                self._assert_device_authorized(d if isinstance(d, dict) else {}, computed)
                 out.append({
                     "deviceId": dev_id,
                     "keyFingerprint": computed,
                     "sealed": ec.wrap_key(k_s, pub),
                 })
+                # #273 只統計**真的拿到 K_S** 的設備：被跳過的設備解不開任何東西。
+                caps = d.get("e2eCaps") if isinstance(d, dict) else None
+                if isinstance(caps, dict):
+                    cur = self._session_device_caps.setdefault(sid, set())
+                    if caps.get("clarify") is True:
+                        cur.add("clarify")
+                    if caps.get("secret") is True:
+                        cur.add("secret")
             except Exception as exc:
-                # 單台壞公鑰：跳過並響亮記錄，其餘設備照封（絕不 all-or-nothing）。
+                # 單台壞公鑰 / 未授權：跳過並響亮記錄，其餘設備照封（絕不 all-or-nothing）。
                 print(f"[E2E wrap skipped device {dev_id}] {exc}", file=sys.stderr)
+                if isinstance(exc, DeviceUnauthorizedError) and isinstance(dev_id, str) and dev_id:
+                    self._device_auth_rejected.append(dev_id)
         return out
+
+    def device_supports(self, sid: str, kind: str) -> bool:
+        """#273 本會話是否有設備解得開該類交互密文。**默認 False**——沒有正向聲明就當不支持，
+        調用方走 #273 之前的路徑（本地 skip 解掛），老 client 因此天然安全。
+
+        進程內記憶：連接器重啟後為空，直到 server 在 Link B ready 重發 wrap 請求把能力帶回。
+        失效方向是**安全**的（退回舊行為），不是打開缺口。
+        """
+        return kind in self._session_device_caps.get(sid, ())
 
     # ── 內容加解密（供 mirror/tui/prompt 接線用）──────────────────────────
     def encrypt_content(self, sid: str, obj) -> str:

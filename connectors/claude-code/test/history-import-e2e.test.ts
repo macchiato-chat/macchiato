@@ -198,6 +198,42 @@ describe("#347 history import E2E wire boundary", () => {
     ).toBe(true);
   });
 
+  it("#687 App ULID pending-enable 無 map 時 allowMissing 不 throw（避免 ready/enable onFatal）", () => {
+    // 可信空身份檔：用戶從 App 新建會話後立刻開加密——wire=ULID、尚無 CLI init。
+    writeFileSync(
+      process.env.MACCHIATO_CC_SESSIONS!,
+      JSON.stringify({
+        v: 2,
+        map: {},
+        aliases: {},
+        aliasHistoryTrusted: true,
+        cwds: {},
+        permModes: {},
+        models: {},
+        efforts: {},
+        pending: [],
+      }),
+    );
+    const ulid = "01K0CC687PENDINGENABLEULID01";
+    const drive = new Drive(
+      stubLinkb(),
+      undefined,
+      {
+        isE2E: (sid: string) => sid === ulid,
+        protectedSessionIds: () => [ulid],
+        hasServerStateSnapshot: () => true,
+      } as any,
+    );
+    // strict：缺 map → throw（內容面仍 fail-closed）
+    expect(() => drive.assertE2EIdentitySafe()).toThrow(/identity map unavailable/);
+    // pending-enable 白名單：enable / ready bootstrap 可過
+    expect(() => drive.assertE2EIdentitySafe(new Set([ulid]))).not.toThrow();
+    // 其它受保護 sid 不得借此白名單放行
+    expect(() => drive.assertE2EIdentitySafe(new Set(["01OTHERSESSION000000000001"]))).toThrow(
+      /identity map unavailable/,
+    );
+  });
+
   it("init rotation 立即持久所有 alias；同进程 import 与重启后的 mirror 都不泄露旧/新 transcript", () => {
     writeTranscript(E2E_SID, "/secret-old", "轮换前绝密");
     writeTranscript(ROTATED_E2E_SID, "/secret-new", "轮换后绝密");

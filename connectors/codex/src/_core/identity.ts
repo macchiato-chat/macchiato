@@ -9,6 +9,42 @@ export type ConnectorKind = "claude-code" | "codex" | "openclaw";
 
 export const CONNECTOR_KINDS = ["claude-code", "codex", "openclaw"] as const;
 
+/**
+ * 本實例狀態根（`MACCHIATO_STATE_DIR`，默認 `~/.macchiato`）。
+ *
+ * 與 Hermes `connector.py` 的 `STATE_DIR` 同名同語義（#309 profile 隔離）：同一台機器上跑多實例時，
+ * 每實例的落盤文件都掛在這個根下。含 `~` 的值按 Hermes 的 `expanduser` 語義展開，免得
+ * 四家對同一個 env 解出不同目錄。
+ */
+export function stateDir(): string {
+  const raw = (process.env.MACCHIATO_STATE_DIR || "").trim();
+  if (!raw) return join(homedir(), ".macchiato");
+  if (raw === "~") return homedir();
+  if (raw.startsWith("~/")) return join(homedir(), raw.slice(2));
+  return raw;
+}
+
+/**
+ * #669 本地心跳快照。**這是進程外 supervisor 唯一的連接器接口**——
+ * supervisor 絕不能 import 連接器樹（那正是會壞的東西，#528 的起因），所以只能讀文件。
+ *
+ * **按 kind 分家**：`~/.macchiato` 是四家共用的狀態根（`<kind>-connector.json`、
+ * `supervise-<kind>.state` 早就按 kind 分了）。同機裝了 CC + Codex 時共用一個 `health.json`
+ * 會讓兩家互相覆蓋——於是「CC 的 supervisor 讀到 Codex 的斷連狀態並重裝 CC」，
+ * 一個誤判就是全體重裝循環。故 supervisor 只認 `health-<kind>.json`。
+ *
+ * 不帶 kind 調用 → 歷史上的 `health.json`（Hermes 從 0.12.0 起就在寫，本機 inspect 用，
+ * 保持不動；Hermes 兩份都寫）。
+ */
+export function healthFilePath(kind?: string): string {
+  return join(stateDir(), kind ? `health-${kind}.json` : "health.json");
+}
+
+/** #669 本機安裝的穩定標識（首次生成後持久化；分批放量的哈希種子）。 */
+export function installIdPath(): string {
+  return join(stateDir(), "install-id");
+}
+
 /** UI / 配对文案用展示名（可被 MACCHIATO_PAIR_GROUP 覆盖）。 */
 export const DISPLAY_NAME: Record<ConnectorKind, string> = {
   "claude-code": "Claude Code",

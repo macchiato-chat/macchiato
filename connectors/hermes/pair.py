@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -51,13 +52,43 @@ def _write_private(path: str, content: str) -> None:
     os.replace(tmp, path)
 
 
-def _save_cred(msg: dict, label: str) -> None:
+# #731 生成側**不用數字**（鏡像 connector-core/src/e2e/device-auth.ts）：
+# 存量 iOS 的配對碼輸入框有 `filter(\.isNumber)`，用戶把完整 token 粘進去時會把 secret 裡的
+# 數字拼進配對碼 → 配對失敗。secret 本身不進配對碼（只在 QR 與單獨一行），這是第二道保險。
+# 解析側照舊接受含數字的 secret（早期配對可能已落盤過），只約束生成。
+_B64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+_DIGIT_FREE_B64URL = "".join(c for c in _B64URL_ALPHABET if not c.isdigit())
+# 43 字符的 base64url 恰好編碼 32 字節，末位只用到高 4 bit——低 2 bit 必須為 0 才是**規範**
+# 編碼（否則嚴格解碼跨端分歧）。故末位取「6-bit 值 ≡ 0 (mod 4)」且不含數字的字符。
+_DIGIT_FREE_B64URL_TAIL = "".join(
+    c for c in _DIGIT_FREE_B64URL if _B64URL_ALPHABET.index(c) % 4 == 0
+)
+_SECRET_CHARS = -(-32 * 8 // 6)  # 32 字節 → 43 字符
+
+
+def _new_device_auth_secret() -> str:
+    """#731：32 字節高熵 secret（base64url、不含數字），僅經 QR/終端行給設備。"""
+    body = "".join(secrets.choice(_DIGIT_FREE_B64URL) for _ in range(_SECRET_CHARS - 1))
+    return body + secrets.choice(_DIGIT_FREE_B64URL_TAIL)
+
+
+def _format_pairing_token(code: str, secret: str) -> str:
+    return f"{code}.{secret}"
+
+
+def _save_cred(msg: dict, label: str, device_auth_secret: str | None) -> None:
     cred = {
         "server_url": SERVER_URL,
         "connector_token": msg["connectorToken"],
         "agent_link_id": msg["agentLinkId"],
         "label": label,
     }
+    # #731 設備授權 secret（舊配對檔無此字段 → wrap 降級）。
+    # ⚠️ 只有**真的展示過**的 secret 才存：#388 一碼多綁的兄弟 agent 是各自的進程、
+    # 各自生成 secret 但從不打印，存了就是「有 secret 卻沒人持有」→ wrap 全跳過、
+    # E2E 永久不可用且零提示。鏡像 packages/connector-core/src/linkb/pairing.ts。
+    if device_auth_secret:
+        cred["device_auth_secret"] = device_auth_secret
     _write_private(CRED_PATH, json.dumps(cred, indent=2))
 
 
@@ -70,20 +101,28 @@ _PAIR_GROUP = os.environ.get("MACCHIATO_PAIR_GROUP", "").strip() or _PAIR_WHO
 _PAIR_BATCH = os.environ.get("MACCHIATO_PAIR_BATCH", "").strip()
 
 
-def _show_code(code: str, fresh: bool) -> None:
+def _show_code(code: str, fresh: bool, device_auth_secret: str) -> None:
+    token = _format_pairing_token(code, device_auth_secret)
     try:
-        _write_private(CODE_FILE, code)  # #254 0600 私有(此前 /tmp 世界可讀 → 他人可搶 claim)
+        # #254 0600 私有；#731 寫完整 token（含 secret），便於本機腳本讀取。
+        _write_private(CODE_FILE, token)
     except Exception:
         pass
     print("\n" + "=" * 54)
     print(f"  Pairing code for {_PAIR_GROUP}" + (" (refreshed)" if fresh else "") + ":")
+    # ⚠️ 回歸契約:scripts/regression/*、scripts/localchain/run.mjs 與 run-folders-e2e.mjs 斷言
+    # 「>>> <純數字碼> <<<」(folders-e2e 還靠上行「code」字樣定位)——這一行**只准放數字**。
     print(f"        >>>  {code}  <<<")
     print(f"  Sign in at {WEB_URL} → \"Pair connector\" → enter this code.")
+    # #731 secret 不進配對碼(見 connector-core/linkb/pairing.ts 的說明);想開 E2E 才需要這行。
+    print("\n  Optional — end-to-end encryption device key (iOS only; scanning the QR covers this):")
+    print(f"        {device_auth_secret}")
     if _PAIR_BATCH and os.environ.get("MACCHIATO_PAIR_BATCH_MANY"):
         print("  Other agents from this install will pair automatically with this code.")
     # #388 終端 QR(可選增強):qrencode 在則打 ANSI 碼(iOS 掃碼配對直接掃終端);缺失靜默跳過
+    # #731 QR 帶完整 token（含 e2eAuth）
     try:
-        qr = subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "2", code], capture_output=True, text=True, timeout=3)
+        qr = subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "2", token], capture_output=True, text=True, timeout=3)
         if qr.returncode == 0 and qr.stdout:
             print("\n" + qr.stdout + "  (scan with the Macchiato iOS app)")
     except Exception:
@@ -91,7 +130,7 @@ def _show_code(code: str, fresh: bool) -> None:
     print("=" * 54 + "\nWaiting for you to claim it…", flush=True)
 
 
-async def _attempt(label: str, fresh: bool) -> str:
+async def _attempt(label: str, fresh: bool, device_auth_secret: str) -> str:
     """一次配對嘗試（連接保活 + 定期換新碼防 server 8-min TTL 過期）。
     返回 'paired' / 'auth_error'；連接斷開則拋 ConnectionClosed 讓外層重連。"""
     async with websockets.connect(
@@ -117,7 +156,7 @@ async def _attempt(label: str, fresh: bool) -> str:
                 msg = json.loads(raw)
                 t = msg.get("t")
                 if t == "pair_pending":
-                    _show_code(msg.get("code", ""), fresh or seen_first)
+                    _show_code(msg.get("code", ""), fresh or seen_first, device_auth_secret)
                     seen_first = True
                 elif t == "auth_error":
                     print(f"FAIL: {msg.get('reason')}", file=sys.stderr)
@@ -126,7 +165,9 @@ async def _attempt(label: str, fresh: bool) -> str:
                     if not seen_first:
                         # #388:沒展示過碼就 paired = 同批安裝免碼自動綁定
                         print("\n✓ Paired automatically — claimed with the same code as the first agent in this install.")
-                    _save_cred(msg, label)
+                        print("  (E2E device auth: this agent has no pairing secret — pair it on its own to enable it.)")
+                    # #731:只存展示過的 secret(見 _save_cred)
+                    _save_cred(msg, label, device_auth_secret if seen_first else None)
                     try:
                         os.remove(CODE_FILE)
                     except OSError:
@@ -144,13 +185,15 @@ async def main() -> int:
         f"Hermes:{_PAIR_PROFILE} ({socket.gethostname()})" if _PAIR_PROFILE else f"Hermes ({socket.gethostname()})"
     )
     label = os.environ.get("MACCHIATO_LABEL") or default_label
+    # #731：整個配對窗口共用一把 secret（換碼不換 secret）。
+    device_auth_secret = _new_device_auth_secret()
     loop = asyncio.get_running_loop()
     deadline = loop.time() + WAIT_S
     fresh = False
     while loop.time() < deadline:
         print(f"· connecting to {SERVER_URL} …", flush=True)
         try:
-            outcome = await _attempt(label, fresh)
+            outcome = await _attempt(label, fresh, device_auth_secret)
             if outcome == "paired":
                 return 0
             if outcome == "auth_error":

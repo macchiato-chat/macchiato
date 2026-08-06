@@ -325,6 +325,88 @@ describe("#132 v2 回合生命週期", () => {
     await tick();
     expect(d.authFailed).toBe(false);
   });
+
+  it("模型需更新 CLI(JSON detail)→ 人話文案,不甩裸 JSON;點明是本機 Codex 不是 Macchiato", async () => {
+    const { client, linkb, sent } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "介绍一下" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    client.fire("turn/completed", {
+      threadId: TID,
+      turn: {
+        status: "failed",
+        error: {
+          message:
+            `{"detail":"The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."}`,
+        },
+      },
+    });
+    await tick();
+    const line = events(sent).find((e) => e.type === "review.summary");
+    const summary = String(line?.payload.summary ?? "");
+    expect(summary).toContain("gpt-5.6-sol");
+    expect(summary).toMatch(/Codex CLI/);
+    expect(summary).toMatch(/不是 Macchiato/);
+    expect(summary).toMatch(/npm i -g @openai\/codex@latest/);
+    expect(summary).not.toMatch(/\{"detail"/);
+  });
+
+  it("粘滯 model 需更新 CLI → 清粘滯 + 靜默換模重試一次(不發 error 終態)", async () => {
+    const { d, client, linkb, sent } = make();
+    (d as any).models[SID] = "gpt-5.6-sol";
+    await linkb.deliver(tui("prompt.submit", SID, { text: "hi" }));
+    // 首回合帶 model
+    const firstStart = client.requests.find((r) => r.method === "turn/start")!;
+    expect(firstStart.params.model).toBe("gpt-5.6-sol");
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    client.fire("turn/completed", {
+      threadId: TID,
+      turn: {
+        status: "failed",
+        error: {
+          message: "The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade.",
+        },
+      },
+    });
+    await tick();
+    // 粘滯已清
+    expect((d as any).models[SID]).toBeUndefined();
+    // 自動重試:第二個 turn/start 不再帶壞 model
+    const starts = client.requests.filter((r) => r.method === "turn/start");
+    expect(starts.length).toBe(2);
+    expect(starts[1]!.params.model).toBeUndefined();
+    // 軟提示,不是 error 終態
+    const summaries = events(sent).filter((e) => e.type === "review.summary");
+    expect(summaries.some((e) => String(e.payload.summary).includes("已自動改用"))).toBe(true);
+    expect(events(sent).filter((e) => e.type === "message.complete" && e.payload.status === "error")).toHaveLength(0);
+    // 重試成功
+    client.fire("turn/started", { threadId: TID, turn: { id: "t2" } });
+    client.fire("item/completed", { threadId: TID, item: { type: "agentMessage", id: "m1", text: "你好" } });
+    client.fire("turn/completed", { threadId: TID, turn: { status: "completed" } });
+    await tick();
+    const ok = events(sent).find((e) => e.type === "message.complete" && e.payload.status === "complete");
+    expect(ok?.payload.text).toBe("你好");
+  });
+
+  it("未指定 model(CLI 默認壞)→ 不空轉重試,直接人話提示", async () => {
+    const { client, linkb, sent } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "hi" }));
+    client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+    client.fire("turn/completed", {
+      threadId: TID,
+      turn: {
+        status: "failed",
+        error: {
+          message: "The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade.",
+        },
+      },
+    });
+    await tick();
+    // 只起一回合(重試沒意義:省略 model 仍撞 CLI 默認)
+    expect(client.requests.filter((r) => r.method === "turn/start")).toHaveLength(1);
+    const line = events(sent).find((e) => e.type === "review.summary");
+    expect(String(line?.payload.summary)).toMatch(/gpt-5\.6-sol/);
+    expect(String(line?.payload.summary)).toMatch(/npm i -g @openai\/codex@latest/);
+  });
 });
 
 describe("#132 v2 steer", () => {

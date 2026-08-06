@@ -9,6 +9,14 @@
 #   1. 啟動前 probe（import 閉合 / 短存活）
 #   2. 秒退 / 崩潰計數超過閾值 → 拉最新 signed release.json → 驗簽 → 重裝
 #   3. exit 78（#387 解綁）直接透傳，不 heal、不重啟
+#   4. #669「活著但連不上」：讀連接器寫的心跳文件，linkConnected=false 持續超閾 → 同樣走 heal
+#   5. #669 階段 3「推錯了能自己退回來」：把已確認健康的安裝快照到本機 N-1 槽位；
+#      版本一變就進試用期，試用不達標 → 回退到那份本機副本 + 拉黑該版本
+#
+# 為什麼要有第 4 條（#669 / #210，產品負責人親身踩過）：前三條只認**崩潰循環**。連接器
+# 「進程活著、但連不上 server」時本腳本完全看不見——子進程穩定存活 ≥60s 就清失敗計數然後
+# 一直 wait。而連不上 = 收不到 `self_update` = 自己爬不出來，死循環。
+# 接口只能是**文件**：本腳本絕不能 import 連接器樹（那正是會壞的東西，#528 的起因）。
 #
 # 用法（由 unit 生成）：
 #   macchiato-supervise <kind> -- <real exec args...>
@@ -21,6 +29,12 @@
 #   MACCHIATO_SUPERVISE_PROBE_S / MACCHIATO_SUPERVISE_STABLE_S
 #   MACCHIATO_SUPERVISE_STATE_DIR  默認 ~/.macchiato
 #   MACCHIATO_SUPERVISE_DISABLE_HEAL=1  關掉自愈（測試/排障）
+#   #669 斷連判據：MACCHIATO_SUPERVISE_DISCONNECT_S（0 = 關掉這條判據）/
+#     MACCHIATO_SUPERVISE_HEARTBEAT_STALE_S / MACCHIATO_SUPERVISE_DISCONNECT_COOLDOWN_S /
+#     MACCHIATO_SUPERVISE_DISCONNECT_POLL_S
+#   #669 試用/回退：MACCHIATO_SUPERVISE_TRIAL_S（0 = 關掉試用與回退）/
+#     MACCHIATO_SUPERVISE_ROLLBACK_COOLDOWN_S / MACCHIATO_SUPERVISE_SNAPSHOT_RETRY_S /
+#     MACCHIATO_SUPERVISE_DISABLE_ROLLBACK=1
 set -euo pipefail
 
 # 剝 loader hooks：與 install/self_update 同邊界（本腳本自身也幾乎不能壞）。
@@ -41,12 +55,56 @@ readonly COOLDOWN_S="${MACCHIATO_SUPERVISE_COOLDOWN_S:-1800}" # 30 min
 readonly PROBE_S="${MACCHIATO_SUPERVISE_PROBE_S:-20}"
 readonly STABLE_S="${MACCHIATO_SUPERVISE_STABLE_S:-60}"
 readonly STATE_DIR="${MACCHIATO_SUPERVISE_STATE_DIR:-$HOME/.macchiato}"
+# ── #669「活著但連不上」判據的閘門 ───────────────────────────────────────────
+# 這條判據實現錯了就是**全體用戶無限重裝循環**,所以每個數字都往保守一側取:
+#   · DISCONNECT_S 15 min:遠大於任何正常重連退避(連接器最大退避 30s)與 server 部署窗口;
+#   · HEARTBEAT_STALE_S 5 min:心跳間隔 30s,超十倍才算「這文件不能信了」;
+#   · DISCONNECT_COOLDOWN_S 6h:**獨立於崩潰循環的冷卻**,且比它(30 min)長一個數量級——
+#     崩潰循環有子進程秒退這個硬證據,本判據只有一個布爾,誤判成本高得多。
+readonly DISCONNECT_S="${MACCHIATO_SUPERVISE_DISCONNECT_S:-900}"
+readonly HEARTBEAT_STALE_S="${MACCHIATO_SUPERVISE_HEARTBEAT_STALE_S:-300}"
+readonly DISCONNECT_COOLDOWN_S="${MACCHIATO_SUPERVISE_DISCONNECT_COOLDOWN_S:-21600}"
+readonly DISCONNECT_POLL_S="${MACCHIATO_SUPERVISE_DISCONNECT_POLL_S:-60}"
+# ── #669 階段 3：N-1 快照 / 試用期 / 自動回退 / 版本黑名單的閘門 ──────────────
+# 同樣往保守一側取:
+#   · TRIAL_S 15 min:遠大於「起得來 + 連得上」需要的時間(啟動 + WS 握手 ≪ 1 min),
+#     短了會把一次網路抖動判成壞版本;長了只是晚一點回退,壞版本期間連接器本來就沒在工作。
+#   · ROLLBACK_COOLDOWN_S 6h:回退要動整棵 app 樹,是本腳本副作用最大的動作,冷卻取最長一檔。
+#   · SNAPSHOT_RETRY_S 1h:快照失敗(多半是磁碟滿)不該每個輪詢週期重試一次 I/O 風暴。
+readonly TRIAL_S="${MACCHIATO_SUPERVISE_TRIAL_S:-900}"
+readonly ROLLBACK_COOLDOWN_S="${MACCHIATO_SUPERVISE_ROLLBACK_COOLDOWN_S:-21600}"
+readonly SNAPSHOT_RETRY_S="${MACCHIATO_SUPERVISE_SNAPSHOT_RETRY_S:-3600}"
+# ── #669 階段 4:自動更新的檢查週期 ───────────────────────────────────────────
+# **「默認關閉」不靠任何本地開關**:公開 repo 沒有 release-policy.json 時,決策器回
+# `no-policy` → 一台都不會升。打開 = 簽一份 rolloutPercent > 0 的策略;關閉 = 撤掉或改回 0。
+# 關閉狀態因此由**簽名的控制面**強制,而不是本地默認值——本地默認會漂、會被誤改、會被遺忘,
+# 而且沒有審計痕跡;簽名策略天然是一次可審計的操作。
+# 這裡這個變量只是**本機急停**(排障/事故時 0 掉它),不是產品開關。
+readonly AUTO_UPDATE_S="${MACCHIATO_SUPERVISE_AUTO_UPDATE_S:-21600}"  # 6h;0 = 本機停掉自動檢查
 readonly RELEASE_BASE="${MACCHIATO_RELEASE_BASE:-https://raw.githubusercontent.com/macchiato-chat/macchiato/main}"
 # 驗簽的公鑰(K0)不在本腳本——它嵌在冷凍的 release_verify.py 裡,由 heal 調用。
 # 這裡刻意不放第二份副本:兩處公鑰遲早漂移,而漂移的那份會顯得「也在把關」。
 
 log() { printf '[macchiato-supervise] %s\n' "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
+
+# 嚴格 X.Y.Z 比較:$1 是否**嚴格高於** $2。畸形/空值一律判否——本函數的唯一調用方是
+# 「要不要重裝」那道閘,判否 = 不重裝,是安全的一側。
+version_is_newer() {
+  local py
+  py="$(command -v python3 || command -v python || true)"
+  [ -n "$py" ] || return 1
+  "$py" - "${1:-}" "${2:-}" <<'PY' >/dev/null 2>&1
+import re
+import sys
+
+R = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+a, b = R.match(sys.argv[1]), R.match(sys.argv[2])
+if not a or not b:
+    raise SystemExit(1)
+raise SystemExit(0 if tuple(map(int, a.groups())) > tuple(map(int, b.groups())) else 1)
+PY
+}
 
 KIND=""
 REAL_CMD=()
@@ -60,6 +118,12 @@ macchiato-supervise <kind> -- <command...>
 EOF
       exit 0
       ;;
+    # 僅供冒煙測試:把升版閘的比較邏輯單獨暴露出來(它決定「斷連要不要重裝」,
+    # 而完整 heal 路徑需要真網路,測不到)。不進 unit、不被任何運行時路徑使用。
+    --check-newer) version_is_newer "${2:-}" "${3:-}"; exit $? ;;
+    # 同上,僅供冒煙:自動安裝路徑那道「本機黑名單 / 已停自動升」的閘。
+    # 它要讀狀態檔,故只記下來,等 STATE_FILE 就緒後在下面處理。
+    --check-blocked) CHECK_BLOCKED="${2:-}"; break ;;
     *)
       if [ -z "$KIND" ]; then KIND="$1"; shift
       else die "unexpected arg: $1 (use -- before real command)"; fi
@@ -71,39 +135,91 @@ case "$KIND" in
   hermes|openclaw|claude-code|codex) ;;
   *) die "unknown kind '$KIND' (want hermes|openclaw|claude-code|codex)" ;;
 esac
-[ "${#REAL_CMD[@]}" -gt 0 ] || die "missing real command after --"
 
 mkdir -p "$STATE_DIR"
-STATE_FILE="$STATE_DIR/supervise-$KIND.state"
+# SLOT = 本機上「一個被監管的連接器實例」的身份。狀態檔與版本黑名單都按它分家
+# ——`~/.macchiato` 是四家(以及多個 hermes profile)共用的目錄。
+SLOT="$KIND"
 # profile 隔離：多 hermes 實例各自計數
 if [ "$KIND" = "hermes" ] && [ -n "${MACCHIATO_HERMES_PROFILE:-}" ]; then
-  STATE_FILE="$STATE_DIR/supervise-hermes-${MACCHIATO_HERMES_PROFILE}.state"
+  SLOT="hermes-${MACCHIATO_HERMES_PROFILE}"
 fi
+STATE_FILE="$STATE_DIR/supervise-$SLOT.state"
+# --check-blocked 只查一個閘、不起任何進程,故不要求真命令。
+[ -n "${CHECK_BLOCKED:-}" ] || [ "${#REAL_CMD[@]}" -gt 0 ] || die "missing real command after --"
 LOG_DIR="$STATE_DIR/logs"
 mkdir -p "$LOG_DIR"
 HEAL_LOG="$LOG_DIR/supervise-heal.log"
 
 now_s() { date +%s; }
 
+# 嚴格 X.Y.Z 才留下,其餘一律清空。狀態檔是被 `.` 進來的,而這幾個欄位現在裝的是
+# 字串而非整數——寧可當「未知」(所有判據對未知都是不動作),也不要把畸形值往下傳。
+sanitize_version_var() { # $1 = 變數名
+  local v="${!1:-}"
+  if [[ "$v" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    printf -v "$1" '%s' "$v"
+  else
+    printf -v "$1" '%s' ""
+  fi
+}
+
 read_state() {
   FAILS=0
   WINDOW_START=0
   LAST_HEAL=0
+  LAST_DC_HEAL=0
+  GOOD_VERSION=""
+  TRIAL_VERSION=""
+  TRIAL_START=0
+  TRIAL_SEEN=0
+  LAST_ROLLBACK=0
+  LAST_SNAP_TRY=0
+  LAST_UPDATE_CHECK=0
+  UPDATE_STOPPED=0
   if [ -f "$STATE_FILE" ]; then
     # shellcheck disable=SC1090
-    # 狀態文件只含 FAILS=/WINDOW_START=/LAST_HEAL= 整數行
+    # 狀態文件只含上面那幾個 KEY=value 行(整數,或嚴格 X.Y.Z 的版本字串)
     # shellcheck source=/dev/null
     . "$STATE_FILE" 2>/dev/null || true
   fi
   FAILS="${FAILS:-0}"
   WINDOW_START="${WINDOW_START:-0}"
   LAST_HEAL="${LAST_HEAL:-0}"
+  # #669 斷連判據自己的冷卻時刻。必須跨進程持久:heal 會重裝並重啟本服務,
+  # 只存在內存的話「上次因斷連重裝過」這件事每次重啟都被忘掉 = 無限重裝。
+  LAST_DC_HEAL="${LAST_DC_HEAL:-0}"
+  # ── #669 階段 3 ──
+  # GOOD_VERSION：本機**確認過能用**(進程穩定 + 心跳已連上)的版本,也是 N-1 槽位裡那份。
+  # TRIAL_VERSION/TRIAL_START：試用中的新版本與起點。必須持久——試用期跨進程重啟,
+  #   只存在內存的話「壞版本正在試用」每次崩潰重啟都被忘掉 = 永遠等不到那個回退判決。
+  # LAST_ROLLBACK/LAST_SNAP_TRY：兩個新觸發條件各自的速率上限(見腳本頂部的閘門說明)。
+  # UPDATE_STOPPED：回退自己失敗過 → 停掉所有自動安裝,只留手工重裝這條逃生通道。
+  TRIAL_START="${TRIAL_START:-0}"
+  TRIAL_SEEN="${TRIAL_SEEN:-0}"
+  LAST_ROLLBACK="${LAST_ROLLBACK:-0}"
+  LAST_SNAP_TRY="${LAST_SNAP_TRY:-0}"
+  # #669 階段 4:上次查版本的時刻。跨進程持久——只存內存的話每次重啟都會立刻再查一次源站。
+  LAST_UPDATE_CHECK="${LAST_UPDATE_CHECK:-0}"
+  UPDATE_STOPPED="${UPDATE_STOPPED:-0}"
+  sanitize_version_var GOOD_VERSION
+  sanitize_version_var TRIAL_VERSION
+  case "$FAILS$WINDOW_START$LAST_HEAL$LAST_DC_HEAL$TRIAL_START$TRIAL_SEEN$LAST_ROLLBACK$LAST_SNAP_TRY$LAST_UPDATE_CHECK" in
+    *[!0-9]*) FAILS=0; WINDOW_START=0; LAST_HEAL=0; LAST_DC_HEAL=0
+              TRIAL_START=0; TRIAL_SEEN=0; LAST_ROLLBACK=0; LAST_SNAP_TRY=0; LAST_UPDATE_CHECK=0 ;;
+  esac
+  [ "$UPDATE_STOPPED" = "1" ] || UPDATE_STOPPED=0
 }
 
 write_state() {
   local tmp
   tmp="$(mktemp "${STATE_FILE}.XXXXXX")"
-  printf 'FAILS=%s\nWINDOW_START=%s\nLAST_HEAL=%s\n' "$FAILS" "$WINDOW_START" "$LAST_HEAL" >"$tmp"
+  printf 'FAILS=%s\nWINDOW_START=%s\nLAST_HEAL=%s\nLAST_DC_HEAL=%s\n' \
+    "$FAILS" "$WINDOW_START" "$LAST_HEAL" "$LAST_DC_HEAL" >"$tmp"
+  printf 'GOOD_VERSION=%s\nTRIAL_VERSION=%s\nTRIAL_START=%s\nTRIAL_SEEN=%s\n' \
+    "$GOOD_VERSION" "$TRIAL_VERSION" "$TRIAL_START" "$TRIAL_SEEN" >>"$tmp"
+  printf 'LAST_ROLLBACK=%s\nLAST_SNAP_TRY=%s\nUPDATE_STOPPED=%s\nLAST_UPDATE_CHECK=%s\n' \
+    "$LAST_ROLLBACK" "$LAST_SNAP_TRY" "$UPDATE_STOPPED" "$LAST_UPDATE_CHECK" >>"$tmp"
   mv -f "$tmp" "$STATE_FILE"
 }
 
@@ -137,6 +253,643 @@ should_heal() {
     log "heal cooldown active ($((COOLDOWN_S - (t - LAST_HEAL)))s left) — not reinstalling"
     return 1
   fi
+  return 0
+}
+
+# ── #669「活著但連不上」判據 ──────────────────────────────────────────────────
+#
+# 唯一接口是連接器寫的心跳文件（本腳本絕不能 import 連接器樹）。三條鐵律：
+#
+#  1. **fail-open**：文件缺失 / 壞 / 過期 / 沒有那幾個字段（老連接器）→ 一律「未知」，
+#     **不觸發 heal**。寧可漏，不可誤——誤判一次 = 全體用戶被重裝循環打成永久掉線，
+#     那正是 #528 要消滅的故障形狀，本判據不該自己再造一個。
+#  2. **獨立的速率上限**：本判據有自己的 LAST_DC_HEAL 冷卻（默認 6h），不與崩潰循環共用。
+#  3. **零新依賴**：只用 heal 已經依賴的 python3 解析 JSON；連 python3 都沒有 → 未知 → 不 heal。
+#
+# 心跳文件為什麼是 per-kind：`~/.macchiato` 是**四家共用**的狀態目錄（`<kind>-connector.json`、
+# `supervise-<kind>.state` 都已按 kind 分家）。同機裝了 CC + Codex 時，共用一個 `health.json`
+# 會讓兩家互相覆蓋——於是「CC 的 supervisor 讀到 Codex 的斷連狀態並重裝 CC」。
+# 故本腳本只認 `health-<kind>.json`；那個沒有就是未知（見鐵律 1）。
+health_file() {
+  # 連接器用 MACCHIATO_STATE_DIR（#309 profile 隔離，unit env 傳入）；缺省與本腳本同根。
+  printf '%s/health-%s.json' "${MACCHIATO_STATE_DIR:-$STATE_DIR}" "$KIND"
+}
+
+# 成功時 echo "<connected 0|1> <ts> <version>"；任何不確定都 return 1（= 未知）。
+# version 是必需字段:斷連重裝的前提是「存在更高的版本」(見 heal 的 require_newer),
+# 拿不到本機版本就沒法做那個判斷 → 未知 → 不重裝。老連接器不寫它,自然落在安全側。
+read_heartbeat() {
+  local f py out
+  f="$(health_file)"
+  [ -f "$f" ] || return 1
+  py="$(command -v python3 || command -v python || true)"
+  [ -n "$py" ] || return 1
+  out="$("$py" - "$f" <<'PY' 2>/dev/null
+import json
+import re
+import sys
+
+try:
+    with open(sys.argv[1], "rb") as fh:
+        h = json.loads(fh.read(1 << 20))  # 封頂 1 MiB：心跳是幾百字節，更大的不是心跳
+except Exception:
+    raise SystemExit(1)
+if not isinstance(h, dict):
+    raise SystemExit(1)
+c, ts, v = h.get("linkConnected"), h.get("ts"), h.get("version")
+# 字段缺失/類型不對 = 老連接器或別的東西寫的 → 未知，絕不據此重裝。
+# bool 是 int 的子類，必須顯式排除，否則 linkConnected 為 True 時 ts 校驗會被蒙混。
+if not isinstance(c, bool) or isinstance(ts, bool) or not isinstance(ts, int):
+    raise SystemExit(1)
+# 版本必須是嚴格 X.Y.Z：它要拿去和已驗簽清單比大小，畸形值一律當未知。
+if not isinstance(v, str) or re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", v) is None:
+    raise SystemExit(1)
+print("%d %d %s" % (1 if c else 0, ts, v))
+PY
+)" || return 1
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+# 本進程內的斷連起點（epoch 秒；0 = 當前不算斷連）。
+# 刻意**不持久化**：supervisor 與連接器同生共死，判斷粒度就該是「本次運行連不上多久了」。
+# 存進盤上反而危險——一個兩天前留下的起點會讓今天一次瞬斷立刻觸發重裝。
+DISCONNECT_SINCE=0
+# 上一次真正**觀測**到的時刻（epoch 秒；0 = 還沒觀測過）。
+# 用來識別「我們沒在看」的間隙——見下面 disconnect_watchdog 裡的 gap 判斷。
+LAST_OBSERVE=0
+
+disconnect_watchdog() {
+  [ "${MACCHIATO_SUPERVISE_DISABLE_HEAL:-0}" = "1" ] && return 0
+  [ "$DISCONNECT_S" -le 0 ] 2>/dev/null && return 0  # 顯式關閉（0 或非法值都當關）
+
+  local t hb connected hb_ts hb_ver age gap max_gap
+  t="$(now_s)"
+
+  # 觀測間隙檢測:本判據要度量的是「**我連續觀測到**斷連多久了」,不是「牆鐘走了多久」。
+  # 兩者在筆記本休眠時會嚴重背離:網路先掉(計時器已武裝)→ 機器睡幾小時 → 喚醒後連接器
+  # 先寫出一份新鮮心跳(WS 還在重連中,linkConnected=false)→ 若按牆鐘算,elapsed 已是幾
+  # 小時 ≥ 閾值 → **立刻重裝**,根本沒給喚醒後的重連留那 15 分鐘。心跳過期檢查擋不住它:
+  # 那隻在連接器**沒寫**時生效,而喚醒後 30s 內它就會寫。
+  # 故:一旦發現兩次觀測之間的間隙遠大於輪詢週期(休眠 / 本進程被 SIGSTOP / 極端負載),
+  # 就把計時器重新起算——寧可多等一個完整週期,也不要憑一段沒看見的時間去重裝。
+  max_gap="${MACCHIATO_SUPERVISE_MAX_OBSERVE_GAP_S:-}"   # 留一個注入點，讓冒煙能真的驅動這條分支
+  if [ -z "$max_gap" ]; then
+    max_gap=$(( DISCONNECT_POLL_S * 3 ))
+    [ "$max_gap" -ge 180 ] || max_gap=180
+  fi
+  if [ "$LAST_OBSERVE" -ne 0 ]; then
+    gap=$(( t - LAST_OBSERVE ))
+    [ "$gap" -lt 0 ] && gap=$(( -gap ))   # 時鐘倒退同樣是「這段時間不可信」
+    if [ "$gap" -gt "$max_gap" ] && [ "$DISCONNECT_SINCE" -ne 0 ]; then
+      log "observation gap ${gap}s (> ${max_gap}s, suspend/stall?) — disconnect timer restarted"
+      DISCONNECT_SINCE=0
+    fi
+  fi
+  LAST_OBSERVE="$t"
+
+  if ! hb="$(read_heartbeat)"; then
+    DISCONNECT_SINCE=0  # 未知 → 不計時、不 heal
+    return 0
+  fi
+  read -r connected hb_ts hb_ver <<<"$hb"
+
+  # 心跳過期（連接器沒在寫了 / 系統時鐘跳變）→ 未知。這裡的「舊」和「來自未來」都算不可信。
+  age=$(( t - hb_ts ))
+  [ "$age" -lt 0 ] && age=$(( -age ))
+  if [ "$age" -gt "$HEARTBEAT_STALE_S" ]; then
+    if [ "$DISCONNECT_SINCE" -ne 0 ]; then
+      log "heartbeat stale (${age}s) — disconnect timer cleared (unknown ≠ unhealthy)"
+      DISCONNECT_SINCE=0
+    fi
+    return 0
+  fi
+
+  if [ "$connected" = "1" ]; then
+    if [ "$DISCONNECT_SINCE" -ne 0 ]; then
+      log "link reconnected — disconnect timer cleared"
+      DISCONNECT_SINCE=0
+    fi
+    return 0
+  fi
+
+  if [ "$DISCONNECT_SINCE" -eq 0 ]; then
+    DISCONNECT_SINCE="$t"
+    log "heartbeat: linkConnected=false — arming ${DISCONNECT_S}s disconnect timer"
+    return 0
+  fi
+  [ $(( t - DISCONNECT_SINCE )) -ge "$DISCONNECT_S" ] || return 0
+
+  read_state
+  # 本判據自己的冷卻（重裝完給它足夠長的時間去證明自己）。
+  if [ "$LAST_DC_HEAL" -gt 0 ] && [ $(( t - LAST_DC_HEAL )) -lt "$DISCONNECT_COOLDOWN_S" ]; then
+    log "disconnect heal cooldown active ($((DISCONNECT_COOLDOWN_S - (t - LAST_DC_HEAL)))s left) — not reinstalling"
+    DISCONNECT_SINCE="$t"  # 重新起算，別讓冷卻一到就立刻放行
+    return 0
+  fi
+  # 也尊重崩潰循環那條的冷卻：剛因崩潰重裝完，不該立刻再來一發。
+  if [ "$LAST_HEAL" -gt 0 ] && [ $(( t - LAST_HEAL )) -lt "$COOLDOWN_S" ]; then
+    log "heal cooldown active ($((COOLDOWN_S - (t - LAST_HEAL)))s left) — not reinstalling for disconnect"
+    DISCONNECT_SINCE="$t"
+    return 0
+  fi
+
+  # 先把冷卻落盤**再**動手：heal 會 spawn 重裝並重啟本服務，這行沒寫成功就等於沒有閘。
+  LAST_DC_HEAL="$t"
+  write_state
+  DISCONNECT_SINCE=0
+  # 第二個參數 = 只在「清單版本嚴格高於本機」時才裝（見 heal 的 require_newer）。
+  heal "alive but link down ≥${DISCONNECT_S}s" "$hb_ver" || true
+}
+
+# ── #669 階段 3：N-1 快照 / 試用期 / 自動回退 / 版本黑名單 ────────────────────
+#
+# 為什麼非要本機快照:連接器自更新走**嚴格升版閘**(assertSelfUpdateAllowed),降級被
+# 一律拒絕;而 install.sh 裝的永遠是公開 repo main 的當前 HEAD——**網路上根本不存在
+# 「N-1 的可安裝物」**。所以壞版本的回退只可能靠本機留下來的、之前已經驗過簽也真跑起來過
+# 的那份副本。
+#
+# 🚨 這條路**只用本機副本**,絕不接受任何從網路拉來的降級清單。嚴格升版閘是防降級重放的
+# 安全屬性(攻擊者不能拿一份舊的合法簽名把你推回有洞的版本),本地回滾是另一回事——
+# 它的信任根是「這份字節此前在本機通過了同一條驗簽鏈、並且真的連上過 server」。
+# 兩者不可混為一談,更不得因為要回退就把升版閘放寬。
+#
+# 本階段(#669 階段 3)刻意**不打開自動升級**:下面的機制只在**用戶手點更新**之後被動
+# 觀測到「版本變了」時才起作用。零產品行為變化,卻讓最難的那段邏輯先在真實流量裡跑過。
+#
+# fail-open 同上:app 目錄認不出來 / 磁碟不夠 / 快照缺失 / 心跳未知 —— 一律「不動作」,
+# 最壞結果是「沒有回退能力」,而不是「連接器起不來」。
+
+# 被監管的那棵 app 樹。與 probe 同一套推導(從 REAL_CMD 反推),不在本腳本裡複述安裝佈局
+# ——佈局一旦漂移,寫死的那份會在未來某個健康版本上指向不存在的目錄。
+app_dir() {
+  local d=""
+  case "$KIND" in
+    hermes)  # REAL_CMD: <python> <app>/connector.py
+      [ -n "${REAL_CMD[1]:-}" ] && d="$(cd "$(dirname "${REAL_CMD[1]}")" 2>/dev/null && pwd)" || true ;;
+    *)       # REAL_CMD: <app>/node_modules/.bin/tsx src/index.ts
+      d="$(cd "$(dirname "${REAL_CMD[0]:-}")/../.." 2>/dev/null && pwd)" || true ;;
+  esac
+  [ -n "$d" ] && [ -d "$d" ] || return 1
+  # 兜底:絕不把 / 或家目錄本身當成「可以整棵搬走的 app 樹」。
+  case "$d" in
+    "/"|"$HOME"|"$STATE_DIR") return 1 ;;
+    /*/*) ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$d"
+}
+
+# N-1 槽位:app 樹的**同級兄弟**目錄。同級 = 同一個檔案系統 = 回退時的三次 mv 都是
+# 原子 rename(瞬時、不佔額外空間、不會半路留下一棵殘樹)。
+snapshot_dir() { local a; a="$(app_dir)" || return 1; printf '%s.n-1' "$a"; }
+SNAPSHOT_MARK=".macchiato-snapshot"
+
+# 槽位裡那份是哪個版本;沒有 / 標記畸形都算「沒有可用快照」。
+snapshot_version() {
+  local s v=""
+  s="$(snapshot_dir)" || return 1
+  [ -f "$s/$SNAPSHOT_MARK" ] || return 1
+  read -r v <"$s/$SNAPSHOT_MARK" 2>/dev/null || return 1
+  sanitize_version_var v
+  [ -n "$v" ] || return 1
+  printf '%s' "$v"
+}
+
+# 把當前(已確認健康的)安裝快照到 N-1 槽位。
+#
+# **源碼真拷、node_modules 硬鏈接。** 這兩半必須分開處理,因為 install.sh 對它們做的事
+# 根本不同(實測數字見 PR):
+#
+#   · 源碼(src + package.json + package-lock.json + tsconfig.json,claude-code 實測 ~0.3 MB)
+#     ——升級時 `cp -r … "$APP/"` **覆蓋到現有檔案上**,cp 走 open(O_TRUNC)+write,**同 inode
+#     就地改**。硬鏈接的話,升級會順手把快照裡的源碼一起改成新版 → 快照變成「新版源碼 +
+#     舊版依賴」的縫合怪,回退到它比不回退更糟。所以這一半**必須真拷**。
+#   · node_modules(claude-code 實測 297 MB / 5561 檔,其中 claude-agent-sdk 的原生二進制
+#     單包就 257 MB)——升級時 `npm ci` **整個刪掉重建**(rm -rf 後重裝),老 inode 靠快照的
+#     硬鏈接活着,不會被就地改。而且 install.sh 用的是 `npm ci --omit=dev --ignore-scripts`,
+#     **--ignore-scripts 堵掉了最後一個漏洞**:沒有 postinstall 能就地改 node_modules 裡的檔案。
+#     所以這一半硬鏈接是安全的。
+#
+# 於是額外磁碟從 ~297 MB 降到 ~1 MB/家,而回退速度(三次原子 rename)與可靠性(快照仍是一棵
+# 完整、不依賴網路的可用樹)一點沒變——不是省空間換可靠性,是兩邊都拿。
+# 硬鏈接一旦不可用(跨檔案系統 / 不支援的 FS)就退回真拷貝,但要先重量一次空間再動手。
+make_snapshot() { # $1 = 已確認健康的版本
+  local v="$1" app snap tmp need avail e base linked=0
+  app="$(app_dir)" || { log "snapshot: cannot locate app tree — no rollback capability on this box"; return 1; }
+  snap="$app.n-1"
+  tmp="$app.n-1.tmp"
+  # 只量真拷貝那一半:硬鏈接的部分不吃空間(只吃 inode 條目)。
+  need="$(du -sk "$app" --exclude=node_modules 2>/dev/null | awk 'NR==1{print $1}')" || true
+  case "${need:-}" in ''|*[!0-9]*)
+    # BSD du 沒有 --exclude;退回「整棵樹」的保守估計(寧可高估空間需求,不可低估)。
+    need="$(du -sk "$app" 2>/dev/null | awk 'NR==1{print $1}')" || true ;;
+  esac
+  case "${need:-}" in ''|*[!0-9]*) log "snapshot: cannot size $app — skipping"; return 1 ;; esac
+  # 先騰空舊槽位再量空間:量到的可用空間就是真話。
+  # 舊快照此刻已經過時(新版本剛剛才被確認健康),丟掉不心疼。
+  rm -rf "$tmp" "$snap" 2>/dev/null || true
+  avail="$(df -Pk "$(dirname "$app")" 2>/dev/null | awk 'NR==2{print $4}')" || true
+  case "${avail:-}" in
+    ''|*[!0-9]*) : ;;  # 量不到就別攔,cp 失敗自己會說話
+    *) if [ "$avail" -lt $(( need + need / 8 + 65536 )) ]; then
+         log "snapshot: only ${avail}K free, need ~$(( need + need / 8 + 65536 ))K — skipping (no rollback capability)"
+         return 1
+       fi ;;
+  esac
+
+  mkdir -p "$tmp" 2>/dev/null || { log "snapshot: cannot create $tmp — skipping"; return 1; }
+  # 除 node_modules 外逐項真拷。-p 保權限 -R 遞歸 -P 不跟隨符號鏈接。
+  for e in "$app"/* "$app"/.[!.]*; do
+    base="${e##*/}"
+    case "$base" in
+      'node_modules') continue ;;
+      '*'|'.[!.]*') continue ;;   # glob 沒命中時 shell 留下字面量
+    esac
+    [ -e "$e" ] || continue
+    if ! cp -pRP "$e" "$tmp/" 2>/dev/null; then
+      log "snapshot: copy failed on $base — dropping the partial tree"
+      rm -rf "$tmp" 2>/dev/null || true
+      return 1
+    fi
+  done
+
+  if [ -d "$app/node_modules" ]; then
+    if cp -al "$app/node_modules" "$tmp/node_modules" 2>/dev/null; then
+      linked=1
+    else
+      # 硬鏈接不可用 → 退回真拷貝,但先按**整棵樹**重量一次空間:剛才那次只量了源碼半邊。
+      local full
+      full="$(du -sk "$app" 2>/dev/null | awk 'NR==1{print $1}')" || true
+      avail="$(df -Pk "$(dirname "$app")" 2>/dev/null | awk 'NR==2{print $4}')" || true
+      case "${full:-}${avail:-}" in
+        *[!0-9]*|'') : ;;
+        *) if [ "$avail" -lt $(( full + full / 8 + 65536 )) ]; then
+             log "snapshot: hardlink unavailable and only ${avail}K free for a ${full}K full copy — skipping"
+             rm -rf "$tmp" 2>/dev/null || true
+             return 1
+           fi ;;
+      esac
+      log "snapshot: hardlink unavailable — falling back to a full copy of node_modules"
+      if ! cp -pRP "$app/node_modules" "$tmp/node_modules" 2>/dev/null; then
+        log "snapshot: node_modules copy failed — dropping the partial tree"
+        rm -rf "$tmp" 2>/dev/null || true
+        return 1
+      fi
+    fi
+  fi
+
+  printf '%s\n' "$v" >"$tmp/$SNAPSHOT_MARK"
+  mv -f "$tmp" "$snap" || { rm -rf "$tmp" 2>/dev/null || true; return 1; }
+  log "snapshot: N-1 slot now holds v$v (~$(( need / 1024 )) MiB copied$([ "$linked" = 1 ] && printf ', node_modules hardlinked')) at $snap"
+}
+
+# 冪等 + 帶自己的速率上限:已經是同版就什麼都不做;失敗了一小時內不再重試(磁碟滿時
+# 每個輪詢週期複製一次 292 MB 是災難)。
+maybe_snapshot() { # $1 = 版本
+  local sv="" t
+  sv="$(snapshot_version)" || sv=""
+  [ "$sv" = "$1" ] && return 0
+  t="$(now_s)"
+  read_state
+  if [ "$LAST_SNAP_TRY" -gt 0 ] && [ $(( t - LAST_SNAP_TRY )) -lt "$SNAPSHOT_RETRY_S" ]; then
+    return 0
+  fi
+  # 先落「試過了」再動手:拷貝途中被殺也不會變成每次重啟都重來一次全量拷貝。
+  LAST_SNAP_TRY="$t"
+  write_state
+  make_snapshot "$1" || return 1
+  # 成功就把節流清掉——它只該攔住**失敗**的重試。留着的話,一小時內連做兩次更新
+  # 會讓第二次拿不到槽位刷新,N-1 裡躺着的就不是真正的 N-1 了。
+  read_state
+  LAST_SNAP_TRY=0
+  write_state
+}
+
+# ── 版本黑名單 ────────────────────────────────────────────────────────────────
+# 沒有它就是「升級 → 試用失敗 → 回退 → 再升級」的無限翻烙餅,比不自動更新更糟。
+# 條目只在出現**更高**版本時才失效——判斷直接複用 version_is_newer(全腳本只有那一份
+# 版本比較邏輯;再寫第二份遲早和第一份漂移,而漂移的那份會顯得「也在把關」)。
+blocked_file() { printf '%s/update-blocked.json' "$STATE_DIR"; }
+
+read_blocked_versions() { # 逐行印出本 SLOT 被拉黑的版本
+  local f py
+  f="$(blocked_file)"
+  [ -f "$f" ] || return 0
+  py="$(command -v python3 || command -v python || true)"
+  [ -n "$py" ] || return 0
+  "$py" - "$f" "$SLOT" <<'PY' 2>/dev/null || true
+import json
+import re
+import sys
+
+try:
+    with open(sys.argv[1], "rb") as fh:
+        d = json.loads(fh.read(1 << 20))  # 封頂 1 MiB
+except Exception:
+    raise SystemExit(0)  # 壞檔 = 沒有黑名單(寧可漏擋,也不要因為讀不懂就癱瘓自愈)
+R = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+for e in (d.get("blocked") or []) if isinstance(d, dict) else []:
+    if isinstance(e, dict) and e.get("slot") == sys.argv[2]:
+        v = e.get("version")
+        if isinstance(v, str) and R.match(v):
+            print(v)
+PY
+}
+
+block_version() { # $1 = 版本  $2 = 原因
+  local f py tmp
+  f="$(blocked_file)"
+  py="$(command -v python3 || command -v python || true)"
+  [ -n "$py" ] || { log "blocklist: no python3 — cannot record v$1"; return 1; }
+  tmp="$(mktemp "${f}.XXXXXX")" || return 1
+  if ! "$py" - "$f" "$tmp" "$SLOT" "$1" "$2" <<'PY' 2>/dev/null; then
+import json
+import re
+import sys
+import time
+
+path, out, slot, version, reason = sys.argv[1:6]
+R = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+if not R.match(version):
+    raise SystemExit(1)
+entries = []
+try:
+    with open(path, "rb") as fh:
+        d = json.loads(fh.read(1 << 20))
+    if isinstance(d, dict):
+        entries = [
+            e for e in (d.get("blocked") or [])
+            if isinstance(e, dict)
+            and isinstance(e.get("slot"), str)
+            and isinstance(e.get("version"), str)
+            and R.match(e["version"])
+            and not (e["slot"] == slot and e["version"] == version)
+        ]
+except Exception:
+    entries = []  # 讀不懂的舊檔就從頭來過,絕不因此放棄記錄
+entries.append(
+    {"slot": slot, "version": version, "ts": int(time.time()), "reason": reason[:200]}
+)
+with open(out, "w", encoding="utf-8") as fh:
+    json.dump({"blocked": entries[-64:]}, fh, indent=1, sort_keys=True)
+    fh.write("\n")
+PY
+    rm -f "$tmp"
+    log "blocklist: FAILED to record v$1 — the flip-flop guard is not in place"
+    return 1
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+  log "blocklist: v$1 blocked ($2) — automatic installs will refuse it until a strictly higher version ships"
+}
+
+updates_stopped() { read_state; [ "$UPDATE_STOPPED" = "1" ]; }
+
+# 自動安裝路徑(= 本腳本的 heal)准不准裝這個版本。
+#
+# 邊界:**只管自動路徑**。用戶在 app 裡手點更新走的是連接器自己的 self_update,本腳本
+# 攔不到、也不該攔——人明確要求的事不該被一份本機記錄靜默否決,而且那正好是壞版本修好後
+# 用戶想再試一次的路。自動路徑是無人值守的,才需要這道閘。
+install_allowed() { # $1 = 已驗簽清單裡的版本
+  local v="${1:-}" e
+  read_state
+  if [ "$UPDATE_STOPPED" = "1" ]; then
+    log "install refused: automatic updates stopped after a failed rollback — manual reinstall required"
+    return 1
+  fi
+  [ -n "$v" ] || return 0
+  # 重裝**當前已確認良好的版本**永遠准許:那是 #528 的同版 repair(壞在本機的安裝,
+  # 重裝同樣的字節就能修好),和「別再升到那個壞版本」是兩件事,不該被一起掐死。
+  [ "$v" = "$GOOD_VERSION" ] && return 0
+  for e in $(read_blocked_versions); do
+    if ! version_is_newer "$v" "$e"; then
+      log "install refused: v$v is blocked locally (rolled back from v$e; only a strictly higher version clears it)"
+      return 1
+    fi
+  done
+  return 0
+}
+
+# ── 回退 ──────────────────────────────────────────────────────────────────────
+# 三步全是同檔案系統的 rename:任何一步失敗都能把上一步原樣搬回去,絕不留下半棵樹。
+rollback_to_snapshot() { # $1 = 原因  $2 = 失敗的版本(可空 = 未知)
+  local reason="$1" bad="${2:-}" t app snap sv
+  t="$(now_s)"
+  read_state
+  if [ "$UPDATE_STOPPED" = "1" ]; then
+    log "rollback refused: automatic updates already stopped by an earlier failure"
+    return 1
+  fi
+  if [ "$LAST_ROLLBACK" -gt 0 ] && [ $(( t - LAST_ROLLBACK )) -lt "$ROLLBACK_COOLDOWN_S" ]; then
+    log "rollback cooldown active ($(( ROLLBACK_COOLDOWN_S - (t - LAST_ROLLBACK) ))s left) — staying put"
+    return 1
+  fi
+  app="$(app_dir)" || { log "rollback: cannot locate app tree — staying on the current version"; return 1; }
+  snap="$app.n-1"
+  sv="$(snapshot_version)" || {
+    log "rollback: no usable N-1 snapshot — staying on the current version ($reason)"
+    return 1
+  }
+
+  # 先拉黑再動樹:回退動作本身若失敗,至少「別再自動升到它」這條已經落盤了。
+  if [ -n "$bad" ]; then
+    if ! block_version "$bad" "$reason"; then
+      # 記不下黑名單 = 翻烙餅的閘沒了 → 直接停掉自動升級,絕不硬著頭皮繼續。
+      LAST_ROLLBACK="$t"
+      UPDATE_STOPPED=1
+      write_state
+      log "rollback: refusing to proceed without a blocklist entry — automatic updates stopped"
+      return 1
+    fi
+  fi
+
+  log "ROLLBACK: $reason — restoring v$sv from $snap"
+  rm -rf "$app.bad" 2>/dev/null || true
+  if ! mv "$snap" "$app.next" 2>/dev/null; then
+    log "rollback FAILED at step 1 (snapshot rename) — nothing touched, staying put"
+    LAST_ROLLBACK="$t"; UPDATE_STOPPED=1; write_state
+    return 1
+  fi
+  if ! mv "$app" "$app.bad" 2>/dev/null; then
+    log "rollback FAILED at step 2 (current tree rename) — putting the snapshot back, staying put"
+    mv "$app.next" "$snap" 2>/dev/null || log "rollback: could not restore the snapshot slot either"
+    LAST_ROLLBACK="$t"; UPDATE_STOPPED=1; write_state
+    return 1
+  fi
+  if ! mv "$app.next" "$app" 2>/dev/null; then
+    log "rollback FAILED at step 3 — trying to put the current tree back"
+    if mv "$app.bad" "$app" 2>/dev/null; then
+      mv "$app.next" "$snap" 2>/dev/null || true
+      log "rollback: current tree restored; staying on the failing version rather than on nothing"
+    else
+      log "rollback: CANNOT restore anything — manual reinstall required: curl -fsSL https://macchiato.chat/install.sh | bash"
+    fi
+    LAST_ROLLBACK="$t"; UPDATE_STOPPED=1; write_state
+    return 1
+  fi
+  rm -f "$app/$SNAPSHOT_MARK" 2>/dev/null || true
+  rm -rf "$app.bad" 2>/dev/null || true
+
+  read_state
+  GOOD_VERSION="$sv"
+  TRIAL_VERSION=""
+  TRIAL_START=0
+  TRIAL_SEEN=0
+  LAST_ROLLBACK="$t"
+  LAST_SNAP_TRY=0     # 槽位已被搬走,允許馬上重建(重建只在健康時才會發生)
+  FAILS=0
+  WINDOW_START="$t"
+  write_state
+  echo "---- rollback $(date -u +%Y-%m-%dT%H:%M:%SZ) kind=$KIND from=${bad:-unknown} to=$sv reason=$reason ----" \
+    >>"$HEAL_LOG" 2>/dev/null || true
+  log "rollback: now on v$sv (was v${bad:-unknown}) — restarting the service"
+  return 0
+}
+
+# 崩潰循環 / probe 判紅時,如果正好有一個新版本在試用期內,那就是「這一版起不來」的
+# 鐵證——本機有驗過簽也真連上過 server 的 N-1 副本,還原它遠比再從網路拉同一份壞字節
+# 有意義。沒在試用(= 平時就壞的安裝)則什麼都不做,原樣走 #528 的同版 repair。
+# 達成回退時本函數不返回:直接重啟服務。
+try_rollback_before_heal() { # $1 = 觸發原因
+  [ -n "$TRIAL_VERSION" ] || return 1
+  rollback_to_snapshot "$1 while trialling v$TRIAL_VERSION" "$TRIAL_VERSION" || return 1
+  restart_after_rollback
+}
+
+# 回退完必須換掉正在跑的舊進程。exit 75(EX_TEMPFAIL)不是 78,systemd Restart=always /
+# launchd KeepAlive 都會把本服務重新拉起來,新進程自然跑在還原後的樹上。
+restart_after_rollback() {
+  if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+    kill -TERM "$CHILD_PID" 2>/dev/null || true
+    local i=0
+    while [ "$i" -lt 15 ] && kill -0 "$CHILD_PID" 2>/dev/null; do sleep 1; i=$((i + 1)); done
+    kill -KILL "$CHILD_PID" 2>/dev/null || true
+  fi
+  trap - TERM INT HUP
+  exit 75
+}
+
+# ── 試用期 ────────────────────────────────────────────────────────────────────
+# 判據 = 進程穩定存活(≥STABLE_S) **且** 心跳 linkConnected=true。兩個都達標 → 提交;
+# TRIAL_S 內沒等到 → 回退 + 拉黑。
+#
+# 為什麼「沒有新鮮心跳」也算未達標(而不是像斷連判據那樣算「未知」):兩處的預設答案不同。
+# 斷連判據的預設是「別動」,因為那台機器本來好好的;試用期的預設是「這一版還沒證明自己」
+# ——新版本裝上去卻連心跳都寫不出來,正是 #528 那種起不來的形狀。而且試用只可能由一次
+# **看見過版本號的心跳**武裝起來,老連接器(不寫心跳)根本進不了試用,不會被誤傷。
+update_trial_tick() { # $1 = 子進程是否已穩定存活(1/0)
+  [ "${MACCHIATO_SUPERVISE_DISABLE_ROLLBACK:-0}" = "1" ] && return 0
+  [ "$TRIAL_S" -le 0 ] 2>/dev/null && return 0
+
+  local stable="${1:-0}" t hb connected="" hb_ts="" hb_ver="" age fresh=0
+  t="$(now_s)"
+  read_state
+
+  if hb="$(read_heartbeat)"; then
+    read -r connected hb_ts hb_ver <<<"$hb"
+    age=$(( t - hb_ts )); [ "$age" -lt 0 ] && age=$(( -age ))
+    if [ "$age" -le "$HEARTBEAT_STALE_S" ]; then fresh=1; fi
+  fi
+
+  # ── 解閂 ──────────────────────────────────────────────────────────────────
+  # UPDATE_STOPPED 是回退自己失敗時拉下的閘。它必須有出口:沒有出口的話,一台機器只要
+  # 回退失敗過一次,就**永久**失去全部自動安裝能力——連 #528 的崩潰自愈也一起沒了。
+  # 更糟的是,用戶照着日誌裡那條 `curl … | bash` 手工重裝、樹修好了,閂仍然閂着,
+  # 從此這台機器再也不會自愈且毫無跡象。那正是 #528 要消滅的「壞包 = 永久掉線」級聯,
+  # 我們不該在回退這條路上把它重新造出來。
+  #
+  # 出口判據 = 這台機器**又健康了**:心跳新鮮 + linkConnected + 進程穩定存活 ≥STABLE_S。
+  # 三者同時成立就是「有人已經把它修好了」的硬證據——連得上 server 的連接器正在正常工作,
+  # 此時再攔着自動安裝沒有任何保護意義,只剩傷害。
+  # 刻意**不**要求「版本必須不同於失敗那版」:回退失敗多半壞在槽位/磁碟而不在版本上,
+  # 手工重裝同版修好是最常見的收場,那條件會把最常見的恢復路徑排除在外。
+  # 反覆解閂→再失敗的風險由回退自己的 6h 冷卻兜住(見下面失敗路徑一併武裝 LAST_ROLLBACK)。
+  if [ "$UPDATE_STOPPED" = "1" ]; then
+    if [ "$fresh" = "1" ] && [ "$connected" = "1" ] && [ "$stable" = "1" ]; then
+      log "recovered: healthy again on v${hb_ver:-?} (stable + linkConnected) — re-enabling automatic installs"
+      UPDATE_STOPPED=0
+      GOOD_VERSION="$hb_ver"
+      TRIAL_VERSION=""; TRIAL_START=0; TRIAL_SEEN=0
+      write_state
+      maybe_snapshot "$hb_ver" || true
+    fi
+    return 0
+  fi
+
+  # ① 試用中
+  if [ -n "$TRIAL_VERSION" ]; then
+    if [ "$fresh" = "1" ] && [ "$hb_ver" != "$TRIAL_VERSION" ]; then
+      # 版本在我們眼皮底下又變了(用戶又點了一次 / 手工重裝)→ 本輪試用作廢,下一輪重新判。
+      log "trial: version changed under us (v$TRIAL_VERSION → v$hb_ver) — trial cleared"
+      TRIAL_VERSION=""; TRIAL_START=0; TRIAL_SEEN=0; write_state
+      return 0
+    fi
+    if [ "$fresh" = "1" ] && [ "$connected" = "1" ] && [ "$stable" = "1" ]; then
+      GOOD_VERSION="$TRIAL_VERSION"; TRIAL_VERSION=""; TRIAL_START=0; TRIAL_SEEN=0; write_state
+      log "trial: v$GOOD_VERSION committed (stable process + linkConnected)"
+      maybe_snapshot "$GOOD_VERSION" || true
+      return 0
+    fi
+    # 觀測間隙不算進試用時長——理由同 #673 給斷連計時器加的那道閘:本判據度量的是
+    # 「**我連續看着它**多久還沒達標」,不是牆鐘。筆記本合蓋一夜/機器關機幾天,醒來第一個
+    # tick 就把一個可能完全健康的新版本回退掉,是純粹的自傷。崩潰循環不受影響:
+    # systemd RestartSec=5,兩次觀測之間只差幾秒,遠小於 max_gap;而且「新版本起不來」
+    # 本來就由崩潰閾值那條路(try_rollback_before_heal)更快地接住。
+    local max_gap gap
+    max_gap="${MACCHIATO_SUPERVISE_MAX_OBSERVE_GAP_S:-}"
+    if [ -z "$max_gap" ]; then
+      max_gap=$(( DISCONNECT_POLL_S * 3 ))
+      [ "$max_gap" -ge 180 ] || max_gap=180
+    fi
+    if [ "$TRIAL_SEEN" -gt 0 ]; then
+      gap=$(( t - TRIAL_SEEN )); [ "$gap" -lt 0 ] && gap=$(( -gap ))
+      if [ "$gap" -gt "$max_gap" ]; then
+        log "trial: observation gap ${gap}s (suspend/downtime?) — not counted against v$TRIAL_VERSION"
+        TRIAL_START=$(( TRIAL_START + gap ))
+      fi
+    fi
+    TRIAL_SEEN="$t"
+    write_state
+    if [ $(( t - TRIAL_START )) -ge "$TRIAL_S" ]; then
+      log "trial: v$TRIAL_VERSION did not prove itself in ${TRIAL_S}s (heartbeat fresh=$fresh connected=${connected:-?})"
+      if rollback_to_snapshot "trial failed for v$TRIAL_VERSION" "$TRIAL_VERSION"; then
+        restart_after_rollback
+      fi
+      # 回退不成 = 保持現狀。把試用起點推後一輪,別讓每個輪詢週期都重敲一次同一扇門。
+      read_state
+      TRIAL_START="$t"; TRIAL_SEEN="$t"; write_state
+      return 0
+    fi
+    return 0
+  fi
+
+  # ② 沒在試用:只有心跳新鮮時才有得判(未知一律不動作)
+  [ "$fresh" = "1" ] || return 0
+  if [ -z "$GOOD_VERSION" ]; then
+    # 首次見到:此前沒有 N-1 可退,談不上試用——健康就直接採納為基線。
+    [ "$connected" = "1" ] && [ "$stable" = "1" ] || return 0
+    GOOD_VERSION="$hb_ver"; write_state
+    log "baseline: adopting v$hb_ver as known-good"
+    maybe_snapshot "$hb_ver" || true
+    return 0
+  fi
+  if [ "$hb_ver" = "$GOOD_VERSION" ]; then
+    [ "$connected" = "1" ] && [ "$stable" = "1" ] || return 0
+    maybe_snapshot "$hb_ver" || true   # 冪等;槽位是空的(剛回退過 / 首次)才真動手
+    return 0
+  fi
+  if version_is_newer "$hb_ver" "$GOOD_VERSION"; then
+    # 有人把它升上去了。本階段唯一的來源就是**用戶手點更新**——我們只是被動觀測到。
+    TRIAL_VERSION="$hb_ver"; TRIAL_START="$t"; TRIAL_SEEN="$t"; write_state
+    log "trial: v$GOOD_VERSION → v$hb_ver — ${TRIAL_S}s trial started (needs: stable process + linkConnected)"
+    return 0
+  fi
+  # 比已知良好版本更低(手工降級,或我們剛回退過)→ 直接當新基線,不試用:
+  # 沒有「更舊的好版本」可退,再開一輪試用只會白白製造一次回退機會。
+  log "baseline: local v$hb_ver is not newer than known-good v$GOOD_VERSION — adopting it as the new baseline"
+  GOOD_VERSION="$hb_ver"; write_state
+  if [ "$connected" = "1" ] && [ "$stable" = "1" ]; then maybe_snapshot "$hb_ver" || true; fi
   return 0
 }
 
@@ -207,6 +960,239 @@ print("ok")
 }
 
 # ── heal：獨立於連接器樹的驗簽 + 重裝（允許同版；這是 repair 不是升版）────────
+# ── #669 階段 4:自動更新 ──────────────────────────────────────────────────────
+#
+# 分工:**決策全在 update_decider.py**(純函數、被 pytest 逐分支覆蓋),本腳本只做兩件事——
+# 把輸入湊齊(下載 + 驗簽 + 讀本機狀態),以及在決策為「升」時執行。執行也**不新寫一條路**,
+# 直接復用 heal:它已經有下載、驗簽、嚴格升版閘、黑名單閘、install.sh 哈希核對、脫離式安裝
+# 這一整套跑了很久的機制。自動更新只是給它換了個觸發理由,而不是第二條安裝路徑。
+#
+# 順序上刻意把 record_policy_sequence 放在**決策之前**(只要防重放檢查一過就記):
+# 剎車那份策略(rolloutPercent 改 0)本身是「不升」的決策,如果只在升級時才記序號,
+# 攻擊者就能永遠重放剎車**之前**那份高比例策略——剎車等於白按。
+auto_update_tick() {
+  [ "${MACCHIATO_SUPERVISE_DISABLE_HEAL:-0}" = "1" ] && return 0
+  [ "$AUTO_UPDATE_S" -le 0 ] 2>/dev/null && return 0
+
+  local t; t="$(now_s)"
+  read_state
+  [ "$UPDATE_STOPPED" = "1" ] && return 0
+  # 正在試用一個版本時不再開新的:先讓它出結果(提交或回退),否則會疊成兩層試用,
+  # 而 N-1 只有一個槽位——第二次升級會把「還沒被證明的版本」當成基線快照下去。
+  [ -n "$TRIAL_VERSION" ] && return 0
+  # 沒有已知良好版本 = 還沒觀測到一次健康運行,談不上「升級」,也沒有可退的東西。
+  [ -n "$GOOD_VERSION" ] || return 0
+
+  # 節流 + 每機穩定抖動:全網不在同一分鐘醒來(否則發布一版就是一次自製的 DDoS,
+  # 而且所有機器同時重啟)。抖動種子與分批分桶同源(install-id),但獨立取模。
+  local jitter=0 due
+  jitter="$(auto_update_jitter)" || jitter=0
+  due=$(( LAST_UPDATE_CHECK + AUTO_UPDATE_S + jitter ))
+  if [ "$LAST_UPDATE_CHECK" -gt 0 ] && [ "$t" -lt "$due" ]; then return 0; fi
+  # 先落「查過了」再動手:網路慢/進程被殺都不該變成每個輪詢週期打一次源站。
+  LAST_UPDATE_CHECK="$t"
+  write_state
+
+  local rv dec py work
+  rv="$(find_release_verify || true)"
+  dec="$(find_update_decider || true)"
+  py="$(command -v python3 || command -v python || true)"
+  [ -n "$py" ] || return 0
+  [ -n "$rv" ] && [ -n "$dec" ] || { log "auto-update: verifier/decider not found — skipping"; return 0; }
+
+  work="$(mktemp -d "${TMPDIR:-/tmp}/macchiato-au.XXXXXX")" || return 0
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work'" RETURN
+
+  local base="${RELEASE_BASE%/}"
+  [[ "$base" == https://* ]] || { log "auto-update: REFUSING non-https RELEASE_BASE"; return 0; }
+  local f
+  for f in release.json release.json.sig release-policy.json release-policy.json.sig; do
+    # 策略檔不存在是**正常狀態**(還沒開自動更新),靜默跳過而不是報錯刷屏。
+    command curl --disable --silent --show-error --fail --proto '=https' --tlsv1.2 \
+      --max-redirs 0 --connect-timeout 15 --max-time 60 --max-filesize 1048576 \
+      --output "$work/$f" "$base/$f" 2>/dev/null || return 0
+  done
+
+  local out
+  out="$("$py" - "$rv" "$dec" "$work" "$(blocked_file)" "$SLOT" "$GOOD_VERSION" \
+        "${MACCHIATO_STATE_DIR:-$STATE_DIR}/install-id" "$(health_file)" 2>>"$HEAL_LOG" <<'PY'
+import importlib.util
+import json
+import os
+import re
+import sys
+import time
+
+rv_path, dec_path, work, blocked_path, slot, current, id_path, health_path = sys.argv[1:9]
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def out(line):
+    print(line)
+    raise SystemExit(0)
+
+
+try:
+    rv = load("release_verify", rv_path)
+    dec = load("update_decider", dec_path)
+except Exception as exc:
+    out("SKIP cannot load verifier/decider: %r" % (exc,))
+
+# ── 1. 清單:先驗簽,再談版本。絕不拿未驗證的輸入去做任何判斷。 ──────────────
+try:
+    with open(os.path.join(work, "release.json"), "rb") as fh:
+        manifest_bytes = fh.read()
+    with open(os.path.join(work, "release.json.sig"), "r", encoding="ascii") as fh:
+        manifest = rv.verify_manifest(manifest_bytes, fh.read().strip())
+except Exception as exc:
+    out("SKIP manifest rejected: %r" % (exc,))
+
+# ── 2. 策略:驗簽 → 防重放 → **立刻記下序號** ────────────────────────────────
+# 記錄放在決策**之前**是刻意的:剎車那份策略(rolloutPercent 改 0)的決策是「不升」,
+# 若只在升級時才記,攻擊者就能永遠重放剎車之前那份高比例策略,剎車等於白按。
+try:
+    with open(os.path.join(work, "release-policy.json"), "rb") as fh:
+        policy_bytes = fh.read()
+    with open(os.path.join(work, "release-policy.json.sig"), "r", encoding="ascii") as fh:
+        policy = rv.verify_policy(policy_bytes, fh.read().strip())
+except rv.PolicyExpiredError as exc:
+    out("SKIP policy stale: %s" % (exc,))
+except Exception as exc:
+    out("SKIP policy rejected: %r" % (exc,))
+
+# 舊版驗簽器沒有防重放 API(supervisor 的查找順序裡包含連接器 app 樹,那份可能比 bin/ 舊)。
+# 缺了就**不升**:沒有防重放保護的自動更新,等於把剎車閘交給任何能重放舊策略的人。
+# 注意不能寫成 `except rv.PolicyReplayError`——屬性不存在時 except 子句自己就會拋 AttributeError,
+# 把一個「該安全跳過」的情形變成未捕獲異常。
+if not all(hasattr(rv, n) for n in
+           ("assert_policy_not_replayed", "read_seen_policy_sequence", "record_policy_sequence")):
+    out("SKIP verifier predates anti-replay (no sequence support) — refusing to auto-update")
+try:
+    rv.assert_policy_not_replayed(policy, rv.read_seen_policy_sequence())
+    rv.record_policy_sequence(policy["sequence"])
+except Exception as exc:
+    if type(exc).__name__ == "PolicyReplayError":
+        out("SKIP %s" % (exc,))
+    out("SKIP policy sequence check failed: %r" % (exc,))
+
+# ── 3. 本機輸入 ──────────────────────────────────────────────────────────────
+try:
+    with open(id_path, "r", encoding="utf-8") as fh:
+        install_id = fh.read().strip()
+except Exception:
+    install_id = ""
+
+heartbeat = None
+try:
+    with open(health_path, "rb") as fh:
+        parsed = json.loads(fh.read(1 << 20))
+    if isinstance(parsed, dict):
+        heartbeat = parsed
+except Exception:
+    heartbeat = None  # 讀不到 → 決策器判「忙」,不是「閒」
+
+# 本機黑名單:#669 階段 3 落盤的是**按 slot 分家**的結構,而決策器收的是扁平版本序列
+# ——必須在這裡按 slot 過濾。不過濾的話,CC 拉黑的版本會擋住 Codex 的升級。
+# 檔案不存在 = 沒拉黑過(傳空序列);**讀得到但解析不了 = 未知**(傳 None → 決策器判不升)。
+SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+if not os.path.exists(blocked_path):
+    local_blocked = ()
+else:
+    try:
+        with open(blocked_path, "rb") as fh:
+            data = json.loads(fh.read(1 << 20))
+        entries = data.get("blocked") or [] if isinstance(data, dict) else []
+        local_blocked = tuple(
+            e["version"]
+            for e in entries
+            if isinstance(e, dict)
+            and e.get("slot") == slot
+            and isinstance(e.get("version"), str)
+            and SEMVER.match(e["version"])
+        )
+    except Exception:
+        local_blocked = None
+
+# ── 4. 決策 ─────────────────────────────────────────────────────────────────
+d = dec.decide_update(
+    policy=policy,
+    manifest_version=manifest["version"],
+    current_version=current,
+    install_id=install_id,
+    heartbeat=heartbeat,
+    now=time.time(),
+    local_blocked=local_blocked,
+)
+print(("UPDATE %s" % d.target_version) if d.update else ("SKIP %s — %s" % (d.reason, d.detail)))
+PY
+)" || out=""
+  case "$out" in
+    UPDATE\ *)
+      local target="${out#UPDATE }"
+      log "auto-update: policy authorises v$GOOD_VERSION → v$target — installing"
+      # require_newer = 本機已知良好版本 ⇒ 天然只向前;黑名單/UPDATE_STOPPED 由 heal 內的
+      # install_allowed 再把一次關。決策器已經查過同樣的閘,這裡是第二道——它們獨立實現,
+      # 任何一道說不就不裝。
+      heal "auto update to v$target" "$GOOD_VERSION" || true
+      ;;
+    SKIP\ *)  log "auto-update: ${out#SKIP }" ;;
+    # 決策器內部出錯 → 不升(fail-safe 方向永遠如此),但**必須留痕**:整套理由碼(#686 的 12 個)
+    # 存在的意義就是回答「為什麼這台沒升」。靜默跳過會讓放量期間最要緊的那個問題無從查起
+    # ——而排查它的人手上只有這台機器的日誌。stderr 也不再丟掉,落到 heal 日誌裡備查。
+    *)        log "auto-update: decider produced no verdict — staying put (see $HEAL_LOG)" ;;
+  esac
+  return 0
+}
+
+# 每機穩定的檢查偏移(0..AUTO_UPDATE_S)。種子是 install-id;拿不到就回 0
+# ——沒有抖動只是「大家同時醒」,而讓自動更新整個停掉的代價更大。
+auto_update_jitter() {
+  local id_file py
+  id_file="${MACCHIATO_STATE_DIR:-$STATE_DIR}/install-id"
+  [ -f "$id_file" ] || { echo 0; return 0; }
+  py="$(command -v python3 || command -v python || true)"
+  [ -n "$py" ] || { echo 0; return 0; }
+  "$py" - "$id_file" "$AUTO_UPDATE_S" <<'PY' 2>/dev/null || echo 0
+import hashlib
+import sys
+
+try:
+    with open(sys.argv[1], "rb") as fh:
+        seed = fh.read(4096).strip()
+    span = int(sys.argv[2])
+    if span <= 0 or not seed:
+        raise ValueError
+except Exception:
+    print(0)
+else:
+    # 與分批分桶同源但獨立取模:同一台機器每次算出同一個偏移(重啟不換),
+    # 不同機器均勻散開在整個週期裡。
+    print(int.from_bytes(hashlib.sha256(b"jitter:" + seed).digest()[:8], "big") % span)
+PY
+}
+
+find_update_decider() {
+  # 與 release_verify 同一套查找順序、同一個理由:優先用 install 時凍結到 bin/ 的副本
+  # (與連接器 app 樹分離——app 樹壞掉正是我們要處理的情形之一,決策層不能跟着一起壞)。
+  local c
+  for c in \
+    "$STATE_DIR/bin/update_decider.py" \
+    "$(dirname "$0")/update_decider.py" \
+    "$HOME/.macchiato/app/update_decider.py" \
+    "$HOME/.macchiato/hermes-${MACCHIATO_HERMES_PROFILE:-}/app/update_decider.py"
+  do
+    [ -f "$c" ] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
 find_release_verify() {
   # 優先：install 時冷凍到 bin 的副本（與 connector app 樹分離）
   local c
@@ -222,8 +1208,21 @@ find_release_verify() {
 }
 
 heal() {
-  log "HEAL: crash loop → pull signed latest and reinstall ($KIND)"
+  log "HEAL: ${1:-crash loop} → pull signed latest and reinstall ($KIND)"
+  # $2（可選）= require_newer:只有當已驗簽清單的版本**嚴格高於**這個版本時才真的裝。
+  # 崩潰循環那條不傳它（同版 repair 正是它要的:壞在本機的安裝,重裝同版就能修好）。
+  # 斷連那條必須傳:重裝同樣的字節不可能修好「這一版連不上」,而不加這道閘的後果是
+  # **server 一次超過閾值的故障 = 全網連接器同時重裝自己**——一個服務端事件觸發全網
+  # 客戶端自我變更,零收益,還會殺光所有進行中的回合。加了之後,故障時大家本就都在最新版
+  # → 判據為假 → 全網無操作;而真正的壞版本場景(升上去連不上)會在你發出修復版的那一刻
+  # 自動走過去,這正是我們要的形狀。
+  local require_newer="${2:-}"
   local work rv py
+  # #669 階段 3:回退自己失敗過的機器不再做任何自動安裝(只留手工重裝這條逃生通道)。
+  if updates_stopped; then
+    log "heal refused: automatic updates stopped after a failed rollback — manual reinstall required"
+    return 1
+  fi
   work="$(mktemp -d "${TMPDIR:-/tmp}/macchiato-heal.XXXXXX")" || die "mktemp failed"
   # shellcheck disable=SC2064
   trap "rm -rf '$work'" RETURN
@@ -281,6 +1280,16 @@ PY
   local version
   version="$(cat "$work/release.json.ok")"
   log "heal: verified release.json v$version"
+
+  # 升版閘（只對傳了 require_newer 的調用方生效）。畸形版本一律判「不高於」= 不裝。
+  if [ -n "$require_newer" ] && ! version_is_newer "$version" "$require_newer"; then
+    log "heal: manifest v$version is not newer than local v$require_newer — not reinstalling (identical bytes cannot fix 'cannot connect')"
+    return 1
+  fi
+
+  # #669 階段 3 的翻烙餅閘:試用失敗回退過的版本不准再被**自動**裝回來。
+  # 放在驗簽之後——我們只對已經驗過簽的版本號做判斷,絕不拿未驗證的輸入去查表。
+  install_allowed "$version" || return 1
 
   # 拉 install.sh 並對 hash
   if ! command curl --disable --silent --show-error --fail --proto '=https' --tlsv1.2 \
@@ -414,6 +1423,10 @@ trap 'forward_signal HUP' HUP
 main() {
   read_state
 
+  # #669 階段 3:每次啟動先評一次試用/基線。必須在起子進程**之前**——壞版本可能秒退,
+  # 主循環根本轉不了幾圈;而試用期是牆鐘,判決不能只掛在「子進程活著」那條路上。
+  update_trial_tick 0 || true
+
   # probe 失敗 **不阻止啟動**（fail-open，見 probe 頭部的設計約束）:
   # probe 只是 heal 的觸發依據。硬攔啟動會讓一次誤判 = 全體用戶永久掉線,
   # 那正是 #528 要消滅的故障形狀,不該由本腳本自己再造一個。
@@ -422,6 +1435,7 @@ main() {
     probe_failed=1
     note_failure
     if should_heal; then
+      try_rollback_before_heal "probe failed" || true
       heal || true
     fi
     log "probe failed — starting anyway (fail-open); the process itself is the judge"
@@ -434,19 +1448,41 @@ main() {
   local start
   start="$(now_s)"
 
-  # 等 STABLE_S 或子進程先死
+  # 等 STABLE_S 或子進程先死；穩定之後**不再阻塞 wait**,而是繼續每秒輪詢——
+  # #669 的斷連判據要在子進程活著的時候跑,阻塞在 wait 上就永遠沒人看心跳(那正是舊盲區)。
+  local stable=0
+  local ticks=0
+  # 節流週期用「循環圈數」而非 date:本循環現在跑滿連接器的整個生命週期,
+  # 每秒多 fork 一個 date 是白燒(sleep 1 已經是一個了)。圈≈秒,對 60s 的節流綽綽有餘。
+  local poll_every="$DISCONNECT_POLL_S"
+  [ "$poll_every" -ge 1 ] 2>/dev/null || poll_every=60
   while kill -0 "$child" 2>/dev/null; do
-    if [ $(( $(now_s) - start )) -ge "$STABLE_S" ]; then
+    if [ "$stable" -eq 0 ] && [ $(( $(now_s) - start )) -ge "$STABLE_S" ]; then
+      stable=1
       reset_fails
-      log "stable ≥${STABLE_S}s — clearing fail counter; waiting on pid $child"
-      # 穩定後：繼續 wait，把 exit 碼透傳（含 78 解綁）
-      set +e
-      wait "$child"
-      local st=$?
-      set -e
-      exit "$st"
+      log "stable ≥${STABLE_S}s — clearing fail counter; watching pid $child"
     fi
+    # 斷連判據只在穩定期後看:啟動頭 STABLE_S 秒本來就還沒連上,那不叫病。
+    # 節流到 DISCONNECT_POLL_S:心跳 30s 一寫,每秒讀一次純屬浪費。
+    if [ "$stable" -eq 1 ] && [ $(( ticks % poll_every )) -eq 0 ]; then
+      disconnect_watchdog || true  # 判據自身出錯絕不能拖垮 supervisor(fail-open)
+    fi
+    # 試用期判據**不**等 stable:它的截止時間是牆鐘,而「一直沒穩定下來」本身就是未達標。
+    # stable 只作為「達標提交」那一半的前提,傳進去讓它自己判。
+    if [ $(( ticks % poll_every )) -eq 0 ]; then
+      update_trial_tick "$stable" || true
+    fi
+    # #669 階段 4:自動更新檢查。**必須等 stable**——剛起來還沒站穩就去裝新版,等於拿一個
+    # 尚未證明自己的狀態當基線;而且 auto_update_tick 內部要求 GOOD_VERSION 非空,
+    # 那個值只在觀測到一次健康運行之後才有。真正的節流在函數內部(週期 + 每機抖動),
+    # 這裡每輪詢週期問一次只是給它一個判斷時機,絕大多數輪次它立刻就返回。
+    if [ "$stable" -eq 1 ] && [ $(( ticks % poll_every )) -eq 0 ]; then
+      auto_update_tick || true
+    fi
+    # sleep 1 而非更長:本腳本夾在 init 與連接器之間,trap 只在前台命令跑完後才執行——
+    # 睡多久,SIGTERM 轉發就最多遲到多久(見上面的 forward_signal)。
     sleep 1
+    ticks=$(( ticks + 1 ))
   done
 
   set +e
@@ -454,9 +1490,20 @@ main() {
   local st=$?
   set -e
 
+  # 穩定過:exit 碼原樣透傳（含 78 解綁），不計崩潰。
+  if [ "$stable" -eq 1 ]; then
+    exit "$st"
+  fi
+
   # 秒退
   if [ "$st" -eq 78 ]; then
     log "exit 78 (unpaired) — not healing, not restarting semantics"
+    # 解綁不是版本問題:讓試用期繼續跑下去只會在 15 分鐘後白白回退一次好版本。
+    read_state
+    if [ -n "$TRIAL_VERSION" ]; then
+      log "exit 78: clearing the in-flight trial for v$TRIAL_VERSION (unpaired ≠ bad version)"
+      TRIAL_VERSION=""; TRIAL_START=0; TRIAL_SEEN=0; write_state
+    fi
     exit 78
   fi
 
@@ -465,10 +1512,16 @@ main() {
   if [ "$probe_failed" -eq 0 ]; then
     note_failure
     if should_heal; then
+      try_rollback_before_heal "crash loop" || true
       heal || true
     fi
   fi
   exit "$st"
 }
+
+# --check-blocked：僅供冒煙,查完就走,不起任何進程。
+if [ -n "${CHECK_BLOCKED:-}" ]; then
+  if install_allowed "$CHECK_BLOCKED"; then exit 0; else exit 1; fi
+fi
 
 main

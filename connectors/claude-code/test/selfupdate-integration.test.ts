@@ -15,24 +15,32 @@
  *    在子進程裡 import 並調用,結果以 JSON 打回 stdout。副作用是每個場景拿到乾淨的
  *    `selfUpdateHandedOff` 閂,互不污染。
  *
- * 3. **絕不能讓 install.sh 真的執行**:真跑會把連接器裝到跑測試的機器上。做法是本地
- *    server 對 `/install.sh` 返回一段**與清單 sha256 對不上**的無害佔位內容——正路徑
- *    因此恰好停在鏈條的最後一關(哈希),既證明前面全過,又永遠到不了 spawn。
- *    「真的沒交棒」不靠推理:每個場景都斷言 TMPDIR 下沒有 `macchiato-update-*`
- *    臨時目錄(那是 spawn 前一步才創建的,見 selfupdate.ts:227)。
+ * 3. **拒絕路徑不真跑 install.sh**:本地 server 對 `/install.sh` 默認返回一段**與清單
+ *    sha256 對不上**的無害佔位——拒絕路徑恰好停在哈希關,永遠到不了 spawn。
+ *    「真的沒交棒」不靠推理:拒絕場景都斷言 TMPDIR 下沒有 `macchiato-update-*`
+ *    (那是 spawn 前一步才創建的)。**正路徑交棒**另有一條:餵 fixtures/install.sh
+ *    (與清單哈希一致的真實已發布物)→ 斷言 ok + handoff 目錄存在 + installer 子進程
+ *    env 白名單(毒丸 BASH_ENV/LD_PRELOAD/… 不得泄漏)→ 立刻殺光後台 installer,
+ *    絕不讓它真去 curl bootstrap / 改本機。
  *
  * 清單只能用**真實已發布**的那一份:公鑰 `RELEASE_PUBKEY_HEX` 硬編碼、不可注入,
- * 自己造的簽名一律驗不過。fixtures/release.json{,.sig} 取自公開 repo main
- * (v1.5.58),不進簽名 artifact(sign-manifest 只收 src、package.json、lockfile、tsconfig)。
+ * 自己造的簽名一律驗不過。fixtures/release.json{,.sig,install.sh} 取自公開 repo
+ * connectors-v1.5.58,不進簽名 artifact(sign-manifest 只收 src、package.json、lockfile、tsconfig)。
  * ⚠️ 維護:fixture **不隨版本 bump 過期**(斷言全用相對版本,不寫死 1.5.58);但
- * 公鑰輪換後這份簽名就驗不過了——屆時重新抓一份公開 repo 的 release.json{,.sig} 即可,
- * 下面第一條「fixture 對得上硬編碼公鑰」就是專門讓那天的失敗一眼看懂的。
+ * 公鑰輪換後這份簽名就驗不過了——屆時重新抓一份公開 repo 的 release.json{,.sig}
+ * 與對應 install.sh 即可,下面第一條「fixture 對得上硬編碼公鑰」就是專門讓那天的失敗一眼看懂的。
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:https";
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verifyManifest } from "../src/_core/selfupdate";
@@ -40,12 +48,29 @@ import { verifyManifest } from "../src/_core/selfupdate";
 const FIXTURES = new URL("./fixtures/", import.meta.url).pathname;
 const REAL_MANIFEST = readFileSync(join(FIXTURES, "release.json"));
 const REAL_SIG = readFileSync(join(FIXTURES, "release.json.sig"));
+/** 與清單 files["install.sh"] sha256 對得上的真實已發布物(connectors-v1.5.58)。 */
+const REAL_INSTALL_SH = readFileSync(join(FIXTURES, "install.sh"));
 const FIXTURE_VERSION: string = JSON.parse(REAL_MANIFEST.toString("utf8")).version;
 
 /** 故意與清單 sha256 對不上;即便某天真被執行也什麼都不做。 */
 const DECOY_INSTALL_SH = Buffer.from(
   "#!/usr/bin/env bash\n# #540 測試佔位:內容與清單哈希不符,自更新必須在此中止。\nexit 90\n",
 );
+
+/** 注入子進程、必須被 buildInstallerEnv 剝掉的毒丸(與 selfupdate.test.ts 同清單)。 */
+const POISON_ENV: Record<string, string> = {
+  BASH_ENV: "/tmp/bash-hook-must-not-leak",
+  ENV: "/tmp/sh-hook-must-not-leak",
+  LD_PRELOAD: "/tmp/preload-must-not-leak.so",
+  DYLD_INSERT_LIBRARIES: "/tmp/dylib-must-not-leak",
+  NODE_OPTIONS: "--require=/tmp/node-hook-must-not-leak",
+  PYTHONPATH: "/tmp/python-hook-must-not-leak",
+  TAR_OPTIONS: "--checkpoint-action=exec=sh",
+  MACCHIATO_VERIFIED_ROOT: "/tmp/evil-verified-root",
+  MACCHIATO_BOOTSTRAP_TESTING: "1",
+  MACCHIATO_BOOTSTRAP_TEST_PUBKEY_HEX: "attacker",
+  SECRET_CANARY: "must-not-leak-into-installer",
+};
 
 const TSX = new URL("../node_modules/.bin/tsx", import.meta.url).pathname;
 // #572 起實現搬到 packages/connector-core;子進程用 tsx 直接按文件 URL 加載(該模塊只依賴
@@ -162,24 +187,36 @@ afterAll(async () => {
 type Attempt = { ok: boolean; message?: string };
 
 /**
- * 在子進程裡跑 `runVerifiedSelfUpdate`,回傳每次調用的結果。
+ * 在子進程裡跑 `runVerifiedSelfUpdate`,回傳每次調用的結果 + stderr(交棒成功日誌)。
  * 每次調用前重置本輪要餵的字節與命中記錄;`times > 1` 用來驗「失敗後閂會鬆開、可安全重試」。
  */
 async function runSelfUpdate(options: {
   currentVersion: string;
   releaseBase?: string;
   times?: number;
-  /** 在起子進程前改本輪要餵的字節(篡改/轉向場景)。 */
+  /** 在起子進程前改本輪要餵的字節(篡改/轉向/真 install.sh 場景)。 */
   serve?: (plan: ServePlan) => void;
-}): Promise<Attempt[]> {
+  /** 啟動時就進子進程 env 的鍵(HOME 沙盒等——不能含會讓 node/tsx 起不來的 NODE_OPTIONS)。 */
+  extraEnv?: Record<string, string>;
+  /**
+   * 子進程**啟動後**再寫進 process.env 的毒丸。必須晚於 node 啟動:
+   * NODE_OPTIONS/LD_PRELOAD 若在 spawn env 裡會直接弄死 tsx 子進程,測不到 selfupdate。
+   * 寫進 process.env 後 buildInstallerEnv 讀到並應剝掉,再交給 installer。
+   */
+  poisonAfterStart?: Record<string, string>;
+}): Promise<{ attempts: Attempt[]; stderr: string }> {
   hits = [];
   plan = freshPlan();
   options.serve?.(plan);
   const times = options.times ?? 1;
+  const poisonAssigns = Object.entries(options.poisonAfterStart ?? {})
+    .map(([k, v]) => `process.env[${JSON.stringify(k)}] = ${JSON.stringify(v)};`)
+    .join("\n");
   // `tsx --eval` 按 CJS 編譯,不支持頂層 await → 包一層 async main。
   const script = [
     `import { runVerifiedSelfUpdate } from ${JSON.stringify(SELFUPDATE_MODULE)};`,
     `async function main() {`,
+    poisonAssigns,
     `  const attempts = [];`,
     `  for (let i = 0; i < ${times}; i++) {`,
     `    try {`,
@@ -199,6 +236,7 @@ async function runSelfUpdate(options: {
       ...process.env,
       MACCHIATO_RELEASE_BASE: options.releaseBase ?? base,
       NODE_EXTRA_CA_CERTS: certPath,
+      ...options.extraEnv,
     },
   });
   let stdout = "";
@@ -215,7 +253,7 @@ async function runSelfUpdate(options: {
   if (code !== 0 || !framed) {
     throw new Error(`self_update 子進程異常(code=${code}):\n${stdout}\n${stderr}`);
   }
-  return JSON.parse(framed[1]!) as Attempt[];
+  return { attempts: JSON.parse(framed[1]!) as Attempt[], stderr };
 }
 
 /** spawn 前一步才創建的臨時目錄;存在即代表真的走到了交棒。 */
@@ -223,15 +261,51 @@ function handoffDirs(): string[] {
   return readdirSync(tmpdir()).filter((name) => name.startsWith("macchiato-update-"));
 }
 
-/** 每個場景都必須成立:什麼都沒交棒出去。 */
+function handoffPaths(): string[] {
+  return handoffDirs().map((name) => join(tmpdir(), name));
+}
+
+/** 殺掉仍在跑的 installer 後台(detached bash -p …/macchiato-update-…/install.sh)。 */
+function killHandoffInstallers() {
+  for (const dir of handoffPaths()) {
+    // pkill 模式:路徑裡的臨時目錄名足夠唯一;失敗(沒進程)不致命。
+    spawnSync("pkill", ["-9", "-f", `${dir}/install.sh`], { encoding: "utf8" });
+    // bridge 也可能起了 curl/bootstrap——按目錄名掃一把。
+    spawnSync("pkill", ["-9", "-f", dir], { encoding: "utf8" });
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* 競態:子進程已自清 */
+    }
+  }
+}
+
+/** 拒絕路徑:什麼都沒交棒出去。 */
 function expectNoHandoff() {
   expect(handoffDirs()).toEqual([]);
 }
 
 /** 單次調用的簡寫。 */
-async function attempt(options: Parameters<typeof runSelfUpdate>[0]): Promise<Attempt> {
-  const [only] = await runSelfUpdate(options);
-  return only!;
+async function attempt(options: Parameters<typeof runSelfUpdate>[0]): Promise<Attempt & { stderr: string }> {
+  const { attempts, stderr } = await runSelfUpdate(options);
+  return { ...attempts[0]!, stderr };
+}
+
+/**
+ * 讀 installer 子進程環境(macOS `ps eww` / Linux `ps eww` 都把 env 附在命令行尾)。
+ * 找不到進程 → null(交棒後 installer 可能已秒退,那條 case 會改走「目錄落盤」斷言)。
+ */
+function readInstallerEnv(handoffDir: string): string | null {
+  const pgrep = spawnSync("pgrep", ["-f", `${handoffDir}/install.sh`], { encoding: "utf8" });
+  const pids = (pgrep.stdout || "")
+    .split(/\s+/)
+    .map((s) => s.trim())
+    .filter((s) => /^\d+$/.test(s));
+  if (pids.length === 0) return null;
+  // 取第一個還活着的;ps 在 Linux/macOS 上都支持 eww。
+  const ps = spawnSync("ps", ["eww", "-p", pids[0]!, "-o", "command="], { encoding: "utf8" });
+  if (ps.status !== 0 || !ps.stdout) return null;
+  return ps.stdout;
 }
 
 // 起子進程 + tsx 轉譯,單條 ~1s;給足餘量,免得 CI 機器慢就抖。
@@ -247,18 +321,27 @@ const HAS_OPENSSL = spawnSync("openssl", ["version"], { encoding: "utf8" }).stat
 if (!HAS_OPENSSL) console.warn("⚠️ [#540 集成測試] 本機無 openssl CLI → 整套跳過(自簽證書生成不了);裝 openssl 即可恢復覆蓋");
 
 describe.skipIf(!HAS_OPENSSL)("#540 self_update 集成鏈路(真 HTTPS + 真簽名清單)", () => {
+  // 交棒成功那條會真 spawn installer;每條結束都清掉,避免洩漏到下一條或宿主。
+  afterEach(() => {
+    killHandoffInstallers();
+  });
+
   it("fixture 是真發布物:對得上硬編碼的生產公鑰(驗不過 = 公鑰輪換了,重抓一份即可)", () => {
     const parsed = verifyManifest(REAL_MANIFEST, REAL_SIG.toString("utf8"));
     expect(parsed.version).toBe(FIXTURE_VERSION);
     expect(parsed.files["install.sh"]).toMatch(/^[0-9a-f]{64}$/);
-    // 佔位 install.sh 必須與清單對不上——正路徑「停在哈希關」的前提。
+    // 佔位 install.sh 必須與清單對不上——拒絕路徑「停在哈希關」的前提。
     expect(createHash("sha256").update(DECOY_INSTALL_SH).digest("hex")).not.toBe(
+      parsed.files["install.sh"],
+    );
+    // 真實 install.sh fixture 必須對得上——正路徑「真交棒」的前提。
+    expect(createHash("sha256").update(REAL_INSTALL_SH).digest("hex")).toBe(
       parsed.files["install.sh"],
     );
   });
 
   it(
-    "低版本 → 驗簽過、版本閘過、抓到 install.sh,恰好停在哈希關(證明前面全過,且永不交棒)",
+    "低版本 + 佔位 install.sh → 驗簽過、版本閘過、抓到 install.sh,恰好停在哈希關(永不交棒)",
     async () => {
       const result = await attempt({ currentVersion: "1.0.0" });
       expect(result.ok).toBe(false);
@@ -272,6 +355,62 @@ describe.skipIf(!HAS_OPENSSL)("#540 self_update 集成鏈路(真 HTTPS + 真簽�
       expect(hits.slice(0, 2).sort()).toEqual(["/release.json", "/release.json.sig"]);
       expect(hits[2]).toBe("/install.sh");
       expectNoHandoff();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "低版本 + 真 install.sh → 驗簽/版本/哈希全過 → 真 spawn installer(白名單 env)+ handoff 目錄",
+    async () => {
+      const smokeHome = mkdtempSync(join(tmpdir(), "selfupdate-spawn-home-"));
+      try {
+        const result = await attempt({
+          currentVersion: "1.0.0",
+          serve: (p) => {
+            p.installSh = REAL_INSTALL_SH;
+          },
+          extraEnv: { HOME: smokeHome },
+          // 毒丸必須啟動後再寫:NODE_OPTIONS 若在 spawn env 會弄死 tsx 本身。
+          poisonAfterStart: POISON_ENV,
+        });
+        // 交棒成功:runVerifiedSelfUpdate 在 spawn+unref 後 resolve,不抛。
+        expect(result.ok).toBe(true);
+        expect(result.stderr).toMatch(/self_update:簽名\/版本\/哈希全過/);
+        // 三個文件真抓。
+        expect(hits).toHaveLength(3);
+        expect(hits.slice(0, 2).sort()).toEqual(["/release.json", "/release.json.sig"]);
+        expect(hits[2]).toBe("/install.sh");
+        // handoff 目錄是 spawn 前同步 mkdir 的——一定看得到(即便 installer 已秒退)。
+        const dirs = handoffPaths();
+        expect(dirs.length).toBeGreaterThanOrEqual(1);
+        const handoff = dirs[0]!;
+        // 落盤的 install.sh 就是真發布物;manifest 也在旁。
+        expect(createHash("sha256").update(readFileSync(join(handoff, "install.sh"))).digest("hex")).toBe(
+          JSON.parse(REAL_MANIFEST.toString("utf8")).files["install.sh"],
+        );
+        expect(readFileSync(join(handoff, "release.json")).equals(REAL_MANIFEST)).toBe(true);
+
+        // env 白名單:Linux 的 `ps eww` 會把 env 附在命令行尾,可直接斷言毒丸被剝;
+        // macOS 出於安全不再暴露他進程 env——此時靠「ok + handoff 落盤」證明交棒,
+        // 白名單本身有 selfupdate.test.ts 的純函數覆蓋(buildInstallerEnv)。
+        const envLine = readInstallerEnv(handoff);
+        if (envLine && /MACCHIATO_ONLY=/.test(envLine)) {
+          expect(envLine).toMatch(/MACCHIATO_ONLY=claude-code/);
+          expect(envLine).toMatch(new RegExp(`MACCHIATO_MANIFEST=${handoff}/release\\.json`));
+          for (const key of Object.keys(POISON_ENV)) {
+            expect(envLine, `毒丸 ${key} 不該出現在 installer env`).not.toMatch(
+              new RegExp(`${key}=`),
+            );
+          }
+        }
+      } finally {
+        killHandoffInstallers();
+        try {
+          rmSync(smokeHome, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+      }
     },
     TIMEOUT,
   );
@@ -351,7 +490,7 @@ describe.skipIf(!HAS_OPENSSL)("#540 self_update 集成鏈路(真 HTTPS + 真簽�
   }, TIMEOUT);
 
   it("下載/驗證失敗後閂會鬆開:第二次仍走完整鏈路,而不是被當成重放", async () => {
-    const attempts = await runSelfUpdate({ currentVersion: "1.0.0", times: 2 });
+    const { attempts } = await runSelfUpdate({ currentVersion: "1.0.0", times: 2 });
     expect(attempts).toHaveLength(2);
     for (const one of attempts) {
       expect(one.ok).toBe(false);

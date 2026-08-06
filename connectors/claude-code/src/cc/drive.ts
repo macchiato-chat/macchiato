@@ -508,6 +508,15 @@ export class Drive {
   readonly counters: Record<string, number> = { driveErrors: 0, turnErrors: 0 };
   /** #310 認證失效持續態:auth 類回合失敗置 true(health 上報 authOk=false),成功回合恢復。 */
   authFailed = false;
+  /** #669 心跳:有進行中回合(在途 sid 集非空)。為「閒時更新」預留,本階段只寫進 health.json。 */
+  get busy(): boolean {
+    return this.pending.size > 0;
+  }
+  /** #669 心跳:有待用戶審批的工具調用(canUseTool 掛起中)。 */
+  get hasPendingApproval(): boolean {
+    for (const list of this.approvals.values()) if (list.length > 0) return true;
+    return false;
+  }
   /** serverSid → CC session uuid（跨重啟持久）。 */
   private map: Record<string, string>;
   /**
@@ -974,8 +983,16 @@ export class Drive {
     throw new Error(`fatal: ${message}`);
   }
 
-  /** 壞/缺 wire↔CC UUID 身份快照時整體拒絕 ready，不能讓 live/mirror/import 猜成明文。 */
-  assertE2EIdentitySafe(): void {
+  /**
+   * 壞/缺 wire↔CC UUID 身份快照時拒絕「當明文處理」的路徑。
+   *
+   * `allowMissingSids` 只給 **pending-enable bootstrap**（#687 / 對齊 OpenClaw）：
+   * App 建的會話 wire 是 ULID，在首次 CLI `init` 之前 map 本來就是空的——開啟加密時
+   * 若此處硬 throw，index 會 `onFatal` 殺進程；`beginEnable` 已落盤 → 重連 ready 再 assert
+   * → 永久 Offline（Unlink 重配也救不了，因為 e2e keystore 按 kind 持久、不隨 agentLink 清）。
+   * 內容面（mirror/import/live）仍走無參 strict assert；此白名單不得用於穩定態 E2E 會話。
+   */
+  assertE2EIdentitySafe(allowMissingSids: ReadonlySet<string> = new Set()): void {
     const protectedWireSids = this.protectedWireSids();
     if (this.identityPersistencePoisoned && protectedWireSids.length) {
       throw new Error(
@@ -984,9 +1001,10 @@ export class Drive {
     }
     const requiringMap = protectedWireSids.filter(
       (sid) =>
-        !CC_UUID_RE.test(sid) ||
-        this.map[sid] !== undefined ||
-        (this.aliases[sid]?.length ?? 0) > 0,
+        !allowMissingSids.has(sid) &&
+        (!CC_UUID_RE.test(sid) ||
+          this.map[sid] !== undefined ||
+          (this.aliases[sid]?.length ?? 0) > 0),
     );
     if (!requiringMap.length) return;
     const missing = requiringMap.filter((sid) => {
@@ -2844,15 +2862,30 @@ export class Drive {
    * clarify.respond 後把答案掛回 `updatedInput.answers`（`{問題原文: 所選 label}`）解掛 canUseTool。
    * 全部跳過/無答案 → 原樣 allow（CLI 自答「The user did not answer the questions.」，模型自行繼續）。
    * multiSelect 一律單選（v1）；「Other」自由文本不做（用戶可事後追問）。
+   *
+   * #273 E2E：問題/選項加密進 enc + requestDigest；回程 answerEnc 解密後填 answers。
+   * 無法安全凍結/超限 → 該題當跳過（不把明文旁路送 server）。
    */
   private requestAnswers(
     sid: string,
     input: Record<string, unknown>,
     toolUseID?: string,
   ): Promise<PermissionResult> {
-    // clarify.request 是明文 TUI 控制幀；E2E 會話不得把問題/選項旁路送往 server。
-    // 無答案即是 SDK 已有的「跳過」語義，讓模型在本地自行繼續。
-    if (this.e2e?.isE2E(sid)) {
+    // #273 能力協商：是 E2E **且**本會話有設備自報解得開 clarify 密文，才走加密形態。
+    // 沒有正向聲明 → 退回 #273 之前的路徑（下面的本地 skip 解掛），老 client 因此天然安全。
+    // 為什麼是這個方向:#273 落地時只看 isE2E,老 iOS 收到一張標題「🔒 Encrypted question」、
+    // 選項為空的卡就把回合掛死;作者用發版紀律（iOS 先上架再 sync-public）補償,但這倉庫
+    // 別處全是能力位（caps.rewind / caps.fork / promptModes）——能力位不用人記得。
+    const e2eSession = Boolean(this.e2e?.isE2E(sid));
+    const e2e = e2eSession && Boolean(this.e2e?.deviceSupports(sid, "clarify"));
+    // ⚠️ E2E 會話裡沒有能解密的設備時，**回到 #273 之前的行為：本地跳過**（SDK 的「無答案」
+    // 語義，模型自行繼續），而**不是**降級成明文 clarify——那條路會把問題/選項旁路送往 server，
+    // 是比「回合掛起」嚴重得多的洩漏。這也是 #273 之前那三行注釋說的同一件事。
+    if (e2eSession && !e2e) {
+      console.error(
+        `[E2E clarify] ${sid}: 本會話無設備自報可解密 clarify → 本地跳過該提問（#273 之前的行為）。` +
+          `帶 #273 客戶端側的 app 上架並註冊後自動啟用，無需改配置。`,
+      );
       return Promise.resolve({ behavior: "allow", updatedInput: input });
     }
     const questions = Array.isArray((input as { questions?: unknown }).questions)
@@ -2872,24 +2905,82 @@ export class Drive {
       questions.forEach((q, i) => {
         const question = String(q?.question ?? "").slice(0, 500);
         const reqId = `${base}#${i}`;
+        const choices = {
+          ...(typeof q?.header === "string" && q.header ? { header: q.header } : {}),
+          ...(q?.multiSelect === true ? { multiSelect: true } : {}),
+          options: (Array.isArray(q?.options) ? (q.options as Record<string, unknown>[]) : [])
+            .slice(0, 8)
+            .map((o, j) => ({
+              id: String(j),
+              label: String(o?.label ?? "").slice(0, 120),
+              ...(typeof o?.description === "string" && o.description
+                ? { description: o.description.slice(0, 300) }
+                : {}),
+            })),
+        };
+
+        if (e2e) {
+          try {
+            const requestSnapshot = immutableE2EApprovalSnapshot({
+              question,
+              choices,
+              request_id: reqId,
+            });
+            const executionSnapshot = immutableE2EApprovalSnapshot({
+              v: 1,
+              connector: "claude-code",
+              sessionId: sid,
+              requestId: reqId,
+              method: "clarify.respond",
+              request: requestSnapshot,
+            });
+            const executionDisplay = canonicalE2EApprovalDisplay(executionSnapshot);
+            const requestDigest = e2eApprovalRequestDigest(
+              this.e2e!.requireKey(sid),
+              executionSnapshot as Record<string, unknown>,
+            );
+            const plaintext = {
+              question,
+              choices,
+              multiSelect: q?.multiSelect === true,
+              requestId: reqId,
+              requestDigest,
+              executionRequest: executionSnapshot,
+              executionDisplay,
+            };
+            if (
+              Buffer.byteLength(JSON.stringify(plaintext), "utf8") > E2E_APPROVAL_PLAINTEXT_MAX_BYTES
+            ) {
+              throw new Error("encrypted clarify payload exceeds device limit");
+            }
+            const enc = this.e2e!.encryptContent(sid, plaintext);
+            this.clarifies.set(reqId, {
+              sid,
+              requestDigest,
+              record: (answer) => finishOne(question, answer),
+            });
+            this.emit(sid, "clarify.request", {
+              question: "🔒 Encrypted question",
+              choices: {},
+              request_id: reqId,
+              request_digest: requestDigest,
+              enc,
+            });
+          } catch (error) {
+            console.error(
+              `[E2E clarify skipped ${sid}] ${error instanceof Error ? error.message : String(error)}`,
+            );
+            finishOne(question, null);
+          }
+          return;
+        }
+
         this.clarifies.set(reqId, { sid, record: (answer) => finishOne(question, answer) });
         this.emit(sid, "clarify.request", {
           question,
           // Macchiato 對 choices 的形狀約定（見 protocol ClarifyRequestPayload 註釋）:
           // {header?, multiSelect?, options:[{id,label,description?}]}。server 映射成選項卡。
-          choices: {
-            ...(typeof q?.header === "string" && q.header ? { header: q.header } : {}),
-            ...(q?.multiSelect === true ? { multiSelect: true } : {}),
-            options: (Array.isArray(q?.options) ? (q.options as Record<string, unknown>[]) : [])
-              .slice(0, 8)
-              .map((o, j) => ({
-                id: String(j),
-                label: String(o?.label ?? "").slice(0, 120),
-                ...(typeof o?.description === "string" && o.description
-                  ? { description: o.description.slice(0, 300) }
-                  : {}),
-              })),
-          },
+          choices,
           request_id: reqId,
         });
       });

@@ -28,17 +28,34 @@ import {
   type E2EDisableReceiptV1,
 } from "./control";
 import {
+  isCanonicalDeviceAuthSecret,
+  verifyDeviceAuthProof,
+  type DeviceAuthConfig,
+} from "./device-auth";
+import {
   E2EKeyStoreConflictError,
   E2EKeyStoreLockTimeoutError,
   mergeE2EKeyStoreSnapshots,
   withE2EKeyStoreLock,
 } from "./file-lock";
 
+export type { DeviceAuthConfig };
+
 export interface DevicePub {
   deviceId: string;
   pubKey: string;
   /** 可選：舊 / 回滾後的 server 不帶；連接器按 `pubKey` 自算，帶了才核對。 */
   keyFingerprint?: string;
+  /**
+   * #731 可選：設備持有配對 secret 時的 HMAC proof。
+   * connector 有 secret 時缺/錯且本地未授權 → 跳過該設備。
+   */
+  authProof?: string;
+  /**
+   * #273 可選：設備自報「解得開哪些 E2E 交互密文」。**默認安全**——缺省即當不支持，
+   * 連接器走 #273 之前的路徑（clarify/secret 本地 skip 解掛），老 client 天然安全。
+   */
+  e2eCaps?: { clarify?: true; secret?: true };
 }
 
 export interface WrappedDeviceKey {
@@ -455,6 +472,18 @@ export class E2EKeyStoreStateError extends E2EKeyStoreError {
   }
 }
 
+/**
+ * #731 設備授權未通過（缺/錯 `authProof`）。刻意單列一個類型：wrap 的 catch 要把
+ * 「這台設備沒被授權」與「這台設備公鑰是壞的」分開——前者要回報給用戶（可修：重新掃碼），
+ * 後者是畸形數據（用戶做不了什麼）。都繼承 StateError，既有 `instanceof` 判據不變。
+ */
+export class E2EDeviceUnauthorizedError extends E2EKeyStoreStateError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "E2EDeviceUnauthorizedError";
+  }
+}
+
 /** 只吞 stale/state mismatch；持久化、poison 或未知錯誤重拋到 connector outer fatal。 */
 export function settleE2EBackfillAck(
   store: Pick<E2EKeyStore, "markEnableComplete" | "completeDisable">,
@@ -484,9 +513,45 @@ export class E2EKeyStore {
   private serverStateSynced = false;
   /** A partial two-file commit makes disk vs memory uncertain; this instance must never continue. */
   private poisoned: E2EKeyStorePoisonedError | null = null;
+  /** #731 設備授權；null = 舊配對無 secret，wrap 降級。 */
+  private deviceAuth: DeviceAuthConfig | null = null;
+  private deviceAuthLegacyWarned = false;
+  /** #273 每會話「已拿到 K_S 的設備」自報的交互能力並集（進程內；見 deviceSupports）。 */
+  private sessionDeviceCaps = new Map<string, { clarify?: true; secret?: true }>();
+  /** #731 上一次 wrap 因授權失敗被跳過的 deviceId（由連接器取走回報 server）。 */
+  private deviceAuthRejected: string[] = [];
 
   constructor(private readonly path: string) {
     withE2EKeyStoreLock(this.path, () => this.load());
+  }
+
+  /**
+   * #731 注入配對 secret + 已授權設備表。可在構造後、首次 wrap 前調用。
+   * secret 非法 → 視為無授權能力（降級），不拋。
+   */
+  configureDeviceAuth(config: DeviceAuthConfig | null): void {
+    if (!config) {
+      this.deviceAuth = null;
+      return;
+    }
+    if (!isCanonicalDeviceAuthSecret(config.secret) || !config.agentLinkId) {
+      console.error(
+        "[E2E device-auth] secret/agentLinkId 無效 → 降級為無設備授權（存量/損壞憑證）",
+      );
+      this.deviceAuth = null;
+      return;
+    }
+    this.deviceAuth = {
+      secret: config.secret,
+      agentLinkId: config.agentLinkId,
+      authorizedDevices: { ...(config.authorizedDevices ?? {}) },
+      persistAuthorized: config.persistAuthorized,
+    };
+  }
+
+  /** 測試 / 觀測：當前是否啟用設備授權校驗。 */
+  hasDeviceAuth(): boolean {
+    return this.deviceAuth !== null;
   }
 
   private load(): void {
@@ -1106,8 +1171,65 @@ export class E2EKeyStore {
     }
   }
 
-  private wrapKeyForDevices(k: Buffer, devices: DevicePub[]): WrappedDeviceKey[] {
+  /**
+   * #731：有 secret 時，每台設備必須 proof 通過或本地已授權同一指紋，才封 K_S。
+   * 無 secret（舊配對）→ 降級 wrap 全部 + 一次性警告。不得把 fingerprint 當授權。
+   */
+  private assertDeviceAuthorized(d: DevicePub, fingerprint: string): void {
+    const auth = this.deviceAuth;
+    if (!auth) {
+      if (!this.deviceAuthLegacyWarned) {
+        this.deviceAuthLegacyWarned = true;
+        console.error(
+          "[E2E device-auth] 本連接器無配對 secret（舊配對）→ wrap 不校驗設備授權；" +
+            "重新配對後新碼會帶 secret。e2eKeyVersionBinding ≠ 設備授權。",
+        );
+      }
+      return;
+    }
+    const prior = auth.authorizedDevices?.[d.deviceId];
+    if (prior && prior === fingerprint) return;
+    if (
+      verifyDeviceAuthProof(
+        auth.secret,
+        auth.agentLinkId,
+        d.deviceId,
+        fingerprint,
+        d.authProof,
+      )
+    ) {
+      const next = { ...(auth.authorizedDevices ?? {}), [d.deviceId]: fingerprint };
+      auth.authorizedDevices = next;
+      try {
+        auth.persistAuthorized?.(next);
+      } catch (error) {
+        console.error(
+          `[E2E device-auth] 持久化授權表失敗（本進程內仍生效）: ${(error as Error).message}`,
+        );
+      }
+      return;
+    }
+    throw new E2EDeviceUnauthorizedError(
+      "device not authorized (missing/invalid authProof; refusing wrap for unknown fingerprint)",
+    );
+  }
+
+  /**
+   * #731：取走並清空「上一次 wrap 因設備授權被跳過」的 deviceId 列表。
+   * 連接器把它掛進 `e2e_key.deviceAuthRejected`，server 據此告訴那台設備「你沒被授權」——
+   * 否則跳過是**完全靜默**的，用戶只看到一個永遠轉圈的 Updating。
+   */
+  takeDeviceAuthRejections(): string[] {
+    const out = this.deviceAuthRejected;
+    this.deviceAuthRejected = [];
+    return out;
+  }
+
+  private wrapKeyForDevices(k: Buffer, devices: DevicePub[], sid?: string): WrappedDeviceKey[] {
     const out: WrappedDeviceKey[] = [];
+    this.deviceAuthRejected = [];
+    // #273 只統計**真的拿到 K_S** 的設備：被跳過的設備解不開任何東西，它的自報能力無意義。
+    const caps: { clarify?: true; secret?: true } = {};
     for (const d of devices ?? []) {
       try {
         if (!d.pubKey) {
@@ -1119,29 +1241,54 @@ export class E2EKeyStore {
         if (d.keyFingerprint && fingerprint !== d.keyFingerprint) {
           throw new E2EKeyStoreStateError("device public key fingerprint mismatch");
         }
+        // #731 設備授權：在封 K_S 之前校驗（單台跳過，其餘照封）。
+        this.assertDeviceAuthorized(d, fingerprint);
         out.push({
           deviceId: d.deviceId,
           keyFingerprint: fingerprint,
           sealed: ec.wrapKey(k, d.pubKey),
         });
+        if (d.e2eCaps?.clarify === true) caps.clarify = true;
+        if (d.e2eCaps?.secret === true) caps.secret = true;
       } catch (error) {
-        // 單台壞公鑰：跳過並響亮記錄，其餘設備照封（絕不 all-or-nothing）。
+        // 單台壞公鑰 / 未授權：跳過並響亮記錄，其餘設備照封（絕不 all-or-nothing）。
         console.error(`[E2E wrap skipped device ${d?.deviceId}] ${(error as Error).message}`);
+        if (error instanceof E2EDeviceUnauthorizedError && d?.deviceId) {
+          this.deviceAuthRejected.push(d.deviceId);
+        }
       }
     }
+    if (sid) {
+      // 並集而非覆蓋:一台老設備 + 一台新設備時,新設備仍該收到密文形態(老設備本來就
+      // 讀不了 E2E 內容,不因這條變差)。全是老設備 → 空 → 走 #273 之前的路徑。
+      const prev = this.sessionDeviceCaps.get(sid) ?? {};
+      const merged = { ...prev, ...caps };
+      if (merged.clarify || merged.secret) this.sessionDeviceCaps.set(sid, merged);
+    }
     return out;
+  }
+
+  /**
+   * #273 本會話是否有設備解得開該類交互密文。**默認 false**——沒有正向聲明就當不支持，
+   * 調用方走 #273 之前的路徑（clarify/secret 本地 skip 解掛）。
+   *
+   * 進程內記憶:連接器重啟後為空,直到 server 在 Link B ready 重發 wrap 請求把能力帶回來。
+   * 失效方向是**安全**的（退回舊行為），不是打開缺口。
+   */
+  deviceSupports(sid: string, kind: "clarify" | "secret"): boolean {
+    return this.sessionDeviceCaps.get(sid)?.[kind] === true;
   }
 
   /** 首次 enable：必要时生成 K_S，再封装给设备。 */
   wrapForEnable(sid: string, devices: DevicePub[]): WrappedDeviceKey[] {
     this.assertWrapTargetsWellFormed(devices); // 畸形幀不得觸發 K_S 生成
-    return this.wrapKeyForDevices(this.createForEnable(sid), devices);
+    return this.wrapKeyForDevices(this.createForEnable(sid), devices, sid);
   }
 
   /** 新设备补封：必须沿用既有 K_S；缺 key 时拒绝，绝不生成不兼容的 K₂。 */
   wrapExistingForDevices(sid: string, devices: DevicePub[]): WrappedDeviceKey[] {
     this.assertWrapTargetsWellFormed(devices);
-    return this.wrapKeyForDevices(this.requireKey(sid), devices);
+    return this.wrapKeyForDevices(this.requireKey(sid), devices, sid);
   }
 
   /** @deprecated 兼容旧调用，语义等同首次 enable；index 会依据 backfill 显式选路。 */

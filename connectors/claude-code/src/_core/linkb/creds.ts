@@ -12,6 +12,16 @@ export interface Creds {
   connectorToken: string;
   agentLinkId: string;
   label?: string;
+  /**
+   * #731 配對時 connector 生成的 device-auth secret（base64url 32B）。
+   * 僅經 QR/終端碼給設備；舊配對檔缺此字段 = 降級（無設備授權校驗）。
+   */
+  deviceAuthSecret?: string;
+  /**
+   * #731 已通過 proof 授權的設備指紋：deviceId → keyFingerprint。
+   * wrap 重連時無 proof 也可沿用（同一把公鑰）；指紋變了需重新 proof。
+   */
+  authorizedDevices?: Record<string, string>;
 }
 
 export const DEFAULT_SERVER_URL = "wss://api.macchiato.chat/connector";
@@ -35,11 +45,25 @@ export function loadCreds(kind: ConnectorKind): Creds | null {
     return null;
   }
   if (!c.connectorToken || !c.agentLinkId) return null;
+  const authorizedDevices =
+    c.authorizedDevices && typeof c.authorizedDevices === "object" && !Array.isArray(c.authorizedDevices)
+      ? Object.fromEntries(
+          Object.entries(c.authorizedDevices as Record<string, unknown>).filter(
+            (e): e is [string, string] => typeof e[0] === "string" && typeof e[1] === "string" && !!e[0] && !!e[1],
+          ),
+        )
+      : undefined;
   return {
     serverUrl: serverUrl(c.serverUrl),
     connectorToken: c.connectorToken,
     agentLinkId: c.agentLinkId,
     label: c.label,
+    ...(typeof c.deviceAuthSecret === "string" && c.deviceAuthSecret
+      ? { deviceAuthSecret: c.deviceAuthSecret }
+      : {}),
+    ...(authorizedDevices && Object.keys(authorizedDevices).length
+      ? { authorizedDevices }
+      : {}),
   };
 }
 

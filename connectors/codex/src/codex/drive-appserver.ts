@@ -22,6 +22,7 @@ import { loadDriveState, saveDriveState, codexPermsFor, CODEX_AUTH_ERR_RE } from
 import { deriveMeta, discoverRollouts } from "./mirror";
 import { fallbackTitle, titleMode } from "./titles";
 import { materializeAttachment } from "./attachments";
+import { formatCodexTurnError, parseModelNeedsNewerCli } from "./turn-errors";
 import type { LinkBClient } from "../_core/linkb/client";
 import type { E2EKeyStore } from "../_core/e2e/keys";
 import {
@@ -162,6 +163,12 @@ interface ActiveTurn {
   lastError?: string;
   /** #245 interrupt 點在 turnId 未到位的窗口 → 掛起,turnId 到位即補發。 */
   interruptPending?: boolean;
+  /** 本回合完整 input(模型版本失敗時可靜默換模重試,不讓用戶重發)。 */
+  input?: UserInput[];
+  /** 本回合 turn/start 實際帶上的 model(空 = 未指定,走 CLI 默認)。 */
+  modelUsed?: string;
+  /** 已因「模型需更新 CLI」自動降級重試過一次——防死循環。 */
+  modelFallbackTried?: boolean;
 }
 
 type CodexApprovalKind = "command" | "fileChange";
@@ -214,8 +221,22 @@ export class AppServerDrive {
   readonly counters: Record<string, number> = { driveErrors: 0, approvalsRequested: 0, steers: 0, engineAppServer: 1, unknownNotifications: 0 };
   /** #310 認證失效持續態:auth 類回合失敗置 true(health 上報 authOk=false),成功回合恢復。 */
   authFailed = false;
+  /** #669 心跳:有進行中回合(在途 sid 集非空)。為「閒時更新」預留,本階段只寫進 health.json。 */
+  get busy(): boolean {
+    return this.pending.size > 0;
+  }
+  /** #669 心跳:有待用戶審批的工具調用(approval.respond 解掛前)。 */
+  get hasPendingApproval(): boolean {
+    for (const list of this.approvals.values()) if (list.length > 0) return true;
+    return false;
+  }
   /** #258 已告警過的未知通知 method(去重,不刷屏)。 */
   private readonly loggedUnknownNotif = new Set<string>();
+  /**
+   * 本進程已知「需更新 CLI 才能跑」的 model id。turn/start 不再帶上,避免用戶連發三條都撞同一牆。
+   * 進程級即可:CLI 升級後連接器重啟/health 重探會清空。
+   */
+  private readonly modelsBlockedByCliVersion = new Set<string>();
   private map: Record<string, string>;
   private cwds: Record<string, string>;
   private models: Record<string, string>;
@@ -467,8 +488,10 @@ export class AppServerDrive {
   }
 
   /** 見 exec Drive 同名方法：壞/缺 sid↔thread 身份快照時禁止任何 plaintext fallback。 */
-  assertE2EIdentitySafe(): void {
-    const requiringMap = this.protectedWireSids().filter((sid) => !UUID_RE.test(sid));
+  assertE2EIdentitySafe(allowMissingSids: ReadonlySet<string> = new Set()): void {
+    const requiringMap = this.protectedWireSids().filter(
+      (sid) => !allowMissingSids.has(sid) && !UUID_RE.test(sid),
+    );
     if (!requiringMap.length) return;
     const missing = requiringMap.filter((sid) => !UUID_RE.test(this.map[sid] ?? ""));
     if (!this.identityStateTrusted || missing.length) {
@@ -525,7 +548,11 @@ export class AppServerDrive {
     return this.resolveSessionCwd(sid).cwd;
   }
   private modelFor(sid: string): string | undefined {
-    return this.models[sid] || process.env.MACCHIATO_CODEX_MODEL || undefined;
+    const raw = this.models[sid] || process.env.MACCHIATO_CODEX_MODEL || undefined;
+    if (!raw) return undefined;
+    // 已知本機 CLI 跑不動 → 省略,讓 Codex 用其默認(或用戶之後手動換模)
+    if (this.modelsBlockedByCliVersion.has(raw)) return undefined;
+    return raw;
   }
   private effortFor(sid: string): string | undefined {
     return this.efforts[sid] || process.env.MACCHIATO_CODEX_EFFORT || undefined; // #231
@@ -1067,6 +1094,7 @@ export class AppServerDrive {
       }
       this.byThread.set(threadId, sid);
       this.mirror?.setDriven(threadId); // live 獨佔投遞
+      const model = this.modelFor(sid);
       const turn: ActiveTurn = {
         threadId,
         started: false,
@@ -1078,11 +1106,12 @@ export class AppServerDrive {
         usage: {},
         isE2E,
         isFirstMacchiatoTurn,
+        input,
+        ...(model ? { modelUsed: model } : {}),
       };
       this.active.set(sid, turn);
       this.pending.add(sid); // #200
       this.saveMap();
-      const model = this.modelFor(sid);
       const effort = this.effortFor(sid); // #231 per-turn reasoning effort
       const res = await this.client.request("turn/start", { threadId, input, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
       // turn/start 立即返回(探針);turnId 也會隨 turn/started 通知到,這裡先記省一拍。
@@ -1092,9 +1121,19 @@ export class AppServerDrive {
       this.active.delete(sid);
       this.pending.delete(sid);
       this.saveMap();
-      const msg = e instanceof AppServerDied ? "codex app-server 不可用(重啟中),請稍後重發" : (e as Error).message.slice(0, 200);
-      if (isE2E) this.sendE2ETurn(sid, `❌ 回合啟動失敗:${msg}`);
-      else this.emit(sid, "review.summary", { summary: `❌ 回合啟動失敗:${msg}` });
+      if (e instanceof AppServerDied) {
+        const note = "❌ codex app-server 不可用(重啟中),請稍後重發";
+        if (isE2E) this.sendE2ETurn(sid, note);
+        else this.emit(sid, "review.summary", { summary: note });
+      } else {
+        // 同步失敗也可能是「模型需更新 CLI」——先記黑名單,文案人話化(與 finishTurn 同路)
+        const raw = (e as Error).message;
+        const need = parseModelNeedsNewerCli(raw);
+        if (need) this.blockModelNeedingNewerCli(sid, need.model);
+        const note = formatCodexTurnError(raw);
+        if (isE2E) this.sendE2ETurn(sid, note);
+        else this.emit(sid, "review.summary", { summary: note });
+      }
       this.counters.driveErrors += 1;
       if (requireDelivery) throw e;
     }
@@ -1271,20 +1310,45 @@ export class AppServerDrive {
     const interrupted = this.interruptedSids.delete(sid);
     const st = String(turnObj.status ?? "completed"); // TurnStatus: completed/interrupted/failed/inProgress
     const status = st === "failed" ? "error" : st === "interrupted" || interrupted ? "interrupted" : "complete";
-    const errMsg = turnObj.error?.message ?? turn.lastError;
+    const errMsg = turnObj.error?.message ?? turnObj.error ?? turn.lastError;
     // #310 認證失效偵測:auth 類失敗置持續態(health authOk=false → app 顯降級);成功回合恢復。
-    const authErr = status === "error" && CODEX_AUTH_ERR_RE.test(String(errMsg ?? ""));
+    const errText = String(errMsg ?? "");
+    const authErr = status === "error" && CODEX_AUTH_ERR_RE.test(errText);
     if (authErr) this.authFailed = true;
     else if (status === "complete") this.authFailed = false;
+
+    // 模型需更新 CLI:黑名單 + 清粘滯;若本回合是帶了該 model 起的,靜默換模重試一次(用戶不用重發)。
+    const needNewer = status === "error" && !turn.agentText ? parseModelNeedsNewerCli(errMsg) : null;
+    if (needNewer) this.blockModelNeedingNewerCli(sid, needNewer.model);
+    const canFallback =
+      !!needNewer &&
+      !turn.isE2E &&
+      !turn.modelFallbackTried &&
+      Array.isArray(turn.input) &&
+      turn.input.length > 0 &&
+      // 只有「我們主動指定了壞 model」時重試才有意義;未指定 = CLI 默認就是壞的,省略 model 仍會撞牆
+      turn.modelUsed === needNewer.model;
+    if (canFallback) {
+      this.emit(sid, "review.summary", {
+        summary: `⚠️ 模型 ${needNewer!.model} 本機 Codex 暫不可用，已自動改用可用模型重試…`,
+      });
+      // 不發 error 終態(避免空失敗氣泡);直接起新回合,帶 modelFallbackTried 防循環
+      void this.runTurnWithFallback(sid, turn.input!, turn.userText);
+      // 排隊消息仍要在重試回合之後投——先塞回隊首,等重試 finish 再 dequeue
+      // (runTurnWithFallback 的 finish 會走正常 queue 路徑)
+      this.mirror?.fastForward(turn.threadId);
+      this.mirror?.unsetDriven(turn.threadId);
+      this.projects?.checkTurnEnd();
+      return;
+    }
+
     if (turn.isE2E) {
       this.sendE2ETurn(sid, turn.agentText);
     } else {
       if (status === "error" && !turn.agentText) {
-        // #310 auth 失敗給可行動文案(而非裸錯誤串,用戶不知道要去終端 login)
+        // 人話 + 可行動下一步(#310 auth / 模型需更新 CLI / 一般錯誤剝 JSON 殼)
         this.emit(sid, "review.summary", {
-          summary: authErr
-            ? "❌ Codex 登錄已失效——請在連接器主機終端跑 `codex login` 重新登錄後重試"
-            : `❌ 回合失敗:${String(errMsg ?? "unknown").slice(0, 200)}`,
+          summary: formatCodexTurnError(errMsg ?? "unknown"),
         });
       }
       this.startMsg(sid, turn);
@@ -1300,6 +1364,26 @@ export class AppServerDrive {
     const next = this.queuedInputs.get(sid)?.shift();
     if (!this.queuedInputs.get(sid)?.length) this.queuedInputs.delete(sid);
     if (next) void this.runTurn(sid, next.input, next.firstText);
+  }
+
+  /** 模型版本失敗後的一次自動重試:不再帶壞 model(已進黑名單);標記寫在 turn 建立後、完成前。 */
+  private async runTurnWithFallback(sid: string, input: UserInput[], firstText: string): Promise<void> {
+    await this.runTurn(sid, input, firstText);
+    // runTurn 只等到 turn/start 返回;active 裡仍是新回合——立刻打標,避免異步完成前又觸發一次 fallback
+    const t = this.active.get(sid);
+    if (t) t.modelFallbackTried = true;
+  }
+
+  /** 記黑名單 + 清本會話粘滯 model(若正好是這個),避免下一條消息再撞牆。 */
+  private blockModelNeedingNewerCli(sid: string, model: string): void {
+    this.modelsBlockedByCliVersion.add(model);
+    if (this.models[sid] === model) {
+      delete this.models[sid];
+      this.saveMap();
+    }
+    console.error(
+      `[drive2] model ${model} 需更新本機 Codex CLI → 已拉黑(本進程);會話粘滯已清(若匹配)`,
+    );
   }
 
   /**

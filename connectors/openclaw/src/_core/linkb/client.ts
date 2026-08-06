@@ -16,6 +16,8 @@ export class LinkBClient {
   private ws: WebSocket | null = null;
   private closed = false;
   private ready = false;
+  /** #669 最近一次 ready 的時刻(epoch ms);從未連上 → null。心跳的 lastConnectedAt 來源。 */
+  private lastReadyAtMs: number | null = null;
   /** #3 連續重連失敗計數(ready 歸零;指數退避 + 每 5 次告警)。 */
   private failures = 0;
   /** 斷線期間的出站幀緩衝(重連 ready 後 flush)——server 部署重啟撞上進行中回合時,
@@ -65,6 +67,11 @@ export class LinkBClient {
   }
   get isReady(): boolean {
     return this.ready;
+  }
+  /** #669 最近一次連上 server 的時刻(epoch ms);從未連上 → null。斷線後**不清零**——
+   * 「上次還連著是什麼時候」正是 supervisor 判「活著但連不上」要看的東西。 */
+  get lastConnectedAtMs(): number | null {
+    return this.lastReadyAtMs;
   }
 
   /** pending-enable 只有在 server 成功 ACK 后才解除本连接的 per-session 出站隔离。 */
@@ -125,6 +132,8 @@ export class LinkBClient {
           e2eFailClosed: 1,
           e2eControlAuth: 1,
           e2eKeyVersionBinding: 1,
+          // #731：本連接器支援配對 secret + wrap 時校驗 authProof（有 secret 才真正 enforce）。
+          e2eDeviceAuth: 1,
           e2eQuiesce: 1,
           mirrorDurable: 1, // #348 durable outbox + 懂 mirror_nack.code 終態語義
           // 能力位按 connector/引擎注入:**沒有的能力就不宣告**,於是 server 409、UI 根本不出
@@ -200,6 +209,7 @@ export class LinkBClient {
           return;
         }
         this.ready = true;
+        this.lastReadyAtMs = Date.now(); // #669 心跳的 lastConnectedAt
         this.failures = 0; // #3 連上歸零
         this.flushPending();
         if (this.firstReady) {
@@ -522,22 +532,64 @@ export class LinkBClient {
         payload.output_tokens >= 0
       );
     }
-    if (params.type !== "approval.request") return false;
-    return (
-      payload !== null &&
-      typeof payload === "object" &&
-      !Array.isArray(payload) &&
-      LinkBClient.onlyKeys(payload, [
-        "command", "pattern_key", "pattern_keys", "description", "enc", "request_id", "request_digest",
-      ]) &&
-      payload.command === "🔒 加密審批請求" &&
-      (payload.description === "" || payload.description === undefined || payload.description === null) &&
-      LinkBClient.looksLikeCiphertext(payload.enc) &&
-      typeof payload.request_id === "string" &&
-      !!payload.request_id &&
-      typeof payload.request_digest === "string" &&
-      !!payload.request_digest
-    );
+    if (params.type === "approval.request") {
+      return (
+        payload !== null &&
+        typeof payload === "object" &&
+        !Array.isArray(payload) &&
+        LinkBClient.onlyKeys(payload, [
+          "command", "pattern_key", "pattern_keys", "description", "enc", "request_id", "request_digest",
+        ]) &&
+        payload.command === "🔒 加密審批請求" &&
+        (payload.description === "" || payload.description === undefined || payload.description === null) &&
+        LinkBClient.looksLikeCiphertext(payload.enc) &&
+        typeof payload.request_id === "string" &&
+        !!payload.request_id &&
+        typeof payload.request_digest === "string" &&
+        !!payload.request_digest
+      );
+    }
+    // #273 E2E clarify：問題/選項僅在 enc；wire 占位 + 空 choices。
+    if (params.type === "clarify.request") {
+      return (
+        payload !== null &&
+        typeof payload === "object" &&
+        !Array.isArray(payload) &&
+        LinkBClient.onlyKeys(payload, [
+          "question", "choices", "request_id", "request_digest", "enc",
+        ]) &&
+        payload.question === "🔒 Encrypted question" &&
+        (payload.choices === undefined ||
+          payload.choices === null ||
+          (typeof payload.choices === "object" &&
+            !Array.isArray(payload.choices) &&
+            Object.keys(payload.choices as object).length === 0)) &&
+        LinkBClient.looksLikeCiphertext(payload.enc) &&
+        typeof payload.request_id === "string" &&
+        !!payload.request_id &&
+        typeof payload.request_digest === "string" &&
+        !!payload.request_digest
+      );
+    }
+    // #273 E2E secret：prompt/env 僅在 enc。
+    if (params.type === "secret.request") {
+      return (
+        payload !== null &&
+        typeof payload === "object" &&
+        !Array.isArray(payload) &&
+        LinkBClient.onlyKeys(payload, [
+          "prompt", "env_var", "request_id", "request_digest", "enc",
+        ]) &&
+        payload.prompt === "🔒 Encrypted secret request" &&
+        (payload.env_var === "" || payload.env_var === undefined || payload.env_var === null) &&
+        LinkBClient.looksLikeCiphertext(payload.enc) &&
+        typeof payload.request_id === "string" &&
+        !!payload.request_id &&
+        typeof payload.request_digest === "string" &&
+        !!payload.request_digest
+      );
+    }
+    return false;
   }
 
   private safeE2EControlResult(raw: Record<string, unknown>): boolean {

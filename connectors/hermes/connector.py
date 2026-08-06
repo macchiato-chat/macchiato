@@ -48,7 +48,7 @@ import threading
 import time
 import traceback
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from urllib.parse import urlparse
 
 import websockets
@@ -112,8 +112,11 @@ LINK_B_PROTO = 5  # 對齊 server（packages/protocol：B=5，#348/#368 可靠 A
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.70"
+CONNECTOR_VERSION = "1.5.72"
 E2E_APPROVAL_PLAINTEXT_MAX = 64 * 1024
+# #273 加密 clarify/secret 的待決快照上限。真實併發遠低於此（一次回合最多幾條問題）；
+# 只是給「用戶從不回答」這條路徑封頂，別讓常駐進程無限攢。
+E2E_INTERACTIVE_PENDING_MAX = 256
 # #279 E2E prompt 解密失敗的用戶可見回執(僅提示語,零內容洩漏;四連接器同文案)。
 E2E_DECRYPT_FAIL_WARNING = "無法解密這條消息(設備與連接器的加密密鑰可能失步)——請重試,或重新關閉再開啟本會話的端到端加密。"
 _UUID_ID_RE = re.compile(
@@ -138,7 +141,21 @@ _SAFE_INSTALLER_ENV = {
     "MACCHIATO_STATE_DIR", "MACCHIATO_HERMES_PROFILE",
     "MACCHIATO_SERVER_URL", "MACCHIATO_WEB_URL", "MACCHIATO_MIRROR",
     "MACCHIATO_CLAUDE_BIN", "MACCHIATO_CODEX_BIN",
+    # #767 服务由外部托管（system unit / 容器 / 一体机镜像）：不进白名单 = self_update 拉起的
+    # installer 收不到它，照样去装 user unit —— 更新写进磁盘、真正在跑的进程纹丝不动，
+    # 用户点 Update 永远失败。
+    "MACCHIATO_SKIP_UNIT",
 }
+
+
+# #773 installer 退出 0 之後再等這麼久;到點本進程還活着 ＝ 重啟沒把它換掉 → 放開交棒閂。
+# 與 TS 三家單源同義(packages/connector-core/src/selfupdate.ts 的 SELF_UPDATE_RESTART_GRACE_MS,
+# 那裡有完整理由):下界要大到「真重啟必然已經把本進程殺掉」(systemd 的 restart 是阻塞的,
+# installer 退出時舊進程早已死透;launchd 的 kickstart -k 也是秒級),上界要明顯小於 app 側
+# 90s 的更新看門狗,用戶那一下「重試」才真的能再裝一次。env 只為測試提供注入點。
+_SELF_UPDATE_RESTART_GRACE_S = (
+    float(os.environ.get("MACCHIATO_SELF_UPDATE_RESTART_GRACE_MS") or 45000) / 1000
+)
 
 
 def _build_installer_env(source: dict[str, str], manifest_path: str) -> dict[str, str]:
@@ -383,7 +400,15 @@ MIRROR_PRUNE_S = float(os.environ.get("MACCHIATO_MIRROR_PRUNE_S", str(30 * 24 * 
 # 沒有這張表，自驅會話的 E2E 加密鏡像投遞 / 重啟後帶上下文續聊 / 歸檔回寫都對不上號。
 SESSIONS_MAP = os.path.join(STATE_DIR, "sessions.json")
 ATTACH_DIR = os.path.join(STATE_DIR, "attachments")  # 入站附件落地（gateway 同機可讀）
-HEALTH_FILE = os.path.join(STATE_DIR, "health.json")  # 本地健康快照（可本機 inspect）
+HEALTH_FILE = os.path.join(STATE_DIR, "health.json")  # 本地健康快照（可本機 inspect，0.12.0 起就在；路徑保持不動）
+# #669 supervisor 讀的是**按 kind 分家**的那份：`~/.macchiato` 是四家共用的狀態根
+# （`<kind>-connector.json`、`supervise-<kind>.state` 早就按 kind 分了），共用一個 health.json
+# 會讓同機的 CC/Codex/Hermes 互相覆蓋 → 「A 的 supervisor 讀到 B 的斷連狀態並重裝 A」。
+# 內容與 HEALTH_FILE 逐字相同，只是名字不撞。
+HEALTH_FILE_KIND = os.path.join(STATE_DIR, "health-hermes.json")
+# #669 本機安裝的穩定標識：分批放量的哈希種子。生成後持久化，不隨進程/重裝變。
+# 與 TS 三家的 `packages/connector-core/src/identity.ts#installIdPath` 同路徑同語義。
+INSTALL_ID_FILE = os.path.join(STATE_DIR, "install-id")
 PUSH_SOCK = os.path.expanduser(os.environ.get("MACCHIATO_PUSH_SOCK") or _default_push_sock())  # §17 主動投遞：Hermes macchiato 插件 → 連接器(#309 profile 實例自動走 per-profile sock)
 HEALTH_INTERVAL_S = float(os.environ.get("MACCHIATO_HEALTH_S", "30"))
 ATTACH_TTL_S = float(os.environ.get("MACCHIATO_ATTACH_TTL_S", str(6 * 3600)))  # 入站附件保留 6h 後 GC
@@ -391,6 +416,44 @@ MIRROR_STUCK_S = float(os.environ.get("MACCHIATO_MIRROR_STUCK_S", "60"))  # 鏡�
 # §19 quiesce 自旋上限。必須**小於** server 的等待上限(默認 300s),否則 server 先超時、連接器還
 # 攥著屏障不放 → 兩側狀態機錯位。對齊 OpenClaw 的 4 分鐘。
 QUIESCE_TIMEOUT_S = float(os.environ.get("MACCHIATO_QUIESCE_TIMEOUT_S", "240"))
+
+
+_INSTALL_ID_RE = re.compile(r"^[0-9a-zA-Z._-]{8,128}$")
+
+
+def _read_or_create_install_id(path: str | None = None) -> str:
+    """#669 讀取（必要時生成）本機安裝標識。與 TS 側 `heartbeat.ts` 逐字同語義。
+
+    併發安全用 ``O_CREAT|O_EXCL`` 搶佔式創建——同機四家連接器同時啟動時只有一個贏，輸的那個
+    回頭讀贏家寫的值。**絕不用 write-then-rename**：那會讓後到的進程覆蓋先到的 id，
+    於是「穩定標識」每次重啟都在兩個值之間跳，分批放量的分桶跟著抖。
+    """
+    p = path or INSTALL_ID_FILE
+
+    def _read() -> str | None:
+        try:
+            with open(p, encoding="utf-8") as f:
+                s = f.read().strip()
+            return s if _INSTALL_ID_RE.match(s) else None
+        except OSError:
+            return None
+
+    existing = _read()
+    if existing:
+        return existing
+    fresh = str(uuid.uuid4())
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, (fresh + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        return fresh
+    except OSError:
+        # 已存在（別人搶先）或盤寫不了：能讀到就用讀到的，否則退回本進程臨時值。
+        # fail-open——心跳寫不出去絕不能把連接器搞崩。
+        return _read() or fresh
 
 
 def _sanitize_filename(name: str) -> str:
@@ -902,6 +965,18 @@ class Connector:
         # 而 server 的 backfillDedupKey 撞唯一索引只會靜默 return false(live 行的 dedup_key
         # 永遠補不上了)。回填在途期間讓鏡像跳過該會話,把「誰先到」的競態變成確定順序。
         self._srcid_pending: set = set()
+        # #656 「本端正在驅動這個會話」——**收到 prompt.submit 的那一刻**就記，而不是等
+        # `_ensure_session` 把它寫進 `_fwd`。鏡像的跳過判據原本只認 `_rev/_fwd/_stored_rev`：
+        #   · `_fwd/_rev` 是運行時的，要 `_ensure_session`（含一次 gateway resume 往返 + #148
+        #     的 per-session 串行鏈排隊）跑完才有；
+        #   · `_stored_rev` 只裝**自驅**會話——`_record_stored` 明確拒絕 `stored == server_sid`，
+        #     而**鏡像來源的會話**（source=discord 等，server_sid 本身就是 state.db id）正是那種。
+        # 於是「連接器起來後、某個鏡像來源會話的第一個 app 回合」有一段誰都不認的窗口：prompt 已
+        # 進 gateway、user 行已落 state.db，而三張表都還沒有它 → 2s 輪詢一撞就把同一行再投一遍。
+        # 生產實錄(brian@xmind.net,Libra,07-15 與 07-31)：live 行 dedup_key 全空、整個回合被複製
+        # 成兩份——因為鏡像先佔了那個 src id，回合末的回填撞唯一索引只會**靜默** return false。
+        # 值是過期時刻（單調鐘）：只是兜底，正常在 `_ensure_session` 寫完 `_fwd` 後即撤。
+        self._driving: dict = {}
         self._sdb = None  # 懶加載的 Hermes SessionDB（session.archive 用，寫 state.db.archived）
         self._mirror_task = None  # §15 持續鏡像 tailer 任務
         self._health_task = None  # 健康上報任務
@@ -909,8 +984,15 @@ class Connector:
         self._push_seq = 0
         self._started_at = time.time()
         self._linkb_state = "init"
+        # #669 最近一次 link B ready 的時刻(epoch 秒);從未連上 → None。斷線後**不清零**——
+        # 「上次還連著是什麼時候」正是 supervisor 判「活著但連不上」要看的東西。
+        self._linkb_connected_at: float | None = None
+        # #669 心跳:掛起中的非 E2E 審批(server_sid 集)。E2E 的在 _e2e_approvals 裡,兩者取並集。
+        self._plain_approvals: set[str] = set()
         self._mirror_last_run = None
         self._last_error = None
+        # #773 「新版已裝好、但本進程沒被換掉」的人話（**不是失敗**，見 _on_installer_exit）。
+        self._self_update_notice: str | None = None
         self._compat: dict = {}
         self._smoke_err: str | None = None  # #112 解析冒煙結果(健康循環定期刷新)
         self._mirror_st = None  # 鏡像水位線狀態（nack 回退也要訪問）
@@ -935,6 +1017,11 @@ class Connector:
         # Hermes gateway 的原生 approval.respond 只有 session FIFO。E2E 下自行赋 request id +
         # digest，并严格只允许签封响应消费队首，绝不把“第二张卡的批准”错批给第一张。
         self._e2e_approvals: dict[str, deque] = {}
+        # #273 加密 clarify/secret 的待決快照（request_id → {kind, serverSid, requestDigest,
+        # executionRequest}）。簽封響應要拿它重算 digest 對賬，絕不信 server 傳來的元數據。
+        # 有界：只在成功響應時 pop，用戶跳過/超時/會話結束都不會清——不設上限就是每條沒答的
+        # 請求都留一份、常駐進程越跑越大（review #273）。超出時丟最老的（FIFO）。
+        self._e2e_interactives: OrderedDict[str, dict] = OrderedDict()
         # #368 server 發出 E2E 切換前先要求 quiesce。只要 sid 在此表，新的 prompt.submit /
         # command.invoke 一律拒絕（審批/澄清/密鑰響應**不攔**——那是讓在途回合走完的幀）；
         # 既有 session chain/live/retry 收斂後才回 ACK，避免回覆跨越明密文邊界。
@@ -946,6 +1033,15 @@ class Connector:
         # resume 帶上下文、歸檔回寫都靠它。
         self._stored: dict[str, str] = self._load_stored()  # server sid -> state.db id
         self._stored_rev: dict[str, str] = {v: k for k, v in self._stored.items()}
+
+    def configure_device_auth(self, secret, agent_link_id, authorized_devices=None, persist_authorized=None) -> None:
+        """#731 注入配對 secret（薄封裝——調用方不該去摸 `_e2e` 這個私有屬性）。"""
+        self._e2e.configure_device_auth(
+            secret,
+            agent_link_id,
+            authorized_devices=authorized_devices,
+            persist_authorized=persist_authorized,
+        )
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -962,9 +1058,8 @@ class Connector:
                         file=sys.stderr,
                     )
                     return
-                # §19 E2E:內容事件(message.*/tool.*)走加密鏡像抑制;但 #240 交互事件不能一起黑洞——
-                # approval.request 加密後放行(否則 agent 要審批用戶永遠看不到、回合卡死),媒體放行
-                # (照 e2e.md 既定邊界:附件不 E2E、存 server 可讀桶)。clarify/secret 的雙向加密走 follow-up。
+                # §19 E2E:內容事件(message.*/tool.*)走加密鏡像抑制;但 #240/#273 交互事件不能一起黑洞——
+                # approval/clarify/secret.request 加密後放行,媒體放行(附件不 E2E、存 server 可讀桶)。
                 etype = params.get("type")
                 # E2E 内容本身被抑制/镜像，但 active 生命周期仍是本地可信事实；签封
                 # interrupt 靠它区分“正在运行”与会取消未来无关回合的 idle 假成功。
@@ -979,6 +1074,9 @@ class Connector:
                     # 缺 provenance / 无法规范化 / 完整正文过大时不能给设备一张可批准的
                     # 摘要卡；本地直接 deny，避免 agent 永久挂起。
                     loop.create_task(self._deny_e2e_approval(real_sid))
+                elif etype in ("clarify.request", "secret.request"):
+                    # #273:無法安全加密時 skip 解掛,避免 gateway 永久等待。
+                    loop.create_task(self._deny_e2e_interactive(real_sid, etype, params.get("payload") or {}))
                 if etype == "message.complete":
                     text = (params.get("payload") or {}).get("text") or ""
                     if text:
@@ -996,6 +1094,12 @@ class Connector:
                 self._live_inflight.add(server_sid)
             elif params.get("type") == "message.complete":
                 self._live_inflight.discard(server_sid)
+            # #669 心跳:非 E2E 審批掛起追蹤(回合結束一律清——回合都完了不可能還吊着審批,
+            # 這條兜底保證 pendingApproval 不會黏住成永久 true)。
+            if params.get("type") == "approval.request":
+                self._plain_approvals.add(server_sid)
+            elif params.get("type") == "message.complete":
+                self._plain_approvals.discard(server_sid)
             # 出站附件：message.complete 正文裡 MEDIA:/裸路徑標的文件 → media.attach。
             if params.get("type") == "message.complete":
                 text = (params.get("payload") or {}).get("text") or ""
@@ -1041,6 +1145,7 @@ class Connector:
                 "e2eFailClosed": 1,
                 "e2eControlAuth": 1,
                 "e2eKeyVersionBinding": 1,
+                "e2eDeviceAuth": 1,  # #731 配對 secret + wrap 校驗 authProof
                 "e2eQuiesce": 1,
                 "mirrorDurable": 1,
                 "rewind": 1,  # #473 SessionDB.rewind_to_message(軟刪 active=0,原生能力)
@@ -1354,6 +1459,8 @@ class Connector:
             except RuntimeError:
                 pass  # 無運行中事件循環(理論不達:本鉤子由 supervise 協程調用)
             self._live_inflight.clear()
+        # #669 gateway 死了，它掛起的審批也跟着死——別讓心跳的 pendingApproval 永久黏住 true。
+        self._plain_approvals.clear()
         # gateway 重啟後，舊 session 映射失效（新 gateway 無這些活躍會話）→ 清空，
         # 下次 prompt 重新 resume（帶上下文）/ create。
         # 自驅會話的 live 消息已投遞過 → 重啟後推進其鏡像水位線、免得重發。需含 _fwd 鍵
@@ -1581,11 +1688,75 @@ class Connector:
         except Exception as exc:
             print(f"[E2E approval auto-deny failed {real_sid}] {exc!r}", file=sys.stderr)
 
+    async def _deny_e2e_interactive(self, real_sid: str, etype: str, payload: dict) -> None:
+        """#273:clarify/secret 無法加密放行時本地 skip 解掛,避免 agent 永久掛起。"""
+        request_id = str(payload.get("request_id") or "")
+        if not request_id or self.gw is None:
+            return
+        try:
+            if etype == "clarify.request":
+                await self.gw.request(
+                    "clarify.respond",
+                    {"request_id": request_id, "answer": ""},
+                )
+            elif etype == "secret.request":
+                await self.gw.request(
+                    "secret.respond",
+                    {"request_id": request_id, "value": ""},
+                )
+        except Exception as exc:
+            print(f"[E2E {etype} auto-skip failed {real_sid}] {exc!r}", file=sys.stderr)
+
+    def _e2e_track_interactive(
+        self,
+        server_sid: str,
+        kind: str,
+        request_id: str,
+        digest: str,
+        execution_request: dict,
+    ) -> None:
+        self._e2e_interactives[request_id] = {
+            "kind": kind,
+            "serverSid": server_sid,
+            "requestId": request_id,
+            "requestDigest": digest,
+            "executionRequest": execution_request,
+        }
+        self._e2e_interactives.move_to_end(request_id)
+        # 越界丟最老的：那些早就沒人會答了（gateway 側的 pending 早已隨回合結束消失）。
+        while len(self._e2e_interactives) > E2E_INTERACTIVE_PENDING_MAX:
+            dropped, _ = self._e2e_interactives.popitem(last=False)
+            print(
+                f"[E2E interactive pending overflow] dropped {dropped}",
+                file=sys.stderr,
+            )
+
     def _e2e_live_frame(self, server_sid: str, etype: str, payload: dict) -> dict | None:
-        """§19 E2E 會話的 live 事件過濾(#240)。返回要轉發的 event frame,或 None(抑制)。
+        """§19 E2E 會話的 live 事件過濾(#240/#273)。返回要轉發的 event frame,或 None(抑制)。
         - approval.request:命令/說明加密進 enc,明文只留占位 + pattern_key/request_id(元數據);
           #370 request_id + request_digest 同时放进密文，设备签封回带；server 不能换卡/伪造 always。
-        - 其餘(message.*/tool.* 走加密鏡像;clarify/secret 待雙向加密 follow-up):抑制。"""
+        - clarify.request / secret.request(#273):問題/選項/prompt 進 enc；回程 answerEnc/secretEnc。
+        - 其餘(message.*/tool.* 走加密鏡像):抑制。"""
+        # #273 能力協商：沒有設備自報解得開，就返回 None → 調用方走 _deny_e2e_interactive
+        # （本地 skip 解掛，即 #273 之前的行為）。**絕不降級成明文** clarify——那會把問題/選項
+        # 旁路送往 server，是比「回合掛起」嚴重得多的洩漏。能力位不用人記得發版順序。
+        if etype == "clarify.request":
+            if not self._e2e.device_supports(server_sid, "clarify"):
+                print(
+                    f"[E2E clarify] {server_sid}: 無設備自報可解密 → 本地跳過(#273 之前的行為);"
+                    "帶客戶端側的 app 上架並註冊後自動啟用",
+                    file=sys.stderr,
+                )
+                return None
+            return self._e2e_live_clarify(server_sid, payload)
+        if etype == "secret.request":
+            if not self._e2e.device_supports(server_sid, "secret"):
+                print(
+                    f"[E2E secret] {server_sid}: 無設備自報可解密 → 本地跳過(#273 之前的行為)",
+                    file=sys.stderr,
+                )
+                return None
+            return self._e2e_live_secret(server_sid, payload)
         if etype != "approval.request":
             return None
         request_id = str(payload.get("request_id") or f"hermes-{uuid.uuid4()}")
@@ -1665,6 +1836,141 @@ class Connector:
             "params": {"type": "approval.request", "session_id": server_sid, "payload": out},
         }
 
+    def _e2e_live_clarify(self, server_sid: str, payload: dict) -> dict | None:
+        """#273 E2E clarify.request → enc 放行。"""
+        request_id = str(payload.get("request_id") or "").strip()
+        if not request_id:
+            print(f"[E2E clarify rejected {server_sid}] missing request_id", file=sys.stderr)
+            return None
+        try:
+            request_snapshot = json.loads(visible_stable_json(payload))
+            execution_request = {
+                "v": 1,
+                "connector": "hermes",
+                "sessionId": server_sid,
+                "requestId": request_id,
+                "method": "clarify.respond",
+                "request": request_snapshot,
+            }
+            execution_display = visible_stable_json(execution_request)
+            if len(execution_display.encode("utf-8")) > 48 * 1024:
+                raise ValueError("canonical clarify display exceeds 48 KiB")
+        except Exception as exc:
+            print(
+                f"[E2E clarify rejected {server_sid}] cannot freeze request: {exc!r}",
+                file=sys.stderr,
+            )
+            return None
+        # ⚠️ require_key / encrypt 也必須包在 try 裡:on_event 只在本函數**返回 None** 時才走
+        # `_deny_e2e_interactive` 兜底解掛;讓異常穿出去 = gateway 那條 clarify 永遠等下去。
+        try:
+            digest = request_digest(self._e2e.require_key(server_sid), execution_request)
+            question = str(request_snapshot.get("question") or "")
+            choices = request_snapshot.get("choices")
+            multi = False
+            if isinstance(choices, dict) and choices.get("multiSelect") is True:
+                multi = True
+            plaintext_obj = {
+                "question": question,
+                "choices": choices if choices is not None else {},
+                "multiSelect": multi,
+                "requestId": request_id,
+                "requestDigest": digest,
+                "executionRequest": execution_request,
+                "executionDisplay": execution_display,
+            }
+            plaintext = visible_stable_json(plaintext_obj)
+            if len(plaintext.encode("utf-8")) > E2E_APPROVAL_PLAINTEXT_MAX:
+                raise ValueError("encrypted plaintext exceeds 64 KiB")
+            enc = self._e2e.encrypt_serialized_content(server_sid, plaintext)
+        except Exception as exc:
+            print(
+                f"[E2E clarify rejected {server_sid}] cannot encrypt: {exc!r}",
+                file=sys.stderr,
+            )
+            return None
+        self._e2e_track_interactive(server_sid, "clarify", request_id, digest, execution_request)
+        return {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": "clarify.request",
+                "session_id": server_sid,
+                "payload": {
+                    "question": "🔒 Encrypted question",
+                    "choices": {},
+                    "request_id": request_id,
+                    "request_digest": digest,
+                    "enc": enc,
+                },
+            },
+        }
+
+    def _e2e_live_secret(self, server_sid: str, payload: dict) -> dict | None:
+        """#273 E2E secret.request → enc 放行。"""
+        request_id = str(payload.get("request_id") or "").strip()
+        if not request_id:
+            print(f"[E2E secret rejected {server_sid}] missing request_id", file=sys.stderr)
+            return None
+        try:
+            request_snapshot = json.loads(visible_stable_json(payload))
+            execution_request = {
+                "v": 1,
+                "connector": "hermes",
+                "sessionId": server_sid,
+                "requestId": request_id,
+                "method": "secret.respond",
+                "request": request_snapshot,
+            }
+            execution_display = visible_stable_json(execution_request)
+            if len(execution_display.encode("utf-8")) > 48 * 1024:
+                raise ValueError("canonical secret display exceeds 48 KiB")
+        except Exception as exc:
+            print(
+                f"[E2E secret rejected {server_sid}] cannot freeze request: {exc!r}",
+                file=sys.stderr,
+            )
+            return None
+        # 同 clarify:異常必須收斂成 None,否則 on_event 的 skip 兜底跑不到,gateway 永久掛起。
+        try:
+            digest = request_digest(self._e2e.require_key(server_sid), execution_request)
+            prompt = str(request_snapshot.get("prompt") or "")
+            env_var = str(request_snapshot.get("env_var") or "")
+            plaintext_obj = {
+                "prompt": prompt,
+                "envVar": env_var,
+                "requestId": request_id,
+                "requestDigest": digest,
+                "executionRequest": execution_request,
+                "executionDisplay": execution_display,
+            }
+            plaintext = visible_stable_json(plaintext_obj)
+            if len(plaintext.encode("utf-8")) > E2E_APPROVAL_PLAINTEXT_MAX:
+                raise ValueError("encrypted plaintext exceeds 64 KiB")
+            enc = self._e2e.encrypt_serialized_content(server_sid, plaintext)
+        except Exception as exc:
+            print(
+                f"[E2E secret rejected {server_sid}] cannot encrypt: {exc!r}",
+                file=sys.stderr,
+            )
+            return None
+        self._e2e_track_interactive(server_sid, "secret", request_id, digest, execution_request)
+        return {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": "secret.request",
+                "session_id": server_sid,
+                "payload": {
+                    "prompt": "🔒 Encrypted secret request",
+                    "env_var": "",
+                    "request_id": request_id,
+                    "request_digest": digest,
+                    "enc": enc,
+                },
+            },
+        }
+
     async def _emit_media_from_text(self, server_sid: str, text: str) -> None:
         # #158/#372 出站附件:僅 MEDIA: + 允許根內(session cwd / ATTACH_DIR / STATE_DIR /
         # MACCHIATO_MEDIA_ALLOW_ROOTS);裸路徑與根外(/etc、~/.ssh…)一律不讀不傳。
@@ -1712,6 +2018,29 @@ class Connector:
             except (FileNotFoundError, ValueError):
                 continue
         return {}
+
+    # #656 driven 標記的 TTL。它只需要橋住「prompt 到達 → `_ensure_session` 寫完 `_fwd`」這一小段
+    # (一次 gateway 往返 + 串行鏈排隊),之後 `_fwd` 永久接手。給 5 分鐘純粹是兜底:萬一那一輪
+    # 徹底失敗(gateway 死/會話建不起來),標記也必須自己過期——鏡像被永久擋住比重複更糟(消息不見了)。
+    DRIVING_TTL_S = 300.0
+
+    def _mark_driving(self, server_sid: str) -> None:
+        """收到 prompt.submit 即標記。**必須同步調用**(讀循環裡,任何 await 之前)——這個標記存在的
+        全部理由就是覆蓋那些 await 期間的窗口。"""
+        self._driving[server_sid] = time.monotonic() + self.DRIVING_TTL_S
+
+    def _clear_driving(self, server_sid: str) -> None:
+        self._driving.pop(server_sid, None)
+
+    def _is_driving(self, sid: str) -> bool:
+        """鏡像用:這個 state.db 會話此刻是不是本端在驅動(過期即不算)。"""
+        until = self._driving.get(sid)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            self._driving.pop(sid, None)
+            return False
+        return True
 
     def _db_sid(self, server_sid: str):
         """#601 這個會話在 state.db 裡的 id（srcId 回填要拿它讀 turn_rows）。
@@ -1856,6 +2185,9 @@ class Connector:
             print(f"· created hermes session {real} ← server {server_sid}（state.db={stored}）")
         self._fwd[server_sid] = real
         self._rev[real] = server_sid
+        # #656 `_fwd/_rev` 接手之後,driven 標記就沒用了(它只負責橋住到這裡為止的那段窗口)。
+        # 不撤也只是 5 分鐘後過期,但撤掉語義更乾淨:任一時刻只有一個東西在說「這會話歸 live」。
+        self._clear_driving(server_sid)
         return real
 
     async def _retry_prompt(self, server_sid: str, text: str, attachments: list | None = None) -> None:
@@ -2288,7 +2620,15 @@ class Connector:
             "mirrorLastPollAgeS": (
                 int(now - self._mirror_last_run) if self._mirror_last_run else None
             ),
-            "lastError": self._degrade_reason() or self._last_error,
+            # #773 尾部再兜一句「新版已裝好、等重啟」——降級原因與鏡像錯誤都排在它前面,
+            # 信息位絕不蓋掉真問題(#348 靜默凍結的教訓)。它也不參與 degraded 判定
+            # (server registry.ts 的 healthFromState 只看 gatewayAlive/compatOk/
+            # mirrorStuck/authOk),所以不會誤亮黃燈。
+            "lastError": (
+                self._degrade_reason()
+                or self._last_error
+                or getattr(self, "_self_update_notice", None)
+            ),
             "connectorVersion": CONNECTOR_VERSION,  # §update：server 據此判 updateAvailable
             "kind": "hermes",  # #94：client gate 專屬功能（如 AI 重命名）
             "stt": _stt_available(),  # #89：語音轉錄能力位（false → server 走雲端 BYOK STT）
@@ -2300,7 +2640,8 @@ class Connector:
         release.json+.sig 內嵌公鑰驗簽 → bootstrap bridge + 嚴格升版 → install.sh sha256
         對上清單 → 從本地臨時文件跑（非 curl|bash 管道），清單經 MACCHIATO_MANIFEST 傳入
         供逐文件校驗。
-        systemd 重啟會殺掉本進程並起新版；非 systemd（手動跑）則只更新文件、下次重啟生效。"""
+        systemd 重啟會殺掉本進程並起新版；非 systemd（手動跑）則只更新文件、下次重啟生效。
+        #773：後一種情況下這個閂不再永久鎖死——見 _on_installer_exit。"""
         if getattr(self, "_self_update_started", False):
             print("[self_update ignored] 已在本进程启动，拒绝并发/重放安装", file=sys.stderr)
             return
@@ -2366,9 +2707,12 @@ class Connector:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            version = m["version"]
+
             def watch_installer() -> None:
-                if child.wait() != 0:
-                    self._self_update_started = False
+                # #773 計時**從 installer 退出算起,不是從 spawn 算起**——安裝本身可能很久,
+                # 從 spawn 起算等於在 installer 還在跑的時候放閂,會同時跑兩個 installer。
+                self._on_installer_exit(child.wait(), version)
 
             threading.Thread(target=watch_installer, daemon=True).start()
         except Exception as exc:
@@ -2376,18 +2720,74 @@ class Connector:
             print(f"[self_update failed] {exc!r}", file=sys.stderr)
             self._last_error = f"self_update failed: {exc}"
 
+    def _on_installer_exit(
+        self, code: int, version: str, grace_s: float | None = None
+    ) -> None:
+        """#773 installer 進程退出後的收尾（在 watch_installer 線程裡跑，會阻塞 grace_s）。
+
+        - 退出**非 0**（裝失敗）：立刻放閂，用戶點重試就能真的再裝一次（既有行為，原樣保留）。
+        - 退出 **0**（裝成功）：**不立刻**放閂——正常情況下服務重啟會把本進程殺掉，閂跟着進程
+          一起消失。等 grace_s 後本進程還活着，才說明重啟沒生效 → 放閂 + 掛一句人話。
+
+        🚨 那句話**絕不能說成「更新失敗」**：非 systemd（手動跑）本來就是「只更新文件、下次
+        重啟生效」，那是正常路徑；說成失敗就是撒謊。只說事實 + 下一步。
+        """
+        if code != 0:
+            self._self_update_started = False
+            return
+        time.sleep(_SELF_UPDATE_RESTART_GRACE_S if grace_s is None else grace_s)
+        self._self_update_started = False
+        self._self_update_notice = f"更新已下載(v{version}),重啟連接器後生效"
+        print(
+            f"· self_update:v{version} 已裝好,但本進程仍在跑——服務沒被重啟替換,"
+            "放開更新閂(下次 self_update 會真的再裝一次)",
+            file=sys.stderr,
+        )
+
+    def _heartbeat(self) -> dict:
+        """#669 supervisor 面的運維字段（四家統一，TS 側單源於 connector-core/heartbeat.ts）。
+
+        為什麼要有：`macchiato-supervise`（#528）只認崩潰循環；連接器「進程活著、但連不上 server」
+        時它完全看不見（穩定存活 ≥60s 就清失敗計數）。而連不上 = 收不到 `self_update` = 自己爬不
+        出來（#669 / #210）。supervisor 絕不能 import 連接器樹，所以唯一乾淨的接口是這個文件。
+
+        🚨 只放運維字段：絕不寫入憑據 / token / 用戶會話內容（文件落盤、會被人看到）。
+        """
+        return {
+            "version": CONNECTOR_VERSION,  # = connectorVersion，給不認識那個名字的 supervisor 用
+            "linkConnected": self._linkb_state == "connected",
+            "lastConnectedAt": int(self._linkb_connected_at) if self._linkb_connected_at else None,
+            "busy": bool(self._live_inflight),
+            "pendingApproval": bool(self._plain_approvals) or any(self._e2e_approvals.values()),
+            "installId": _read_or_create_install_id(),
+        }
+
     def _write_health_file(self, h: dict) -> None:
+        """落盤 = `connector_health` 上報體 ⊕ 運維字段。
+
+        上報體部分原樣保留（向後兼容既有消費者 / 本機 inspect）；**只擴文件、不擴 wire**——
+        `connector_health` 幀的形狀一個字節都沒動。寫失敗永不上拋：心跳是觀測面，
+        寫不出去只該讓 supervisor 判「未知」，不該把健康的連接器搞崩。
+        """
         try:
+            payload = json.dumps(
+                {**h, **self._heartbeat(), "ts": int(time.time())}, ensure_ascii=False, indent=2
+            )
             os.makedirs(os.path.dirname(HEALTH_FILE), exist_ok=True)
-            tmp = HEALTH_FILE + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(h, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, HEALTH_FILE)
+            for path in (HEALTH_FILE, HEALTH_FILE_KIND):
+                tmp = path + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(payload)
+                os.replace(tmp, path)
         except Exception as exc:
             print(f"[health file write failed] {exc!r}", file=sys.stderr)
 
     async def _health_loop(self) -> None:
         """每 HEALTH_INTERVAL_S：寫本地 health.json + 發 connector_health（讓 server 看出降級）。"""
+        # #669 先落一次再進循環:本任務在 link B 撥號**之前**創建,所以連不上 server 的機器也會有
+        # 一份「我活着、linkConnected=false」的證據——那正是 supervisor 唯一看得見的信號。
+        # 等滿一個 HEALTH_INTERVAL_S 才首寫會留下 30s 的盲窗(重裝後尤其要緊)。
+        self._write_health_file(self._health())
         while True:
             try:
                 await asyncio.sleep(HEALTH_INTERVAL_S)
@@ -2724,7 +3124,14 @@ class Connector:
                 )
                 continue
             e2e = protected  # §19：E2E 會話走加密鏡像（方案 A），不跳過
-            if (sid in self._rev or sid in self._fwd or sid in self._stored_rev) and not e2e:
+            if (
+                sid in self._rev
+                or sid in self._fwd
+                or sid in self._stored_rev
+                # #656 收到 prompt.submit 起就算「本端驅動中」——上面三張表要等 _ensure_session
+                # 跑完才有,那段窗口正是雙投的來源(見 self._driving 的註)。
+                or self._is_driving(sid)
+            ) and not e2e:
                 # 續聊 Discord 會話（source=discord，經 tui 驅動）：運行時 id ≠ 持久化 id、消息落
                 # 持久化 id 下、鏡像看到的是它，故連 _fwd 一起查,否則重複投遞。macchiato 新建會話
                 # （source=tui，_stored_rev 鍵）由 live 路徑獨佔投遞，同樣跳過。
@@ -3554,6 +3961,7 @@ class Connector:
                     await self.ws.close(code=1008, reason="invalid E2E ready state")
                 return
             self._linkb_state = "connected"
+            self._linkb_connected_at = time.time()  # #669 心跳的 lastConnectedAt
             print("✓ link B ready — 連接器上線，等待 server 下達")
             if self._out_pending and getattr(self, "ws", None) is not None:
                 n = len(self._out_pending)
@@ -3681,11 +4089,14 @@ class Connector:
                     # 軟拒絕該幀:不回 e2e_key、不動本地狀態、連接照常。
                     print(f"[E2E wrap rejected {sid}] {exc}", file=sys.stderr)
                     return
+                # #731 未授權設備要讓用戶知道:跳過本身是靜默的,不回報就只剩永遠轉圈的 Updating。
+                rejected = self._e2e.take_device_auth_rejections()
                 await self._send({
                     "t": "e2e_key",
                     "agentLinkId": self.agent_link_id,
                     "hermesSessionId": sid,
                     "wrapped": wrapped,
+                    **({"deviceAuthRejected": rejected} if rejected else {}),
                 })
                 print(f"· E2E：會話 {sid} 封裝 K_S 給 {len(wrapped)} 台設備")
                 if msg.get("backfill"):
@@ -3898,22 +4309,61 @@ class Connector:
                         not isinstance(payload.get(k), str) or not payload[k] for k in required
                     ):
                         raise E2EControlError("invalid clarify.respond payload")
-                    # 协议预留完整认证 kind；Hermes 当前没有安全的 E2E request/UI 回路（#273），
-                    # 因而响应也 fail closed，不能把 server 自造值喂给 gateway。
-                    raise E2EControlError(
-                        "clarify.respond unsupported until encrypted request channel exists"
-                    )
+                    # #273:解密 answerEnc 並與本地 pending 對賬；成功後 payload 帶明文 answer。
+                    pending_map = self._e2e_interactives
+                    pending = pending_map.get(payload["requestId"])
+                    if (
+                        not isinstance(pending, dict)
+                        or pending.get("kind") != "clarify"
+                        or pending.get("serverSid") != server_sid
+                        or pending.get("requestDigest") != payload["requestDigest"]
+                    ):
+                        raise E2EControlError("no matching pending encrypted clarification")
+                    frozen = pending.get("executionRequest")
+                    if not isinstance(frozen, dict) or request_digest(
+                        self._e2e.require_key(server_sid), frozen
+                    ) != payload["requestDigest"]:
+                        raise E2EControlError("clarification request digest mismatch")
+                    try:
+                        answer = self._e2e.decrypt_text(server_sid, payload["answerEnc"])
+                    except Exception as exc:
+                        raise E2EControlError("failed to decrypt clarify answer") from exc
+                    payload = {
+                        "blockId": payload["blockId"],
+                        "requestId": payload["requestId"],
+                        "requestDigest": payload["requestDigest"],
+                        "answer": answer if isinstance(answer, str) else "",
+                    }
                 elif method == "secret.respond":
                     required = {"blockId", "requestId", "requestDigest", "secretEnc"}
                     if keys != required or any(
                         not isinstance(payload.get(k), str) or not payload[k] for k in required
                     ):
                         raise E2EControlError("invalid secret.respond payload")
-                    # 协议预留完整认证 kind；Hermes 当前没有安全的 E2E request/UI 回路（#273），
-                    # 因而响应也 fail closed，不能把 server 自造值喂给 gateway。
-                    raise E2EControlError(
-                        "secret.respond unsupported until encrypted request channel exists"
-                    )
+                    pending_map = self._e2e_interactives
+                    pending = pending_map.get(payload["requestId"])
+                    if (
+                        not isinstance(pending, dict)
+                        or pending.get("kind") != "secret"
+                        or pending.get("serverSid") != server_sid
+                        or pending.get("requestDigest") != payload["requestDigest"]
+                    ):
+                        raise E2EControlError("no matching pending encrypted secret request")
+                    frozen = pending.get("executionRequest")
+                    if not isinstance(frozen, dict) or request_digest(
+                        self._e2e.require_key(server_sid), frozen
+                    ) != payload["requestDigest"]:
+                        raise E2EControlError("secret request digest mismatch")
+                    try:
+                        value = self._e2e.decrypt_text(server_sid, payload["secretEnc"])
+                    except Exception as exc:
+                        raise E2EControlError("failed to decrypt secret value") from exc
+                    payload = {
+                        "blockId": payload["blockId"],
+                        "requestId": payload["requestId"],
+                        "requestDigest": payload["requestDigest"],
+                        "value": value if isinstance(value, str) else "",
+                    }
                 elif method == "session.cwd.set":
                     if keys != {"cwd"} or payload["cwd"] is not None and not isinstance(payload["cwd"], str):
                         raise E2EControlError("invalid session.cwd.set payload")
@@ -3965,6 +4415,11 @@ class Connector:
             "approval.respond",
             "clarify.respond",
             "secret.respond",
+            # #702:本 PR 補上 sudo.respond 的轉發之後,它才**第一次**成為一條真的能打到
+            # gateway 的路——此前沒有 dispatch 分支,漏不漏在這張表上都一樣。加了分支就必須
+            # 同時進表,否則 E2E 會話下不可信 server 能把任意密碼(或空串取消)直送 sudo 提示,
+            # 而同族的 clarify/secret 是 fail-closed 的——那個不對稱純屬疏漏,不是取捨。
+            "sudo.respond",
             "session.create",
             "session.cwd.set",
             "session.permission.set",
@@ -3990,6 +4445,10 @@ class Connector:
         control_accepted = False
         try:
             if method == "prompt.submit":
+                # #656 **就在這裡、任何 await 之前**標記「本端驅動中」。往下走的每一步都是異步的
+                # (串行鏈排隊 → 附件/STT → _ensure_session 的 resume 往返),而 user 行一進 state.db
+                # 鏡像就看得見它——標記晚一步,那一輪 2s 輪詢就把同一行再投一遍(見 self._driving)。
+                self._mark_driving(server_sid)
                 # #148:慢路徑(resume 往返/附件下載/STT)出讀循環——經 per-session 串行鏈派發,
                 # 某會話的大附件/慢 STT 不再 head-of-line 阻塞其他會話。同會話仍按序。
                 async def _do_prompt(params=params, server_sid=server_sid):
@@ -4131,6 +4590,7 @@ class Connector:
                         if not pending:
                             self._e2e_approvals.pop(server_sid, None)
                     real = await self._ensure_session(server_sid)
+                    self._plain_approvals.discard(server_sid)  # #669 心跳:已答覆 → 不再掛起
                     await self.gw.request(
                         "approval.respond",
                         {"session_id": real, "choice": params.get("choice", "deny"), "all": params.get("all", False)},
@@ -4160,6 +4620,88 @@ class Connector:
                 if authenticated_control:
                     await approval_task
                 control_accepted = authenticated_control
+            elif method == "clarify.respond":
+                # #702/#109:非 E2E 把用戶所選 label 轉到 tui_gateway。
+                # #273 E2E：verify 階段已解出 answer，這裡 pop 待決並投遞。
+                async def _do_clarify(params=params, server_sid=server_sid):
+                    req_id = str(params.get("requestId") or params.get("request_id") or "")
+                    answer = params.get("answer")
+                    if not isinstance(answer, str):
+                        answer = ""
+                    if authenticated_control:
+                        pending_map = self._e2e_interactives
+                        pending = pending_map.pop(req_id, None)
+                        if not isinstance(pending, dict) or pending.get("kind") != "clarify":
+                            raise E2EControlError("no matching pending encrypted clarification")
+                    if not req_id:
+                        if authenticated_control:
+                            raise E2EControlError("clarify.respond missing request_id")
+                        print(
+                            f"[clarify.respond dropped {server_sid}] missing request_id",
+                            file=sys.stderr,
+                        )
+                        return
+                    assert self.gw is not None
+                    await self.gw.request(
+                        "clarify.respond",
+                        {"request_id": req_id, "answer": answer},
+                    )
+                clarify_task = self._dispatch_session(
+                    server_sid, _do_clarify, propagate=authenticated_control
+                )
+                if authenticated_control:
+                    await clarify_task
+                control_accepted = authenticated_control
+            elif method == "secret.respond":
+                # #396/#702 非 E2E：value 瞬態回 gateway；#273 E2E：verify 已解出 value。
+                async def _do_secret(params=params, server_sid=server_sid):
+                    req_id = str(params.get("requestId") or params.get("request_id") or "")
+                    value = params.get("value")
+                    if not isinstance(value, str):
+                        value = ""
+                    if authenticated_control:
+                        pending_map = self._e2e_interactives
+                        pending = pending_map.pop(req_id, None)
+                        if not isinstance(pending, dict) or pending.get("kind") != "secret":
+                            raise E2EControlError("no matching pending encrypted secret request")
+                    if not req_id:
+                        if authenticated_control:
+                            raise E2EControlError("secret.respond missing request_id")
+                        print(
+                            f"[secret.respond dropped {server_sid}] missing request_id",
+                            file=sys.stderr,
+                        )
+                        return
+                    assert self.gw is not None
+                    await self.gw.request(
+                        "secret.respond",
+                        {"request_id": req_id, "value": value},
+                    )
+                secret_task = self._dispatch_session(
+                    server_sid, _do_secret, propagate=authenticated_control
+                )
+                if authenticated_control:
+                    await secret_task
+                control_accepted = authenticated_control
+            elif method == "sudo.respond":
+                # #396:sudo 密碼瞬態回 gateway(空串 = 取消)。E2E 下仍抑制(無雙向加密)。
+                async def _do_sudo(params=params, server_sid=server_sid):
+                    req_id = str(params.get("requestId") or params.get("request_id") or "")
+                    password = params.get("password")
+                    if not isinstance(password, str):
+                        password = ""
+                    if not req_id:
+                        print(
+                            f"[sudo.respond dropped {server_sid}] missing request_id",
+                            file=sys.stderr,
+                        )
+                        return
+                    assert self.gw is not None
+                    await self.gw.request(
+                        "sudo.respond",
+                        {"request_id": req_id, "password": password},
+                    )
+                self._dispatch_session(server_sid, _do_sudo)
             elif method == "session.interrupt":
                 # #5:重投等待期(#4)收到中斷 → 取消重投——用戶已叫停的 prompt 不許復活雙發。
                 rt = self._retry_tasks.pop(server_sid, None)
@@ -4311,9 +4853,14 @@ async def _main() -> int:
 
     # 回落到 pair.py 存下的憑證（~/.macchiato/connector.json）。
     cred_path = _cred_path()
-    if (not token or not agent_link_id) and os.path.exists(cred_path):
-        with open(cred_path) as f:
-            cred = json.load(f)
+    cred: dict = {}
+    if os.path.exists(cred_path):
+        try:
+            with open(cred_path) as f:
+                cred = json.load(f)
+        except Exception:
+            cred = {}
+    if not token or not agent_link_id:
         token = token or cred.get("connector_token")
         agent_link_id = agent_link_id or cred.get("agent_link_id")
         server_url = server_url or cred.get("server_url")
@@ -4335,6 +4882,29 @@ async def _main() -> int:
         )
         return 2
     c = Connector(server_url, token, agent_link_id)
+    # #731 設備授權：從配對憑證注入 secret；舊檔無 secret → wrap 降級。
+    def _persist_authorized(authorized: dict) -> None:
+        try:
+            latest = dict(cred)
+            if os.path.exists(cred_path):
+                with open(cred_path) as f:
+                    latest = json.load(f)
+            latest["authorized_devices"] = authorized
+            tmp = cred_path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                os.fchmod(f.fileno(), 0o600)
+                json.dump(latest, f, indent=2)
+            os.replace(tmp, cred_path)
+        except Exception as exc:
+            print(f"[E2E device-auth] 寫回 authorized_devices 失敗: {exc}", file=sys.stderr)
+
+    c.configure_device_auth(
+        cred.get("device_auth_secret"),
+        agent_link_id,
+        authorized_devices=cred.get("authorized_devices") if isinstance(cred.get("authorized_devices"), dict) else None,
+        persist_authorized=_persist_authorized if cred.get("device_auth_secret") else None,
+    )
     try:
         await c.run()
     except (KeyboardInterrupt, asyncio.CancelledError):

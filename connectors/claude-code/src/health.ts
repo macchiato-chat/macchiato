@@ -9,11 +9,13 @@ import { gcAttachments } from "./cc/attachments";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { LinkBClient } from "./_core/linkb/client";
+import type { HeartbeatWriter } from "./_core/heartbeat";
 import type { Drive } from "./cc/drive";
 import type { Mirror } from "./cc/mirror";
 import { projectsDir } from "./cc/transcripts";
 import { checkCompat } from "./cc/compat";
 import { resolveClaudeBin } from "./cc/claude-bin";
+import { selfUpdatePendingRestartNotice } from "./_core/selfupdate";
 
 const HEALTH_INTERVAL_MS = Number(process.env.MACCHIATO_HEALTH_INTERVAL_MS) || 60_000;
 const MIRROR_STUCK_MS = Number(process.env.MACCHIATO_MIRROR_STUCK_MS) || 120_000;
@@ -43,6 +45,8 @@ export class HealthLoop {
     private readonly mirror: Mirror,
     private readonly version: string,
     private readonly drive?: Drive, // #10:驅動錯誤計數來源
+    /** #669 本地心跳(自帶時鐘、早於 linkb.start());這裡只餵最新上報體。 */
+    private readonly heartbeat?: HeartbeatWriter,
   ) {}
 
   start(): void {
@@ -79,7 +83,9 @@ export class HealthLoop {
       gatewayAlive: this.cliFound && existsSync(projectsDir()),
       compatOk: this.cliFound && compat.ok,
       mirrorLastPollAgeS: ageS,
-      lastError: compat.ok ? this.mirror.lastError : (compat.reason ?? "兼容自檢失敗"),
+      // #773 沒有真錯誤時,才把「新版已裝好、等重啟」這句人話放出來——真錯誤(鏡像卡住/丟批、
+      // 兼容失敗)永遠優先,絕不能被一條信息位蓋掉(#348 靜默凍結的教訓)。
+      lastError: (compat.ok ? this.mirror.lastError : (compat.reason ?? "兼容自檢失敗")) ?? selfUpdatePendingRestartNotice(),
       kind: "claude-code",
       connectorVersion: this.version,
       stt: false,
@@ -92,6 +98,9 @@ export class HealthLoop {
       this.mirror.restart();
       h.lastError = `mirror stuck ${ageS}s → restarted`;
     }
+    // #669 把最新上報體餵給心跳文件(它自己有時鐘,連不上 server 時照樣寫)。
+    // 只擴文件、不擴 wire:下面發出去的 connector_health 形狀一個字節都沒動。
+    this.heartbeat?.setSnapshot(h as unknown as Record<string, unknown>);
     if (this.linkb.isReady) {
       this.linkb.send({ t: "connector_health", agentLinkId: this.linkb.agentLinkId, health: h });
     }

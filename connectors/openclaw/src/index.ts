@@ -3,7 +3,7 @@
  *   憑證（未配對則先配對）→ 連 OpenClaw gateway + Macchiato Link B → 啟動鏡像。
  * 跑：pnpm --filter @macchiato/openclaw-connector start
  */
-import { loadCreds, quarantineCreds } from "./_core/linkb/creds";
+import { loadCreds, quarantineCreds, saveCreds } from "./_core/linkb/creds";
 import { LinkBClient } from "./_core/linkb/client";
 import { runPairing } from "./_core/linkb/pairing";
 import { resolveGatewayConfig } from "./openclaw/config";
@@ -13,10 +13,12 @@ import { announceImportAvailable, runImport } from "./openclaw/history-import";
 import { isCommittedE2EBackfillResult, Mirror } from "./openclaw/mirror";
 import { PushHandler } from "./push/handler";
 import { E2EKeyStore, E2EKeyStoreStateError, settleE2EBackfillAck } from "./_core/e2e/keys";
+import { deviceAuthConfigFromCreds } from "./_core/e2e/device-auth";
 import { e2eStorePath } from "./_core/identity";
 import { authorizeE2EDisableResume } from "./_core/e2e/control";
 import { CommandsReporter } from "./openclaw/commands";
 import { HealthLoop } from "./health";
+import { HeartbeatWriter } from "./_core/heartbeat";
 import { CONNECTOR_VERSION } from "./linkb/proto";
 import { runVerifiedSelfUpdate } from "./_core/selfupdate";
 import { KIND } from "./identity";
@@ -51,6 +53,16 @@ async function main(): Promise<void> {
 
   // #347 密鑰檔先於任何 agent/gateway 事件校驗；損壞時直接離線退出，沒有明文退化窗口。
   const e2e = new E2EKeyStore(e2eStorePath(KIND));
+  // #731 設備授權：有配對 secret 才 enforce wrap proof；舊配對降級。
+  e2e.configureDeviceAuth(
+    deviceAuthConfigFromCreds({
+      ...creds,
+      persist: (authorized) => {
+        const latest = loadCreds(KIND) ?? creds;
+        saveCreds(KIND, { ...latest, authorizedDevices: authorized });
+      },
+    }),
+  );
 
   // 2. OpenClaw gateway（驅動 + 索引）
   const gw = new OpenClawGateway(resolveGatewayConfig());
@@ -184,7 +196,15 @@ async function main(): Promise<void> {
         const wrapped = msg.backfill
           ? e2e.wrapForEnable(sid, (msg.devices as any[]) ?? [])
           : e2e.wrapExistingForDevices(sid, (msg.devices as any[]) ?? []);
-        linkb.send({ t: "e2e_key", agentLinkId: linkb.agentLinkId, hermesSessionId: sid, wrapped });
+        // #731 未授權設備要讓用戶知道:跳過本身是靜默的,不回報就只剩一個永遠轉圈的 Updating。
+        const deviceAuthRejected = e2e.takeDeviceAuthRejections();
+        linkb.send({
+          t: "e2e_key",
+          agentLinkId: linkb.agentLinkId,
+          hermesSessionId: sid,
+          wrapped,
+          ...(deviceAuthRejected.length ? { deviceAuthRejected } : {}),
+        });
         console.log(`· E2E: session ${sid} — wrapped K_S for ${wrapped.length} device(s)`);
         if (msg.backfill) {
           void mirror.backfillE2E(sid).catch((error) => {
@@ -258,6 +278,17 @@ async function main(): Promise<void> {
       linkb.onFatal();
     }
   });
+  // #669 心跳必須在 `linkb.start()` **之前**起：那個 await 只在首次 ready 才返回，連不上 server
+  // 的機器會永遠停在這行——而那恰好是本心跳唯一要觀測的故障（#210 同形狀）。
+  const heartbeat = new HeartbeatWriter(KIND, () => ({
+    version: CONNECTOR_VERSION,
+    linkConnected: linkb.isReady,
+    lastConnectedAtMs: linkb.lastConnectedAtMs,
+    busy: drive?.busy ?? false,
+    pendingApproval: drive?.hasPendingApproval ?? false,
+  }));
+  heartbeat.start();
+
   await linkb.start();
   // OpenClaw 可在 connector 停機時 rotation 同一 key 的 transcript UUID；任何 announce/import/
   // mirror.start 前先同步保存 current+aliases。失敗時 preflight flag 保持 false，local import 全擋。
@@ -287,7 +318,7 @@ async function main(): Promise<void> {
   push.start();
 
   // 7. 健康上報 + 鏡像看門狗
-  const health = new HealthLoop(gw, linkb, mirror, CONNECTOR_VERSION, drive); // #10:計數上報
+  const health = new HealthLoop(gw, linkb, mirror, CONNECTOR_VERSION, drive, heartbeat); // #10:計數上報 + #669 心跳
   health.start();
 
   const shutdown = (): void => {
