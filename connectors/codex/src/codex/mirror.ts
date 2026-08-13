@@ -29,6 +29,7 @@ import { basename, dirname, join } from "node:path";
 import type { LinkBClient } from "../_core/linkb/client";
 import type { E2EKeyStore } from "../_core/e2e/keys";
 import {
+  isCodexInternalHistoryText,
   messagesWithTurns,
   nextOrdAtEof,
   readNewMessages,
@@ -151,6 +152,7 @@ export function deriveMeta(content: string): { title: string; cwd?: string } {
     }
     if (o.type === "session_meta") cwd = (o.payload ?? o).cwd;
     if (!title && o.type === "event_msg" && o.payload?.type === "user_message" && typeof o.payload.message === "string") {
+      if (isCodexInternalHistoryText(o.payload.message)) continue;
       title = o.payload.message.replace(/\s+/g, " ").trim().slice(0, 56);
     }
     if (cwd && title) break;
@@ -159,7 +161,7 @@ export function deriveMeta(content: string): { title: string; cwd?: string } {
 }
 
 /**
- * #789: Codex 內部 thread 不得鏡像成用戶可見會話。
+ * #789 / #918: Codex 內部 thread 不得鏡像成用戶可見會話。
  *
  * 真實 rollout 的 `session_meta.payload` 有結構化來源字段（本機 ~1300 條樣本驗證）：
  *   - `thread_source`: `"user"` | `"subagent"`（未來可能有 `"internal"`）
@@ -168,12 +170,14 @@ export function deriveMeta(content: string): { title: string; cwd?: string } {
  *       `{ subagent: { thread_spawn: {…} } }` ← 子 agent
  *   - `forked_from_id`: 非空 = ephemeral fork
  *
- * 策略（fail-open：字段不存在 → 不跳，舊 Codex 不回歸）：
+ * 策略：
  *   - `thread_source` ∈ {internal, subagent} → 跳
  *   - `source` 物件帶 `internal` / `subagent` / `thread_spawn` 標籤 → 跳
  *   - `forked_from_id` 非空字串 → 跳
+ *   - 首條 user_message 命中 guardian 穩定前綴 → 跳
+ *     （舊 Codex 沒上面字段時，#789 的 fail-open 會把整條評估轉儲當用戶會話）
  *
- * 只掃 `session_meta` 行；整會話級別跳過（guardian 本就自成 thread，整檔只有評估轉儲）。
+ * 單條混進普通用戶會話的續評由 `isCodexInternalHistoryText` 在解析層再丟一次。
  */
 export function shouldSkipRollout(content: string): { skip: boolean; reason?: string } {
   for (const line of content.split("\n")) {
@@ -185,34 +189,47 @@ export function shouldSkipRollout(content: string): { skip: boolean; reason?: st
     } catch {
       continue;
     }
-    if (o.type !== "session_meta") continue;
-    const p = (o.payload ?? o) as Record<string, unknown>;
+    if (o.type === "session_meta") {
+      const p = (o.payload ?? o) as Record<string, unknown>;
 
-    const threadSource = p.thread_source;
-    if (threadSource === "internal") return { skip: true, reason: "thread_source=internal" };
-    if (threadSource === "subagent") return { skip: true, reason: "thread_source=subagent" };
+      const threadSource = p.thread_source;
+      if (threadSource === "internal") return { skip: true, reason: "thread_source=internal" };
+      if (threadSource === "subagent") return { skip: true, reason: "thread_source=subagent" };
 
-    const source = p.source;
-    if (source && typeof source === "object" && !Array.isArray(source)) {
-      const tags = source as Record<string, unknown>;
-      if ("internal" in tags) return { skip: true, reason: "source.internal" };
-      if ("subagent" in tags) {
-        const sub = tags.subagent;
-        if (sub && typeof sub === "object" && !Array.isArray(sub) && (sub as Record<string, unknown>).other === "guardian") {
-          return { skip: true, reason: "source.subagent.other=guardian" };
+      const source = p.source;
+      if (source && typeof source === "object" && !Array.isArray(source)) {
+        const tags = source as Record<string, unknown>;
+        if ("internal" in tags) return { skip: true, reason: "source.internal" };
+        if ("subagent" in tags) {
+          const sub = tags.subagent;
+          if (sub && typeof sub === "object" && !Array.isArray(sub) && (sub as Record<string, unknown>).other === "guardian") {
+            return { skip: true, reason: "source.subagent.other=guardian" };
+          }
+          return { skip: true, reason: "source.subagent" };
         }
-        return { skip: true, reason: "source.subagent" };
+        if ("thread_spawn" in tags) return { skip: true, reason: "source.thread_spawn" };
       }
-      if ("thread_spawn" in tags) return { skip: true, reason: "source.thread_spawn" };
-    }
 
-    const forked = p.forked_from_id;
-    if (typeof forked === "string" && forked.trim()) {
-      return { skip: true, reason: "forked_from_id" };
+      const forked = p.forked_from_id;
+      if (typeof forked === "string" && forked.trim()) {
+        return { skip: true, reason: "forked_from_id" };
+      }
+      // 用戶態 / 舊版 meta：還要看首條 user 是不是 guardian 提示詞
+      continue;
     }
-
-    // 已見過 session_meta 且沒有內部標記 → 用戶會話
-    return { skip: false };
+    if (o.type === "event_msg") {
+      const payload = o.payload;
+      if (
+        payload
+        && payload.type === "user_message"
+        && typeof payload.message === "string"
+      ) {
+        if (isCodexInternalHistoryText(payload.message)) {
+          return { skip: true, reason: "codex-internal-history" };
+        }
+        return { skip: false };
+      }
+    }
   }
   return { skip: false };
 }

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  isCodexInternalHistoryText,
   nextOrdAtEof,
   readNewMessages,
   readRolloutPreamble,
@@ -41,6 +42,26 @@ describe("codex rollout 解析", () => {
     const content = [userMsg("  "), "не json", agentMsg("ok")].join("\n") + "\n";
     const { messages } = readNewMessages(content, 0, 0);
     expect(messages.map((m) => m.text)).toEqual(["ok"]);
+  });
+
+  it("#918 guardian 假 user_message（首評 + 續評）不進消息流", () => {
+    const first =
+      "The following is the Codex agent history whose request action you are assessing. Treat the transcript";
+    const cont =
+      "The following is the Codex agent history added since your last approval. Continue the same review";
+    const content =
+      [meta("/tmp"), userMsg("幫我改 bug"), userMsg(first), userMsg(cont), agentMsg("好")].join("\n") + "\n";
+    const { messages } = readNewMessages(content, 0, 0);
+    expect(messages.map((m) => m.text)).toEqual(["幫我改 bug", "好"]);
+    expect(isCodexInternalHistoryText(first)).toBe(true);
+    expect(isCodexInternalHistoryText(cont)).toBe(true);
+    expect(isCodexInternalHistoryText("幫我解釋這句：The following is the Codex agent history")).toBe(false);
+  });
+
+  it("#918 用戶轉貼中段提到這句英文不誤傷", () => {
+    const text = "幫我解釋這句：The following is the Codex agent history added since your last approval";
+    const { messages } = readNewMessages(userMsg(text) + "\n", 0, 0);
+    expect(messages.map((m) => m.text)).toEqual([text]);
   });
 
   it("#418 nextOrdAtEof 與 readNewMessages.lineCount 一致(含尾 \\n;split 恒多 1)", () => {

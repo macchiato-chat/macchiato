@@ -22,6 +22,21 @@ describe("codex mirror 派生", () => {
   it("無 user 消息 → 標題回退 Codex", () => {
     expect(deriveMeta(JSON.stringify({ type: "session_meta", payload: {} })).title).toBe("Codex");
   });
+
+  it("#918 首條是 guardian 提示詞時標題跳過，改用下一條真人 user", () => {
+    const content = [
+      JSON.stringify({ type: "session_meta", payload: { cwd: "/w" } }),
+      JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "The following is the Codex agent history added since your last approval\nxxxx",
+        },
+      }),
+      JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "幫我改時區" } }),
+    ].join("\n");
+    expect(deriveMeta(content)).toEqual({ title: "幫我改時區", cwd: "/w" });
+  });
 });
 
 /**
@@ -134,6 +149,30 @@ describe("#789 shouldSkipRollout（session_meta 結構化過濾）", () => {
     expect(shouldSkipRollout(meta({ thread_source: "user", source: "cli", forked_from_id: "  " }))).toEqual({
       skip: false,
     });
+  });
+
+  it("#918 舊 Codex 無內部標記，首條是 guardian 續評 → 跳", () => {
+    expect(
+      shouldSkipRollout(
+        meta({ cwd: "/old" }) + "\n" + user("The following is the Codex agent history added since your last approval"),
+      ),
+    ).toEqual({ skip: true, reason: "codex-internal-history" });
+  });
+
+  it("#918 無 session_meta、首條即 assessing 提示 → 跳", () => {
+    expect(
+      shouldSkipRollout(user("The following is the Codex agent history whose request action you are assessing.")),
+    ).toEqual({ skip: true, reason: "codex-internal-history" });
+  });
+
+  it("#918 普通用戶消息中段提到這句英文 → 不跳", () => {
+    expect(
+      shouldSkipRollout(
+        meta({ cwd: "/w", thread_source: "user", source: "cli" })
+          + "\n"
+          + user("幫我解釋 The following is the Codex agent history"),
+      ),
+    ).toEqual({ skip: false });
   });
 });
 
@@ -262,6 +301,62 @@ describe("#789 mirror poll 不投遞內部 rollout", () => {
       expect(batches).toHaveLength(1);
       expect(batches[0].sessions[0].hermesSessionId).toBe(uTid);
       expect(batches[0].sessions[0].messages[0].text).toBe("正常用戶問題");
+      expect(m.counters.mirrorInternalSkipped).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      if (prevSessions === undefined) delete process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+      else process.env.MACCHIATO_CODEX_SESSIONS_DIR = prevSessions;
+      if (prevMirror === undefined) delete process.env.MACCHIATO_CODEX_MIRROR;
+      else process.env.MACCHIATO_CODEX_MIRROR = prevMirror;
+    }
+  });
+
+  it("#918 舊 Codex 無內部標記的 guardian 續評：不投遞、水位推到 EOF", async () => {
+    const { mkdirSync, mkdtempSync, rmSync, writeFileSync, statSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const root = mkdtempSync(join(tmpdir(), "cx-918-"));
+    const prevSessions = process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+    const prevMirror = process.env.MACCHIATO_CODEX_MIRROR;
+    try {
+      process.env.MACCHIATO_CODEX_SESSIONS_DIR = join(root, "sessions");
+      process.env.MACCHIATO_CODEX_MIRROR = join(root, "mirror.json");
+      const tid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee0918";
+      const dir = join(root, "sessions", "2026", "08", "13");
+      mkdirSync(dir, { recursive: true });
+      const file = join(dir, `rollout-2026-08-13T00-00-00-${tid}.jsonl`);
+      const body =
+        [
+          JSON.stringify({ type: "session_meta", payload: { cwd: "/Users/xiang/proj" } }),
+          JSON.stringify({
+            type: "event_msg",
+            payload: {
+              type: "user_message",
+              message:
+                "The following is the Codex agent history added since your last approval\n" + "x".repeat(2000),
+            },
+          }),
+          JSON.stringify({
+            type: "event_msg",
+            payload: {
+              type: "agent_message",
+              message: JSON.stringify({ risk_level: "low", outcome: "allow" }),
+            },
+          }),
+        ].join("\n") + "\n";
+      writeFileSync(file, body);
+      writeFileSync(process.env.MACCHIATO_CODEX_MIRROR, JSON.stringify({ offsets: {}, ords: {}, seeded: true }));
+
+      const sent: any[] = [];
+      const m: any = new Mirror({
+        agentLinkId: "al",
+        isReady: true,
+        send: (f: unknown) => sent.push(f),
+      } as any);
+      m.pollOnce();
+
+      expect(sent.filter((f) => f.t === "mirror_append")).toHaveLength(0);
+      expect(m.state.offsets[tid]).toBe(statSync(file).size);
       expect(m.counters.mirrorInternalSkipped).toBe(1);
     } finally {
       rmSync(root, { recursive: true, force: true });

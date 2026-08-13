@@ -112,7 +112,7 @@ LINK_B_PROTO = 5  # 對齊 server（packages/protocol：B=5，#348/#368 可靠 A
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.79"
+CONNECTOR_VERSION = "1.5.80"
 
 # #768 安裝目錄版本標記（對齊 TS connector-core/disk-version.ts）。
 _INSTALLED_VERSION_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
@@ -582,6 +582,70 @@ def _du_attach_root(root: str | None = None) -> int:
     return total
 
 
+# #917 SSRF 目標網段——**與 TS 三家的 `connector-core/attachments/ssrf.ts:isPrivateIp` 逐格對齊**。
+#
+# 事故：Hermes 這份用的是 `ipaddress` 的 `is_private or is_reserved or …`，比 TS 那份嚴得多——
+# Python 的 `is_private` 把 IANA 特殊用途段也算進去，其中 `198.18.0.0/15` 正是 Surge / Clash /
+# Shadowrocket 這類代理 **fake-ip 模式的默認映射段**。用戶（或其網關）開着代理時，
+# `fly.storage.tigris.dev` 被解析成 `198.18.x.x`（真實公網地址另有其人），於是 Hermes 對
+# **每一個附件**都在發出請求之前就自我拒絕：用戶只看到「⚠️ 附件下載失敗」，文件從未落過盤，
+# 而同機的 CC/Codex/OpenClaw 一切正常——因為 TS 那份不拒這一段。四家同構的安全原語必須真同構。
+#
+# fake-ip 不是「內網主機」：連上去的是代理自己，代理再按**原域名**出網；TLS 依舊拿域名做
+# SNI/證書校驗（見 `_open_validated_download`），一格都沒鬆。故域名解析落到這裡放行。
+#
+# **但 url 直接寫 IP 字面量時仍按最嚴判**（`strict=True`）：那是「有人指名要連這個地址」，
+# 與「用戶的 DNS 把域名映射到了代理」是兩回事，沒有任何正當理由，照拒。
+_SSRF_V4_NETS = tuple(
+    ipaddress.ip_network(c)
+    for c in (
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "127.0.0.0/8",
+        "100.64.0.0/10",  # CGNAT
+        "169.254.0.0/16",  # link-local / 雲元數據
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "224.0.0.0/3",  # multicast + 高位保留（含 255.255.255.255）
+    )
+)
+_SSRF_V6_NETS = tuple(
+    ipaddress.ip_network(c) for c in ("::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8")
+)
+
+
+def _parse_ip(value: str):
+    """解析 IP（去掉 IPv6 scope id、v4-mapped 剝殼）；解析不了回 None。"""
+    try:
+        addr = ipaddress.ip_address(str(value).strip("[]").split("%", 1)[0])
+    except ValueError:
+        return None
+    return getattr(addr, "ipv4_mapped", None) or addr
+
+
+def _is_ssrf_target(ip: str, *, strict: bool = False) -> bool:
+    """解析不了 → 按危險處理（同 TS）。
+
+    `strict`：url 的 host 本身就是 IP 字面量時用——連 IANA 保留/特殊用途段一起拒，
+    不給 fake-ip 段開的那道門（那道門只為「域名被代理解析成 fake-ip」而開）。
+    """
+    addr = _parse_ip(ip)
+    if addr is None:
+        return True
+    if strict and (addr.is_private or addr.is_reserved or addr.is_multicast or addr.is_link_local):
+        return True
+    nets = _SSRF_V4_NETS if addr.version == 4 else _SSRF_V6_NETS
+    return any(addr in n for n in nets)
+
+
+def _scrub_reason(exc: BaseException) -> str:
+    """#917 給用戶看的失敗原因:一句話、不帶簽名 URL（那行會落進聊天記錄）、封頂 120 字。"""
+    msg = str(exc).strip() or type(exc).__name__
+    msg = re.sub(r"https?://\S+", "<url>", msg)  # 簽名 URL 絕不進聊天記錄（#381 同理）
+    msg = " ".join(msg.split())
+    return msg[:120]
+
+
 def _is_allowed_local_http(p) -> bool:
     """#379:僅顯式 dev 開關才放行 http→loopback（對齊 server dev-disk 的 /attachments/raw@8080）。
 
@@ -646,10 +710,10 @@ def _validate_download_url(url: str) -> None:
         infos = socket.getaddrinfo(host, p.port or 443, proto=socket.IPPROTO_TCP)
     except OSError as exc:
         raise ValueError(f"解析主機失敗：{exc}")
+    literal = _parse_ip(host) is not None   # host 是 IP 字面量 → 按最嚴判（#917）
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-            raise ValueError(f"目標 IP {ip} 在私網/環回/保留範圍（防 SSRF）")
+        if _is_ssrf_target(info[4][0], strict=literal):
+            raise ValueError(f"目標 IP {info[4][0]} 在私網/環回/保留範圍（防 SSRF）")
 
 
 def _open_validated_download(url: str, timeout: float = 30.0):
@@ -679,16 +743,28 @@ def _open_validated_download(url: str, timeout: float = 30.0):
             raise ValueError("url 不得含 userinfo（防混淆）")
         port = p.port or 443
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-        ip = None
+        literal = _parse_ip(host) is not None   # 同上：IP 字面量不吃 fake-ip 那道門
+        ips = []
         for info in infos:
-            cand = ipaddress.ip_address(info[4][0])
-            if cand.is_private or cand.is_loopback or cand.is_link_local or cand.is_reserved or cand.is_multicast:
-                raise ValueError(f"目標 IP {cand} 在私網/環回/保留範圍（防 SSRF DNS-rebinding）")
-            if ip is None:
-                ip = info[4][0]
-        if ip is None:
+            if _is_ssrf_target(info[4][0], strict=literal):
+                raise ValueError(f"目標 IP {info[4][0]} 在私網/環回/保留範圍（防 SSRF DNS-rebinding）")
+            if info[4][0] not in ips:
+                ips.append(info[4][0])
+        if not ips:
             raise ValueError("解析無可用地址")
-        raw = socket.create_connection((ip, port), timeout=timeout)  # 連校驗過的 IP（pin）
+        # #917 逐個試,不是只試第一個。getaddrinfo 在雙棧配置下常把 AAAA 排在前面,而不少
+        # 機器（容器 / 沒有 v6 路由的 VPS）連上去就是 ENETUNREACH——只認第一條 = 該機所有附件
+        # 永遠下載失敗。urllib 的老路徑本來會逐個回落,#249 改成 pin-IP 時把這個能力丟了。
+        raw = None
+        last_err = None
+        for ip in ips:
+            try:
+                raw = socket.create_connection((ip, port), timeout=timeout)  # 連校驗過的 IP（pin）
+                break
+            except OSError as exc:
+                last_err = exc
+        if raw is None:
+            raise ValueError(f"連接失敗（已試 {len(ips)} 個地址）：{last_err}")
         try:
             sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host)  # SNI/cert 用 hostname
         except Exception:
@@ -1669,9 +1745,17 @@ class Connector:
         # 入站附件：下載 presigned url → image.attach/file.attach；回傳落盤路徑給調用方拼進 prompt。
         # #855:file.attach 只把文件當可讀工件、不注入本回合輸入——必須把路徑寫進正文,
         # 否則 agent 只看到光禿文字,得自己 grep 文件名才找得到(用戶實測 PDF 正是這樣)。
+        #
+        # #917 落盤與登記分開對待:**文件已經在盤上**這件事一旦成立,這條消息就算送到了——
+        # gateway 的 attach 只是把它掛進 artifacts 列表,掛不上不影響 agent 按正文裡的路徑讀它。
+        # 此前 attach 一拋就整條算失敗、路徑註記也一起丟,等於因為「沒登記」而把已到手的文件藏起來。
         path = await asyncio.to_thread(_materialize_attachment, ref)
         method = "image.attach" if ref.get("kind") == "image" else "file.attach"
-        await self.gw.request(method, {"session_id": real_sid, "path": path})
+        try:
+            await self.gw.request(method, {"session_id": real_sid, "path": path})
+        except Exception as exc:
+            print(f"[attach 登記失敗(文件已落盤,照常給 agent 路徑)] {exc!r}", file=sys.stderr)
+            return path
         # #381:附件名/URL 不落默认日志
         print(f"· 附件 {method} nameLen={text_len(ref.get('name'))} → {short_id(real_sid)}")
         log_content("attach", str(ref.get("name") or ""))
@@ -1707,6 +1791,7 @@ class Connector:
         調用方把 notes 拼進 prompt,failed 走 review.summary 讓用戶看見(#855)。"""
         notes: list[str] = []
         failed: list[str] = []
+        reasons: list[str] = []
         for ref in refs or []:
             label = (str(ref.get("name") or "").strip() or str(ref.get("id") or "file"))[:80]
             try:
@@ -1715,9 +1800,13 @@ class Connector:
             except Exception as exc:
                 print(f"[attach failed {label!r}] {exc!r}", file=sys.stderr)
                 failed.append(label)
+                reasons.append(_scrub_reason(exc))
         if failed:
             # 與 Codex 同形:用戶側氣泡掛着附件,agent 側卻沒收到時不能只 silently print。
+            # #917 帶上原因:光一句「下載失敗」既幫不到用戶(不知道下一步做什麼),
+            # 也幫不到我們(#917 查到根因全靠用戶另開一輪會話讓 agent 滿盤搜文件)。
             names = "、".join(failed)
+            why = reasons[0] if len(set(reasons)) == 1 else "；".join(reasons)
             await self._to_server(
                 server_sid,
                 {
@@ -1727,7 +1816,7 @@ class Connector:
                         "type": "review.summary",
                         "session_id": server_sid,
                         "payload": {
-                            "summary": f"⚠️ 附件下載失敗:{names}",
+                            "summary": f"⚠️ 附件下載失敗:{names}（{why}）" if why else f"⚠️ 附件下載失敗:{names}",
                         },
                     },
                 },

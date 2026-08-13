@@ -88,6 +88,34 @@ describe("#347 history import E2E wire boundary", () => {
     expect(JSON.stringify(built)).not.toContain("Codex agent history");
   });
 
+  it("#918 舊 Codex 無內部標記的 guardian 續評不進歷史導入", () => {
+    const guardianSid = "44444444-4444-4444-8444-444444444444";
+    writeRollout(PLAIN_SID, "/plain-project", "普通问题");
+    const dir = join(root, "2026", "07", "23");
+    writeFileSync(
+      join(dir, `rollout-2026-07-23T00-00-02-${guardianSid}.jsonl`),
+      [
+        JSON.stringify({ type: "session_meta", payload: { cwd: "/plain-project" } }),
+        JSON.stringify({
+          type: "event_msg",
+          payload: {
+            type: "user_message",
+            message: "The following is the Codex agent history added since your last approval",
+          },
+        }),
+        JSON.stringify({
+          type: "event_msg",
+          payload: { type: "agent_message", message: '{"outcome":"allow"}' },
+        }),
+        "",
+      ].join("\n"),
+    );
+    const { built } = collectImportSessions();
+    expect(built.map((s) => s.hermesSessionId)).toEqual([PLAIN_SID]);
+    expect(JSON.stringify(built)).not.toContain("Codex agent history");
+    expect(JSON.stringify(built)).not.toContain("outcome");
+  });
+
   it("混合批剔除 E2E session，普通 session 与 announce 计数保留", () => {
     writeRollout(E2E_SID, "/secret-project", "绝密问题");
     writeRollout(PLAIN_SID, "/plain-project", "普通问题");

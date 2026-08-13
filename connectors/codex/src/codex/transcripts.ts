@@ -129,6 +129,14 @@ export function readRolloutPreamble(file: string): RolloutPreamble {
   }
 }
 
+/**
+ * Codex guardian review 寫進 rollout 的假 user_message。
+ * 首評 / 續評共用此前綴；只認開頭，用戶轉貼中段不誤傷。
+ */
+export function isCodexInternalHistoryText(text: string): boolean {
+  return text.trimStart().startsWith("The following is the Codex agent history");
+}
+
 /** 一行 rollout envelope → 消息(user_message / agent_message);其餘 → null。 */
 function lineToMessage(o: unknown, ord: number): CodexMessage | null {
   if (!o || typeof o !== "object") return null;
@@ -137,7 +145,8 @@ function lineToMessage(o: unknown, ord: number): CodexMessage | null {
   const p = env.payload;
   if (p.type === "user_message" && typeof p.message === "string") {
     const text = p.message.trim();
-    return text ? { role: "user", text, ord } : null;
+    if (!text || isCodexInternalHistoryText(text)) return null;
+    return { role: "user", text, ord };
   }
   if (p.type === "agent_message" && typeof p.message === "string") {
     const text = p.message.trim();
