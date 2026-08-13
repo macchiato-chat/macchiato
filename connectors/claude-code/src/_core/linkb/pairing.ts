@@ -2,9 +2,9 @@
  * Link B 配對（design.md §5）：把這台機綁到你的 Macchiato 帳戶。
  *   開 WS → pair_request → server 回一次性 code（打印）→ 你在 web 輸入 → server 回 paired（長期憑證）。
  * #252 重連指數退避(3s→60s+抖動)。kind / displayName / default label 由呼叫方注入。
+ * #832 終端純庫 QR + 按 expiresAt 自動換碼重打（不再依賴系統 qrencode / 固定 6.5min）。
  */
 import { hostname } from "node:os";
-import { spawnSync } from "node:child_process";
 import WebSocket from "ws";
 import { LINK_B_PROTO } from "../../linkb/proto";
 import { backoffMs } from "../backoff";
@@ -15,9 +15,19 @@ import {
 } from "../identity";
 import { type Creds, DEFAULT_SERVER_URL, DEFAULT_WEB_URL, saveCreds } from "./creds";
 import { formatPairingToken, generateDeviceAuthSecret } from "../e2e/device-auth";
+import { printQrTerminal } from "./qr-terminal";
 
-const REFRESH_MS = (6 * 60 + 30) * 1000; // 趕在 server 8-min code TTL 前換新
-const WINDOW_MS = 30 * 60 * 1000; // 整體配對窗口
+/** 整段配對窗口（重連+換碼都在此內）。 */
+const WINDOW_MS = 30 * 60 * 1000;
+/**
+ * 沒拿到 expiresAt 時的兜底刷新間隔。
+ * server #832 起 TTL=20min；留 90s 餘量在過期前主動換，避免用戶掃到已失效碼。
+ */
+const FALLBACK_REFRESH_MS = (18 * 60 + 30) * 1000;
+/** 距過期至少提前這麼久換新碼（並立刻重打終端）。 */
+const REFRESH_BEFORE_EXPIRY_MS = 90 * 1000;
+/** 刷新間隔下限，避免異常 expiresAt 造成熱循環。 */
+const MIN_REFRESH_MS = 30 * 1000;
 
 export interface PairOptions {
   kind: ConnectorKind;
@@ -49,6 +59,7 @@ function showCode(
   fresh: boolean,
   displayName: string,
   deviceAuthSecret: string,
+  expiresAt?: Date | null,
 ): void {
   const line = "=".repeat(54);
   const token = formatPairingToken(code, deviceAuthSecret);
@@ -58,6 +69,16 @@ function showCode(
   const who = process.env.MACCHIATO_PAIR_GROUP || displayName;
   console.log(`  Pairing code for ${who}${fresh ? " (refreshed)" : ""}:`);
   console.log(`        >>>  ${code}  <<<`);
+  if (expiresAt && Number.isFinite(expiresAt.getTime())) {
+    // 同 refreshDelayMs：本機時鐘可能偏，封頂到「最晚也會自動換碼」的那個時刻，別報出
+    // 「Expires in ~80 min」這種讓人放心離開一小時的假數字。
+    const remainMs = Math.min(
+      expiresAt.getTime() - Date.now(),
+      FALLBACK_REFRESH_MS + REFRESH_BEFORE_EXPIRY_MS,
+    );
+    const remainMin = Math.max(1, Math.round(remainMs / 60_000));
+    console.log(`  Expires in ~${remainMin} min (a new code will appear automatically before then).`);
+  }
   console.log(`  Sign in at ${webUrl} → \"Pair connector\" → enter this code.`);
   // #731 只有想開端到端加密的人才需要下面這行；掃 QR 的話它已經在碼裡，無需手動處理。
   console.log(`\n  Optional — end-to-end encryption device key (iOS only; scanning the QR covers this):`);
@@ -66,15 +87,30 @@ function showCode(
   if (process.env.MACCHIATO_PAIR_BATCH && process.env.MACCHIATO_PAIR_BATCH_MANY) {
     console.log("  Other agents from this install will pair automatically with this code.");
   }
-  // #388 終端 QR(可選增強):qrencode 在則打 ANSI 碼——iOS app 的掃碼配對直接掃終端。
-  // #731 QR 帶完整 token（含 e2eAuth），掃碼零額外步驟。
-  try {
-    const qr = spawnSync("qrencode", ["-t", "ANSIUTF8", "-m", "2", token], { encoding: "utf8", timeout: 3000 });
-    if (qr.status === 0 && qr.stdout) console.log(`\n${qr.stdout}  (scan with the Macchiato iOS app)`);
-  } catch {
-    /* 無 qrencode / 失敗:純視覺增強,靜默跳過 */
-  }
+  // #832 終端 QR：純庫渲染（不依賴 qrencode）。#731 帶完整 token（含 e2eAuth）。
+  printQrTerminal(token);
   console.log(`${line}\nWaiting for you to claim it…`);
+}
+
+/**
+ * 根據 server 給的 expiresAt 算下次 pair_request 延遲；趕在過期前 REFRESH_BEFORE_EXPIRY_MS 換新。
+ *
+ * ⚠️ 上限必須鉗到 FALLBACK_REFRESH_MS：`expiresAt` 是 server 的**絕對**時間，而這裡拿它跟
+ * 本機時鐘相減。剛裝好的機器 / VM 時鐘慢一小時是常事——不鉗的話會算出「78 分鐘後再換」，
+ * 可碼 20 分鐘就死了，中間用戶掃到的全是死碼（舊實現用本機固定間隔，天然不受時鐘影響，
+ * 換成絕對時間就得自己補上這道）。
+ */
+export function refreshDelayMs(expiresAtIso: string | undefined, now = Date.now()): number {
+  if (expiresAtIso) {
+    const exp = Date.parse(expiresAtIso);
+    if (Number.isFinite(exp)) {
+      const delay = exp - now - REFRESH_BEFORE_EXPIRY_MS;
+      if (delay >= MIN_REFRESH_MS) return Math.min(delay, FALLBACK_REFRESH_MS);
+      // 已很接近過期：盡快換，但仍守下限避免熱循環
+      return MIN_REFRESH_MS;
+    }
+  }
+  return FALLBACK_REFRESH_MS;
 }
 
 /** 一次配對嘗試：paired → resolve(Creds)；auth_error → reject("PAIR_REJECTED")；斷線 → reject("PAIR_CLOSED")。 */
@@ -91,7 +127,7 @@ function attempt(
     // #380 pairing 幀極小；仍顯式封頂，避免沿用 ws 默認 100MiB。
     const ws = new WebSocket(serverUrl, { handshakeTimeout: 20000, maxPayload: 1 * 1024 * 1024 });
     let seenFirst = false;
-    let refresher: ReturnType<typeof setInterval> | null = null;
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
     let settled = false;
     const sendPair = (): void =>
       ws.send(
@@ -103,28 +139,58 @@ function attempt(
           ...(process.env.MACCHIATO_PAIR_BATCH ? { batch: process.env.MACCHIATO_PAIR_BATCH } : {}),
         }),
       );
+    const clearRefresh = (): void => {
+      if (refreshTimer) {
+        clearTimeout(refreshTimer);
+        refreshTimer = null;
+      }
+    };
+    /** #832 按本碼 expiresAt 排程下一次 pair_request（過期前自動換新並重打終端）。 */
+    const scheduleRefresh = (expiresAtIso: string | undefined): void => {
+      clearRefresh();
+      const delay = refreshDelayMs(expiresAtIso);
+      refreshTimer = setTimeout(() => {
+        if (settled || ws.readyState !== WebSocket.OPEN) return;
+        sendPair();
+      }, delay);
+    };
     const done = (fn: () => void): void => {
       if (settled) return;
       settled = true;
-      if (refresher) clearInterval(refresher);
+      clearRefresh();
       ws.close();
       fn();
     };
 
     ws.on("open", () => {
       sendPair();
-      refresher = setInterval(sendPair, REFRESH_MS);
     });
     ws.on("message", (raw: WebSocket.RawData) => {
-      let msg: { t?: string; code?: string; reason?: string; connectorToken?: string; agentLinkId?: string };
+      let msg: {
+        t?: string;
+        code?: string;
+        expiresAt?: string;
+        reason?: string;
+        connectorToken?: string;
+        agentLinkId?: string;
+      };
       try {
         msg = JSON.parse(raw.toString());
       } catch {
         return;
       }
       if (msg.t === "pair_pending") {
-        showCode(msg.code ?? "", webUrl, fresh || seenFirst, displayName, deviceAuthSecret);
+        const exp = msg.expiresAt ? new Date(msg.expiresAt) : null;
+        showCode(
+          msg.code ?? "",
+          webUrl,
+          fresh || seenFirst,
+          displayName,
+          deviceAuthSecret,
+          exp && Number.isFinite(exp.getTime()) ? exp : null,
+        );
         seenFirst = true;
+        scheduleRefresh(msg.expiresAt);
       } else if (msg.t === "auth_error") {
         // ⚠️ 回歸契約:scripts/regression/* 以「FAIL:」識別安裝/配對失敗(install.log),改動需同步
         console.error(`FAIL: ${msg.reason}`);

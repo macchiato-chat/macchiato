@@ -41,6 +41,10 @@ _PENDING_DISABLE_PREFIX = "\0macchiato:pending-disable-v2:"
 _PENDING_DISABLE_MARKER = hashlib.sha256(b"macchiato-e2e-pending-disable-v2").digest()
 _PROTECTED_PREFIX = "\0macchiato:protected-v1:"
 _PROTECTED_MARKER = hashlib.sha256(b"macchiato-e2e-protected-v1").digest()
+# #818：pending-enable 标记（与 TS keystore 的 pendingOp=enable 对齐）。权威省略 / 显式
+# abort 时可安全丢钥；稳定 E2E 绝不能靠 server 裸帧降级。
+_PENDING_ENABLE_PREFIX = "\0macchiato:pending-enable-v1:"
+_PENDING_ENABLE_MARKER = hashlib.sha256(b"macchiato-e2e-pending-enable-v1").digest()
 _DISABLE_INTENT_KEYS = {
     "v",
     "sessionId",
@@ -98,21 +102,37 @@ def _protected_key(sid: str) -> str:
     return _PROTECTED_PREFIX + encoded
 
 
-def _protected_sid(key: str) -> str:
-    encoded = key[len(_PROTECTED_PREFIX):]
+def _pending_enable_key(sid: str) -> str:
+    encoded = base64.urlsafe_b64encode(sid.encode("utf-8")).decode("ascii").rstrip("=")
+    return _PENDING_ENABLE_PREFIX + encoded
+
+
+def _meta_sid_from_prefix(key: str, prefix: str, label: str) -> str:
+    encoded = key[len(prefix):]
     if not encoded:
-        raise ValueError("protected metadata missing session id")
+        raise ValueError(f"{label} metadata missing session id")
     try:
         raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
         sid = raw.decode("utf-8")
     except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
-        raise ValueError("protected metadata session id is not canonical base64url") from exc
-    if (
-        not sid
-        or base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=") != encoded
-    ):
-        raise ValueError("protected metadata session id is not canonical base64url")
+        raise ValueError(f"{label} metadata session id is not canonical base64url") from exc
+    if not sid:
+        raise ValueError(f"{label} metadata session id is empty")
+    # 再编码必须 round-trip，防止非 canonical 前缀绕过分组。
+    if _pending_enable_key(sid) != key and prefix == _PENDING_ENABLE_PREFIX:
+        raise ValueError(f"{label} metadata session id is not canonical base64url")
+    if prefix == _PROTECTED_PREFIX:
+        if _protected_key(sid) != key:
+            raise ValueError(f"{label} metadata session id is not canonical base64url")
     return sid
+
+
+def _protected_sid(key: str) -> str:
+    return _meta_sid_from_prefix(key, _PROTECTED_PREFIX, "protected")
+
+
+def _pending_enable_sid(key: str) -> str:
+    return _meta_sid_from_prefix(key, _PENDING_ENABLE_PREFIX, "pending-enable")
 
 
 def _pending_disable_key(state: dict) -> str:
@@ -176,14 +196,20 @@ def _pending_disable_state(key: str) -> dict:
     return state
 
 
-def _decode_snapshot(raw: bytes) -> tuple[dict[str, bytes], dict[str, dict], set[str]]:
-    """严格解码一个 keystore snapshot；供启动恢复与锁内三方合并共用。"""
+def _decode_snapshot(
+    raw: bytes,
+) -> tuple[dict[str, bytes], dict[str, dict], set[str], set[str]]:
+    """严格解码一个 keystore snapshot；供启动恢复与锁内三方合并共用。
+
+    返回 ``(keys, pending_disable, protected, pending_enable)``。
+    """
     data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError("E2E store root must be an object")
     keys: dict[str, bytes] = {}
     pending_disable: dict[str, dict] = {}
     protected: set[str] = set()
+    pending_enable: set[str] = set()
     for stored_sid, encoded in data.items():
         if not isinstance(stored_sid, str) or not isinstance(encoded, str):
             raise ValueError("E2E store entry must be string:string")
@@ -193,6 +219,12 @@ def _decode_snapshot(raw: bytes) -> tuple[dict[str, bytes], dict[str, dict], set
             if value != _PROTECTED_MARKER or sid in protected:
                 raise ValueError("invalid or duplicate protected metadata")
             protected.add(sid)
+            continue
+        if stored_sid.startswith(_PENDING_ENABLE_PREFIX):
+            sid = _pending_enable_sid(stored_sid)
+            if value != _PENDING_ENABLE_MARKER or sid in pending_enable:
+                raise ValueError("invalid or duplicate pending-enable metadata")
+            pending_enable.add(sid)
             continue
         if stored_sid.startswith(_PENDING_DISABLE_PREFIX):
             state = _pending_disable_state(stored_sid)
@@ -206,18 +238,25 @@ def _decode_snapshot(raw: bytes) -> tuple[dict[str, bytes], dict[str, dict], set
         keys[stored_sid] = value
     if not set(pending_disable).issubset(keys):
         raise ValueError("pending-disable metadata has no corresponding K_S")
+    # 悬挂的 pending-enable（无 K_S/floor）无法代表有效 epoch——静默丢弃，避免把
+    # 并发删除后的残元数据变成「整库拒载」。写入路径仍应同步清理（abort / complete_disable）。
+    orphan_pe = pending_enable - protected.union(keys)
+    if orphan_pe:
+        pending_enable -= orphan_pe
     for sid, state in pending_disable.items():
         expected_key_id = base64.urlsafe_b64encode(
             hashlib.sha256(keys[sid]).digest()
         ).decode("ascii").rstrip("=")
         if state["intent"]["keyId"] != expected_key_id:
             raise ValueError("pending-disable metadata key id mismatch")
-    return keys, pending_disable, protected
+    return keys, pending_disable, protected, pending_enable
 
 
 def _logical_session_id(stored_sid: str) -> str:
     if stored_sid.startswith(_PROTECTED_PREFIX):
         return _protected_sid(stored_sid)
+    if stored_sid.startswith(_PENDING_ENABLE_PREFIX):
+        return _pending_enable_sid(stored_sid)
     if stored_sid.startswith(_PENDING_DISABLE_PREFIX):
         return _pending_disable_state(stored_sid)["intent"]["hermesSessionId"]
     return stored_sid
@@ -343,6 +382,8 @@ class E2EKeyStore:
         # server 的 e2e:true 只能把会话加入保护域，绝不能靠后续 e2e:false/omission 删除。
         # 即使 K_S 丢失也要持续 quarantine，避免把密文/控制误走 legacy 明文路径。
         self._protected: set[str] = set()
+        # #818 pending-enable：权威可中止；与 stable protection floor 分列。
+        self._pending_enable: set[str] = set()
         self._disk_snapshot = b"{}"
         self._poisoned = False
         # #731 設備授權（None = 舊配對無 secret，wrap 降級）。
@@ -412,10 +453,11 @@ class E2EKeyStore:
             try:
                 with open(path, "rb") as f:
                     raw = f.read()
-                keys, pending_disable, protected = _decode_snapshot(raw)
+                keys, pending_disable, protected, pending_enable = _decode_snapshot(raw)
                 self._keys = keys
                 self._pending_disable = pending_disable
                 self._protected = protected
+                self._pending_enable = pending_enable
                 repaired = self._serialized_snapshot()
                 if path != self._path:
                     print(f"[e2e] 主檔壞/缺,已從 .bak 恢復 {len(keys)} 把密鑰", file=sys.stderr)
@@ -446,6 +488,7 @@ class E2EKeyStore:
         self._keys = {}  # 全新安裝
         self._pending_disable = {}
         self._protected = set()
+        self._pending_enable = set()
         self._disk_snapshot = b"{}"
 
     def _serialized_snapshot(self) -> bytes:
@@ -460,6 +503,13 @@ class E2EKeyStore:
         for sid in self._protected:
             serialized[_protected_key(sid)] = base64.b64encode(
                 _PROTECTED_MARKER
+            ).decode("ascii")
+        for sid in self._pending_enable:
+            # 只持久化仍挂在保护域/钥上的标记；删除 K_S 后残留不写回。
+            if sid not in self._keys and sid not in self._protected:
+                continue
+            serialized[_pending_enable_key(sid)] = base64.b64encode(
+                _PENDING_ENABLE_MARKER
             ).decode("ascii")
         return json.dumps(
             serialized,
@@ -526,12 +576,15 @@ class E2EKeyStore:
                 desired_raw,
                 disk_raw,
             )
-            merged_keys, merged_pending, merged_protected = _decode_snapshot(merged_raw)
+            merged_keys, merged_pending, merged_protected, merged_pending_enable = (
+                _decode_snapshot(merged_raw)
+            )
             self._write_snapshot_pair(merged_raw)
             # 合并可能吸收另一进程的 unrelated session；当前内存也必须发布同一 committed generation。
             self._keys = merged_keys
             self._pending_disable = merged_pending
             self._protected = merged_protected
+            self._pending_enable = merged_pending_enable
             self._disk_snapshot = merged_raw
         except (E2EKeyStoreConflict, E2EKeyStoreLockTimeout):
             # 這兩類不是持久化故障：內存過期 / 拿不到鎖。實例照舊可用，交由 _save 重試或
@@ -646,21 +699,114 @@ class E2EKeyStore:
             self._assert_usable()
             return set(self._keys).union(self._protected)
 
-    def protect_sessions(self, session_ids: set[str]) -> None:
-        """单调持久化 server-positive floor；server omission/false 永远不能降级。"""
+    def protect_sessions(
+        self,
+        session_ids: set[str],
+        *,
+        pending_enable: set[str] | None = None,
+    ) -> None:
+        """单调持久化 server-positive floor；server omission/false 永远不能降级。
+
+        #818 ``pending_enable``：本次 ready/控制帧声明为 pending-enable 的 sid 集。
+        只**增加**标记（与 floor 一样单调）；清除走 ``mark_enable_complete`` /
+        ``abort_incomplete_enable``。
+        """
         with self._lock:
             self._assert_usable()
             if any(not isinstance(sid, str) or not sid for sid in session_ids):
                 raise ValueError("invalid protected session id")
+            pe = pending_enable or set()
+            if any(not isinstance(sid, str) or not sid for sid in pe):
+                raise ValueError("invalid pending-enable session id")
+            if not pe.issubset(session_ids):
+                raise ValueError("pending-enable must be subset of protected floor")
             added = session_ids - self._protected
-            if not added:
+            pe_added = pe - self._pending_enable
+            if not added and not pe_added:
                 return
             self._protected.update(added)
+            self._pending_enable.update(pe_added)
             try:
                 self._save()
             except Exception:
                 self._protected.difference_update(added)
+                self._pending_enable.difference_update(pe_added)
                 raise
+
+    def mark_pending_enable(self, sid: str) -> None:
+        """live wrap(backfill=true) 入口：标记 pending-enable 并抬 protection floor。"""
+        with self._lock:
+            self._assert_usable()
+            if not isinstance(sid, str) or not sid:
+                raise ValueError("invalid session id")
+            if sid in self._pending_disable:
+                raise RuntimeError("cannot mark pending-enable while disable is pending")
+            if sid in self._pending_enable and sid in self._protected:
+                return
+            self._protected.add(sid)
+            self._pending_enable.add(sid)
+            try:
+                self._save()
+            except Exception:
+                # 尽力回滚；若本就 protected 只撤 pe 标记。
+                self._pending_enable.discard(sid)
+                raise
+
+    def mark_enable_complete(self, sid: str) -> None:
+        """enable backfill ACK 后：退出 pending-enable，保留 stable protection floor + K_S。"""
+        with self._lock:
+            self._assert_usable()
+            if sid not in self._pending_enable:
+                return
+            self._pending_enable.discard(sid)
+            self._protected.add(sid)
+            try:
+                self._save()
+            except Exception:
+                self._pending_enable.add(sid)
+                raise
+
+    def is_pending_enable(self, sid: str) -> bool:
+        with self._lock:
+            return sid in self._pending_enable
+
+    def abort_incomplete_enable(self, sid: str) -> bool:
+        """#818：server 权威中止 pending-enable → 丢 K_S + 撤 floor。
+
+        只在本地仍标 pending-enable 时生效；stable / pending-disable 一律拒绝。
+        """
+        with self._lock:
+            self._assert_usable()
+            if not isinstance(sid, str) or not sid:
+                return False
+            if sid not in self._pending_enable:
+                return False
+            if sid in self._pending_disable:
+                return False
+            prev_key = self._keys.pop(sid, None)
+            was_protected = sid in self._protected
+            self._protected.discard(sid)
+            self._pending_enable.discard(sid)
+            try:
+                self._save()
+            except Exception:
+                if prev_key is not None:
+                    self._keys[sid] = prev_key
+                if was_protected:
+                    self._protected.add(sid)
+                self._pending_enable.add(sid)
+                raise
+            print(
+                f"[e2e] #818 abort_incomplete_enable {sid}：server 权威中止 pending-enable，"
+                "已收敛为明文",
+                file=sys.stderr,
+            )
+            return True
+
+    def pending_enable_sessions(self) -> set[str]:
+        with self._lock:
+            self._assert_usable()
+            return set(self._pending_enable)
 
     def require_key(self, sid: str) -> bytes:
         """返回既有 K_S；控制认证等安全边界绝不能在缺钥时偷偷创建新钥。"""
@@ -684,11 +830,14 @@ class E2EKeyStore:
             if sid not in self._keys:
                 self._keys[sid] = ec.new_session_key()
                 self._protected.add(sid)
+                # 首次建钥 = enable 路径；标 pending-enable 直到 backfill ACK / 权威 abort。
+                self._pending_enable.add(sid)
                 try:
                     self._save()
                 except Exception:
                     self._keys.pop(sid, None)
                     self._protected.discard(sid)
+                    self._pending_enable.discard(sid)
                     raise
             return self._keys[sid]
 
@@ -809,6 +958,8 @@ class E2EKeyStore:
             key = self._keys.pop(sid)
             self._pending_disable.pop(sid)
             was_protected = sid in self._protected
+            was_pending_enable = sid in self._pending_enable
+            self._pending_enable.discard(sid)
             if retain_protection:
                 self._protected.add(sid)
             else:
@@ -818,6 +969,8 @@ class E2EKeyStore:
             except Exception:
                 self._keys[sid] = key
                 self._pending_disable[sid] = previous
+                if was_pending_enable:
+                    self._pending_enable.add(sid)
                 if was_protected:
                     self._protected.add(sid)
                 else:
@@ -884,13 +1037,34 @@ class E2EKeyStore:
             "device not authorized (missing/invalid authProof; refusing wrap for unknown fingerprint)"
         )
 
-    def wrap_for_devices(self, sid: str, devices: list) -> list:
-        """把 K_S 封裝給已绑定 fingerprint 的設備。
+    def wrap_for_enable(self, sid: str, devices: list) -> list:
+        """首次 enable：必要时生成 K_S，再封装给设备。"""
+        return self._wrap_key_for_devices(sid, devices, create=True)
 
-        畸形幀整批拒絕（且不生成 K_S）；單台壞公鑰/未授權只跳過該台、其餘照封。
+    def wrap_existing_for_devices(self, sid: str, devices: list) -> list:
+        """新设备补封：必须沿用既有 K_S；缺 key 时拒绝，绝不生成不兼容的 K₂。"""
+        return self._wrap_key_for_devices(sid, devices, create=False)
+
+    def wrap_for_devices(self, sid: str, devices: list) -> list:
+        """兼容旧调用，语义等同首次 enable；调用方应按 backfill 显式选路。"""
+        return self.wrap_for_enable(sid, devices)
+
+    def _wrap_key_for_devices(self, sid: str, devices: list, *, create: bool) -> list:
+        """把 K_S 封装给已绑定 fingerprint 的设备。
+
+        畸形帧整批拒绝（且不生成 K_S）；单台坏公钥/未授权只跳过该台、其余照封。
+        ``create=False``（新设备补封）缺本地钥时以 ValueError 软拒绝，绝不铸造 K₂。
         """
-        self._assert_wrap_targets_well_formed(devices)  # 畸形幀不得觸發 K_S 生成
-        k_s = self.get_or_create_key(sid)
+        self._assert_wrap_targets_well_formed(devices)  # 畸形帧不得触发 K_S 生成
+        if create:
+            k_s = self.get_or_create_key(sid)
+        else:
+            try:
+                k_s = self.require_key(sid)
+            except KeyError as exc:
+                raise ValueError(
+                    f"缺少本地 K_S（新设备补封不得生成 K₂）: {sid}"
+                ) from exc
         out = []
         self._device_auth_rejected = []
         for d in devices or []:
@@ -899,19 +1073,19 @@ class E2EKeyStore:
             try:
                 if not pub:
                     raise ValueError("missing device public key")
-                computed = device_key_fingerprint(pub)  # 非 canonical 公鑰在此拋
-                # 能力自適應：舊 server（或回滾後的 server）不帶 ``keyFingerprint``——按公鑰
-                # 自算即可，絕不因對端沒宣告版本就跳過該設備。帶了就必須對得上。
+                computed = device_key_fingerprint(pub)  # 非 canonical 公钥在此抛
+                # 能力自适应：旧 server（或回滚后的 server）不带 ``keyFingerprint``——按公钥
+                # 自算即可，绝不因对端没宣告版本就跳过该设备。带了就必须对得上。
                 if fingerprint and computed != fingerprint:
                     raise ValueError("device public key fingerprint mismatch")
-                # #731 設備授權：封 K_S 前校驗。
+                # #731 设备授权：封 K_S 前校验。
                 self._assert_device_authorized(d if isinstance(d, dict) else {}, computed)
                 out.append({
                     "deviceId": dev_id,
                     "keyFingerprint": computed,
                     "sealed": ec.wrap_key(k_s, pub),
                 })
-                # #273 只統計**真的拿到 K_S** 的設備：被跳過的設備解不開任何東西。
+                # #273 只统计**真的拿到 K_S** 的设备：被跳过的设备解不开任何东西。
                 caps = d.get("e2eCaps") if isinstance(d, dict) else None
                 if isinstance(caps, dict):
                     cur = self._session_device_caps.setdefault(sid, set())
@@ -920,7 +1094,7 @@ class E2EKeyStore:
                     if caps.get("secret") is True:
                         cur.add("secret")
             except Exception as exc:
-                # 單台壞公鑰 / 未授權：跳過並響亮記錄，其餘設備照封（絕不 all-or-nothing）。
+                # 单台坏公钥 / 未授权：跳过并响亮记录，其余设备照封（绝不 all-or-nothing）。
                 print(f"[E2E wrap skipped device {dev_id}] {exc}", file=sys.stderr)
                 if isinstance(exc, DeviceUnauthorizedError) and isinstance(dev_id, str) and dev_id:
                     self._device_auth_rejected.append(dev_id)

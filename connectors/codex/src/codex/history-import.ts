@@ -5,7 +5,7 @@
 import { readFileSync } from "node:fs";
 import type { E2EKeyStore } from "../_core/e2e/keys";
 import type { LinkBClient } from "../_core/linkb/client";
-import { deriveMeta, discoverRollouts } from "./mirror";
+import { deriveMeta, discoverRollouts, shouldSkipRollout } from "./mirror";
 import { readNewMessages } from "./transcripts";
 
 const FRAME_BUDGET = 3 * 1024 * 1024;
@@ -40,6 +40,8 @@ export function collectImportSessions(): { built: BuiltSession[]; compressed: nu
     } catch {
       continue;
     }
+    // #789: guardian review / subagent / fork 等內部 thread 不進歷史導入
+    if (shouldSkipRollout(content).skip) continue;
     const { messages } = readNewMessages(content, 0, 0);
     if (!messages.length) continue; // 純工具/空會話跳過
     const { title, cwd } = deriveMeta(content);

@@ -2,7 +2,7 @@
  * Codex 回合錯誤 → 用戶可見文案。
  *
  * 原則(Agents.md)：失敗說人話 + 給下一步；不甩 JSON / 協議術語 / 誤導用戶升級 Macchiato。
- * 已知類（#310 auth、模型需更新 CLI、ENOENT）→ 可行動文案；其餘只剝掉 JSON 殼再截斷。
+ * 已知類（#310 auth、模型需更新 CLI、ENOENT / 原生二進制損壞 #692）→ 可行動文案；其餘只剝掉 JSON 殼再截斷。
  */
 import { CODEX_AUTH_ERR_RE } from "./state";
 
@@ -39,6 +39,47 @@ export function unwrapCodexErrorText(raw: unknown): string {
 const MODEL_NEEDS_NEWER_CLI_RE =
   /['"]([^'"]+)['"]\s+model requires a newer version of (?:Codex|the Codex)/i;
 
+/**
+ * #692：npm `@openai/codex` JS 包裝在，但其 vendor 原生二進制缺失。
+ * 真實 stderr 形狀：
+ *   Error: spawn
+ *   /opt/homebrew/.../node_modules/@openai/codex-darwin-arm64/vendor/.../codex/codex ENOENT
+ *   at ChildProcess._handle.onexit ...
+ */
+const CODEX_NATIVE_MISSING_RE =
+  /codex-(?:darwin|linux|win)|[/\\]vendor[/\\][^\n]*[/\\]codex/i;
+
+const ENOENT_RE = /\bENOENT\b/i;
+/** spawn 與路徑可能換行（Node 預設對長路徑會斷行）。 */
+const SPAWN_ENOENT_RE = /spawn[\s\S]{0,500}?ENOENT/i;
+
+/** 是否為「原生二進制缺失 / 安裝損壞」（包裝在、vendor 不在）。 */
+export function isCodexNativeBinMissing(text: string): boolean {
+  if (!ENOENT_RE.test(text) && !SPAWN_ENOENT_RE.test(text)) return false;
+  return CODEX_NATIVE_MISSING_RE.test(text);
+}
+
+/** 是否為 spawn / ENOENT 類（找不到命令或原生二進制）。 */
+export function isCodexEnoent(text: string): boolean {
+  return ENOENT_RE.test(text) || SPAWN_ENOENT_RE.test(text);
+}
+
+/** health / 日誌用：無 ❌ 前綴的可行動短句。 */
+export function humanizeCodexProbeError(raw: unknown): string {
+  const text = unwrapCodexErrorText(raw);
+  if (isCodexNativeBinMissing(text)) {
+    return (
+      "Codex CLI 安裝損壞（原生二進制缺失）。" +
+      "請在連接器主機執行：npm install -g @openai/codex（或先 uninstall 再 install），然後重啟連接器"
+    );
+  }
+  if (isCodexEnoent(text)) {
+    return "本機找不到 Codex 命令。請安裝：npm i -g @openai/codex ，然後重啟連接器";
+  }
+  const short = text.slice(0, 160).replace(/\s+/g, " ").trim();
+  return short || "codex CLI 探測失敗";
+}
+
 export function parseModelNeedsNewerCli(raw: unknown): { model: string; text: string } | null {
   const text = unwrapCodexErrorText(raw);
   const m = MODEL_NEEDS_NEWER_CLI_RE.exec(text);
@@ -63,8 +104,14 @@ export function formatCodexTurnError(raw: unknown): string {
   if (CODEX_AUTH_ERR_RE.test(text)) {
     return "❌ Codex 登錄已失效——請在連接器主機終端跑 `codex login` 重新登錄後重試";
   }
-  // #692：原生二進制缺失時以前甩 ENOENT 路徑
-  if (/\bENOENT\b/i.test(text) || /spawn\s+\S+\s+ENOENT/i.test(text)) {
+  // #692：區分「原生二進制壞了」vs「根本找不到 codex 命令」——都不要甩 spawn 堆棧
+  if (isCodexNativeBinMissing(text)) {
+    return (
+      "❌ Codex CLI 安裝損壞（原生二進制缺失）。\n" +
+      "請在連接器主機執行：npm install -g @openai/codex（或先 uninstall 再 install），然後重啟連接器。"
+    );
+  }
+  if (isCodexEnoent(text)) {
     return (
       "❌ 本機找不到 Codex 命令。請在連接器主機安裝：npm i -g @openai/codex ，然後重啟連接器。"
     );

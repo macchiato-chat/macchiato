@@ -48,7 +48,7 @@ import { claudeBinIsAbsolute, resolveClaudeBin } from "./claude-bin";
 import { sdkEnv } from "./sdk-env";
 import type { CommandsReporter } from "./commands";
 import { CC_DEFAULT_EFFORT } from "./models";
-import { generateTitle } from "./titles";
+import { fallbackTitle, generateTitle, titleMode } from "./titles";
 import type { LinkBClient } from "../_core/linkb/client";
 import type { E2EKeyStore } from "../_core/e2e/keys";
 import { formatCommandInvokeLog, logContent, safeErr, shortId, textLen } from "../_core/safe-log";
@@ -1435,6 +1435,7 @@ export class Drive {
             return;
           }
           const filePaths: string[] = [];
+          const videoNotes: string[] = [];
           const imageBlocks: unknown[] = [];
           for (const a of atts) {
             if (a?.kind === "audio" && a.id) {
@@ -1450,11 +1451,19 @@ export class Drive {
             } else if (a?.url) {
               // #72 附件入站:下載落盤(SSRF 防護見 attachments.ts)。#118:小圖直接進 content
               // (原生 image block,視覺直達);超限/非圖/E2E → 路徑注入 prompt 供 Read 工具讀。
+              // #859 視頻：無原生視頻輸入 → 路徑注入 + ffmpeg 抽幀提示。
               try {
                 const p = await materializeAttachment(a);
-                const blk = this.e2e?.isE2E(sid) ? null : imageBlockFor(p, String(a.mime ?? ""));
+                const mime = String(a.mime ?? "");
+                const kind = String(a.kind ?? "");
+                const blk = this.e2e?.isE2E(sid) ? null : imageBlockFor(p, mime);
                 if (blk) imageBlocks.push(blk);
-                else filePaths.push(p);
+                else if (kind === "video" || mime.toLowerCase().startsWith("video/")) {
+                  const name = String(a.name ?? "file");
+                  videoNotes.push(
+                    `[Macchiato video ${name}(${mime || "?"}) saved to: ${p}. Models usually cannot read video natively — extract frames with ffmpeg, e.g.: ffmpeg -i ${p} -vf fps=1/5 frame_%03d.jpg]`,
+                  );
+                } else filePaths.push(p);
               } catch (e) {
                 console.error(`[attachment ${String(a.id)} download failed] ${(e as Error).message}`);
               }
@@ -1476,6 +1485,10 @@ export class Drive {
           }
           if (filePaths.length) {
             const note = `[The user attached ${filePaths.length} file(s), read them with the Read tool: ${filePaths.join(", ")}]`;
+            text = text ? `${text}\n\n${note}` : note;
+          }
+          if (videoNotes.length) {
+            const note = videoNotes.join("\n\n");
             text = text ? `${text}\n\n${note}` : note;
           }
           if (!text && !imageBlocks.length) return;
@@ -2678,26 +2691,46 @@ export class Drive {
    * 首回合互相覆蓋 → 錯標題被 renameSession 寫回另一會話。改 per-sid Map。 */
   private readonly genTitle = new Map<string, string>();
 
-  /** #94：立即用首條 user 文本生成標題 → emit session.title(server 更新)。ccSid 有則順帶寫回 transcript。 */
+  /**
+   * #94：立即用首條 user 文本生成標題 → emit session.title(server 更新)。ccSid 有則順帶寫回 transcript。
+   *
+   * #677:summary 模式以前整段等 LLM(冷啟可到 20s)才 emit——側欄一直卡「新會話」,且並發第二
+   * 個 query 失敗時才回退截斷,體感像「又沒自動總結」。改兩段式:
+   *   1) 先同步發 firstmsg 截斷(零 LLM,立即有名);
+   *   2) summary 再異步升級,成功且不同於截斷才重發。
+   * off 仍不發;firstmsg 只走第 1 步。
+   */
   private async maybeTitle(sid: string, ccSid: string | undefined, firstUserText: string): Promise<void> {
     try {
+      const mode = titleMode();
+      if (mode === "off") return;
+
+      // 第 1 步:本地截斷立刻上屏——永不因 LLM 慢/失敗而卡在「新會話」
+      const quick = fallbackTitle(firstUserText);
+      this.applyGeneratedTitle(sid, ccSid, quick);
+      if (mode === "firstmsg") return;
+
+      // 第 2 步:summary 升級(失敗時 generateTitle 回退截斷=quick,跳過重發)
       const title = await generateTitle(firstUserText);
-      if (!title) return;
-      this.genTitle.set(sid, title); // 供回合末寫回 transcript(首回合時 ccSid 尚未建立)
-      this.emit(sid, "session.title", { title });
-      if (ccSid) {
-        try {
-          await renameSession(ccSid, title);
-        } catch {
-          /* 寫回 transcript 失敗不致命(session.title 已發給 server) */
-        }
-      }
-      // #381:标题可能含用户首条消息片段
-      console.log(`· session.title len=${textLen(title)} → ${shortId(sid)}`);
-      logContent("session.title", title);
+      if (title && title !== quick) this.applyGeneratedTitle(sid, ccSid, title);
     } catch (e) {
       console.error(`[title gen failed for ${shortId(sid)}] ${safeErr(e)}`);
     }
+  }
+
+  /** 落 genTitle 緩存 + emit session.title + 可選 renameSession。 */
+  private applyGeneratedTitle(sid: string, ccSid: string | undefined, title: string): void {
+    if (!title) return;
+    this.genTitle.set(sid, title); // 供回合末寫回 transcript(首回合時 ccSid 尚未建立)
+    this.emit(sid, "session.title", { title });
+    if (ccSid) {
+      void renameSession(ccSid, title).catch(() => {
+        /* 寫回 transcript 失敗不致命(session.title 已發給 server) */
+      });
+    }
+    // #381:标题可能含用户首条消息片段
+    console.log(`· session.title len=${textLen(title)} → ${shortId(sid)}`);
+    logContent("session.title", title);
   }
 
   /**

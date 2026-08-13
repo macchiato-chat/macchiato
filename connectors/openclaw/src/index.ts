@@ -19,17 +19,118 @@ import { authorizeE2EDisableResume } from "./_core/e2e/control";
 import { CommandsReporter } from "./openclaw/commands";
 import { HealthLoop } from "./health";
 import { HeartbeatWriter } from "./_core/heartbeat";
+import { installProcessFaultHandlers } from "./_core/runtime-faults";
 import { CONNECTOR_VERSION } from "./linkb/proto";
 import { runVerifiedSelfUpdate } from "./_core/selfupdate";
 import { KIND } from "./identity";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // §update 連接器發布版本:單源自 packages/protocol 的 CONNECTOR_VERSION(#526 起 TS 三家不再
 // 各持副本——2026-07-20「bump 漏一家 → 該家永亮更新」與 2026-07-28 三連事故的同類根子都是
 // 手工多份)。公開樹由 sync-public 重寫為 ./linkb/proto(常量再生,不漂移)。bump 用
 // scripts/release/bump-connector-version.mjs(改 protocol + hermes.py + well-known 三處)。
+
+type E2EControlLink = Pick<LinkBClient, "agentLinkId" | "send">;
+
+/**
+ * #687 wrap/disable 狀態機；導出供測試。身份 Error 只軟拒，不得冒泡 onFatal。
+ * 生產 onFrame 外層仍 catch 非身份錯誤 → close + onFatal。
+ */
+export function handleE2EWrapOrDisable(
+  msg: Record<string, unknown>,
+  linkb: E2EControlLink,
+  e2e: E2EKeyStore,
+  drive: Pick<Drive, "beginE2ETransition" | "assertE2EIdentitySafe">,
+  mirror: Pick<Mirror, "assertE2EIdentitySafe" | "backfillE2E">,
+): void {
+  const sid = typeof msg.hermesSessionId === "string" ? msg.hermesSessionId : undefined;
+  if (!sid) return;
+
+  if (msg.t === "e2e_wrap_request") {
+    try {
+      // 首次 enable 才可生成 K_S；新設備補封缺 key 必須失敗，不能偷偷换成无法解旧历史的 K₂。
+      const enabling = msg.backfill === true;
+      if (enabling) {
+        drive.beginE2ETransition(sid, "enable");
+        e2e.beginEnable(sid, msg.disableReceipt);
+        // #687：pending-enable 允許該 sid 暫缺 map；不得 strict assert → onFatal。
+        // wrap/backfill 不依賴 map；無本地 transcript 時 backfill 回 found:false（server #604 可回滾）。
+        drive.assertE2EIdentitySafe(new Set([sid]));
+      }
+      const wrapped = enabling
+        ? e2e.wrapForEnable(sid, (msg.devices as any[]) ?? [])
+        : e2e.wrapExistingForDevices(sid, (msg.devices as any[]) ?? []);
+      // #731 未授權設備要讓用戶知道:跳過本身是靜默的,不回報就只剩一個永遠轉圈的 Updating。
+      const deviceAuthRejected = e2e.takeDeviceAuthRejections();
+      linkb.send({
+        t: "e2e_key",
+        agentLinkId: linkb.agentLinkId,
+        hermesSessionId: sid,
+        wrapped,
+        ...(deviceAuthRejected.length ? { deviceAuthRejected } : {}),
+      });
+      console.log(`· E2E: session ${sid} — wrapped K_S for ${wrapped.length} device(s)`);
+      if (enabling) {
+        void mirror.backfillE2E(sid).catch((error) => {
+          // #817：單會話回灌失敗保持 pending + transition lock，交給 Retry/Cancel/重連收斂。
+          // 殺整個 connector 只會在同一份持久壞狀態上形成永久 Offline crash loop。
+          console.error(
+            `[E2E enable backfill failed ${sid}] ${(error as Error).message}; waiting for Retry/Cancel`,
+          );
+        });
+      }
+    } catch (error) {
+      // StateError + 身份閘：只軟拒本幀。#687 前身份 Error 會冒泡 onFatal → 永久 Offline。
+      if (
+        error instanceof E2EKeyStoreStateError ||
+        (error instanceof Error &&
+          /identity map unavailable|identity persistence is poisoned/i.test(error.message))
+      ) {
+        console.error(`[E2E wrap rejected ${sid}] ${(error as Error).message}`);
+        return;
+      }
+      throw error;
+    }
+    return;
+  }
+
+  if (msg.t === "e2e_disable_request") {
+    // 裸帧只恢复 connector 本地已持久化的 authenticated pending-disable；stable
+    // 状态下一律拒绝，server 不能单方面触发明文历史回灌。
+    try {
+      if (!authorizeE2EDisableResume(e2e, linkb, sid)) {
+        console.error(`[E2E raw disable rejected ${sid}] no authenticated local pending-disable`);
+        return;
+      }
+      drive.beginE2ETransition(sid, "disable");
+      e2e.markServerE2E(sid, "disable");
+      // disable 需要本地 transcript 身份；缺 map 時軟拒絕本幀，絕不 onFatal 殺整條 link。
+      try {
+        drive.assertE2EIdentitySafe();
+        mirror.assertE2EIdentitySafe();
+      } catch (identityError) {
+        console.error(
+          `[E2E disable rejected ${sid}] identity unsafe: ${
+            identityError instanceof Error ? identityError.message : String(identityError)
+          }`,
+        );
+        return;
+      }
+      void mirror.backfillE2E(sid, "disable").catch((error) => {
+        console.error(
+          `[E2E disable backfill failed ${sid}] ${(error as Error).message}; ` +
+            "K_S kept, waiting for Retry/Cancel",
+        );
+      });
+    } catch (error) {
+      if (!(error instanceof E2EKeyStoreStateError)) throw error;
+      console.error(`[E2E disable rejected ${sid}] ${(error as Error).message}`);
+    }
+  }
+}
 
 /** §update：收到 self_update → 後台跑安裝腳本（拉最新版 + 重啟服務，配對保留）。 */
 function runSelfUpdate(): void {
@@ -182,64 +283,12 @@ async function main(): Promise<void> {
     ) {
       mirror.handleAck(msg.batchId);
     }
-    else if (msg.t === "import_start") void runIdentitySafeImport(); // web「re-import」→ 身份對賬後回灌全量歷史
+    // web「re-import」→ 身份對賬後回灌全量歷史。#874 失敗要在日誌裡響一聲（此前 rejection 直接漏出去，
+    // app 那邊只看見「正在導入」乾轉）；狀態由 server 的殭屍導入回收兜住。
+    else if (msg.t === "import_start") void runIdentitySafeImport().catch((e) => console.error(`[#874 歷史導入失敗] ${(e as Error).message}`));
     else if (msg.t === "self_update") runSelfUpdate(); // §update：一鍵更新
-    else if (msg.t === "e2e_wrap_request" && typeof msg.hermesSessionId === "string") {
-      const sid = msg.hermesSessionId;
-      try {
-        // 首次 enable 才可生成 K_S；新設備補封缺 key 必須失敗，不能偷偷换成无法解旧历史的 K₂。
-        if (msg.backfill) {
-          drive.beginE2ETransition(sid, "enable");
-          e2e.beginEnable(sid, msg.disableReceipt);
-          drive.assertE2EIdentitySafe();
-        }
-        const wrapped = msg.backfill
-          ? e2e.wrapForEnable(sid, (msg.devices as any[]) ?? [])
-          : e2e.wrapExistingForDevices(sid, (msg.devices as any[]) ?? []);
-        // #731 未授權設備要讓用戶知道:跳過本身是靜默的,不回報就只剩一個永遠轉圈的 Updating。
-        const deviceAuthRejected = e2e.takeDeviceAuthRejections();
-        linkb.send({
-          t: "e2e_key",
-          agentLinkId: linkb.agentLinkId,
-          hermesSessionId: sid,
-          wrapped,
-          ...(deviceAuthRejected.length ? { deviceAuthRejected } : {}),
-        });
-        console.log(`· E2E: session ${sid} — wrapped K_S for ${wrapped.length} device(s)`);
-        if (msg.backfill) {
-          void mirror.backfillE2E(sid).catch((error) => {
-            console.error(`[E2E enable backfill fatal ${sid}] ${(error as Error).message}`);
-            linkb.close();
-            linkb.onFatal();
-          });
-        }
-      } catch (error) {
-        if (!(error instanceof E2EKeyStoreStateError)) throw error;
-        console.error(`[E2E wrap rejected ${sid}] ${(error as Error).message}`);
-      }
-    } else if (msg.t === "e2e_disable_request" && typeof msg.hermesSessionId === "string") {
-      // 裸帧只恢复 connector 本地已持久化的 authenticated pending-disable；stable
-      // 状态下一律拒绝，server 不能单方面触发明文历史回灌。
-      try {
-        if (!authorizeE2EDisableResume(e2e, linkb, msg.hermesSessionId)) {
-          console.error(
-            `[E2E raw disable rejected ${msg.hermesSessionId}] no authenticated local pending-disable`,
-          );
-          return;
-        }
-        drive.beginE2ETransition(msg.hermesSessionId, "disable");
-        e2e.markServerE2E(msg.hermesSessionId, "disable");
-        drive.assertE2EIdentitySafe();
-        mirror.assertE2EIdentitySafe();
-        void mirror.backfillE2E(msg.hermesSessionId, "disable").catch((error) => {
-          console.error(`[E2E disable backfill fatal ${msg.hermesSessionId}] ${(error as Error).message}`);
-          linkb.close();
-          linkb.onFatal();
-        });
-      } catch (error) {
-        if (!(error instanceof E2EKeyStoreStateError)) throw error;
-        console.error(`[E2E disable rejected ${msg.hermesSessionId}] ${(error as Error).message}`);
-      }
+    else if (msg.t === "e2e_wrap_request" || msg.t === "e2e_disable_request") {
+      handleE2EWrapOrDisable(msg, linkb, e2e, drive, mirror);
     } else if (
       msg.t === "e2e_backfill_result" &&
       typeof msg.hermesSessionId === "string" &&
@@ -261,6 +310,15 @@ async function main(): Promise<void> {
       } else if (msg.mode === "disable" && msg.ok === false) {
         // found:false/明确拒绝且 receipt 尚未释放：撤销旧 intent，保留 K_S，允许设备重新签请求。
         e2e.cancelDisableBeforeRelease(msg.hermesSessionId);
+      } else if (msg.mode === "enable" && msg.ok === false && msg.e2e === false) {
+        // #818：server 已回滚 pending-enable → 按权威收敛丢钥。
+        if (e2e.abortIncompleteEnable(msg.hermesSessionId)) {
+          linkb.unblockSession(msg.hermesSessionId);
+          accepted = true;
+          console.log(
+            `· E2E enable aborted by server: ${msg.hermesSessionId} — K_S dropped, plaintext resumed`,
+          );
+        }
       }
       // 只有 store 确认 ACK 仍对应当前转换后，水位线才可提交；迟到 ACK 按失败解锁旧 pending。
       mirror.handleE2EBackfillResult(msg.hermesSessionId, msg.mode, accepted);
@@ -269,6 +327,21 @@ async function main(): Promise<void> {
         console.error(
           `· E2E backfill rejected/inconsistent: ${msg.hermesSessionId} mode=${msg.mode} ` +
             `ok=${String(msg.ok)} e2e=${String(msg.e2e)} (${String(msg.error ?? "unknown")})`,
+        );
+      }
+    } else if (
+      msg.t === "e2e_enable_aborted" &&
+      typeof msg.hermesSessionId === "string"
+    ) {
+      // #818 live 路径：server 权威中止 pending-enable。
+      const sid = msg.hermesSessionId;
+      if (e2e.abortIncompleteEnable(sid)) {
+        linkb.unblockSession(sid);
+        drive.releaseE2EQuiesce(sid, "enable");
+        console.log(`· E2E enable aborted (live): ${sid} — K_S dropped, plaintext resumed`);
+      } else {
+        console.error(
+          `· E2E enable_aborted ignored for ${sid}（非 pending-enable，fail-closed 保留 K_S）`,
         );
       }
     }
@@ -288,6 +361,9 @@ async function main(): Promise<void> {
     pendingApproval: drive?.hasPendingApproval ?? false,
   }));
   heartbeat.start();
+  // #893 進程級故障地板:掛在心跳之後(此刻才有東西可落盤)、linkb.start() 之前。
+  // 啟動段本身由文件末尾的 main().catch 兜住,故這裡不必更早。
+  installProcessFaultHandlers({ flushHealth: () => heartbeat.writeNow() });
 
   await linkb.start();
   // OpenClaw 可在 connector 停機時 rotation 同一 key 的 transcript UUID；任何 announce/import/
@@ -334,7 +410,10 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 }
 
-main().catch((e) => {
-  console.error("Connector failed to start:", e);
-  process.exit(1);
-});
+// 允許測試只導入 wrap/disable 狀態機；直接執行 src/index.ts 時行為不變。
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  void main().catch((e) => {
+    console.error("Connector failed to start:", e);
+    process.exit(1);
+  });
+}

@@ -112,7 +112,71 @@ LINK_B_PROTO = 5  # 對齊 server（packages/protocol：B=5，#348/#368 可靠 A
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.72"
+CONNECTOR_VERSION = "1.5.79"
+
+# #768 安裝目錄版本標記（對齊 TS connector-core/disk-version.ts）。
+_INSTALLED_VERSION_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+_CONNECTOR_VERSION_SRC_RE = re.compile(
+    r'CONNECTOR_VERSION\s*=\s*["\'](\d+\.\d+\.\d+)["\']'
+)
+
+
+def _installed_version_mark_path() -> str:
+    return os.path.join(STATE_DIR, "installed-version-hermes")
+
+
+def _note_installed_version_on_disk(version: str) -> None:
+    """installer 退出 0 後寫入；health 用它判 pendingRestart。"""
+    if not _INSTALLED_VERSION_RE.match(version):
+        return
+    path = _installed_version_mark_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(version + "\n")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _read_disk_connector_version() -> str | None:
+    path = _installed_version_mark_path()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = (fh.read() or "").strip().split()[0]
+        if _INSTALLED_VERSION_RE.match(raw):
+            return raw
+    except OSError:
+        pass
+    # 兜底：安裝樹 connector.py 內的 CONNECTOR_VERSION 常量
+    app = os.path.join(STATE_DIR, "app", "connector.py")
+    try:
+        with open(app, "r", encoding="utf-8") as fh:
+            m = _CONNECTOR_VERSION_SRC_RE.search(fh.read())
+        if m and _INSTALLED_VERSION_RE.match(m.group(1)):
+            return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def _report_installed_version(process_version: str) -> str:
+    """進程版 vs 磁盤版取較新者（磁盤 > 進程 = 待重啟）。"""
+    disk = _read_disk_connector_version()
+    if not disk:
+        return process_version
+    # 簡易 semver 比較（與 assert_self_update_allowed 同嚴格三元組）
+    def parts(v: str) -> tuple[int, int, int]:
+        a, b, c = v.split(".")
+        return int(a), int(b), int(c)
+
+    try:
+        if parts(process_version) < parts(disk):
+            return disk
+    except (TypeError, ValueError):
+        pass
+    return process_version
 E2E_APPROVAL_PLAINTEXT_MAX = 64 * 1024
 # #273 加密 clarify/secret 的待決快照上限。真實併發遠低於此（一次回合最多幾條問題）；
 # 只是給「用戶從不回答」這條路徑封頂，別讓常駐進程無限攢。
@@ -1601,14 +1665,74 @@ class Connector:
         sid, ok = await asyncio.to_thread(_do)
         print(f"· session.archive {sid} → archived={archived}（{'ok' if ok else 'no-op'}）")
 
-    async def _attach_to_session(self, real_sid: str, ref: dict) -> None:
-        # 入站附件：下載 presigned url → image.attach/file.attach；隨後的 prompt.submit 會帶上。
+    async def _attach_to_session(self, real_sid: str, ref: dict) -> str:
+        # 入站附件：下載 presigned url → image.attach/file.attach；回傳落盤路徑給調用方拼進 prompt。
+        # #855:file.attach 只把文件當可讀工件、不注入本回合輸入——必須把路徑寫進正文,
+        # 否則 agent 只看到光禿文字,得自己 grep 文件名才找得到(用戶實測 PDF 正是這樣)。
         path = await asyncio.to_thread(_materialize_attachment, ref)
         method = "image.attach" if ref.get("kind") == "image" else "file.attach"
         await self.gw.request(method, {"session_id": real_sid, "path": path})
         # #381:附件名/URL 不落默认日志
         print(f"· 附件 {method} nameLen={text_len(ref.get('name'))} → {short_id(real_sid)}")
         log_content("attach", str(ref.get("name") or ""))
+        return path
+
+    @staticmethod
+    def _attach_note(ref: dict, path: str) -> str:
+        """#855 入站附件路徑註記——對齊 CC/Codex:agent 本回合輸入裡就有「這條消息帶了這個文件」。
+        #859 視頻額外提示 ffmpeg 抽幀（多數模型無原生視頻輸入）。"""
+        name = (str(ref.get("name") or "").strip() or "file")[:120]
+        mime = (str(ref.get("mime") or "").strip() or "?")[:80]
+        kind = str(ref.get("kind") or "")
+        base = f"[Macchiato 附件 {name}({mime})已保存到:{path}]"
+        if kind == "video" or mime.startswith("video/"):
+            return (
+                f"{base}\n"
+                f"[這是一段視頻。模型通常不能直接讀視頻，可用 ffmpeg 抽幀後查看，"
+                f"例如: ffmpeg -i {path} -vf fps=1/5 frame_%03d.jpg]"
+            )
+        return base
+
+    @staticmethod
+    def _merge_attach_notes(text: str, notes: list[str]) -> str:
+        if not notes:
+            return text
+        block = "\n".join(notes)
+        return f"{text}\n\n{block}" if text else block
+
+    async def _attach_refs(
+        self, server_sid: str, real_sid: str, refs: list
+    ) -> tuple[list[str], list[str]]:
+        """落盤 + gateway attach。回 (notes, failed_labels)；失敗只記名、不拋——
+        調用方把 notes 拼進 prompt,failed 走 review.summary 讓用戶看見(#855)。"""
+        notes: list[str] = []
+        failed: list[str] = []
+        for ref in refs or []:
+            label = (str(ref.get("name") or "").strip() or str(ref.get("id") or "file"))[:80]
+            try:
+                path = await self._attach_to_session(real_sid, ref)
+                notes.append(self._attach_note(ref, path))
+            except Exception as exc:
+                print(f"[attach failed {label!r}] {exc!r}", file=sys.stderr)
+                failed.append(label)
+        if failed:
+            # 與 Codex 同形:用戶側氣泡掛着附件,agent 側卻沒收到時不能只 silently print。
+            names = "、".join(failed)
+            await self._to_server(
+                server_sid,
+                {
+                    "jsonrpc": "2.0",
+                    "method": "event",
+                    "params": {
+                        "type": "review.summary",
+                        "session_id": server_sid,
+                        "payload": {
+                            "summary": f"⚠️ 附件下載失敗:{names}",
+                        },
+                    },
+                },
+            )
+        return notes, failed
 
     async def _send_voice_transcript(
         self, server_sid: str, attachment_id, text: str, error: str | None = None
@@ -2217,16 +2341,16 @@ class Connector:
                 print(f"[#4 重投放棄:gateway 180s 未就緒 {server_sid}]", file=sys.stderr)
                 return
             real = await self._ensure_session(server_sid)
-            for ref in attachments or []:
-                try:
-                    await self._attach_to_session(real, ref)
-                except Exception as exc:
-                    print(f"[#4 重投 attach 失敗 {ref.get('name')!r}] {exc!r}", file=sys.stderr)
+            # #855:重投路徑也拼路徑註記。若首次已把註記寫進 text,再 append 會重複——
+            # 用「路徑是否已在正文」去重;GatewayDied 在 attach 之前時 text 尚無註記,必須在此補上。
+            notes, _failed = await self._attach_refs(server_sid, real, attachments or [])
+            extra = [n for n in notes if n not in (text or "")]
+            submit_text = self._merge_attach_notes(text or "", extra)
             try:
-                await self.gw.submit_prompt(real, text)
+                await self.gw.submit_prompt(real, submit_text)
             except GatewayError as exc:
-                if exc.code == 4009 and text:
-                    await self.gw.steer(real, text)
+                if exc.code == 4009 and submit_text:
+                    await self.gw.steer(real, submit_text)
                 else:
                     raise
             print(f"· #4 prompt 重投成功 {server_sid}(gateway 死於在途,已補投)")
@@ -2630,6 +2754,8 @@ class Connector:
                 or getattr(self, "_self_update_notice", None)
             ),
             "connectorVersion": CONNECTOR_VERSION,  # §update：server 據此判 updateAvailable
+            # #768 磁盤版（裝完未重啟時 > 進程版）
+            "installedVersion": _report_installed_version(CONNECTOR_VERSION),
             "kind": "hermes",  # #94：client gate 專屬功能（如 AI 重命名）
             "stt": _stt_available(),  # #89：語音轉錄能力位（false → server 走雲端 BYOK STT）
             "counters": dict(getattr(self, "_counters", {}) or {}),  # #10：累計計數（進程生命週期）
@@ -2643,9 +2769,16 @@ class Connector:
         systemd 重啟會殺掉本進程並起新版；非 systemd（手動跑）則只更新文件、下次重啟生效。
         #773：後一種情況下這個閂不再永久鎖死——見 _on_installer_exit。"""
         if getattr(self, "_self_update_started", False):
+            # #791:不覆蓋已有 pending-restart / failure 文案——用戶該看到「為什麼沒換代」。
             print("[self_update ignored] 已在本进程启动，拒绝并发/重放安装", file=sys.stderr)
             return
         self._self_update_started = True
+        # 新一輪更新:清掉上一輪的信息位,避免 health 一直掛舊話。
+        self._self_update_notice = None
+        if isinstance(self._last_error, str) and self._last_error.startswith(
+            ("self_update failed:", "更新安裝失敗", "更新失敗:")
+        ):
+            self._last_error = None
         print("· 收到 self_update → 驗證發布簽名…", file=sys.stderr)
         try:
             import tempfile
@@ -2723,18 +2856,28 @@ class Connector:
     def _on_installer_exit(
         self, code: int, version: str, grace_s: float | None = None
     ) -> None:
-        """#773 installer 進程退出後的收尾（在 watch_installer 線程裡跑，會阻塞 grace_s）。
+        """#773/#791 installer 進程退出後的收尾（在 watch_installer 線程裡跑，會阻塞 grace_s）。
 
-        - 退出**非 0**（裝失敗）：立刻放閂，用戶點重試就能真的再裝一次（既有行為，原樣保留）。
+        - 退出**非 0**（裝失敗）：立刻放閂 + 寫 lastError，用戶點重試就能真的再裝一次。
         - 退出 **0**（裝成功）：**不立刻**放閂——正常情況下服務重啟會把本進程殺掉，閂跟着進程
-          一起消失。等 grace_s 後本進程還活着，才說明重啟沒生效 → 放閂 + 掛一句人話。
+          一起消失。**立刻**掛「等待重啟」(#791:client 看門狗期間要能讀到真狀態)；grace_s
+          後本進程還活着，才說明重啟沒生效 → 放閂 + 改成「重啟後生效」。
 
         🚨 那句話**絕不能說成「更新失敗」**：非 systemd（手動跑）本來就是「只更新文件、下次
         重啟生效」，那是正常路徑；說成失敗就是撒謊。只說事實 + 下一步。
         """
         if code != 0:
             self._self_update_started = False
+            self._self_update_notice = None
+            self._last_error = (
+                f"更新安裝失敗(退出碼 {code})，可重試；若反复失敗請在終端重跑安裝命令"
+            )
+            print(f"[self_update failed] installer exit {code}", file=sys.stderr)
             return
+        # #768:磁盤已是新版——寫標記供 health.installedVersion / server pendingRestart。
+        _note_installed_version_on_disk(version)
+        # #791:裝成功當下就讓 health 能說出「在等重啟」——client 不必乾等到 grace/看門狗。
+        self._self_update_notice = f"更新已安裝(v{version})，等待連接器重啟…"
         time.sleep(_SELF_UPDATE_RESTART_GRACE_S if grace_s is None else grace_s)
         self._self_update_started = False
         self._self_update_notice = f"更新已下載(v{version}),重啟連接器後生效"
@@ -3845,7 +3988,19 @@ class Connector:
 
                 # 先单调持久化 server-positive floor，再处理 receipt / flush。即使本机 K_S
                 # 已丢，后续 raw prompt/control/mirror 也只能 quarantine，绝不降到明文。
-                self._e2e.protect_sessions(set(server_e2e))
+                pe_from_ready = {
+                    sid for sid, op in server_e2e.items() if op == "enable"
+                }
+                self._e2e.protect_sessions(set(server_e2e), pending_enable=pe_from_ready)
+                # #818：本地仍标 pending-enable、权威快照却省略 → enable 已被中止，按权威收敛。
+                for sid in list(self._e2e.pending_enable_sessions()):
+                    if sid not in server_e2e:
+                        if self._e2e.abort_incomplete_enable(sid):
+                            print(
+                                f"· E2E #818 ready 对账：pending-enable {sid} 被权威省略，"
+                                "已收敛为明文",
+                                file=sys.stderr,
+                            )
                 # floor 提升前断线缓冲里可能已有 plaintext TUI/import；必须在任何 receipt
                 # 结算和 ready flush 之前按“提升后的完整保护域”过滤。后续迟到 producer
                 # 仍由 `_send` 的最终出站闸门逐帧重验。
@@ -3857,41 +4012,57 @@ class Connector:
                     receipt = receipt_by_sid.get(sid)
                     pending = self._e2e.pending_disable(sid)
                     remote_op = server_e2e.get(sid)
-                    if remote_op == "enable":
-                        # ACK 丢失后用户可能立刻重新开启：server 此时仍在同一 ready
-                        # 中携 R1。只有本地 K1 能验过且与 durable release 完全一致的 R1
-                        # 才允许退休 K1；随后保留 floor，wrap 必须生成全新的 K2。
-                        if (
-                            receipt is None
-                            or pending is None
-                            or pending["receipt"] != receipt
-                        ):
+                    try:
+                        if remote_op == "enable":
+                            # ACK 丢失后用户可能立刻重新开启：server 此时仍在同一 ready
+                            # 中携 R1。只有本地 K1 能验过且与 durable release 完全一致的 R1
+                            # 才允许退休 K1；随后保留 floor，wrap 必须生成全新的 K2。
+                            if (
+                                receipt is None
+                                or pending is None
+                                or pending["receipt"] != receipt
+                            ):
+                                raise ValueError(
+                                    "pending re-enable has no matching authenticated disable receipt"
+                                )
+                            verify_disable_receipt(
+                                self._e2e.require_key(sid),
+                                receipt,
+                                expected_intent=pending["intent"],
+                            )
+                            self._e2e.complete_disable_for_reenable(sid, receipt)
+                            completed.add(sid)
+                            continue
+                        if receipt is None or pending is None or pending["receipt"] != receipt:
+                            continue
+                        if sid in server_e2e:
+                            # stable E2E / pending-disable 与“旧 plaintext release 已提交”
+                            # 同时出现是矛盾状态：隔离该 sid，不得关掉整条 link。
                             raise ValueError(
-                                "pending re-enable has no matching authenticated disable receipt"
+                                "disable receipt conflicts with active E2E server state"
                             )
                         verify_disable_receipt(
                             self._e2e.require_key(sid),
                             receipt,
                             expected_intent=pending["intent"],
                         )
-                        self._e2e.complete_disable_for_reenable(sid, receipt)
+                        self._e2e.complete_disable(sid, receipt)
                         completed.add(sid)
-                        continue
-                    if receipt is None or pending is None or pending["receipt"] != receipt:
-                        continue
-                    if sid in server_e2e:
-                        # stable E2E / pending-disable 与“旧 plaintext release 已提交”
-                        # 同时出现是矛盾状态，不能任选其一继续。
-                        raise ValueError(
-                            "disable receipt conflicts with active E2E server state"
+                    except Exception as exc:
+                        # #817：单 sid receipt 冲突只隔离该会话（留 K_S、不结算 disable、
+                        # 不铸 K₂），其余会话继续 ready。快照 shape 错误仍由外层 1008。
+                        try:
+                            self._e2e.protect_sessions({sid})
+                        except Exception as protect_exc:
+                            print(
+                                f"[E2E ready isolate {sid}] protect_sessions: {protect_exc!r}",
+                                file=sys.stderr,
+                            )
+                        print(
+                            f"[E2E ready isolated {sid}] {exc}；"
+                            "保留 K_S、不结算 disable、不铸 K₂，其余会话继续",
+                            file=sys.stderr,
                         )
-                    verify_disable_receipt(
-                        self._e2e.require_key(sid),
-                        receipt,
-                        expected_intent=pending["intent"],
-                    )
-                    self._e2e.complete_disable(sid, receipt)
-                    completed.add(sid)
                 if completed:
                     # 这些旧 epoch 已由 server 提交；断线期间缓存的旧密文/回灌帧不能再补发。
                     # re-enable 会话仍由 retained protection floor 保持隔离，直到生成 K2。
@@ -4060,15 +4231,16 @@ class Connector:
             )
             return
         if t == "e2e_wrap_request":
-            # §19：iOS 開啟某會話 E2E / 新設備加入 → 生成或取出 K_S，封裝給各設備公鑰、回傳。
+            # §19：iOS 開啟某會話 E2E（backfill）可生成 K_S；新設備補封只能沿用既有钥。
             sid = msg.get("hermesSessionId")
             if sid:
                 # 顯式拒絕 + 明確日誌，與 cc / codex / openclaw 的內層 catch 對稱
                 # （#366 驗收項）。此前狀態級錯誤只會被主循環的通用 catch 吞成
                 # 「_on_server_msg 分支異常」，運維無從分辨是畸形幀還是真故障。
                 try:
+                    enabling = bool(msg.get("backfill"))
                     pending = self._e2e.pending_disable(sid)
-                    if pending is not None:
+                    if enabling and pending is not None:
                         # disable 已提交但 ACK 丢失时，server 可能在同一连接上立刻收到用户
                         # re-enable，来不及经过下一次 ready 对账。此时绝不能 createForEnable
                         # 复用 K1；live 请求也必须携带并通过本地 K1 验证 R1，先原子退休旧
@@ -4084,7 +4256,13 @@ class Connector:
                             expected_intent=pending["intent"],
                         )
                         self._e2e.complete_disable_for_reenable(sid, receipt)
-                    wrapped = self._e2e.wrap_for_devices(sid, msg.get("devices") or [])
+                    # 只有 enable/backfill 可建钥；新设备补封缺 key 必须软拒绝，绝不铸 K₂。
+                    if enabling:
+                        wrapped = self._e2e.wrap_for_enable(sid, msg.get("devices") or [])
+                    else:
+                        wrapped = self._e2e.wrap_existing_for_devices(
+                            sid, msg.get("devices") or []
+                        )
                 except (ValueError, E2EControlError) as exc:
                     # 軟拒絕該幀:不回 e2e_key、不動本地狀態、連接照常。
                     print(f"[E2E wrap rejected {sid}] {exc}", file=sys.stderr)
@@ -4101,8 +4279,28 @@ class Connector:
                 print(f"· E2E：會話 {sid} 封裝 K_S 給 {len(wrapped)} 台設備")
                 if msg.get("backfill"):
                     self._begin_e2e_transition(sid, "enable")
+                    try:
+                        self._e2e.mark_pending_enable(sid)
+                    except Exception as exc:
+                        print(f"[E2E pending-enable mark {sid}] {exc!r}", file=sys.stderr)
                     # §19 D2 新開啟：把該會話全量歷史重加密回灌，server 原地替換明文。
                     asyncio.create_task(self._e2e_backfill_history(sid))
+            return
+        if t == "e2e_enable_aborted":
+            # #818 live 路径：server 权威中止 pending-enable（client abort / 设备授权全拒等）。
+            sid = msg.get("hermesSessionId")
+            if isinstance(sid, str) and sid:
+                if self._e2e.abort_incomplete_enable(sid):
+                    self._release_e2e_quiesce(sid, "enable")
+                    print(
+                        f"· E2E enable aborted (live): {sid} — K_S dropped, plaintext resumed"
+                    )
+                else:
+                    print(
+                        f"· E2E enable_aborted ignored for {sid}"
+                        "（非 pending-enable，fail-closed 保留 K_S）",
+                        file=sys.stderr,
+                    )
             return
         if t == "e2e_disable_request":
             # 仅用于断线恢复：发起动作必须先经过 `session.e2e.disable` 设备签封，
@@ -4151,6 +4349,23 @@ class Connector:
                 (mode == "enable" and msg.get("e2e") is True)
                 or (mode == "disable" and msg.get("e2e") is False)
             )
+            if (
+                mode == "enable"
+                and isinstance(sid, str)
+                and sid
+                and msg.get("ok") is False
+                and msg.get("e2e") is False
+            ):
+                # #818：server 已回滚 pending-enable → 按权威收敛丢钥。
+                if self._e2e.abort_incomplete_enable(sid):
+                    print(
+                        f"· E2E enable aborted by server: {sid} — K_S dropped, plaintext resumed"
+                    )
+            if mode == "enable" and committed and isinstance(sid, str) and sid:
+                try:
+                    self._e2e.mark_enable_complete(sid)
+                except Exception as exc:
+                    print(f"[E2E mark_enable_complete {sid}] {exc!r}", file=sys.stderr)
             if mode == "disable" and isinstance(sid, str) and sid:
                 try:
                     if committed:
@@ -4514,11 +4729,18 @@ class Connector:
                             self._retry_prompt(server_sid, final_text, non_audio_refs)
                         )
                         return
-                    for ref in non_audio_refs:
-                        try:
-                            await self._attach_to_session(real, ref)
-                        except Exception as exc:
-                            print(f"[attach failed {ref.get('name')!r}] {exc!r}", file=sys.stderr)
+                    # #855:落盤 + file/image.attach 之後,把路徑註記拼進本回合 prompt。
+                    # file.attach 不注入輸入;不寫註記 = agent 只看得到文字、要自己搜文件名。
+                    notes, failed = await self._attach_refs(server_sid, real, non_audio_refs)
+                    final_text = self._merge_attach_notes(final_text, notes)
+                    if not final_text:
+                        # 純附件且全部 attach 失敗 → 不打擾 agent;用戶已收 review.summary。
+                        if failed or non_audio_refs:
+                            print(
+                                f"· 附件全部失敗,跳過提交 agent（failed={len(failed)}）",
+                                file=sys.stderr,
+                            )
+                            return
                     await self._submit_final(server_sid, real, final_text, non_audio_refs)
                 self._dispatch_session(server_sid, _do_prompt)
             elif method == "command.invoke":

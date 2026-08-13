@@ -2604,6 +2604,72 @@ describe("#370 E2E control ingress", () => {
   });
 });
 
+describe("#677 Macchiato 首回合自動標題", () => {
+  it("ULID 新會話 firstmsg → 首條 prompt 立刻 emit session.title(不再卡「新會話」)", async () => {
+    // firstmsg 不調第二個 query,避免與主通道 mock 搶腳本/蓋 lastOptions
+    process.env.MACCHIATO_CC_TITLE_MODE = "firstmsg";
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    const sid = "01ULIDTITLETEST0000000000AA";
+    fire(tuiFrame(sid, "prompt.submit", { text: "幫我重構支付模組的錯誤處理" }));
+    await new Promise((r) => setTimeout(r, 40));
+    const titleEvt = sent.find((f: any) => f.frame?.params?.type === "session.title") as any;
+    expect(titleEvt?.frame.params.payload.title).toBe("幫我重構支付模組的錯誤處理");
+    expect(titleEvt?.frame.params.session_id).toBe(sid);
+    // 回合末應 renameSession 寫回 transcript(ccSid 已由 init 建立)
+    expect(renameCalls.some(([cc, t]) => cc === CC_SID && t === "幫我重構支付模組的錯誤處理")).toBe(true);
+    d.dispose();
+    delete process.env.MACCHIATO_CC_TITLE_MODE;
+  });
+
+  it("summary 兩段式:先截斷上屏,再升級為 LLM 摘要(兩次 session.title)", async () => {
+    // openChannel 與 title 各調一次 query;mock 每次拷貝 emitScript,互不搶。
+    // title 的 result 當摘要;主通道同一腳本也能 init+result 收尾。
+    delete process.env.MACCHIATO_CC_TITLE_MODE; // 默認 summary
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "Payment Error Refactor" },
+    ];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    const sid = "01ULIDTITLESUM00000000000AA";
+    const first = "幫我重構支付模組的錯誤處理";
+    fire(tuiFrame(sid, "prompt.submit", { text: first }));
+    await new Promise((r) => setTimeout(r, 50));
+    const titles = sent
+      .filter((f: any) => f.frame?.params?.type === "session.title")
+      .map((f: any) => f.frame.params.payload.title as string);
+    // 第 1 步截斷 + 第 2 步摘要(mock result)
+    expect(titles[0]).toBe(first);
+    expect(titles).toContain("Payment Error Refactor");
+    expect(titles.at(-1)).toBe("Payment Error Refactor");
+    d.dispose();
+  });
+
+  it("off 模式不發 session.title", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "off";
+    emitScript = [
+      { type: "system", subtype: "init", session_id: CC_SID },
+      { type: "result", subtype: "success", result: "ok" },
+    ];
+    const { linkb, sent, fire } = fakeLinkb();
+    const d = new Drive(linkb);
+    d.wire();
+    fire(tuiFrame("01ULIDTITLEOFF00000000000AA", "prompt.submit", { text: "不該生成標題" }));
+    await new Promise((r) => setTimeout(r, 40));
+    const titleEvt = sent.find((f: any) => f.frame?.params?.type === "session.title");
+    expect(titleEvt).toBeUndefined();
+    d.dispose();
+    delete process.env.MACCHIATO_CC_TITLE_MODE;
+  });
+});
+
 describe("#94 session.retitle(AI 重新命名老会话)", () => {
   it("读 transcript 首条 user → 生成 → emit session.title", async () => {
     // mock generateTitle:vitest 里 titles.ts 的 query 已被 mock(返回 result),但更稳的是直接铺 transcript

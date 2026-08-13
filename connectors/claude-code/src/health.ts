@@ -15,7 +15,12 @@ import type { Mirror } from "./cc/mirror";
 import { projectsDir } from "./cc/transcripts";
 import { checkCompat } from "./cc/compat";
 import { resolveClaudeBin } from "./cc/claude-bin";
-import { selfUpdatePendingRestartNotice } from "./_core/selfupdate";
+import {
+  selfUpdateFailureNotice,
+  selfUpdatePendingRestartNotice,
+} from "./_core/selfupdate";
+import { runtimeFaultNotice } from "./_core/runtime-faults";
+import { reportInstalledVersion } from "./_core/disk-version";
 
 const HEALTH_INTERVAL_MS = Number(process.env.MACCHIATO_HEALTH_INTERVAL_MS) || 60_000;
 const MIRROR_STUCK_MS = Number(process.env.MACCHIATO_MIRROR_STUCK_MS) || 120_000;
@@ -85,9 +90,20 @@ export class HealthLoop {
       mirrorLastPollAgeS: ageS,
       // #773 沒有真錯誤時,才把「新版已裝好、等重啟」這句人話放出來——真錯誤(鏡像卡住/丟批、
       // 兼容失敗)永遠優先,絕不能被一條信息位蓋掉(#348 靜默凍結的教訓)。
-      lastError: (compat.ok ? this.mirror.lastError : (compat.reason ?? "兼容自檢失敗")) ?? selfUpdatePendingRestartNotice(),
+      // #888 但自更新**失敗**不是信息位,是用戶剛按下按鈕、正盯着結果的那個真錯誤,必須排最前:
+      // 此前它和 pending-restart 一起掛在 `??` 的最尾端,於是只要鏡像有一條 sticky lastError
+      // (黏到下一批被 server 提交為止),自更新失敗的真原因就永遠到不了 app。
+      lastError:
+        selfUpdateFailureNotice() ??
+        // #893 進程級故障(已兜住的 rejection / 剛因 uncaught 重啟過)排在自更新失敗之後、
+        // sticky 鏡像錯誤之前——理由同 #888:真問題不許被黏住的舊錯誤擋在門口。
+        runtimeFaultNotice() ??
+        (compat.ok ? this.mirror.lastError : (compat.reason ?? "兼容自檢失敗")) ??
+        selfUpdatePendingRestartNotice(),
       kind: "claude-code",
       connectorVersion: this.version,
+      // #768 磁盤版（裝完未重啟時 > 進程版）
+      installedVersion: reportInstalledVersion(this.version, "claude-code"),
       stt: false,
       ...(this.cliVersion ? { cliVersion: this.cliVersion } : {}),
       authOk: !this.drive?.authFailed, // #310:auth 失效上浮降級,成功回合自動恢復

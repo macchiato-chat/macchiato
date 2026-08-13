@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { E2EKeyStore, E2EKeyStoreStateError, deviceKeyFingerprint } from "../src/_core/e2e/keys";
 import * as ec from "../src/_core/e2e/crypto";
-import { handleE2EControlFrame } from "../src/index";
+import { bindE2EIdentityAssert, handleE2EControlFrame } from "../src/index";
+import { Drive } from "../src/codex/drive";
 import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/_core/e2e/control";
 
 function disableIntent(sid: string, key: Buffer): E2EControlEnvelopeV1 {
@@ -344,6 +345,97 @@ describe("#347 E2E 控制 roundtrip", () => {
     expect(sent).toEqual([]);
     // beginEnable 已落盤 protection floor；軟拒後進程仍活，ready 可再 bootstrap。
     expect(e2e.isE2E(sid)).toBe(true);
+  });
+
+  it("#817 bindE2EIdentityAssert 把 allow-set 原樣轉給 drive", () => {
+    const seen: Array<ReadonlySet<string> | undefined> = [];
+    const bound = bindE2EIdentityAssert({
+      assertE2EIdentitySafe(sids) {
+        seen.push(sids);
+      },
+    });
+    const allow = new Set(["01K0817CODEXENABLEULID00001"]);
+    bound(allow);
+    bound(undefined);
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toBe(allow);
+    expect(seen[1]).toBeUndefined();
+  });
+
+  it("#817 App ULID pending-enable：allow 含本 sid 不因缺 map throw，strict 仍 throw", () => {
+    const previous = process.env.MACCHIATO_CODEX_SESSIONS;
+    process.env.MACCHIATO_CODEX_SESSIONS = join(dir, "codex-sessions.json");
+    try {
+      const sid = "01K0817CODEXENABLEULID00001";
+      const drive = new Drive(
+        { onFrame: () => () => {} } as any,
+        undefined,
+        {
+          isE2E: (wireSid: string) => wireSid === sid,
+          protectedSessionIds: () => [sid],
+        } as any,
+      );
+      const assertIdentitySafe = bindE2EIdentityAssert(drive);
+      expect(() => assertIdentitySafe()).toThrow(/identity map unavailable/);
+      expect(() => assertIdentitySafe(new Set())).toThrow(/identity map unavailable/);
+      expect(() => assertIdentitySafe(new Set([sid]))).not.toThrow();
+    } finally {
+      if (previous === undefined) delete process.env.MACCHIATO_CODEX_SESSIONS;
+      else process.env.MACCHIATO_CODEX_SESSIONS = previous;
+    }
+  });
+
+  it("#817 enable 配線轉發 allow-set：App ULID 無 map 仍回 e2e_key", () => {
+    const previous = process.env.MACCHIATO_CODEX_SESSIONS;
+    process.env.MACCHIATO_CODEX_SESSIONS = join(dir, "codex-sessions.json");
+    try {
+      const sid = "01K0817CODEXENABLEULID00002";
+      const e2e = new E2EKeyStore(path);
+      e2e.applyServerState({
+        version: 1,
+        disabledReceipts: [],
+        sessions: [{ hermesSessionId: sid, pendingOp: "enable" }],
+      });
+      const sent: Record<string, any>[] = [];
+      const linkb = { agentLinkId: "al", send: (msg: Record<string, unknown>) => sent.push(msg) };
+      const mirror = { backfillE2E: async () => {}, handleE2EBackfillResult: () => {} };
+      const drive = new Drive(
+        { onFrame: () => () => {} } as any,
+        undefined,
+        {
+          isE2E: (wireSid: string) => e2e.isE2E(wireSid),
+          protectedSessionIds: () => e2e.protectedSessionIds?.() ?? [sid],
+        } as any,
+      );
+      const device = ec.genDeviceKeypair();
+
+      expect(
+        handleE2EControlFrame(
+          {
+            t: "e2e_wrap_request",
+            hermesSessionId: sid,
+            backfill: true,
+            devices: [
+              {
+                deviceId: "phone",
+                pubKey: device.pubB64,
+                keyFingerprint: deviceKeyFingerprint(device.pubB64),
+              },
+            ],
+          },
+          linkb,
+          e2e,
+          mirror,
+          drive,
+          bindE2EIdentityAssert(drive),
+        ),
+      ).toBe(true);
+      expect(sent.at(-1)?.t).toBe("e2e_key");
+      expect(e2e.hasKey(sid)).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.MACCHIATO_CODEX_SESSIONS;
+      else process.env.MACCHIATO_CODEX_SESSIONS = previous;
+    }
   });
 
   it("#366 畸形 devices 幀被軟拒絕:不上拋(不觸發 onFatal)、不回 e2e_key、既有 K_S 不動", () => {

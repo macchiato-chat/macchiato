@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { announceImportAvailable, runImport } from "../src/openclaw/history-import";
 import { keyForSid, Mirror } from "../src/openclaw/mirror";
 import { applyReadyE2EIdentityState, Drive } from "../src/openclaw/drive";
+import { handleE2EWrapOrDisable } from "../src/index";
 import { E2EKeyStore } from "../src/_core/e2e/keys";
+import { e2eControlKeyId, type E2EControlEnvelopeV1 } from "../src/_core/e2e/control";
 
 // 渠道用戶消息（帶 OpenClaw 的 metadata wrapper）
 function metaUser(channelId: string, channelName: string, text: string, ts = 1): string {
@@ -21,6 +23,30 @@ function cronUser(id: string): string {
 }
 function plainUser(text: string, ts = 1): string {
   return JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text }], timestamp: ts } }) + "\n";
+}
+
+function disableIntent(sid: string, key: Buffer): E2EControlEnvelopeV1 {
+  return {
+    v: 1,
+    sessionId: `public-${sid}`,
+    hermesSessionId: sid,
+    deviceId: "device-A",
+    keyId: e2eControlKeyId(key),
+    msgId: "00000000-0000-4000-8000-000000000001",
+    seq: "1",
+    issuedAtMs: "1",
+    expiresAtMs: "2",
+    kind: "session.e2e.disable",
+    payloadB64: "e30=",
+    mac: Buffer.alloc(32).toString("base64"),
+  };
+}
+
+function writeTrustedEmptyDrive(): void {
+  writeFileSync(
+    process.env.MACCHIATO_OPENCLAW_DRIVE!,
+    JSON.stringify({ v: 1, driven: {}, wm: {} }),
+  );
 }
 
 describe("history-import（深度：全文件 + 清洗 + 合併 + 過濾）", () => {
@@ -381,8 +407,9 @@ describe("history-import（深度：全文件 + 清洗 + 合併 + 過濾）", ()
     const e2e = new E2EKeyStore(join(root, "corrupt-map-e2e.json"));
     const mirror = new Mirror({} as any, { isReady: true, send: () => {} } as any, e2e);
     const drive = new Drive({} as any, {} as any, mirror, e2e);
-    // pending-enable 只豁免「当前 sid 暂缺 fileId」，绝不把损坏/backup fallback 身份档提升为可信。
-    expect(() =>
+    // pending-enable 只豁免「当前 sid 暂缺 fileId」，绝不把损坏/backup fallback 身份档提升为可信；
+    // 但 ready 保持在线，受影响内容面继续由 strict assert 隔离。
+    expect(
       applyReadyE2EIdentityState(
         e2e,
         drive,
@@ -393,7 +420,7 @@ describe("history-import（深度：全文件 + 清洗 + 合併 + 過濾）", ()
           sessions: [{ hermesSessionId: wireSid, pendingOp: "enable" }],
         },
       ),
-    ).toThrow(/trusted=false/);
+    ).toEqual([wireSid]);
     expect(() => drive.assertE2EIdentitySafe()).not.toThrow();
     expect(() => mirror.assertE2EIdentitySafe()).toThrow(/identity state unavailable/);
 
@@ -413,7 +440,7 @@ describe("history-import（深度：全文件 + 清洗 + 合併 + 過濾）", ()
     expect(JSON.stringify(sent)).not.toContain("归档秘密");
   });
 
-  it("#347 valid-but-incomplete / enable crash：agent:* 缺 fileId 时 ready 失败且归档 UUID 全部冻结", async () => {
+  it("#347 valid-but-incomplete / enable crash：agent:* 缺 fileId 时 ready 保持在线且归档 UUID 全部冻结", async () => {
     const wireSid = "agent:main:discord:channel:347-agent";
     const localSid = "archived-agent-secret";
     // 主檔格式有效，只是 pending-enable 在補寫 fileId 前崩潰；agent:* 不需要 drive 大小寫映射，
@@ -433,8 +460,9 @@ describe("history-import（深度：全文件 + 清洗 + 合併 + 過濾）", ()
     const mirror = new Mirror({} as any, {} as any, e2e);
     const drive = new Drive({} as any, {} as any, mirror, e2e);
 
-    // stable/disable 快照不在 bootstrap 例外内；即使 agent:* 不需要 drive 映射，ready 仍須拒絕。
-    expect(() =>
+    // stable/disable 快照不在 bootstrap 例外内；即使 agent:* 不需要 drive 映射，內容仍須拒絕，
+    // 但不能把整條 connector 殺掉。
+    expect(
       applyReadyE2EIdentityState(
         e2e,
         drive,
@@ -445,7 +473,7 @@ describe("history-import（深度：全文件 + 清洗 + 合併 + 過濾）", ()
           sessions: [{ hermesSessionId: wireSid, pendingOp: null }],
         },
       ),
-    ).toThrow(/missing=agent:main:discord:channel:347-agent/);
+    ).toEqual([wireSid]);
     expect(() => mirror.assertE2EIdentitySafe()).toThrow(/missing=agent:main:discord:channel:347-agent/);
     expect(mirror.localSessionE2EStatus().isE2E(localSid)).toBe(true);
 
@@ -574,6 +602,125 @@ describe("history-import（深度：全文件 + 清洗 + 合併 + 過濾）", ()
     const drive = new Drive({} as any, {} as any, mirror, e2e);
     expect(() => drive.assertE2EIdentitySafe()).not.toThrow();
     expect(() => mirror.assertE2EIdentitySafe()).not.toThrow();
+  });
+
+  it("#687 App ULID pending-enable 無 driven map 時 allowMissing 不 throw（strict 仍擋其它 ULID）", () => {
+    writeTrustedEmptyDrive();
+    const ulid = "01K0OC687PENDINGENABLEULID01";
+    const e2e = new E2EKeyStore(join(root, "687-allow-missing-e2e.json"));
+    e2e.createForEnable(ulid);
+    const drive = new Drive({} as any, {} as any, undefined, e2e);
+    // strict：缺 map → throw（內容面仍 fail-closed）
+    expect(() => drive.assertE2EIdentitySafe()).toThrow(/identity map unavailable/);
+    // pending-enable 白名單：enable / wrap bootstrap 可過
+    expect(() => drive.assertE2EIdentitySafe(new Set([ulid]))).not.toThrow();
+    // 其它受保護 sid 不得借此白名單放行
+    expect(() => drive.assertE2EIdentitySafe(new Set(["01OTHERSESSION000000000001"]))).toThrow(
+      /identity map unavailable/,
+    );
+  });
+
+  it("#687 pending-enable wrap 缺 driven map 不 throw / 不 onFatal，並能回 e2e_key", () => {
+    writeTrustedEmptyDrive();
+    const ulid = "01K0OC687WRAPMISSINGMAPULID1";
+    const e2e = new E2EKeyStore(join(root, "687-wrap-missing-e2e.json"));
+    const sent: Record<string, unknown>[] = [];
+    const linkb = { agentLinkId: "al", send: (msg: Record<string, unknown>) => sent.push(msg) };
+    const drive = new Drive({} as any, {} as any, undefined, e2e);
+    const mirror = { assertE2EIdentitySafe() {}, async backfillE2E() {} };
+    let fatal = 0;
+
+    try {
+      handleE2EWrapOrDisable(
+        { t: "e2e_wrap_request", hermesSessionId: ulid, backfill: true, devices: [] },
+        linkb,
+        e2e,
+        drive,
+        mirror,
+      );
+    } catch {
+      fatal += 1;
+    }
+    expect(fatal).toBe(0);
+    expect(sent).toEqual([
+      expect.objectContaining({ t: "e2e_key", hermesSessionId: ulid, wrapped: [] }),
+    ]);
+    expect(e2e.isE2E(ulid)).toBe(true);
+  });
+
+  it("#687 wrap identity Error 只軟拒、不上拋 onFatal", () => {
+    writeTrustedEmptyDrive();
+    const sid = "01K0OC687WRAPIDENTITYERR0001";
+    const other = "01K0OC687OTHERPROTECTEDULID1";
+    const e2e = new E2EKeyStore(join(root, "687-wrap-identity-e2e.json"));
+    e2e.createForEnable(other);
+    const sent: Record<string, unknown>[] = [];
+    const linkb = { agentLinkId: "al", send: (msg: Record<string, unknown>) => sent.push(msg) };
+    const drive = new Drive({} as any, {} as any, undefined, e2e);
+    const mirror = { assertE2EIdentitySafe() {}, async backfillE2E() {} };
+
+    expect(() =>
+      handleE2EWrapOrDisable(
+        { t: "e2e_wrap_request", hermesSessionId: sid, backfill: true, devices: [] },
+        linkb,
+        e2e,
+        drive,
+        mirror,
+      ),
+    ).not.toThrow();
+    expect(sent).toEqual([]);
+    // beginEnable 已落盤 protection floor；軟拒後進程仍活，ready 可再 bootstrap。
+    expect(e2e.isE2E(sid)).toBe(true);
+
+    const poisoned = new E2EKeyStore(join(root, "687-wrap-poisoned-e2e.json"));
+    expect(() =>
+      handleE2EWrapOrDisable(
+        { t: "e2e_wrap_request", hermesSessionId: sid, backfill: true, devices: [] },
+        linkb,
+        poisoned,
+        {
+          beginE2ETransition() {},
+          assertE2EIdentitySafe() {
+            throw new Error(
+              "OpenClaw E2E identity persistence is poisoned; refusing all protected identity paths",
+            );
+          },
+        },
+        mirror,
+      ),
+    ).not.toThrow();
+    expect(sent).toEqual([]);
+  });
+
+  it("#687 disable 身份 assert 失敗只軟拒本幀，不 onFatal", () => {
+    writeTrustedEmptyDrive();
+    const sid = "01K0OC687DISABLEIDENTITY0001";
+    const e2e = new E2EKeyStore(join(root, "687-disable-identity-e2e.json"));
+    e2e.createForEnable(sid);
+    e2e.markServerE2E(sid, "disable");
+    e2e.beginDisable(sid, disableIntent(sid, e2e.requireKey(sid)));
+    const sent: Record<string, unknown>[] = [];
+    const linkb = { agentLinkId: "al", send: (msg: Record<string, unknown>) => sent.push(msg) };
+    const drive = new Drive({} as any, {} as any, undefined, e2e);
+    const backfills: string[] = [];
+    const mirror = {
+      assertE2EIdentitySafe() {},
+      async backfillE2E(wireSid: string) {
+        backfills.push(wireSid);
+      },
+    };
+
+    expect(() =>
+      handleE2EWrapOrDisable(
+        { t: "e2e_disable_request", hermesSessionId: sid },
+        linkb,
+        e2e,
+        drive,
+        mirror,
+      ),
+    ).not.toThrow();
+    expect(backfills).toEqual([]);
+    expect(e2e.hasPendingDisable(sid)).toBe(true);
   });
 
   it("#347 本地 keys=0 但 ready 快照未同步前不得提升 alias trust；权威空快照后才安全迁移", async () => {

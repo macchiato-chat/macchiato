@@ -12,6 +12,7 @@
 #
 # Choosing what to install (when you run more than one agent):
 #   • Pass a list:   … | bash -s -- --agents=claude-code,codex
+#   • Or a bare name: … | bash -s -- claude-code   (#861; aliases: cc, oc, …; all = every agent found)
 #   • Or just run it: with a terminal attached and several agents found, an
 #     interactive picker lets you tick the ones you want (↑/↓ + space + enter).
 #   • No terminal (CI/containers) and no --agents → installs every agent found.
@@ -25,6 +26,7 @@
 # CLI flags (after `bash -s --`):
 #   --agents=LIST   comma-separated: hermes, openclaw, claude-code, codex, or "all"
 #                   (aliases: cc/claude → claude-code, oc → openclaw)
+#   bare NAME       same as --agents=NAME (#861: claude-code / cc / codex / hermes / openclaw)
 #   --no-mirror     don't mirror terminal-side agent sessions into the app —
 #                   only sessions you start from the app will appear
 #                   (also disables the "terminal busy" indicator)
@@ -74,6 +76,39 @@ UNIT_DIR="$HOME/.config/systemd/user"
 say()  { printf '\033[1;35m[macchiato]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[macchiato]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[macchiato] FAIL:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# #786: npm ci is first-install's longest quiet step. Show elapsed seconds on a TTY
+# so users don't abandon a working install; non-TTY gets start + done lines only.
+# Drop --silent so a failure leaves a real log we can tail.
+run_npm_ci() { # $1=APP
+  local app="$1" log pid rc=0 start now elapsed
+  log="$(mktemp "${TMPDIR:-/tmp}/macchiato-npmci.XXXXXX")" \
+    || fail "mktemp failed for npm ci log"
+  say "Installing npm dependencies (first run can take several minutes)…"
+  start="$(date +%s)"
+  (cd "$app" && npm ci --omit=dev --ignore-scripts >"$log" 2>&1) &
+  pid=$!
+  if [ -t 2 ]; then
+    while kill -0 "$pid" 2>/dev/null; do
+      now="$(date +%s)"
+      elapsed=$((now - start))
+      printf '\r\033[2K\033[1;35m[macchiato]\033[0m npm ci… %ss elapsed' "$elapsed" >&2
+      sleep 1
+    done
+    printf '\r\033[2K' >&2
+  fi
+  wait "$pid" || rc=$?
+  now="$(date +%s)"
+  elapsed=$((now - start))
+  if [ "$rc" -ne 0 ]; then
+    printf '\033[1;31m[macchiato]\033[0m npm ci failed — last output:\n' >&2
+    tail -n 40 "$log" 2>/dev/null || true
+    rm -f "$log"
+    fail "npm ci failed in $app (lockfile missing or out of sync with package.json; see output above)"
+  fi
+  rm -f "$log"
+  say "npm dependencies ready (${elapsed}s)"
+}
 
 have_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
 have_launchd() { [ "$(uname -s)" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; }
@@ -344,18 +379,22 @@ bridge_to_verified_bootstrap() {
   bridge_dir="$(command mktemp -d "${TMPDIR:-/tmp}/macchiato-bridge.XXXXXX")"
   bootstrap_path="$bridge_dir/bootstrap-v1.sh"
   bootstrap_url="https://raw.githubusercontent.com/macchiato-chat/macchiato/connectors-v$version/bootstrap-v1.sh"
-  trap 'command rm -rf "$bridge_dir"' EXIT HUP INT TERM
+  # #888: 不 trap EXIT——bash 3.2 會讓 trap 的最後一條命令蓋掉真實退出碼，
+  # 把「腳本半路死了」洗成 exit 0，連接器據此認定安裝成功。清理改為顯式收尾。
+  trap 'command rm -rf "$bridge_dir"' HUP INT TERM
   command curl --disable --silent --show-error --fail --proto '=https' --tlsv1.2 --max-redirs 0 \
     --connect-timeout 15 --max-time 120 --max-filesize 2097152 \
     --output "$bootstrap_path" "$bootstrap_url" \
-    || fail "versioned bootstrap download failed (redirects are forbidden)"
+    || { command rm -rf "$bridge_dir"; fail "versioned bootstrap download failed (redirects are forbidden)"; }
   actual="$(sha256_of "$bootstrap_path")"
   [ "$actual" = "$bootstrap_sha" ] \
-    || fail "versioned bootstrap sha256 mismatch — refusing to execute"
-  /bin/bash -p "$bootstrap_path" --release="$version" --bootstrap-sha256="$bootstrap_sha" -- "${ORIGINAL_ARGS[@]}"
+    || { command rm -rf "$bridge_dir"; fail "versioned bootstrap sha256 mismatch — refusing to execute"; }
+  # #888: 空數組必須走守衛展開——self_update 起 installer 時一個參數都不帶，
+  # 而 macOS 的 /bin/bash 3.2 在 set -u 下把 "${arr[@]}" 判成 unbound variable。
+  /bin/bash -p "$bootstrap_path" --release="$version" --bootstrap-sha256="$bootstrap_sha" -- ${ORIGINAL_ARGS[@]+"${ORIGINAL_ARGS[@]}"}
   local status=$?
   command rm -rf "$bridge_dir"
-  trap - EXIT HUP INT TERM
+  trap - HUP INT TERM
   exit "$status"
 }
 
@@ -409,6 +448,9 @@ add_requested() { # $1 = comma/space-separated token list
   for tok in $1; do
     [ -n "$tok" ] || continue
     if [ "$tok" = "all" ]; then REQUESTED="all"; return; fi
+    # #884: `all` already claimed everything — a later specific name must not turn
+    # the literal word "all" into a bogus agent key (pre-existing with repeated --agents).
+    [ "$REQUESTED" = "all" ] && continue
     norm="$(normalize_agent "$tok")"
     [ -n "$norm" ] || fail "Unknown agent '$tok' (valid: hermes, hermes:<profile>, openclaw, claude-code, codex, all)"
     case " $REQUESTED " in *" $norm "*) ;; *) REQUESTED="${REQUESTED:+$REQUESTED }$norm" ;; esac
@@ -426,6 +468,7 @@ Options:
   --agents=LIST   comma-separated connectors to install:
                   hermes, openclaw, claude-code, codex, or "all"
                   (aliases: cc/claude → claude-code, oc → openclaw)
+                  Bare agent names also work: … | bash -s -- claude-code
                   Hermes profiles: hermes:<name> installs a connector for the
                   named profile (~/.hermes/profiles/<name>) — its own pairing,
                   shown as a separate agent in the app. Detected profiles also
@@ -466,7 +509,18 @@ while [ $# -gt 0 ]; do
     --mirror)      MIRROR_MODE="on"; MIRROR_EXPLICIT=1 ;;
     -y|--yes|--non-interactive) ASSUME_YES=1 ;;
     -h|--help)     usage; exit 0 ;;
-    *)             fail "Unknown option: $1 (try --help)" ;;
+    # #861: bare agent name is a natural guess (unpair/uninstall already bare) —
+    # treat known tokens as --agents= aliases so `bash -s -- claude-code` works.
+    *)
+      if [ "$1" = "all" ] || [ -n "$(normalize_agent "$1")" ]; then
+        add_requested "$1"
+      else
+        case "$1" in
+          -*) fail "Unknown option: $1 (try --help)" ;;
+          *)  fail "Unknown option: $1 — did you mean --agents=$1? (try --help)" ;;
+        esac
+      fi
+      ;;
   esac
   shift
 done
@@ -598,7 +652,7 @@ install_openclaw() {
   mkdir -p "$APP"
   cp -r "$TMP"/connectors/openclaw/src "$TMP"/connectors/openclaw/plugin "$TMP"/connectors/openclaw/package.json "$TMP"/connectors/openclaw/package-lock.json "$TMP"/connectors/openclaw/tsconfig.json "$APP/"
   [ -f "$APP/package-lock.json" ] || fail "signed package-lock.json missing for openclaw (supply-chain #373)"
-  (cd "$APP" && npm ci --omit=dev --ignore-scripts --silent) || fail "npm ci failed in $APP (lockfile missing or out of sync with package.json)"
+  run_npm_ci "$APP"
   if [ ! -f "$CRED" ]; then
     say "Pairing OpenClaw connector (enter the code below at macchiato.chat)"
     (cd "$APP" && MACCHIATO_PAIR_ONLY=1 MACCHIATO_PAIR_BATCH="$PAIR_BATCH" MACCHIATO_PAIR_BATCH_MANY="$PAIR_BATCH_MANY" ./node_modules/.bin/tsx src/index.ts) || fail "Pairing not completed. Re-run this script to continue."
@@ -640,7 +694,7 @@ install_claude_code() {
   mkdir -p "$APP"
   cp -r "$TMP"/connectors/claude-code/src "$TMP"/connectors/claude-code/package.json "$TMP"/connectors/claude-code/package-lock.json "$TMP"/connectors/claude-code/tsconfig.json "$APP/"
   [ -f "$APP/package-lock.json" ] || fail "signed package-lock.json missing for claude-code (supply-chain #373)"
-  (cd "$APP" && npm ci --omit=dev --ignore-scripts --silent) || fail "npm ci failed in $APP (lockfile missing or out of sync with package.json)"
+  run_npm_ci "$APP"
   if [ ! -f "$CRED" ]; then
     say "Pairing Claude Code connector (enter the code below at macchiato.chat)"
     (cd "$APP" && MACCHIATO_PAIR_ONLY=1 MACCHIATO_CLAUDE_BIN="$CLAUDE" MACCHIATO_PAIR_BATCH="$PAIR_BATCH" MACCHIATO_PAIR_BATCH_MANY="$PAIR_BATCH_MANY" ./node_modules/.bin/tsx src/index.ts) || fail "Pairing not completed. Re-run this script to continue."
@@ -677,7 +731,7 @@ install_codex() {
   mkdir -p "$APP"
   cp -r "$TMP"/connectors/codex/src "$TMP"/connectors/codex/package.json "$TMP"/connectors/codex/package-lock.json "$TMP"/connectors/codex/tsconfig.json "$APP/"
   [ -f "$APP/package-lock.json" ] || fail "signed package-lock.json missing for codex (supply-chain #373)"
-  (cd "$APP" && npm ci --omit=dev --ignore-scripts --silent) || fail "npm ci failed in $APP (lockfile missing or out of sync with package.json)"
+  run_npm_ci "$APP"
   if [ ! -f "$CRED" ]; then
     say "Pairing Codex connector (enter the code below at macchiato.chat)"
     (cd "$APP" && MACCHIATO_PAIR_ONLY=1 MACCHIATO_CODEX_BIN="$CODEX" MACCHIATO_PAIR_BATCH="$PAIR_BATCH" MACCHIATO_PAIR_BATCH_MANY="$PAIR_BATCH_MANY" ./node_modules/.bin/tsx src/index.ts) || fail "Pairing not completed. Re-run this script to continue."
@@ -745,7 +799,9 @@ pick_agents() {
   local -a keys=("$@")
   local n=${#keys[@]} i cur=0
   local -a on
-  for ((i = 0; i < n; i++)); do on[i]=1; done   # default: everything ticked
+  # #787: default nothing ticked — ❯ is focus only; space ticks what you want to link.
+  # Old default-all made "move to Hermes + enter" silently link every detected agent.
+  for ((i = 0; i < n; i++)); do on[i]=0; done
   local saved; saved="$(stty -g </dev/tty)"
   # Ctrl-C during the picker: restore the terminal, then abort the whole install.
   trap 'stty "$saved" </dev/tty 2>/dev/null; printf "\033[?25h\n" >/dev/tty; exit 130' INT
@@ -757,7 +813,7 @@ pick_agents() {
     [ "$drawn" = 1 ] && printf '\033[%dA' "$lines" >/dev/tty
     drawn=1
     {
-      printf '\r\033[2K  \033[1;35m✻\033[0m \033[1mMacchiato\033[0m \033[2m·\033[0m choose connectors to install\n'
+      printf '\r\033[2K  \033[1;35m✻\033[0m \033[1mMacchiato\033[0m \033[2m·\033[0m tick connectors to link\n'
       printf '\r\033[2K\n'
       for ((i = 0; i < n; i++)); do
         if [ "${on[i]}" = 1 ]; then mark=$'\033[32m◉\033[0m'; else mark=$'\033[2m○\033[0m'; fi
@@ -768,7 +824,7 @@ pick_agents() {
         fi
       done
       printf '\r\033[2K\n'
-      printf '\r\033[2K   \033[2m↑/↓ move · space toggle · a all/none · enter confirm · q quit\033[0m\n'
+      printf '\r\033[2K   \033[2m↑/↓ move · space tick · a all/none · enter confirm · q quit\033[0m\n'
     } >/dev/tty
 
     if ! IFS= read -rsn1 key </dev/tty 2>/dev/null; then key="__quit__"; fi
@@ -1017,6 +1073,15 @@ SKIPPED=()
 for a in ${DETECTED[@]+"${DETECTED[@]}"}; do    # DETECTED may be empty (explicit --agents, nothing detected)
   case " ${SELECTED[*]} " in *" $a "*) ;; *) SKIPPED+=("$a") ;; esac
 done
+
+# #787: before any download/pair, say exactly who will link — catches the
+# "I thought the cursor was the selection" mistake while it's still free to abort.
+if [ "${MACCHIATO_SELFTEST:-0}" != 1 ]; then
+  say "Will link: $(labels_of ${SELECTED[@]+"${SELECTED[@]}"})"
+  if [ "${#SKIPPED[@]}" -gt 0 ]; then
+    say "Skipping: $(labels_of "${SKIPPED[@]}") — re-run later with --agents=$(IFS=,; echo "${SKIPPED[*]}") to add $([ "${#SKIPPED[@]}" -gt 1 ] && echo them || echo it)."
+  fi
+fi
 
 # ── mirror choice (#308): flag/env decided above; else one-key [Y/n] on a terminal ──
 if [ -z "$MIRROR_MODE" ] && [ "$ASSUME_YES" != 1 ] && has_tty && stty -g </dev/tty >/dev/null 2>&1; then

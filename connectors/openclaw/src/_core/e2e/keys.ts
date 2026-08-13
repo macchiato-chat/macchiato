@@ -744,7 +744,8 @@ export class E2EKeyStore {
 
   /**
    * ready 的 server E2E 快照必须先于出站缓冲 flush 应用。
-   * 返回「server 已保护但本地缺 key」的 pending-enable sid，调用方据此丢弃首连前积压的明文 TUI。
+   * 返回被隔离/阻止的 sid（缺 K_S、receipt 冲突、quarantine）；调用方据此丢弃
+   * 首连前积压的明文 TUI。单 session 冲突只隔离该 sid，不得拒绝整份 ready。
    */
   applyServerState(raw: unknown): string[] {
     this.assertUsable();
@@ -759,7 +760,10 @@ export class E2EKeyStore {
       throw new E2EKeyStoreStateError("[e2e] Link B ready 缺少 disabledReceipts 数组（fail-closed）");
     }
 
-    // Protection floor 单调累积；ready omission 不能抹掉已见过的 E2E session。
+    // Protection floor 单调累积（**stable / pending-disable**）；ready omission 不能抹掉
+    // 已见过的稳定 E2E session。#818：**pending-enable** 例外——server 是会话 e2e 标记权威，
+    // 权威省略 = enable 已被中止（abortIncompleteE2EEnable），必须按权威收敛丢钥，否则
+    // mirror 继续加密 → 永久卡死（#807）。
     const next = new Map(this.serverE2E);
     const reported = new Set<string>();
     const blockedSessionIds: string[] = [];
@@ -809,6 +813,22 @@ export class E2EKeyStore {
     const reconciledIntents = new Map(this.disableIntents);
     const reconciledReceipts = new Map(this.disableReceipts);
     const completedDisable = new Set<string>();
+    const abortedEnable = new Set<string>();
+    const receiptConflictSids = new Set<string>();
+
+    // #818：本地仍标 pending-enable、权威快照却省略 → enable 已中止，按权威收敛。
+    // 绝不能对 stable（pendingOp=null）或 pending-disable 做同样的事——那需要 disable receipt。
+    for (const [sid, pendingOp] of this.serverE2E) {
+      if (pendingOp !== "enable" || reported.has(sid) || this.pendingDisable.has(sid)) continue;
+      reconciledKeys.delete(sid);
+      next.delete(sid);
+      abortedEnable.add(sid);
+      console.error(
+        `[e2e] #818 pending-enable ${sid} 被 server 权威快照省略（abortIncompleteE2EEnable 回滚）；` +
+          "按权威收敛：删除本地 K_S 与 protection floor，会话恢复明文镜像。",
+      );
+    }
+
     for (const sid of this.pendingDisable) {
       const reportedPendingOp = reported.has(sid) ? next.get(sid) : undefined;
       if (reported.has(sid) && reportedPendingOp !== "enable") {
@@ -843,17 +863,23 @@ export class E2EKeyStore {
             : `[e2e] pending-disable ${sid} 的 ACK 丢失；ready receipt 验真后清理 K_S`,
         );
       } catch (error) {
+        // #817：单 sid receipt 冲突不得 throw 整份 ready（LinkBClient 会 close + onFatal）。
+        // 与缺 K_S 的 server-positive 一样按 sid 隔离；K_S/intent/floor 保留，等匹配 R1。
+        // 这不是 #818 abort——稳定 E2E 仍必须凭 disable receipt 才删钥。
         if (reportedPendingOp === "enable") {
-          throw new E2EKeyStoreStateError(
+          receiptConflictSids.add(sid);
+          if (!blockedSessionIds.includes(sid)) blockedSessionIds.push(sid);
+          console.error(
             `[e2e] pending-disable ${sid} 遇到 pending-enable 但缺少匹配 completion receipt；` +
-              "拒绝复用旧 K_S（fail-closed）",
-            { cause: error },
+              "保留 K_S/intent/floor，该 session 已隔离并阻止复用旧 K_S，其他会话继续运行：" +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        } else {
+          console.error(
+            `[e2e] pending-disable ${sid} 被 ready omission 但无有效 completion receipt；` +
+              `保留 K_S/intent 并隔离：${error instanceof Error ? error.message : String(error)}`,
           );
         }
-        console.error(
-          `[e2e] pending-disable ${sid} 被 ready omission 但无有效 completion receipt；` +
-            `保留 K_S/intent 并隔离：${error instanceof Error ? error.message : String(error)}`,
-        );
       }
     }
     if (
@@ -873,9 +899,9 @@ export class E2EKeyStore {
       );
     }
 
-    const quarantined = new Set<string>();
+    const quarantined = new Set<string>(receiptConflictSids);
     for (const sid of reconciledKeys.keys()) {
-      if (!reported.has(sid) && !completedDisable.has(sid)) {
+      if (!reported.has(sid) && !completedDisable.has(sid) && !abortedEnable.has(sid)) {
         console.error(
           `[e2e] 本地 keystore 持有 session ${sid} 的 K_S，但 server e2eState 未列出；` +
             "保留本地 protection floor 并隔离，不自动删钥/降明文。请核实 disable 是否已提交后再受控清理。",
@@ -894,12 +920,52 @@ export class E2EKeyStore {
       }
     }
     for (const sid of completedDisable) quarantined.delete(sid);
+    for (const sid of abortedEnable) quarantined.delete(sid);
 
-    // 只有完整快照全部验证通过后才发布；失败时 LinkBClient 会终止，绝不 flush。
+    // 畸形快照 shape 仍在上面 fail-closed；单 session 冲突已按 sid 隔离，其余会话继续。
     this.serverE2E = next;
     this.quarantined = quarantined;
     this.serverStateSynced = true;
     return blockedSessionIds;
+  }
+
+  /**
+   * #818：server 权威中止尚未完成的 enable（live 帧 `e2e_enable_aborted` 或 backfill
+   * result ok:false/e2e:false）。
+   *
+   * 只在本地 `pendingOp === "enable"` 时生效——删 K_S、撤 protection floor、解除 quarantine。
+   * stable / pending-disable / 从未见过 server floor 的孤儿钥一律拒绝（返回 false），
+   * 避免恶意/迟到的 abort 帧把已稳定加密的会话静默降明文。
+   */
+  abortIncompleteEnable(sid: string): boolean {
+    this.assertUsable();
+    if (!sid) return false;
+    if (this.pendingDisable.has(sid)) return false;
+    if (this.serverE2E.get(sid) !== "enable") return false;
+
+    const nextKeys = new Map(this.keys);
+    nextKeys.delete(sid);
+    const nextProtected = new Map(this.serverE2E);
+    nextProtected.delete(sid);
+    this.commit(
+      nextKeys,
+      new Set(this.pendingDisable),
+      new Map(this.disableIntents),
+      new Map(this.disableReceipts),
+      nextProtected,
+    );
+    this.quarantined.delete(sid);
+    this.serverStateSynced = true;
+    console.error(
+      `[e2e] #818 abortIncompleteEnable ${sid}：server 权威中止 pending-enable，已收敛为明文`,
+    );
+    return true;
+  }
+
+  /** 本地是否仍处在 server-authoritative pending-enable（可被 abort 收敛）。 */
+  isPendingEnable(sid: string): boolean {
+    this.assertUsable();
+    return this.serverE2E.get(sid) === "enable";
   }
 
   /** 在线 enable/disable 控制帧先提升保护状态；只有 pending-enable 可暂时缺 key。 */

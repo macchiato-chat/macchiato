@@ -81,9 +81,29 @@ export class LoginFlow {
     }, LOGIN_TIMEOUT_MS);
   }
 
-  /** claude 流:授權頁給的一次性 code 餵給 CLI stdin。 */
+  /**
+   * claude 流:授權頁給的一次性 code 餵給 CLI stdin。
+   *
+   * #893 三道防護,缺一都能崩進程:`this.proc` 只在 `'exit'` 回調裡置 null,所以「子進程已死、
+   * `'exit'` 還沒投遞」的窗口裡 `stdin` 已銷毀;CLI 讀完 code 後主動關 stdin 也一樣。往銷毀的
+   * writable 寫,Node 會經 `process.nextTick` **異步**發 `'error'`——幀處理器和 LinkBClient 的
+   * 兩層 try/catch **都抓不到**,直接落成 uncaught。而授權碼是用戶在手機上點完隔幾十秒到幾分鐘
+   * 才回傳的,server 的 `connector.login.code` 也不檢查本地還有沒有活躍登錄流(點兩次、app 重試
+   * 都會撞上),這個窗口一點都不窄。
+   */
   submitCode(code: string): void {
-    this.proc?.stdin?.write(code.trim() + "\n");
+    const proc = this.proc;
+    const stdin = proc?.stdin;
+    if (!proc || !stdin || this.done || proc.exitCode !== null || proc.signalCode !== null) return;
+    if (stdin.destroyed || stdin.writableEnded) return;
+    stdin.once("error", () => {
+      /* 已死的流:寫不進去就算了,登錄流自己會超時收尾。絕不讓它冒成 uncaught。 */
+    });
+    try {
+      stdin.write(code.trim() + "\n");
+    } catch {
+      /* 同步拋(極少)同樣吞掉 */
+    }
   }
 
   /** 殺掉進行中的流(不觸發 onResult——調用方自己決定語義)。 */

@@ -11,11 +11,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "qrcode": "1.5.4",
     "tsx": "^4.19.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/qrcode": "1.5.5",
     "@types/ws": "^8.5.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.8"

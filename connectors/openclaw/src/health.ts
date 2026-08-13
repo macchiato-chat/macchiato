@@ -13,7 +13,12 @@ import type { OpenClawGateway } from "./openclaw/gateway";
 import type { Drive } from "./openclaw/drive";
 import type { Mirror } from "./openclaw/mirror";
 import { smokeParseLatest } from "./openclaw/history-import";
-import { selfUpdatePendingRestartNotice } from "./_core/selfupdate";
+import {
+  selfUpdateFailureNotice,
+  selfUpdatePendingRestartNotice,
+} from "./_core/selfupdate";
+import { runtimeFaultNotice } from "./_core/runtime-faults";
+import { reportInstalledVersion } from "./_core/disk-version";
 
 const HEALTH_INTERVAL_MS = Number(process.env.MACCHIATO_HEALTH_INTERVAL_MS) || 60_000;
 const MIRROR_STUCK_MS = Number(process.env.MACCHIATO_MIRROR_STUCK_MS) || 120_000;
@@ -71,13 +76,20 @@ export function buildHealth(gw: OpenClawGateway, mirror: Mirror, version: string
     mirrorLastPollAgeS: mirror.disabled ? 0 : Math.round((Date.now() - mirror.lastPollAt) / 1000),
     // #773 尾部再兜一句「新版已裝好、等重啟」——僵屍 gateway / gateway 連不上 / 兼容失敗 /
     // 鏡像錯誤都排在它前面,信息位絕不蓋掉真問題(#348 靜默凍結的教訓)。
+    // #888 自更新**失敗**不是信息位,是用戶剛按下按鈕、正盯着結果的那個真錯誤,必須排最前:
+    // 此前它和 pending-restart 一起掛在 `??` 的最尾端,於是只要鏡像有一條 sticky lastError
+    // (黏到下一批被 server 提交為止),自更新失敗的真原因就永遠到不了 app。
     lastError:
+      selfUpdateFailureNotice() ??
+      // #893 見 cc/health.ts 同處註釋。
+      runtimeFaultNotice() ??
       stale ??
       gwDown ??
       (compat.ok ? mirror.lastError : (compat.reason ?? "兼容自檢失敗")) ??
       selfUpdatePendingRestartNotice(),
     kind: "openclaw",
     connectorVersion: version,
+    installedVersion: reportInstalledVersion(version, "openclaw"),
     stt: false,
     counters: { ...mirror.counters, ...(drive?.counters ?? {}) }, // #10
   };

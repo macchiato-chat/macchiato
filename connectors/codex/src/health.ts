@@ -14,7 +14,13 @@ import type { Mirror } from "./codex/mirror";
 import { sessionsRoot } from "./codex/transcripts";
 import { checkCompat } from "./codex/compat";
 import { resolveCodexBin } from "./codex/codex-bin";
-import { selfUpdatePendingRestartNotice } from "./_core/selfupdate";
+import { humanizeCodexProbeError } from "./codex/turn-errors";
+import {
+  selfUpdateFailureNotice,
+  selfUpdatePendingRestartNotice,
+} from "./_core/selfupdate";
+import { runtimeFaultNotice } from "./_core/runtime-faults";
+import { reportInstalledVersion } from "./_core/disk-version";
 
 const HEALTH_INTERVAL_MS = Number(process.env.MACCHIATO_HEALTH_INTERVAL_MS) || 60_000;
 const MIRROR_STUCK_MS = Number(process.env.MACCHIATO_MIRROR_STUCK_MS) || 120_000;
@@ -42,6 +48,8 @@ export class HealthLoop {
   private timer: ReturnType<typeof setInterval> | null = null;
   private cliVersion: string | undefined;
   private cliFound = false;
+  /** #692：CLI 探測失敗時的人話原因（原生二進制缺失 / 找不到命令）；成功探測後清空。 */
+  private cliProbeError: string | null = null;
   private lastProbeAt = 0;
 
   constructor(
@@ -73,12 +81,18 @@ export class HealthLoop {
   private probeCli(): void {
     this.lastProbeAt = Date.now();
     // 用解析出的絕對路徑,不靠進程 PATH(systemd 服務常缺 ~/.local/bin → 誤報降級)。
+    // --version 會觸達 npm 包裝下的 vendor 原生二進制；裝壞時 err 即 #692 ENOENT，gatewayAlive 自然變紅。
     execFile(resolveCodexBin(), ["--version"], { timeout: 15_000 }, (err, stdout) => {
       if (!err) {
         this.cliFound = true;
+        this.cliProbeError = null;
         this.cliVersion = (stdout.trim().match(/\d+\.\d+\.\d+/) || [stdout.trim()])[0]; // "2.1.201 (Claude Code)" → "2.1.201"
       } else {
-        console.error(`[health] codex --version 失敗(${resolveCodexBin()}): ${err.message}`);
+        this.cliFound = false;
+        this.cliVersion = undefined;
+        // 人話化（原生缺失 / 找不到命令），別把 spawn 堆棧寫進 lastError
+        this.cliProbeError = humanizeCodexProbeError(err.message);
+        console.error(`[health] codex --version 失敗(${resolveCodexBin()}): ${this.cliProbeError}`);
       }
     });
   }
@@ -93,20 +107,35 @@ export class HealthLoop {
     const compat = checkCompat(this.cliVersion);
     // #260 v2:app-server 未就緒(重啟中)也算 gateway 不活;restartFailures 上浮(重啟風暴 app 不再一片綠)。
     const appOk = this.appServer ? this.appServer.isReady : true;
+    // #692：CLI 探測失敗優先用人話 probe 原因（原生二進制缺失 ≠ 單純「未找到」）
+    const cliDownReason = !this.cliFound
+      ? (this.cliProbeError ?? compat.reason ?? "codex CLI 未找到")
+      : null;
     const h: HealthSnapshot = {
       gatewayAlive: this.cliFound && existsSync(sessionsRoot()) && appOk,
       compatOk: this.cliFound && compat.ok,
       mirrorLastPollAgeS: ageS,
-      // #773 尾部再兜一句「新版已裝好、等重啟」——真錯誤(app-server 未就緒、鏡像卡住、兼容失敗)
-      // 與 #258 升版告警都排在它前面,信息位絕不蓋掉真問題(#348 靜默凍結的教訓)。
+      // 尾部兜一句「新版已裝好、等重啟」——真錯誤(app-server 未就緒、鏡像卡住、兼容失敗)
+      // 與 #258 升版告警都排在它前面,**信息位**絕不蓋掉真問題(#348 靜默凍結的教訓)。
+      //
+      // #888 但自更新**失敗**不是信息位,是用戶剛按下按鈕、正盯着結果的那個真錯誤,必須排最前:
+      // 此前它和 pending-restart 一起走 selfUpdateStatusNotice()、掛在 `??` 的最尾端,於是
+      // 只要鏡像有一條 sticky lastError(它會黏到下一批被 server 提交為止),自更新失敗的真原因
+      // 就永遠到不了 app——#791 把真話準備好了,卻被擋在門口,用戶只看到一句空白的「重試」。
       lastError:
-        (compat.ok
-          ? this.appServer && !this.appServer.isReady
-            ? `app-server 未就緒(重啟失敗 ${this.appServer.restartFailures} 次)`
-            : (this.mirror.lastError ?? compat.advisory ?? null) // #258 無錯時把升版告警上浮
-          : (compat.reason ?? "兼容自檢失敗")) ?? selfUpdatePendingRestartNotice(),
+        selfUpdateFailureNotice() ??
+        // #893 見 cc/health.ts 同處註釋。
+        runtimeFaultNotice() ??
+        (cliDownReason
+          ? cliDownReason
+          : compat.ok
+            ? this.appServer && !this.appServer.isReady
+              ? `app-server 未就緒(重啟失敗 ${this.appServer.restartFailures} 次)`
+              : (this.mirror.lastError ?? compat.advisory ?? null) // #258 無錯時把升版告警上浮
+            : (compat.reason ?? "兼容自檢失敗")) ?? selfUpdatePendingRestartNotice(),
       kind: "codex",
       connectorVersion: this.version,
+      installedVersion: reportInstalledVersion(this.version, "codex"),
       stt: false,
       ...(this.cliVersion ? { cliVersion: this.cliVersion } : {}),
       authOk: !this.drive?.authFailed, // #310:auth 失效上浮降級,成功回合自動恢復

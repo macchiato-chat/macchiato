@@ -98,6 +98,13 @@ function sandboxMode(): string {
   return "workspace-write";
 }
 
+/** #895 回合看門狗(與 exec v1 同 env / 默認)。活動式;掛起審批時豁免。 */
+function turnStallMs(): number {
+  const v = Number(process.env.MACCHIATO_CODEX_TURN_STALL_MS);
+  if (Number.isFinite(v) && v >= 0) return v;
+  return 30 * 60_000;
+}
+
 /** #153 同款工具卡,v2 item 形狀(camelCase:aggregatedOutput/exitCode;schema 0.144.1)。 */
 export function toolCardForV2(it: any): { name: string; args: Record<string, unknown>; resultText: string; error?: string } {
   const type = String(it?.type ?? "tool");
@@ -169,6 +176,12 @@ interface ActiveTurn {
   modelUsed?: string;
   /** 已因「模型需更新 CLI」自動降級重試過一次——防死循環。 */
   modelFallbackTried?: boolean;
+  /** #895 看門狗:最近一次 app-server 通知時刻。 */
+  lastActivityAt: number;
+  /** #895 看門狗 timer。 */
+  watchdog?: ReturnType<typeof setTimeout>;
+  /** #895 已由看門狗強制收尾——晚到的 turn/completed 不再二次 finish。 */
+  finalized?: boolean;
 }
 
 type CodexApprovalKind = "command" | "fileChange";
@@ -360,7 +373,61 @@ export class AppServerDrive {
   }
 
   dispose(): void {
+    for (const t of this.active.values()) this.clearTurnWatchdog(t);
     this.client.close();
+  }
+
+  /**
+   * #895 回合看門狗:引擎活着但連續無通知達 stall → 強制 interrupted 收尾。
+   * 否則 active 永佔 → 後續 prompt 靜默排隊;server stream GC 後停止鍵消失。
+   * 掛起審批豁免(等用戶點卡不是卡死)。
+   */
+  private armTurnWatchdog(sid: string, turn: ActiveTurn): void {
+    this.clearTurnWatchdog(turn);
+    const stall = turnStallMs();
+    if (!stall) return;
+    const due = turn.lastActivityAt + stall - Date.now();
+    turn.watchdog = setTimeout(() => {
+      turn.watchdog = undefined;
+      if (turn.finalized || this.active.get(sid) !== turn) return;
+      // 審批卡掛起 / 期間有活動 → 沒卡,重排
+      if ((this.approvals.get(sid)?.length ?? 0) > 0 || Date.now() - turn.lastActivityAt < stall) {
+        this.armTurnWatchdog(sid, turn);
+        return;
+      }
+      this.forceFinalizeStuck(sid, turn, stall);
+    }, Math.max(due, 25));
+    turn.watchdog.unref?.();
+  }
+
+  private clearTurnWatchdog(turn: ActiveTurn): void {
+    if (turn.watchdog) {
+      clearTimeout(turn.watchdog);
+      turn.watchdog = undefined;
+    }
+  }
+
+  /** #895 卡死回合強制收尾(best-effort interrupt + 本地定稿 interrupted)。 */
+  private forceFinalizeStuck(sid: string, turn: ActiveTurn, stall: number): void {
+    this.clearTurnWatchdog(turn);
+    if (turn.finalized || this.active.get(sid) !== turn) return;
+    console.error(
+      `[turn watchdog] ${sid} 回合 ${Math.round(stall / 1000)}s 無任何通知 → 判定卡死,強制中斷`,
+    );
+    this.interruptedSids.add(sid);
+    if (turn.turnId) {
+      void this.client
+        .request("turn/interrupt", { threadId: turn.threadId, turnId: turn.turnId })
+        .catch(() => {
+          /* 引擎若也掛了,本地定稿仍要走 */
+        });
+    }
+    if (!turn.isE2E) {
+      this.emit(sid, "review.summary", {
+        summary: "⚠️ 回合長時間無響應，已判定卡死並中斷——請重試。",
+      });
+    }
+    this.finishTurn(sid, turn, { status: "interrupted" });
   }
 
   /**
@@ -952,8 +1019,14 @@ export class AppServerDrive {
       try {
         const p = await materializeAttachment(a);
         // #132 原生圖片:image 附件 → localImage UserInput(視覺直達,活測 "Red");其餘照舊路徑注入。
+        // #859 視頻：無原生視頻輸入 → 路徑注入 + ffmpeg 抽幀提示。
+        const mime = String(a.mime ?? "?");
         if (a.kind === "image") images.push({ type: "localImage", path: p });
-        else attachNotes.push(`[Macchiato 附件 ${a.name ?? "file"}(${a.mime ?? "?"})已保存到:${p}]`);
+        else if (a.kind === "video" || mime.toLowerCase().startsWith("video/")) {
+          attachNotes.push(
+            `[Macchiato 視頻 ${a.name ?? "file"}(${mime})已保存到:${p}。模型通常不能直接讀視頻，可用 ffmpeg 抽幀後查看，例如: ffmpeg -i ${p} -vf fps=1/5 frame_%03d.jpg]`,
+          );
+        } else attachNotes.push(`[Macchiato 附件 ${a.name ?? "file"}(${mime})已保存到:${p}]`);
       } catch (e) {
         console.error(`[attachment failed for ${sid}] ${(e as Error).message}`);
         if (!this.e2e?.isE2E(sid)) {
@@ -1107,17 +1180,29 @@ export class AppServerDrive {
         isE2E,
         isFirstMacchiatoTurn,
         input,
+        lastActivityAt: Date.now(), // #895
         ...(model ? { modelUsed: model } : {}),
       };
       this.active.set(sid, turn);
       this.pending.add(sid); // #200
       this.saveMap();
+      this.armTurnWatchdog(sid, turn); // #895 在 turn/start 之前掛——start 本身掛死也要收
       const effort = this.effortFor(sid); // #231 per-turn reasoning effort
       const res = await this.client.request("turn/start", { threadId, input, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
+      // 看門狗可能在 await 期間已強制收尾——別再寫 turnId / 補發 interrupt
+      if (turn.finalized || this.active.get(sid) !== turn) return;
       // turn/start 立即返回(探針);turnId 也會隨 turn/started 通知到,這裡先記省一拍。
       if (res?.turn?.id) turn.turnId = String(res.turn.id);
       if (turn.turnId && turn.interruptPending) void this.fireDeferredInterrupt(sid, turn); // #245
     } catch (e) {
+      // runTurn 失敗路徑:若看門狗已收尾(active 已空),別再潑第二條錯誤。
+      const stuck = this.active.get(sid);
+      if (!stuck) {
+        this.counters.driveErrors += 1;
+        if (requireDelivery) throw e;
+        return;
+      }
+      this.clearTurnWatchdog(stuck);
       this.active.delete(sid);
       this.pending.delete(sid);
       this.saveMap();
@@ -1146,6 +1231,7 @@ export class AppServerDrive {
     const sid = threadId ? this.byThread.get(threadId) : undefined;
     if (!sid) return;
     const turn = this.active.get(sid);
+    if (turn) turn.lastActivityAt = Date.now(); // #895 看門狗續期
     switch (method) {
       case "turn/started": {
         if (turn && !turn.turnId) turn.turnId = String(p.turn?.id ?? "");
@@ -1301,6 +1387,9 @@ export class AppServerDrive {
   }
 
   private finishTurn(sid: string, turn: ActiveTurn, turnObj: any): void {
+    if (turn.finalized) return; // #895 看門狗已收尾 / 防雙份
+    turn.finalized = true;
+    this.clearTurnWatchdog(turn);
     this.active.delete(sid);
     this.pending.delete(sid);
     this.saveMap();
@@ -1543,8 +1632,10 @@ export class AppServerDrive {
   private onServerRestart(): void {
     this.loadedThreads.clear();
     for (const [sid, turn] of [...this.active]) {
+      this.clearTurnWatchdog(turn); // #895
       this.active.delete(sid);
       this.pending.delete(sid);
+      turn.finalized = true;
       for (const p of this.approvals.get(sid) ?? []) p.resolve("decline");
       this.approvals.delete(sid);
       if (turn.isE2E) {

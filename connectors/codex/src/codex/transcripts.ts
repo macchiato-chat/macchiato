@@ -4,6 +4,7 @@
  * (文本乾淨、無 metadata wrapper)。response_item/message 攜同一文本 → 跳過防雙份;
  * 工具細節(exec/file_change)v1 不入(對齊 OpenClaw v1,見 #61 同款後續)。
  */
+import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -16,6 +17,116 @@ export interface CodexMessage {
   text: string;
   /** 文件內序號(0 起)——srcId 去重的穩定成分(rollout 行無 uuid)。 */
   ord: number;
+}
+
+export interface RolloutTail {
+  /** 從請求 offset 起實際讀到的字節；可能以未完成 JSONL 行結尾。 */
+  content: Buffer;
+  /** 本次 snapshot 的讀取終點；完整行水位仍由 readNewMessages 決定。 */
+  endOffset: number;
+}
+
+/**
+ * 只讀 rollout 在 byte offset 之後的尾部。每輪 poll 的成本因此取決於新增內容，
+ * 不再取決於整條長會話的歷史大小。文件在 fstat 後繼續增長時，剩餘字節留到下輪。
+ */
+export function readRolloutTail(file: string, offset: number): RolloutTail {
+  const fd = openSync(file, "r");
+  try {
+    const size = fstatSync(fd).size;
+    if (size <= offset) return { content: Buffer.alloc(0), endOffset: offset };
+    const buffer = Buffer.allocUnsafe(size - offset);
+    let bytesRead = 0;
+    while (bytesRead < buffer.length) {
+      const read = readSync(
+        fd,
+        buffer,
+        bytesRead,
+        buffer.length - bytesRead,
+        offset + bytesRead,
+      );
+      if (read <= 0) break;
+      bytesRead += read;
+    }
+    return {
+      content: bytesRead === buffer.length ? buffer : buffer.subarray(0, bytesRead),
+      endOffset: offset + bytesRead,
+    };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export interface RolloutPreamble {
+  /** 僅含首條 session_meta 與首條 user_message，足夠派生 cwd/title/內部 thread 判據。 */
+  content: string;
+  hasUserMessage: boolean;
+}
+
+/**
+ * 流式找 rollout 頭部 metadata，不把歷史正文載入內存。正常格式兩條內即可返回；
+ * 舊格式缺字段時掃到 snapshot EOF，仍只保留命中的兩行。
+ */
+export function readRolloutPreamble(file: string): RolloutPreamble {
+  const fd = openSync(file, "r");
+  try {
+    const snapshotSize = fstatSync(fd).size;
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    let carry = Buffer.alloc(0);
+    let sessionMeta: string | undefined;
+    let userMessage: string | undefined;
+
+    while (position < snapshotSize) {
+      const length = Math.min(chunk.length, snapshotSize - position);
+      const bytesRead = readSync(fd, chunk, 0, length, position);
+      if (bytesRead <= 0) break;
+      position += bytesRead;
+      const data = carry.length
+        ? Buffer.concat([carry, chunk.subarray(0, bytesRead)])
+        : chunk.subarray(0, bytesRead);
+      let lineStart = 0;
+      let newline = data.indexOf(0x0a, lineStart);
+      while (newline >= 0) {
+        const line = data.subarray(lineStart, newline).toString("utf8").trim();
+        if (line) {
+          try {
+            const value = JSON.parse(line) as {
+              type?: string;
+              payload?: { type?: string; message?: unknown };
+            };
+            if (!sessionMeta && value.type === "session_meta") sessionMeta = line;
+            if (
+              !userMessage
+              && value.type === "event_msg"
+              && value.payload?.type === "user_message"
+              && typeof value.payload.message === "string"
+            ) {
+              userMessage = line;
+            }
+          } catch {
+            /* 壞行不影響後續 metadata 探測 */
+          }
+        }
+        if (sessionMeta && userMessage) {
+          return {
+            content: `${sessionMeta}\n${userMessage}\n`,
+            hasUserMessage: true,
+          };
+        }
+        lineStart = newline + 1;
+        newline = data.indexOf(0x0a, lineStart);
+      }
+      carry = Buffer.from(data.subarray(lineStart));
+    }
+
+    return {
+      content: [sessionMeta, userMessage].filter(Boolean).join("\n"),
+      hasUserMessage: userMessage !== undefined,
+    };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** 一行 rollout envelope → 消息(user_message / agent_message);其餘 → null。 */
@@ -43,10 +154,11 @@ function lineToMessage(o: unknown, ord: number): CodexMessage | null {
  * seed / endOrd 等「水位快進到 EOF」路徑必須與增量路徑同一計法，否則 ordBase 偏移 →
  * srcId 哈希不一致 → 跨路徑去重失效。
  */
-export function nextOrdAtEof(content: string): number {
+export function nextOrdAtEof(content: string | Buffer): number {
+  const buffer = Buffer.isBuffer(content) ? content : Buffer.from(content, "utf8");
   let n = 0;
-  for (let i = 0; i < content.length; i++) {
-    if (content.charCodeAt(i) === 0x0a) n += 1;
+  for (let i = 0; i < buffer.length; i++) {
+    if (buffer[i] === 0x0a) n += 1;
   }
   return n;
 }
@@ -56,12 +168,12 @@ export function nextOrdAtEof(content: string): number {
  * ord 用**全文行號**(從 0 掃),保證同一文件內去重穩定;調用方傳入起始行號基準。
  */
 export function readNewMessages(
-  content: string,
+  content: string | Buffer,
   offset: number,
   ordBase: number,
   maxMessages = Number.POSITIVE_INFINITY,
 ): { messages: CodexMessage[]; newOffset: number; lineCount: number } {
-  const buf = Buffer.from(content, "utf8");
+  const buf = Buffer.isBuffer(content) ? content : Buffer.from(content, "utf8");
   if (buf.length <= offset) return { messages: [], newOffset: offset, lineCount: 0 };
   const slice = buf.subarray(offset);
   const lastNl = slice.lastIndexOf(0x0a);

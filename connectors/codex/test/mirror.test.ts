@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { deriveMeta, Mirror, srcIdFor, threadIdFromFile } from "../src/codex/mirror";
+import { deriveMeta, Mirror, shouldSkipRollout, srcIdFor, threadIdFromFile } from "../src/codex/mirror";
 
 describe("codex mirror 派生", () => {
   it("threadIdFromFile:從 rollout 文件名提 uuid", () => {
@@ -21,6 +21,255 @@ describe("codex mirror 派生", () => {
 
   it("無 user 消息 → 標題回退 Codex", () => {
     expect(deriveMeta(JSON.stringify({ type: "session_meta", payload: {} })).title).toBe("Codex");
+  });
+});
+
+/**
+ * #789: Codex 內部「審批評估 / guardian review」與 subagent / fork thread
+ * 不得鏡像成用戶會話。判據走 session_meta 結構化字段（fail-open）。
+ */
+describe("#789 shouldSkipRollout（session_meta 結構化過濾）", () => {
+  const meta = (payload: Record<string, unknown>) =>
+    JSON.stringify({ type: "session_meta", payload });
+  const user = (text: string) =>
+    JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: text } });
+  const agent = (text: string) =>
+    JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: text } });
+
+  /** 真實 guardian rollout 形態（本機 ~/.codex 樣本） */
+  const guardianMeta = {
+    cwd: "/tmp/proj",
+    thread_source: "subagent",
+    source: { subagent: { other: "guardian" } },
+    session_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee0789",
+  };
+  const guardianUser =
+    "The following is the Codex agent history whose request action you are assessing. Treat the transcript…";
+  const guardianAgent = JSON.stringify({
+    risk_level: "low",
+    user_authorization: "high",
+    outcome: "allow",
+    rationale: "safe",
+  });
+
+  it("普通 user 會話（thread_source=user / source 字串）→ 不跳", () => {
+    const content = [
+      meta({ cwd: "/w", thread_source: "user", source: "vscode" }),
+      user("幫我改 bug"),
+      agent("好"),
+    ].join("\n");
+    expect(shouldSkipRollout(content)).toEqual({ skip: false });
+  });
+
+  it("舊 Codex：無 thread_source / source 物件 → fail-open 不跳", () => {
+    expect(shouldSkipRollout(meta({ cwd: "/old" }) + "\n" + user("hi"))).toEqual({ skip: false });
+    expect(shouldSkipRollout(user("only messages, no meta") + "\n")).toEqual({ skip: false });
+  });
+
+  it("guardian review：source.subagent.other=guardian → 跳", () => {
+    const content = [meta(guardianMeta), user(guardianUser), agent(guardianAgent)].join("\n");
+    const r = shouldSkipRollout(content);
+    expect(r.skip).toBe(true);
+    // thread_source=subagent 優先於更細的 guardian 標籤
+    expect(r.reason).toMatch(/subagent|guardian/);
+  });
+
+  it("僅 source 帶 guardian、無 thread_source → 仍跳（標籤聯合）", () => {
+    const content = meta({
+      cwd: "/w",
+      source: { subagent: { other: "guardian" } },
+    });
+    expect(shouldSkipRollout(content)).toEqual({
+      skip: true,
+      reason: "source.subagent.other=guardian",
+    });
+  });
+
+  it("thread_source=internal → 跳（memory_consolidation 等）", () => {
+    expect(shouldSkipRollout(meta({ thread_source: "internal", source: "cli" }))).toEqual({
+      skip: true,
+      reason: "thread_source=internal",
+    });
+  });
+
+  it("source.internal 標籤聯合 → 跳", () => {
+    expect(shouldSkipRollout(meta({ source: { internal: { kind: "memory_consolidation" } } }))).toEqual({
+      skip: true,
+      reason: "source.internal",
+    });
+  });
+
+  it("thread_spawn 子 agent → 跳（不混進主列表）", () => {
+    const content = meta({
+      thread_source: "subagent",
+      source: {
+        subagent: {
+          thread_spawn: {
+            parent_thread_id: "019f8de8-de9d-7a63-a40f-7c2119ea34df",
+            depth: 1,
+            agent_path: "/root/inspect",
+            agent_nickname: "Herschel",
+          },
+        },
+      },
+      forked_from_id: "019f8de8-de9d-7a63-a40f-7c2119ea34df",
+    });
+    expect(shouldSkipRollout(content).skip).toBe(true);
+  });
+
+  it("頂層 source.thread_spawn → 跳", () => {
+    expect(shouldSkipRollout(meta({ source: { thread_spawn: { parent_thread_id: "p" } } }))).toEqual({
+      skip: true,
+      reason: "source.thread_spawn",
+    });
+  });
+
+  it("forked_from_id 非空 → 跳（ephemeral fork）", () => {
+    expect(
+      shouldSkipRollout(meta({ thread_source: "user", source: "cli", forked_from_id: "019f-parent" })),
+    ).toEqual({ skip: true, reason: "forked_from_id" });
+  });
+
+  it("forked_from_id 空字串 → 不跳", () => {
+    expect(shouldSkipRollout(meta({ thread_source: "user", source: "cli", forked_from_id: "  " }))).toEqual({
+      skip: false,
+    });
+  });
+});
+
+describe("#789 mirror poll 不投遞內部 rollout", () => {
+  it("guardian rollout：mirror_append 為空、水位推到 EOF、計數 +1", async () => {
+    const { mkdirSync, mkdtempSync, rmSync, writeFileSync, statSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const root = mkdtempSync(join(tmpdir(), "cx-789-"));
+    const prevSessions = process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+    const prevMirror = process.env.MACCHIATO_CODEX_MIRROR;
+    try {
+      process.env.MACCHIATO_CODEX_SESSIONS_DIR = join(root, "sessions");
+      process.env.MACCHIATO_CODEX_MIRROR = join(root, "mirror.json");
+      const tid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee0789";
+      const dir = join(root, "sessions", "2026", "08", "05");
+      mkdirSync(dir, { recursive: true });
+      const file = join(dir, `rollout-2026-08-05T09-26-00-${tid}.jsonl`);
+      const body =
+        [
+          JSON.stringify({
+            type: "session_meta",
+            payload: {
+              cwd: "/Users/xiang/proj",
+              thread_source: "subagent",
+              source: { subagent: { other: "guardian" } },
+            },
+          }),
+          JSON.stringify({
+            type: "event_msg",
+            payload: {
+              type: "user_message",
+              message:
+                "The following is the Codex agent history whose request action you are assessing.\n" +
+                "x".repeat(2000),
+            },
+          }),
+          JSON.stringify({
+            type: "event_msg",
+            payload: {
+              type: "agent_message",
+              message: JSON.stringify({ risk_level: "low", outcome: "allow" }),
+            },
+          }),
+        ].join("\n") + "\n";
+      writeFileSync(file, body);
+      // seeded=true → 新 rollout 會從頭嘗試鏡像；修前會投出 80KB 假 user 消息
+      writeFileSync(process.env.MACCHIATO_CODEX_MIRROR, JSON.stringify({ offsets: {}, ords: {}, seeded: true }));
+
+      const sent: any[] = [];
+      const m: any = new Mirror({
+        agentLinkId: "al",
+        isReady: true,
+        send: (f: unknown) => sent.push(f),
+      } as any);
+      m.pollOnce();
+
+      expect(sent.filter((f) => f.t === "mirror_append")).toHaveLength(0);
+      expect(m.state.offsets[tid]).toBe(statSync(file).size);
+      expect(m.counters.mirrorInternalSkipped).toBe(1);
+
+      // 再 poll 不重複計數、仍不投遞
+      m.pollOnce();
+      expect(sent.filter((f) => f.t === "mirror_append")).toHaveLength(0);
+      expect(m.counters.mirrorInternalSkipped).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      if (prevSessions === undefined) delete process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+      else process.env.MACCHIATO_CODEX_SESSIONS_DIR = prevSessions;
+      if (prevMirror === undefined) delete process.env.MACCHIATO_CODEX_MIRROR;
+      else process.env.MACCHIATO_CODEX_MIRROR = prevMirror;
+    }
+  });
+
+  it("同輪：內部 rollout 跳過、普通 rollout 仍鏡像", async () => {
+    const { mkdirSync, mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const root = mkdtempSync(join(tmpdir(), "cx-789-mix-"));
+    const prevSessions = process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+    const prevMirror = process.env.MACCHIATO_CODEX_MIRROR;
+    try {
+      process.env.MACCHIATO_CODEX_SESSIONS_DIR = join(root, "sessions");
+      process.env.MACCHIATO_CODEX_MIRROR = join(root, "mirror.json");
+      const dir = join(root, "sessions", "2026", "08", "05");
+      mkdirSync(dir, { recursive: true });
+      const gTid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee0790";
+      const uTid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee0791";
+      writeFileSync(
+        join(dir, `rollout-2026-08-05T00-00-00-${gTid}.jsonl`),
+        [
+          JSON.stringify({
+            type: "session_meta",
+            payload: { thread_source: "subagent", source: { subagent: { other: "guardian" } } },
+          }),
+          JSON.stringify({
+            type: "event_msg",
+            payload: { type: "user_message", message: "The following is the Codex agent history…" },
+          }),
+          "",
+        ].join("\n"),
+      );
+      writeFileSync(
+        join(dir, `rollout-2026-08-05T00-00-01-${uTid}.jsonl`),
+        [
+          JSON.stringify({
+            type: "session_meta",
+            payload: { cwd: "/w", thread_source: "user", source: "cli" },
+          }),
+          JSON.stringify({
+            type: "event_msg",
+            payload: { type: "user_message", message: "正常用戶問題" },
+          }),
+          "",
+        ].join("\n"),
+      );
+      writeFileSync(process.env.MACCHIATO_CODEX_MIRROR, JSON.stringify({ offsets: {}, ords: {}, seeded: true }));
+      const sent: any[] = [];
+      const m: any = new Mirror({
+        agentLinkId: "al",
+        isReady: true,
+        send: (f: unknown) => sent.push(f),
+      } as any);
+      m.pollOnce();
+      const batches = sent.filter((f) => f.t === "mirror_append");
+      expect(batches).toHaveLength(1);
+      expect(batches[0].sessions[0].hermesSessionId).toBe(uTid);
+      expect(batches[0].sessions[0].messages[0].text).toBe("正常用戶問題");
+      expect(m.counters.mirrorInternalSkipped).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      if (prevSessions === undefined) delete process.env.MACCHIATO_CODEX_SESSIONS_DIR;
+      else process.env.MACCHIATO_CODEX_SESSIONS_DIR = prevSessions;
+      if (prevMirror === undefined) delete process.env.MACCHIATO_CODEX_MIRROR;
+      else process.env.MACCHIATO_CODEX_MIRROR = prevMirror;
+    }
   });
 });
 

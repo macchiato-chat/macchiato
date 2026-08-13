@@ -107,8 +107,8 @@ Notes:
 - Pairing codes expire (~minutes). Refresh by sending another `pair_request` on the same
   open socket before expiry.
 - Optional QR payload for scanners: `{ "v": 1, "url": "https://api.macchiato.chat", "code": "<code>" }`
-  (or the web origin your app uses for claim). Official connectors print ANSI QR when
-  `qrencode` is available.
+  (or the web origin your app uses for claim). Official connectors print an ANSI QR in the
+  terminal (pure library — no system `qrencode` required).
 
 ### 3.2 Hello (credentials on disk)
 

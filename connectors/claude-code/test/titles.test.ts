@@ -7,7 +7,7 @@ const sdk = vi.hoisted(() => ({
   calls: [] as any[],
   closeCalls: 0,
   reply: '"標題：Scrape 30 Papers"',
-  behavior: "success" as "success" | "empty" | "throw" | "iterator-throw" | "hang",
+  behavior: "success" as "success" | "empty" | "throw" | "iterator-throw" | "hang" | "assistant-only",
   emitToolUse: false,
   cwdEmptyAtQuery: false,
 }));
@@ -30,6 +30,15 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
             if (signal.aborted) fail();
             else signal.addEventListener("abort", fail, { once: true });
           });
+          return;
+        }
+        if (sdk.behavior === "assistant-only") {
+          // #677:只有 assistant 文本、result 空——應從 assistant 收斂標題
+          yield {
+            type: "assistant",
+            message: { content: [{ type: "text", text: "From Assistant Only" }] },
+          };
+          yield { type: "result", subtype: "success", result: "" };
           return;
         }
         if (sdk.emitToolUse) yield { type: "assistant", message: { content: [{ type: "tool_use", name: "Bash" }] } };
@@ -117,7 +126,7 @@ describe("generateTitle", () => {
     expect(sdk.calls).toHaveLength(0);
   });
 
-  it("summary 禁用工具、隔離 cwd/設定;#590 標題固定輕量檔 haiku(可 env 覆蓋),不帶 effort", async () => {
+  it("summary 禁用工具、隔離 cwd/設定;#590 標題固定輕量檔 haiku(可 env 覆蓋),不帶 effort;#677 env=sdkEnv + thinking off", async () => {
     vi.useFakeTimers();
     process.env.MACCHIATO_CC_TITLE_MODE = "summary";
     const canonicalConfig = join(testTmp, "canonical-config");
@@ -148,7 +157,12 @@ describe("generateTitle", () => {
     expect(options.plugins).toEqual([]);
     expect(options.model).toBe("haiku"); // #590:標題輕量檔;env MACCHIATO_CC_TITLE_MODEL 可換
     expect(options).not.toHaveProperty("effort"); // Brian 拍板不帶(haiku 不宣告 effort 檔位)
-    expect(options).not.toHaveProperty("env");
+    expect(options.thinking).toEqual({ type: "disabled" }); // #677:標題一行字不燒 reasoning
+    // #677:與主通道一致走 sdkEnv——展開 process.env + 聲明 macchiato entrypoint
+    expect(options.env).toBeDefined();
+    expect(options.env.PATH).toBe(process.env.PATH);
+    expect(options.env.HOME).toBe(process.env.HOME);
+    expect(options.env.CLAUDE_CODE_ENTRYPOINT).toBe("macchiato");
     expect(options.cwd).not.toBe(process.cwd());
     expect(options.cwd).not.toBe(canonicalConfig);
     expect(options.cwd.startsWith(testTmp)).toBe(true);
@@ -159,6 +173,14 @@ describe("generateTitle", () => {
     expect(options.abortController.signal.aborted).toBe(false);
     await vi.advanceTimersByTimeAsync(20_000);
     expect(options.abortController.signal.aborted).toBe(false);
+  });
+
+  it("#677 result 空時從 assistant 文本收斂標題", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "summary";
+    sdk.behavior = "assistant-only";
+    const { generateTitle } = await fresh();
+    expect(await generateTitle("任意首條")).toBe("From Assistant Only");
+    expect(sdk.closeCalls).toBe(1);
   });
 
   it("summary 同步/迭代失敗與空結果都安全回退，並清掉臨時 cwd", async () => {

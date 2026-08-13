@@ -528,3 +528,56 @@ describe("#230 codex 權限 → sandbox", () => {
     expect(sandboxOf(spawnArgs[0]!)).toBe("workspace-write");
   });
 });
+
+describe("#895 回合看門狗(exec)", () => {
+  it("子進程掛住(無事件無 close)→ stall 後強制 interrupted + 清 active + 人話提示", async () => {
+    process.env.MACCHIATO_CODEX_TURN_STALL_MS = "50";
+    vi.useFakeTimers();
+    try {
+      const { d, linkb, sent } = makeDrive();
+      await linkb.deliver(tui("prompt.submit", SID, { text: "會卡住" }));
+      expect((d as any).active.has(SID)).toBe(true);
+      expect(procs).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(80);
+      expect(procs[0]!.killed).toContain("SIGTERM");
+      const cs = completes(sent);
+      expect(cs).toHaveLength(1);
+      expect(cs[0].status).toBe("interrupted");
+      expect(sent.some((f) => JSON.stringify(f).includes("卡死"))).toBe(true);
+      expect((d as any).active.has(SID)).toBe(false);
+      expect((d as any).pending.has(SID)).toBe(false);
+      vi.useRealTimers();
+      // 後續 prompt 不再靜默排隊——可立刻起新回合
+      await linkb.deliver(tui("prompt.submit", SID, { text: "重試" }));
+      expect(procs).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+      delete process.env.MACCHIATO_CODEX_TURN_STALL_MS;
+    }
+  });
+
+  it("有 JSONL 事件續期 → 不誤殺", async () => {
+    process.env.MACCHIATO_CODEX_TURN_STALL_MS = "100";
+    vi.useFakeTimers();
+    try {
+      const { d, linkb, sent } = makeDrive();
+      await linkb.deliver(tui("prompt.submit", SID, { text: "慢但活着" }));
+      const proc = procs[0]!;
+      for (let i = 0; i < 3; i++) {
+        await vi.advanceTimersByTimeAsync(60);
+        proc.stdout.emit(
+          "data",
+          Buffer.from(`${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: `chunk${i}` } })}\n`),
+        );
+      }
+      expect((d as any).active.has(SID)).toBe(true);
+      expect(completes(sent)).toHaveLength(0);
+      proc.emit("close", 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(completes(sent)[0].status).toBe("complete");
+    } finally {
+      vi.useRealTimers();
+      delete process.env.MACCHIATO_CODEX_TURN_STALL_MS;
+    }
+  });
+});

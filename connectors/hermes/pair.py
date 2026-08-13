@@ -8,7 +8,8 @@ Flow:
   3. server pushes a long-lived connector_token back over THIS socket (plaintext once)
      → saved to ~/.macchiato/connector.json
 
-The socket must stay open until you claim, so this script waits (≈ the 8-min code TTL).
+The socket must stay open until you claim. #832：server 碼 TTL 20 分鐘；本腳本按
+expiresAt 在過期前自動 pair_request 換新並重打終端 QR（純庫，不依賴 qrencode）。
 
 Run with the Hermes venv python (has `websockets`):
   MACCHIATO_SERVER_URL=wss://api.macchiato.chat/connector \
@@ -22,10 +23,12 @@ import json
 import os
 import secrets
 import socket
-import subprocess
 import sys
+import time
 
 import websockets
+
+from qr_terminal import print_qr_terminal
 
 SERVER_URL = os.environ.get("MACCHIATO_SERVER_URL", "wss://api.macchiato.chat/connector")
 WEB_URL = os.environ.get("MACCHIATO_WEB_URL", "https://macchiato.chat")
@@ -37,7 +40,10 @@ CRED_PATH = os.path.expanduser(os.environ.get("MACCHIATO_CRED") or os.path.join(
 CODE_FILE = os.path.expanduser(os.environ.get("MACCHIATO_CODE_FILE") or os.path.join(STATE_DIR, "pair-code.txt"))
 PROTO = 5  # 對齊 server 的 LINK_B_PROTO（packages/protocol）；不符會被拒 "proto mismatch"
 WAIT_S = 30 * 60  # overall pairing window (we refresh the code well within the server TTL)
-REFRESH_S = 6 * 60 + 30  # re-request a fresh code before the server's 8-min code TTL
+# #832 沒拿到 expiresAt 時的兜底（server TTL 20min，留 90s 餘量）
+_FALLBACK_REFRESH_S = 18 * 60 + 30
+_REFRESH_BEFORE_EXPIRY_S = 90
+_MIN_REFRESH_S = 30
 
 
 def _write_private(path: str, content: str) -> None:
@@ -101,7 +107,31 @@ _PAIR_GROUP = os.environ.get("MACCHIATO_PAIR_GROUP", "").strip() or _PAIR_WHO
 _PAIR_BATCH = os.environ.get("MACCHIATO_PAIR_BATCH", "").strip()
 
 
-def _show_code(code: str, fresh: bool, device_auth_secret: str) -> None:
+def _refresh_delay_s(expires_at_iso: str | None, now: float | None = None) -> float:
+    """#832 按 server expiresAt 算下次 pair_request 延遲（過期前 90s 換新）。
+
+    ⚠️ 上限鉗到 _FALLBACK_REFRESH_S：expires_at 是 server 的**絕對**時間，這裡拿它跟本機
+    時鐘相減。剛裝好的機器 / VM 時鐘慢一小時是常事——不鉗的話會算出「78 分鐘後再換」，
+    可碼 20 分鐘就死了，中間用戶掃到的全是死碼。
+    """
+    now = time.time() if now is None else now
+    if expires_at_iso:
+        try:
+            # ISO-8601 UTC from server, e.g. 2026-08-10T12:00:00.000Z
+            exp = expires_at_iso.replace("Z", "+00:00")
+            from datetime import datetime
+
+            exp_ts = datetime.fromisoformat(exp).timestamp()
+            delay = exp_ts - now - _REFRESH_BEFORE_EXPIRY_S
+            if delay >= _MIN_REFRESH_S:
+                return float(min(delay, _FALLBACK_REFRESH_S))
+            return float(_MIN_REFRESH_S)
+        except Exception:
+            pass
+    return float(_FALLBACK_REFRESH_S)
+
+
+def _show_code(code: str, fresh: bool, device_auth_secret: str, expires_at_iso: str | None = None) -> None:
     token = _format_pairing_token(code, device_auth_secret)
     try:
         # #254 0600 私有；#731 寫完整 token（含 secret），便於本機腳本讀取。
@@ -113,51 +143,74 @@ def _show_code(code: str, fresh: bool, device_auth_secret: str) -> None:
     # ⚠️ 回歸契約:scripts/regression/*、scripts/localchain/run.mjs 與 run-folders-e2e.mjs 斷言
     # 「>>> <純數字碼> <<<」(folders-e2e 還靠上行「code」字樣定位)——這一行**只准放數字**。
     print(f"        >>>  {code}  <<<")
+    if expires_at_iso:
+        try:
+            exp = expires_at_iso.replace("Z", "+00:00")
+            from datetime import datetime
+
+            # 同 _refresh_delay_s：本機時鐘可能偏，封頂到「最晚也會自動換碼」的那個時刻，
+            # 別報出「Expires in ~80 min」這種讓人放心離開一小時的假數字。
+            remain_s = min(
+                datetime.fromisoformat(exp).timestamp() - time.time(),
+                _FALLBACK_REFRESH_S + _REFRESH_BEFORE_EXPIRY_S,
+            )
+            remain_min = max(1, round(remain_s / 60))
+            print(f"  Expires in ~{remain_min} min (a new code will appear automatically before then).")
+        except Exception:
+            pass
     print(f"  Sign in at {WEB_URL} → \"Pair connector\" → enter this code.")
     # #731 secret 不進配對碼(見 connector-core/linkb/pairing.ts 的說明);想開 E2E 才需要這行。
     print("\n  Optional — end-to-end encryption device key (iOS only; scanning the QR covers this):")
     print(f"        {device_auth_secret}")
     if _PAIR_BATCH and os.environ.get("MACCHIATO_PAIR_BATCH_MANY"):
         print("  Other agents from this install will pair automatically with this code.")
-    # #388 終端 QR(可選增強):qrencode 在則打 ANSI 碼(iOS 掃碼配對直接掃終端);缺失靜默跳過
-    # #731 QR 帶完整 token（含 e2eAuth）
-    try:
-        qr = subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "2", token], capture_output=True, text=True, timeout=3)
-        if qr.returncode == 0 and qr.stdout:
-            print("\n" + qr.stdout + "  (scan with the Macchiato iOS app)")
-    except Exception:
-        pass
+    # #832 終端 QR：純庫渲染（不依賴 qrencode）。#731 帶完整 token（含 e2eAuth）。
+    print_qr_terminal(token)
     print("=" * 54 + "\nWaiting for you to claim it…", flush=True)
 
 
 async def _attempt(label: str, fresh: bool, device_auth_secret: str) -> str:
-    """一次配對嘗試（連接保活 + 定期換新碼防 server 8-min TTL 過期）。
+    """一次配對嘗試（連接保活 + 按 expiresAt 換新碼）。
     返回 'paired' / 'auth_error'；連接斷開則拋 ConnectionClosed 讓外層重連。"""
     async with websockets.connect(
         SERVER_URL, open_timeout=20, ping_interval=15, ping_timeout=None, close_timeout=10
     ) as ws:
 
-        async def refresher() -> None:
-            while True:
-                await asyncio.sleep(REFRESH_S)
-                await ws.send(json.dumps({
-            "t": "pair_request", "proto": PROTO, "label": label, "kind": "hermes",
-            **({"batch": _PAIR_BATCH} if _PAIR_BATCH else {}),
-        }))
+        async def send_pair() -> None:
+            await ws.send(json.dumps({
+                "t": "pair_request", "proto": PROTO, "label": label, "kind": "hermes",
+                **({"batch": _PAIR_BATCH} if _PAIR_BATCH else {}),
+            }))
 
-        await ws.send(json.dumps({
-            "t": "pair_request", "proto": PROTO, "label": label, "kind": "hermes",
-            **({"batch": _PAIR_BATCH} if _PAIR_BATCH else {}),
-        }))
+        refresh_task: asyncio.Task | None = None
+
+        async def schedule_refresh(expires_at_iso: str | None) -> None:
+            nonlocal refresh_task
+            if refresh_task is not None:
+                refresh_task.cancel()
+                try:
+                    await refresh_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            async def _fire() -> None:
+                delay = _refresh_delay_s(expires_at_iso)
+                await asyncio.sleep(delay)
+                await send_pair()
+
+            refresh_task = asyncio.create_task(_fire())
+
+        await send_pair()
         seen_first = False
-        ref = asyncio.create_task(refresher())
         try:
             async for raw in ws:
                 msg = json.loads(raw)
                 t = msg.get("t")
                 if t == "pair_pending":
-                    _show_code(msg.get("code", ""), fresh or seen_first, device_auth_secret)
+                    exp = msg.get("expiresAt")
+                    _show_code(msg.get("code", ""), fresh or seen_first, device_auth_secret, exp)
                     seen_first = True
+                    await schedule_refresh(exp if isinstance(exp, str) else None)
                 elif t == "auth_error":
                     print(f"FAIL: {msg.get('reason')}", file=sys.stderr)
                     return "auth_error"
@@ -176,7 +229,12 @@ async def _attempt(label: str, fresh: bool, device_auth_secret: str) -> str:
                     print(f"  Credentials saved to {CRED_PATH} (connector_token shown in plaintext only this once).")
                     return "paired"
         finally:
-            ref.cancel()
+            if refresh_task is not None:
+                refresh_task.cancel()
+                try:
+                    await refresh_task
+                except (asyncio.CancelledError, Exception):
+                    pass
         raise websockets.exceptions.ConnectionClosed(None, None)
 
 

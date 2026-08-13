@@ -2,7 +2,7 @@
 export const LINK_B_PROTO = 5;
 
 /** Connector release version (mirrors packages/protocol CONNECTOR_VERSION; sync-public 再生,永不漂移). */
-export const CONNECTOR_VERSION = "1.5.72";
+export const CONNECTOR_VERSION = "1.5.79";
 
 /** #199 一條 agent 命令/技能(連接器上報 {t:"commands"};鏡像 packages/protocol CommandInfo,字段只增不改)。 */
 export interface CommandInfo {
@@ -37,6 +37,8 @@ export interface ConnectorHealthState {
   compat?: Record<string, true | string>;
   lastError?: string | null;
   connectorVersion?: string;
+  /** #768 安裝目錄(磁盤)版本;磁盤 > 進程 = 已裝待重啟。缺省 = 舊連接器不報。 */
+  installedVersion?: string;
   kind?: string;
   authOk?: boolean;
   stt?: boolean;

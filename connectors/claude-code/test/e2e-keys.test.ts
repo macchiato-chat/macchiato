@@ -186,6 +186,48 @@ describe("E2EKeyStore（fail-closed 持鑰/封裝/加解密/持久化）", () =>
     expect(store.isE2E("pending")).toBe(true);
   });
 
+  it("#818 pending-enable 被权威省略 → 按权威收敛丢钥（不 quarantine 死循环）", () => {
+    const store = new E2EKeyStore(path);
+    store.applyServerState({
+      version: 1,
+      disabledReceipts: [],
+      sessions: [{ hermesSessionId: "aborted", pendingOp: "enable" }],
+    });
+    store.createForEnable("aborted");
+    expect(store.hasKey("aborted")).toBe(true);
+    expect(store.isPendingEnable("aborted")).toBe(true);
+
+    // server abortIncompleteE2EEnable 后 ready 省略该 session
+    expect(store.applyServerState({ version: 1, sessions: [], disabledReceipts: [] })).toEqual([]);
+    expect(store.hasKey("aborted")).toBe(false);
+    expect(store.isE2E("aborted")).toBe(false);
+    expect(store.isPendingEnable("aborted")).toBe(false);
+  });
+
+  it("#818 abortIncompleteEnable live 帧只收敛 pending-enable；stable 拒绝", () => {
+    const store = new E2EKeyStore(path);
+    store.applyServerState({
+      version: 1,
+      disabledReceipts: [],
+      sessions: [{ hermesSessionId: "live", pendingOp: "enable" }],
+    });
+    store.createForEnable("live");
+    expect(store.abortIncompleteEnable("live")).toBe(true);
+    expect(store.hasKey("live")).toBe(false);
+    expect(store.isE2E("live")).toBe(false);
+
+    // stable：完成 enable 后 abort 必须拒绝
+    store.applyServerState({
+      version: 1,
+      disabledReceipts: [],
+      sessions: [{ hermesSessionId: "stable", pendingOp: "enable" }],
+    });
+    store.createForEnable("stable");
+    store.markEnableComplete("stable");
+    expect(store.abortIncompleteEnable("stable")).toBe(false);
+    expect(store.hasKey("stable")).toBe(true);
+  });
+
   it.each([
     ["enabled", null],
     ["pending-disable", "disable"],
@@ -310,19 +352,21 @@ describe("E2EKeyStore（fail-closed 持鑰/封裝/加解密/持久化）", () =>
     expect(readSnapshot(backup)).toEqual(readSnapshot(path));
   });
 
-  it("旧 K1 的 pending-disable 遇 pending-enable：无 R1 拒绝，有 matching R1 才删 K1 后生成 K2", () => {
+  it("旧 K1 的 pending-disable 遇 pending-enable：无 R1 隔离该 sid，有 matching R1 才删 K1 后生成 K2", () => {
     const store = new E2EKeyStore(path);
     const k1 = store.createForEnable("d1");
     store.markServerE2E("d1", "disable");
     store.beginDisable("d1", disableIntent("d1", k1));
-    expect(() =>
+    expect(
       store.applyServerState({
         version: 1,
         sessions: [{ hermesSessionId: "d1", pendingOp: "enable" }],
         disabledReceipts: [],
       }),
-    ).toThrow(/拒绝复用旧 K_S/);
-    expect(store.requireKey("d1").equals(k1)).toBe(true);
+    ).toEqual(["d1"]);
+    expect(store.hasKey("d1")).toBe(true);
+    expect(store.hasPendingDisable("d1")).toBe(true);
+    expect(() => store.requireKey("d1")).toThrow(/quarantine/);
 
     const receipt = store.disableReceiptForBackfill("d1");
     expect(

@@ -108,7 +108,8 @@ const E2E_SENSITIVE_METHODS = new Set([
 /**
  * Link B ready 的 E2E 身份閘門。pending-enable 的 bootstrap control 一定排在 ready 後：
  * 僅准該快照中的 sid 暫缺 mirror fileId，以便收到 backfill 後用 gateway 權威 sessionId 補圖。
- * drive identity、mirror state trust、stable/disable 的 fileId 都不得豁免；內容面另走 strict assert。
+ * drive identity、mirror state trust、stable/disable 的 fileId 都不得豁免；但單一身份檔異常只隔離
+ * 內容面，不能把整條 Link B 殺進重啟循環。mirror/import/drive 副作用仍各自走 strict assert。
  */
 export function applyReadyE2EIdentityState(
   e2e: E2EKeyStore,
@@ -125,8 +126,19 @@ export function applyReadyE2EIdentityState(
       .filter((session) => session.pendingOp === "enable")
       .map((session) => session.hermesSessionId),
   );
-  drive.assertE2EIdentitySafe();
-  mirror.assertE2EIdentitySafe(pendingEnables);
+  try {
+    drive.assertE2EIdentitySafe();
+    mirror.assertE2EIdentitySafe(pendingEnables);
+  } catch (error) {
+    // #817：身份狀態壞掉時，內容面本來就會 fail closed；ready 再 throw 只會讓 supervisor
+    // 重啟後命中同一份持久壞狀態，整個 agent 永久 Offline。保持 Link B 在線，讓健康會話、
+    // self_update 與用戶處置入口仍可用；受影響內容路徑由各自 strict assert 精確隔離。
+    console.error(
+      `[E2E identity] ready continuing with isolation — ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
   return blocked;
 }
 
@@ -360,9 +372,19 @@ export class Drive {
     );
   }
 
-  /** E2E wire ULID 必須能由持久 driven key 精確還原大小寫；否則禁止整個內容面 ready。 */
-  assertE2EIdentitySafe(): void {
-    const requiringMap = this.protectedWireSids().filter((sid) => !sid.startsWith("agent:"));
+  /**
+   * 壞/缺 driven key↔wire ULID 身份快照時拒絕「當明文處理」的路徑。
+   *
+   * `allowMissingSids` 只給 **pending-enable bootstrap**（#687 / 對齊 CC）：
+   * App 建的會話 wire 是 ULID，在首次 markDriven 之前 map 本來就是空的——開啟加密時
+   * 若此處硬 throw，index 會 `onFatal` 殺進程；`beginEnable` 已落盤 → 重連 ready 再 assert
+   * → 永久 Offline（Unlink 重配也救不了，因為 e2e keystore 按 kind 持久、不隨 agentLink 清）。
+   * 內容面（mirror/import/live）仍走無參 strict assert；此白名單不得用於穩定態 E2E 會話。
+   */
+  assertE2EIdentitySafe(allowMissingSids: ReadonlySet<string> = new Set()): void {
+    const requiringMap = this.protectedWireSids().filter(
+      (sid) => !sid.startsWith("agent:") && !allowMissingSids.has(sid),
+    );
     if (!requiringMap.length) return;
     const missing = requiringMap.filter((sid) => this.drivenPersist[keyForSid(sid)] !== sid);
     if (!this.identityStateTrusted || missing.length) {
@@ -407,7 +429,15 @@ export class Drive {
     });
     this.gw.onEvent((e) => this.onGatewayEvent(e));
     // #202 重連後對賬 + #242 回合態重置(斷連窗內 lifecycle end 可能已丟)。
-    this.gw.onConnected?.(() => void this.onGatewayConnected());
+    // #893 補 .catch:今天它 await 的三件(subscribeSessionEvents / reconcileAll / flushFollowUps)
+    // 逐項都有 try/catch、跑不出來,但那是「靠每個被調者自覺」——而本回調觸發的時刻恰好是 gateway
+    // 正在抖,是最不該有崩潰路徑的一刻。日後誰在 onGatewayConnected 裡加一個沒守住的 await,
+    // 這一行就是唯一的攔網。
+    this.gw.onConnected?.(() =>
+      void this.onGatewayConnected().catch((e) =>
+        console.error(`[gateway reconnect 對賬失敗] ${(e as Error).message}`),
+      ),
+    );
     // #302 gateway 死亡:在途回合立即定稿 error(否則 server 永卡 streaming,用戶氣泡轉圈無終態)。
     this.gw.onDisconnected?.(() => this.onGatewayDisconnected());
   }
@@ -769,15 +799,20 @@ export class Drive {
               });
             }
           }
-          // #60 真支持:非 audio 附件(圖片/文件)下載 → base64 → chat.send 的 attachments
+          // #60 真支持:非 audio 附件(圖片/文件/視頻)下載 → base64 → chat.send 的 attachments
           // 參數(gateway 原生收,落 agent 工作區/圖片走視覺,默認 20MB 上限)。
           // 單個失敗不擋正文,失敗的才發降級回執(E2E 跳過明文行——同舊)。
+          // #859 視頻同樣走這條；gateway 上限 20MB，超限那條會進 failed 回執。
           const media = atts.filter((a) => a?.kind && a.kind !== "audio");
           const chatAtts: ChatAttachment[] = [];
           let failed = 0;
+          let hasVideo = false;
           for (const a of media) {
             try {
               chatAtts.push(await fetchChatAttachment(a as Record<string, unknown>));
+              const kind = String((a as { kind?: string }).kind ?? "");
+              const mime = String((a as { mime?: string }).mime ?? "");
+              if (kind === "video" || mime.toLowerCase().startsWith("video/")) hasVideo = true;
             } catch (e) {
               failed += 1;
               console.error(`[#60 attachment ${String((a as any).name ?? (a as any).id)} failed] ${(e as Error).message}`);
@@ -810,6 +845,13 @@ export class Drive {
             this.titled.add(sid);
             saveTitled(this.titled);
             void this.autoTitle(sid, text);
+          }
+          // #859 視頻：gateway 落工作區後 agent 可能只看到文件名——補一句 ffmpeg 提示。
+          // 放在標題判定之後(樣板提示不進 autoTitle 素材)、E2E 解密之後(不往密文上貼明文)。
+          if (hasVideo && chatAtts.length) {
+            const tip =
+              "[Macchiato: 本消息含視頻附件，已落 agent 工作區。模型通常不能直接讀視頻，可用 ffmpeg 抽幀後查看，例如: ffmpeg -i <path> -vf fps=1/5 frame_%03d.jpg]";
+            text = text ? `${text}\n\n${tip}` : tip;
           }
           await this.sendPrompt(key, sid, text, chatAtts);
           return;

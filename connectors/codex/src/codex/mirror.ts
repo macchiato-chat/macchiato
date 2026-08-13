@@ -28,7 +28,15 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { LinkBClient } from "../_core/linkb/client";
 import type { E2EKeyStore } from "../_core/e2e/keys";
-import { messagesWithTurns, nextOrdAtEof, readNewMessages, sessionsRoot, type CodexMessage } from "./transcripts";
+import {
+  messagesWithTurns,
+  nextOrdAtEof,
+  readNewMessages,
+  readRolloutPreamble,
+  readRolloutTail,
+  sessionsRoot,
+  type CodexMessage,
+} from "./transcripts";
 
 /**
  * 鏡像狀態檔的耐久寫（0600 + fsync + 原子 rename + 目錄 fsync）。
@@ -150,6 +158,65 @@ export function deriveMeta(content: string): { title: string; cwd?: string } {
   return { title: title || "Codex", cwd };
 }
 
+/**
+ * #789: Codex 內部 thread 不得鏡像成用戶可見會話。
+ *
+ * 真實 rollout 的 `session_meta.payload` 有結構化來源字段（本機 ~1300 條樣本驗證）：
+ *   - `thread_source`: `"user"` | `"subagent"`（未來可能有 `"internal"`）
+ *   - `source`: 字串（`"vscode"` / `"cli"` / `"exec"`）或標籤聯合
+ *       `{ subagent: { other: "guardian" } }`  ← guardian review（審批風險評估）
+ *       `{ subagent: { thread_spawn: {…} } }` ← 子 agent
+ *   - `forked_from_id`: 非空 = ephemeral fork
+ *
+ * 策略（fail-open：字段不存在 → 不跳，舊 Codex 不回歸）：
+ *   - `thread_source` ∈ {internal, subagent} → 跳
+ *   - `source` 物件帶 `internal` / `subagent` / `thread_spawn` 標籤 → 跳
+ *   - `forked_from_id` 非空字串 → 跳
+ *
+ * 只掃 `session_meta` 行；整會話級別跳過（guardian 本就自成 thread，整檔只有評估轉儲）。
+ */
+export function shouldSkipRollout(content: string): { skip: boolean; reason?: string } {
+  for (const line of content.split("\n")) {
+    const s = line.trim();
+    if (!s) continue;
+    let o: { type?: string; payload?: Record<string, unknown> } & Record<string, unknown>;
+    try {
+      o = JSON.parse(s);
+    } catch {
+      continue;
+    }
+    if (o.type !== "session_meta") continue;
+    const p = (o.payload ?? o) as Record<string, unknown>;
+
+    const threadSource = p.thread_source;
+    if (threadSource === "internal") return { skip: true, reason: "thread_source=internal" };
+    if (threadSource === "subagent") return { skip: true, reason: "thread_source=subagent" };
+
+    const source = p.source;
+    if (source && typeof source === "object" && !Array.isArray(source)) {
+      const tags = source as Record<string, unknown>;
+      if ("internal" in tags) return { skip: true, reason: "source.internal" };
+      if ("subagent" in tags) {
+        const sub = tags.subagent;
+        if (sub && typeof sub === "object" && !Array.isArray(sub) && (sub as Record<string, unknown>).other === "guardian") {
+          return { skip: true, reason: "source.subagent.other=guardian" };
+        }
+        return { skip: true, reason: "source.subagent" };
+      }
+      if ("thread_spawn" in tags) return { skip: true, reason: "source.thread_spawn" };
+    }
+
+    const forked = p.forked_from_id;
+    if (typeof forked === "string" && forked.trim()) {
+      return { skip: true, reason: "forked_from_id" };
+    }
+
+    // 已見過 session_meta 且沒有內部標記 → 用戶會話
+    return { skip: false };
+  }
+  return { skip: false };
+}
+
 /** §9 去重身份:rollout 行無 uuid → 內容指紋(role+text+ord 的 sha256 前綴),確定性、逐字節穩定。 */
 export function srcIdFor(threadId: string, m: CodexMessage): string {
   return createHash("sha256").update(`${threadId} ${m.role} ${m.ord} ${m.text}`).digest("hex").slice(0, 24);
@@ -185,10 +252,18 @@ interface State {
   >;
 }
 
+interface RolloutMetadata {
+  title: string;
+  cwd?: string;
+  skip: { skip: boolean; reason?: string };
+}
+
 export class Mirror {
   private state: State;
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly drivenIds = new Set<string>();
+  /** title/cwd/internal 判據只來自 rollout 頭部；每個活躍文件在進程內最多掃一次。 */
+  private readonly rolloutMetadata = new Map<string, RolloutMetadata>();
   /**
    * 影子兜底(對齊 CC mirror 的 `drivenUuids`,2026-07-12 事故同款):**曾被 Macchiato 驅動過**的
    * 本地 thread uuid(由 Drive 從 wire→local 映射灌入,跨重啟)。這些 thread 的正文由 live 在 wire
@@ -225,6 +300,7 @@ export class Mirror {
     mirrorGhostBlocked: 0, // 攔下的「為 driven thread 憑空建明文會話」次數(正常應恆 0)
     mirrorDirectionRewinds: 0, // E2E 方向翻轉導致丟棄凍結批、回退重編的次數
     mirrorDropped: 0, // server 判畸形/毒批而丟棄跳過的批次數(非 0 = 有內容沒進 app)
+    mirrorInternalSkipped: 0, // #789: guardian / subagent / fork 等內部 rollout 被整檔跳過的次數
   };
   private polling = false;
 
@@ -241,6 +317,21 @@ export class Mirror {
     private readonly plaintextLocalAllowed?: () => boolean,
   ) {
     this.state = this.load();
+  }
+
+  private metadataFor(file: string): RolloutMetadata {
+    const cached = this.rolloutMetadata.get(file);
+    if (cached) return cached;
+    const preamble = readRolloutPreamble(file);
+    const metadata = {
+      ...deriveMeta(preamble.content),
+      skip: shouldSkipRollout(preamble.content),
+    };
+    // 空 rollout 之後可能才出現首條 user message；標題尚未確定時不把 Codex fallback 鎖死。
+    if (preamble.hasUserMessage || metadata.skip.skip) {
+      this.rolloutMetadata.set(file, metadata);
+    }
+    return metadata;
   }
 
   /** #161 墓碑:永不再鏡像此 thread(持久;rollout 不動)。 */
@@ -712,28 +803,53 @@ export class Mirror {
         continue;
       }
       this.ghostAt.delete(threadId);
-      // #262 stat-first:非 driven 且水位線已到檔末 → 跳過,不 readFileSync。每 5s 對每個未變
-      // rollout 全量重讀是 Pi 上的主要開銷(CC 鏡像早已 stat-first);driven/首基線仍讀。
-      const off0 = this.state.offsets[threadId];
-      if (!this.drivenIds.has(threadId) && off0 !== undefined) {
+      if (this.drivenIds.has(threadId)) {
+        // #350 driven 内容必须先进入 durable outbox；poll 只让路，绝不读檔或预推水位。
+        continue;
+      }
+
+      const off = this.state.offsets[threadId];
+      const startOff = off ?? 0;
+      let content: string | Buffer;
+      let endOffset: number;
+      let metadata: RolloutMetadata;
+
+      if (off === undefined) {
+        // 首次見到的 rollout 仍需從 0 建基線或投遞；只有已有 per-thread 水位的活躍檔走尾讀。
+        let fullContent: string;
         try {
-          if (statSync(file).size <= off0) continue;
+          fullContent = readFileSync(file, "utf8");
+        } catch {
+          continue;
+        }
+        content = fullContent;
+        endOffset = Buffer.byteLength(fullContent, "utf8");
+        metadata = this.metadataFor(file);
+      } else {
+        try {
+          const tail = readRolloutTail(file, off);
+          if (!tail.content.length) continue;
+          content = tail.content;
+          endOffset = tail.endOffset;
+          metadata = this.metadataFor(file);
         } catch {
           continue;
         }
       }
-      let content: string;
-      try {
-        content = readFileSync(file, "utf8");
-      } catch {
+
+      // #789:內部 thread 只消費本輪新增尾部，不建用戶會話。它的正文不投遞，
+      // 因此可直接把 byte/ord 水位推到本次 snapshot EOF。
+      if (metadata.skip.skip) {
+        this.state.offsets[threadId] = endOffset;
+        this.state.ords[threadId] =
+          (this.state.ords[threadId] ?? 0) + nextOrdAtEof(content);
+        this.counters.mirrorInternalSkipped += 1;
+        console.log(
+          `· #789 skip internal rollout ${threadId} (${metadata.skip.reason}; mirrorInternalSkipped=${this.counters.mirrorInternalSkipped})`,
+        );
         continue;
       }
-      const size = Buffer.byteLength(content, "utf8");
-      const off = this.state.offsets[threadId];
-      if (this.drivenIds.has(threadId)) {
-        // #350 driven 内容必须先进入 durable outbox；poll 只让路，绝不预推水位。
-        continue;
-      }
+
       if (off === undefined) {
         // #236:`seeded` 持久化(對齊 CC #154)——首掃把存量會話基線到檔末(歷史走「導入」,
         // 避免裝上/重啟即全量回灌);首掃**成功走完**之後新出現的 rollout(終端新開的會話,
@@ -742,19 +858,21 @@ export class Mirror {
         // 定向輪詢的目標是 app 自己建的 driven thread → 一律 from-zero（`seeded` 在 MIRROR=off
         // 下可能從未置過，按它走會把本 thread 誤基線到檔末、正文永遠不投）。
         if (!this.state.seeded && !scope) {
-          this.state.offsets[threadId] = size;
+          this.state.offsets[threadId] = endOffset;
           // #418:與 readNewMessages 的「下一完整行 ord」對齊；split("\n").length 尾 \n 恒多 1。
           this.state.ords[threadId] = nextOrdAtEof(content);
           continue;
         }
       }
-      const startOff = off ?? 0;
-      if (size <= startOff) continue;
       const ordBase = this.state.ords[threadId] ?? 0;
-      const all = readNewMessages(content, startOff, ordBase);
+      const relativeAll = readNewMessages(content, 0, ordBase);
+      const all = {
+        ...relativeAll,
+        newOffset: startOff + relativeAll.newOffset,
+      };
       const { messages } = all;
       if (messages.length) {
-        const { title, cwd } = deriveMeta(content); // #659 文件夾：rollout 的 session_meta.cwd
+        const { title, cwd } = metadata; // #659 文件夾：rollout 的 session_meta.cwd
         const folder = cwd?.trim() ? { cwd: cwd.trim() } : {};
         // app-driven E2E 的 key/session identity 掛在 wire ULID，rollout 則以本地 UUID 命名。
         // unsetDriven 後 terminal 續聊必須仍回到 wire session 並用 wire key 加密，不能另建
@@ -802,7 +920,11 @@ export class Mirror {
         const batchId = randomUUID();
         while (lo <= hi) {
           const take = Math.floor((lo + hi) / 2);
-          const partial = readNewMessages(content, startOff, ordBase, take);
+          const relative = readNewMessages(content, 0, ordBase, take);
+          const partial = {
+            ...relative,
+            newOffset: startOff + relative.newOffset,
+          };
           const frame = {
             t: "mirror_append",
             agentLinkId: this.linkb.agentLinkId,

@@ -1,5 +1,13 @@
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { nextOrdAtEof, readNewMessages } from "../src/codex/transcripts";
+import {
+  nextOrdAtEof,
+  readNewMessages,
+  readRolloutPreamble,
+  readRolloutTail,
+} from "../src/codex/transcripts";
 
 const meta = (cwd: string) => JSON.stringify({ type: "session_meta", payload: { cwd, session_id: "x" } });
 const userMsg = (t: string) => JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: t } });
@@ -44,5 +52,80 @@ describe("codex rollout 解析", () => {
     expect(withTrail.split("\n").length).toBe(nextOrdAtEof(withTrail) + 1);
     expect(nextOrdAtEof("")).toBe(0);
     expect(nextOrdAtEof("no-nl")).toBe(0);
+  });
+});
+
+describe("#889 rollout 尾部窗口", () => {
+  it("已有水位時只返回 offset 後的新增字節，ord 仍以 thread 全文水位續接", () => {
+    const root = mkdtempSync(join(tmpdir(), "codex-tail-"));
+    const file = join(root, "rollout.jsonl");
+    try {
+      const history =
+        meta("/tmp") + "\n"
+        + Array.from({ length: 2_000 }, (_, i) => respItem(`歷史-${i}`)).join("\n")
+        + "\n";
+      const tail = userMsg("新增問題") + "\n" + agentMsg("新增回答") + "\n";
+      writeFileSync(file, history + tail);
+
+      const offset = Buffer.byteLength(history, "utf8");
+      const window = readRolloutTail(file, offset);
+      expect(window.content.toString("utf8")).toBe(tail);
+      expect(window.content.length).toBe(Buffer.byteLength(tail, "utf8"));
+      expect(window.endOffset).toBe(offset + Buffer.byteLength(tail, "utf8"));
+
+      const parsed = readNewMessages(window.content, 0, 2_001);
+      expect(parsed.messages.map((message) => [message.text, message.ord])).toEqual([
+        ["新增問題", 2_001],
+        ["新增回答", 2_002],
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("末尾半行不推进水位，补齐后从同一 offset 完整读出 UTF-8 消息", () => {
+    const root = mkdtempSync(join(tmpdir(), "codex-tail-partial-"));
+    const file = join(root, "rollout.jsonl");
+    try {
+      const history = meta("/tmp") + "\n";
+      const partial = '{"type":"event_msg","payload":{"type":"user_message","message":"你';
+      writeFileSync(file, history + partial);
+      const offset = Buffer.byteLength(history, "utf8");
+
+      const first = readRolloutTail(file, offset);
+      expect(readNewMessages(first.content, 0, 1)).toMatchObject({
+        messages: [],
+        newOffset: 0,
+        lineCount: 0,
+      });
+
+      appendFileSync(file, '好"}}\n');
+      const second = readRolloutTail(file, offset);
+      const parsed = readNewMessages(second.content, 0, 1);
+      expect(parsed.messages.map((message) => message.text)).toEqual(["你好"]);
+      expect(offset + parsed.newOffset).toBe(second.endOffset);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("头部 metadata 流式提取后不携带后续历史正文", () => {
+    const root = mkdtempSync(join(tmpdir(), "codex-preamble-"));
+    const file = join(root, "rollout.jsonl");
+    try {
+      const sessionMeta = meta("/repo");
+      const firstUser = userMsg("首条问题");
+      writeFileSync(
+        file,
+        `${sessionMeta}\n${firstUser}\n${agentMsg("x".repeat(200_000))}\n`,
+      );
+      const preamble = readRolloutPreamble(file);
+      expect(preamble.hasUserMessage).toBe(true);
+      expect(preamble.content).toContain(sessionMeta);
+      expect(preamble.content).toContain(firstUser);
+      expect(preamble.content).not.toContain("x".repeat(1_000));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

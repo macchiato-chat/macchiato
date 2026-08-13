@@ -89,6 +89,15 @@ function sandboxMode(): string {
   return "workspace-write";
 }
 
+/** #895 回合看門狗:回合內連續**無任何 JSONL 事件**達此毫秒數 → 判定卡死、強制收尾。
+ * 活動式(每個事件續期)故不誤殺長回合。默認 30min(對齊 CC #253 / server INGEST_STREAM_TTL_MS);
+ * env MACCHIATO_CODEX_TURN_STALL_MS 可調(0=關)。 */
+function turnStallMs(): number {
+  const v = Number(process.env.MACCHIATO_CODEX_TURN_STALL_MS);
+  if (Number.isFinite(v) && v >= 0) return v;
+  return 30 * 60_000;
+}
+
 /**
  * #153 工具卡取實料(活測 2026-07-14 形狀:command_execution 帶 command/aggregated_output/exit_code/status)。
  * 按 item 子類型填 args/result/error;未知類型回退整個 item(去大字段)——別再恆 {}。
@@ -146,6 +155,10 @@ interface Turn {
   isE2E: boolean;
   isFirstMacchiatoTurn: boolean;
   toolItems: Map<string, { name: string }>;
+  /** #895 看門狗:最近一次 JSONL 事件時刻。 */
+  lastActivityAt: number;
+  /** #895 看門狗 timer。 */
+  watchdog?: ReturnType<typeof setTimeout>;
 }
 
 export class Drive {
@@ -324,7 +337,61 @@ export class Drive {
   }
 
   dispose(): void {
-    for (const t of this.active.values()) t.proc.kill("SIGTERM");
+    for (const t of this.active.values()) {
+      this.clearTurnWatchdog(t);
+      t.proc.kill("SIGTERM");
+    }
+  }
+
+  /**
+   * #895 回合看門狗:回合在途但連續無任何 JSONL 事件達 turnStallMs → 判定卡死。
+   * 子進程掛住(不 close、不吐事件)時 active 永久卡住 → 後續 prompt 只進隊、server 30min
+   * stream GC 後停止鍵消失 = 靜默黑洞。活動式(每事件續期)故不誤殺長回合。
+   */
+  private armTurnWatchdog(sid: string, turn: Turn): void {
+    this.clearTurnWatchdog(turn);
+    const stall = turnStallMs();
+    if (!stall) return; // 0=關
+    const due = turn.lastActivityAt + stall - Date.now();
+    turn.watchdog = setTimeout(() => {
+      turn.watchdog = undefined;
+      if (turn.completed || this.active.get(sid) !== turn) return;
+      if (Date.now() - turn.lastActivityAt < stall) {
+        this.armTurnWatchdog(sid, turn);
+        return;
+      }
+      this.forceFinalizeStuck(sid, turn, stall);
+    }, Math.max(due, 25));
+    turn.watchdog.unref?.();
+  }
+
+  private clearTurnWatchdog(turn: Turn): void {
+    if (turn.watchdog) {
+      clearTimeout(turn.watchdog);
+      turn.watchdog = undefined;
+    }
+  }
+
+  /** #895 卡死回合強制收尾:kill + 定稿 interrupted + 人話提示(即使 close 永不來也清 active)。 */
+  private forceFinalizeStuck(sid: string, turn: Turn, stall: number): void {
+    this.clearTurnWatchdog(turn);
+    if (turn.completed) return;
+    console.error(
+      `[turn watchdog] ${sid} 回合 ${Math.round(stall / 1000)}s 無任何事件 → 判定卡死,強制中斷`,
+    );
+    this.interruptedSids.add(sid);
+    if (!turn.isE2E) {
+      this.emit(sid, "review.summary", {
+        summary: "⚠️ 回合長時間無響應，已判定卡死並中斷——請重試。",
+      });
+    }
+    try {
+      turn.proc.kill("SIGTERM");
+    } catch {
+      /* 進程已死也照收尾 */
+    }
+    // 子進程若連 close 都不發,仍必須清 active——否則後續 prompt 繼續靜默排隊。
+    this.finishTurn(sid, turn, null, "turn stall watchdog");
   }
 
   private emit(sid: string, type: string, payload: Record<string, unknown>): void {
@@ -574,7 +641,16 @@ export class Drive {
             if (!a?.url) continue;
             try {
               const p = await materializeAttachment(a);
-              attachNotes.push(`[Macchiato 附件 ${a.name ?? "file"}(${a.mime ?? "?"})已保存到:${p}]`);
+              // #859 視頻：路徑注入 + ffmpeg 抽幀提示（exec 無原生媒體通道）。
+              const mime = String(a.mime ?? "?");
+              const kind = String(a.kind ?? "");
+              if (kind === "video" || mime.toLowerCase().startsWith("video/")) {
+                attachNotes.push(
+                  `[Macchiato 視頻 ${a.name ?? "file"}(${mime})已保存到:${p}。模型通常不能直接讀視頻，可用 ffmpeg 抽幀後查看，例如: ffmpeg -i ${p} -vf fps=1/5 frame_%03d.jpg]`,
+                );
+              } else {
+                attachNotes.push(`[Macchiato 附件 ${a.name ?? "file"}(${mime})已保存到:${p}]`);
+              }
             } catch (e) {
               console.error(`[attachment failed for ${sid}] ${(e as Error).message}`);
               if (!this.e2e?.isE2E(sid)) {
@@ -738,10 +814,12 @@ export class Drive {
       isE2E,
       isFirstMacchiatoTurn,
       toolItems: new Map(),
+      lastActivityAt: Date.now(), // #895
     };
     this.active.set(sid, turn);
     this.pending.add(sid); // #200
     this.saveMap();
+    this.armTurnWatchdog(sid, turn); // #895
 
     proc.stdout!.on("data", (chunk: Buffer) => {
       turn.stdoutBuf += chunk.toString("utf8");
@@ -771,6 +849,7 @@ export class Drive {
     } catch {
       return; // 非 JSON 行(如 "Reading additional input…")跳過
     }
+    turn.lastActivityAt = Date.now(); // #895 看門狗續期:有事件 = 沒卡
     switch (ev.type) {
       case "thread.started": {
         const tid = String(ev.thread_id ?? "");
@@ -847,6 +926,7 @@ export class Drive {
   private finishTurn(sid: string, turn: Turn, code: number | null, stderr: string): void {
     if (turn.completed) return;
     turn.completed = true;
+    this.clearTurnWatchdog(turn); // #895
     this.active.delete(sid);
     this.pending.delete(sid); // #200
     this.saveMap();

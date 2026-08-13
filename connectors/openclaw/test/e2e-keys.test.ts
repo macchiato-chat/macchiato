@@ -313,19 +313,21 @@ describe("E2EKeyStore（持鑰/封裝/加解密/持久化）", () => {
     expect(persisted.d1).toBeUndefined();
   });
 
-  it("旧 K1 的 pending-disable 遇 pending-enable：无 R1 拒绝，有 matching R1 才删 K1 后生成 K2", () => {
+  it("旧 K1 的 pending-disable 遇 pending-enable：无 R1 隔离该 sid，有 matching R1 才删 K1 后生成 K2", () => {
     const s = new E2EKeyStore(path);
     const k1 = s.createForEnable("d1");
     s.markServerE2E("d1", "disable");
     s.beginDisable("d1", disableIntent("d1", k1));
-    expect(() =>
+    expect(
       s.applyServerState({
         version: 1,
         sessions: [{ hermesSessionId: "d1", pendingOp: "enable" }],
         disabledReceipts: [],
       }),
-    ).toThrow(/拒绝复用旧 K_S/);
-    expect(s.requireKey("d1").equals(k1)).toBe(true);
+    ).toEqual(["d1"]);
+    expect(s.hasKey("d1")).toBe(true);
+    expect(s.hasPendingDisable("d1")).toBe(true);
+    expect(() => s.requireKey("d1")).toThrow(/quarantine/);
 
     const receipt = s.disableReceiptForBackfill("d1");
     expect(

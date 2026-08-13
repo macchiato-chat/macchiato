@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { announceImportAvailable, runImport } from "../src/codex/history-import";
+import { announceImportAvailable, collectImportSessions, runImport } from "../src/codex/history-import";
 import { Drive } from "../src/codex/drive";
 
 const E2E_SID = "11111111-1111-4111-8111-111111111111";
@@ -53,6 +53,40 @@ describe("#347 history import E2E wire boundary", () => {
     (drive as any).map[E2E_WIRE_SID] = E2E_SID;
     return drive.localSessionE2EStatus();
   }
+
+  it("#789 guardian / subagent rollout 不進歷史導入", () => {
+    const guardianSid = "33333333-3333-4333-8333-333333333333";
+    writeRollout(PLAIN_SID, "/plain-project", "普通问题");
+    const dir = join(root, "2026", "07", "23");
+    writeFileSync(
+      join(dir, `rollout-2026-07-23T00-00-01-${guardianSid}.jsonl`),
+      [
+        JSON.stringify({
+          type: "session_meta",
+          payload: {
+            cwd: "/plain-project",
+            thread_source: "subagent",
+            source: { subagent: { other: "guardian" } },
+          },
+        }),
+        JSON.stringify({
+          type: "event_msg",
+          payload: {
+            type: "user_message",
+            message: "The following is the Codex agent history whose request action you are assessing.",
+          },
+        }),
+        JSON.stringify({
+          type: "event_msg",
+          payload: { type: "agent_message", message: '{"outcome":"allow"}' },
+        }),
+        "",
+      ].join("\n"),
+    );
+    const { built } = collectImportSessions();
+    expect(built.map((s) => s.hermesSessionId)).toEqual([PLAIN_SID]);
+    expect(JSON.stringify(built)).not.toContain("Codex agent history");
+  });
 
   it("混合批剔除 E2E session，普通 session 与 announce 计数保留", () => {
     writeRollout(E2E_SID, "/secret-project", "绝密问题");

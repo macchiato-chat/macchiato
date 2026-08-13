@@ -20,6 +20,7 @@ import { Drive, workDir } from "./cc/drive";
 import { LoginFlow } from "./cc/login";
 import { HealthLoop } from "./health";
 import { HeartbeatWriter } from "./_core/heartbeat";
+import { installProcessFaultHandlers } from "./_core/runtime-faults";
 import { CONNECTOR_VERSION } from "./linkb/proto";
 import { runVerifiedSelfUpdate } from "./_core/selfupdate";
 import { KIND } from "./identity";
@@ -234,7 +235,15 @@ async function main(): Promise<void> {
     ) {
       mirror.handleAck(msg.batchId);
     }
-    else if (msg.t === "import_start") runImport(linkb, localE2EStatus(), Array.isArray(msg.projects) ? (msg.projects as string[]) : undefined); // #154 可按 project 過濾
+    else if (msg.t === "import_start") {
+      // #154 可按 project 過濾。#874 枚舉拋錯會被 onFrame 靜默吞掉（app 那邊只看見「正在導入」乾轉）——
+      // 至少在連接器日誌裡響一聲；狀態由 server 的殭屍導入回收兜住。
+      try {
+        runImport(linkb, localE2EStatus(), Array.isArray(msg.projects) ? (msg.projects as string[]) : undefined);
+      } catch (e) {
+        console.error(`[#874 歷史導入失敗] ${(e as Error).message}`);
+      }
+    }
     else if (msg.t === "self_update") runSelfUpdate();
     else if (msg.t === "auth_login_start") login.start(loginEvents);
     else if (msg.t === "auth_login_code" && typeof msg.code === "string") login.submitCode(msg.code);
@@ -329,6 +338,13 @@ async function main(): Promise<void> {
       } else if (msg.mode === "disable" && msg.ok === false) {
         // found:false/明确拒绝且 receipt 尚未释放：撤销旧 intent，保留 K_S，允许设备重新签请求。
         e2e.cancelDisableBeforeRelease(sid);
+      } else if (msg.mode === "enable" && msg.ok === false && msg.e2e === false) {
+        // #818：server 已回滚 pending-enable（found:false 等）→ 按权威收敛丢钥。
+        if (e2e.abortIncompleteEnable(sid)) {
+          linkb.unblockSession(sid);
+          accepted = true;
+          console.log(`· E2E enable aborted by server: ${sid} — K_S dropped, plaintext resumed`);
+        }
       }
       mirror.handleE2EBackfillResult(sid, msg.mode, msg.batchId, accepted);
       drive.releaseE2EQuiesce(sid, msg.mode);
@@ -336,6 +352,21 @@ async function main(): Promise<void> {
         console.error(
           `· E2E backfill rejected/inconsistent: ${sid} mode=${msg.mode} ` +
             `ok=${String(msg.ok)} e2e=${String(msg.e2e)} (${String(msg.error ?? "unknown")})`,
+        );
+      }
+    } else if (
+      msg.t === "e2e_enable_aborted" &&
+      typeof msg.hermesSessionId === "string"
+    ) {
+      // #818 live 路径：client abort / 设备授权全拒 等把 DB 翻回明文后的权威通知。
+      const sid = msg.hermesSessionId;
+      if (e2e.abortIncompleteEnable(sid)) {
+        linkb.unblockSession(sid);
+        drive.releaseE2EQuiesce(sid, "enable");
+        console.log(`· E2E enable aborted (live): ${sid} — K_S dropped, plaintext resumed`);
+      } else {
+        console.error(
+          `· E2E enable_aborted ignored for ${sid}（非 pending-enable，fail-closed 保留 K_S）`,
         );
       }
     }
@@ -355,6 +386,9 @@ async function main(): Promise<void> {
     pendingApproval: drive?.hasPendingApproval ?? false,
   }));
   heartbeat.start();
+  // #893 進程級故障地板:掛在心跳之後(此刻才有東西可落盤)、linkb.start() 之前。
+  // 啟動段本身由文件末尾的 main().catch 兜住,故這裡不必更早。
+  installProcessFaultHandlers({ flushHealth: () => heartbeat.writeNow() });
 
   await linkb.start();
 

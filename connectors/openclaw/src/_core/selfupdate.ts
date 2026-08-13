@@ -11,6 +11,7 @@ import { mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from 
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { spawn } from "node:child_process";
+import { noteInstalledVersionOnDisk, readAppTreeConnectorVersion } from "./disk-version";
 
 /** 發布簽名公鑰(ed25519 raw 32B hex;私鑰在發布機 ~/.macchiato/release-signing.key)。 */
 export const RELEASE_PUBKEY_HEX = "48d741eac2364340cfbd14502eac7506f8babcd4ce502775e831abcd1ed0f105";
@@ -23,6 +24,8 @@ const MAX_SIGNATURE_BYTES = 1024;
 const MAX_INSTALL_BYTES = 2 * 1024 * 1024;
 let selfUpdateHandedOff = false;
 let selfUpdatePendingRestart: string | null = null;
+/** #791 真失敗原因(驗簽/非升級/裝失敗…);health 併入 lastError,client 超時 toast 用。 */
+let selfUpdateFailure: string | null = null;
 
 /**
  * #773 installer 退出 0 之後再等這麼久;到點本進程還活着 ＝ 重啟沒把它換掉 → 放開交棒閂。
@@ -36,10 +39,11 @@ let selfUpdatePendingRestart: string | null = null;
  * **N 為什麼取 45s**:
  *  - 下界(不能更小):閂的本意是防並發/重放安裝,清早了會同時跑兩個 installer,比本 bug 更糟。
  *    真重啟路徑上本進程幾乎不可能活到 45s:systemd 的 `systemctl --user restart` 是**阻塞**的
- *    (stop 完成才返回),所以 installer 退出時舊進程早已死透;launchd 的 `kickstart -k` 發完
- *    SIGTERM 就返回,本進程再優雅退出也是秒級。45s 遠在這兩條之上。
- *  - 上界(不能更大):app 側「正在更新…」的看門狗是 90s,到點提示「更新失敗/重試」。N 必須
- *    明顯小於它,用戶那一下重試才真的能再裝一次,而不是又撞在閂上。
+ *    (stop 完成才返回),所以 installer 退出時舊進程早已死透;launchd 的 bootout/bootstrap
+ *    也是秒級換進程。45s 遠在這兩條之上。
+ *  - 上界(不能更大):app 側「正在更新…」的看門狗(#791 起 180s)必須明顯大於 N,用戶那一下
+ *    重試才真的能再裝一次,而不是又撞在閂上;也要留給下載/安裝本身(bridge→artifact→npm)
+ *    的時間——90s 在慢網上幾乎必假失敗。
  *  - 計時**從 installer 退出算起,不是從 spawn 算起**——下載/安裝本身可能很久,從 spawn 起算
  *    等於在 installer 還在跑的時候放閂。
  *
@@ -49,15 +53,34 @@ export const SELF_UPDATE_RESTART_GRACE_MS =
   Number(process.env.MACCHIATO_SELF_UPDATE_RESTART_GRACE_MS) || 45_000;
 
 /**
- * #773 「新版已裝好、但本進程沒被換掉」的一句人話,由 health 併入 `lastError` 上報。
+ * #773/#791 「新版已裝好、但本進程沒被換掉」的一句人話,由 health 併入 `lastError` 上報。
  *
  * 🚨 **絕不是「更新失敗」**:非 systemd(手動跑)的連接器本來就是「只更新文件、下次重啟生效」,
  * 那是**正常**路徑;說成失敗就是撒謊。這條只說事實 + 下一步(重啟)。`lastError` 不參與
  * server 的 degraded 判定(registry.ts 的 healthFromState 只看 gatewayAlive/compatOk/
  * mirrorStuck/authOk),所以拿它當信息位不會誤亮黃燈。
+ *
+ * #791:裝成功**當下**就掛「等待重啟」(不是等 grace 才掛)——client 90~180s 看門狗期間
+ * 就能讀到真狀態,不會只剩一句空白「重試」。grace 到點若進程仍在,改成「重啟後生效」並放閂。
  */
 export function selfUpdatePendingRestartNotice(): string | null {
   return selfUpdatePendingRestart;
+}
+
+/**
+ * #791 自更新**真失敗**原因(驗簽不過 / 拒絕非升級 / installer 非 0…)。
+ * health 併入 lastError 時排在 pending-restart 之前——失敗永遠壓過信息位。
+ */
+export function selfUpdateFailureNotice(): string | null {
+  return selfUpdateFailure;
+}
+
+/**
+ * health 用的自更新狀態串:真失敗優先,其次「已裝好等重啟」。
+ * 真 gateway/鏡像錯誤仍由各家 health 自己排在更前面。
+ */
+export function selfUpdateStatusNotice(): string | null {
+  return selfUpdateFailure ?? selfUpdatePendingRestart;
 }
 
 /** 交棒閂當前狀態:true ＝ 本進程已放出一個 installer,拒絕第二個(防並發/重放安裝)。 */
@@ -72,6 +95,9 @@ export function isSelfUpdateHandedOff(): boolean {
 export function acquireSelfUpdateHandoff(): boolean {
   if (selfUpdateHandedOff) return false;
   selfUpdateHandedOff = true;
+  // 新一輪更新開始:清掉上一輪的失敗/等待文案,避免 health 一直掛舊話。
+  selfUpdateFailure = null;
+  selfUpdatePendingRestart = null;
   return true;
 }
 
@@ -80,27 +106,91 @@ export function releaseSelfUpdateHandoff(): void {
   selfUpdateHandedOff = false;
 }
 
+/** 記錄一條可上報的自更新失敗原因(不放閂——由調用方決定何時放)。 */
+export function noteSelfUpdateFailure(message: string): void {
+  const text = message.trim();
+  if (!text) return;
+  // 截斷:health 是觀測面,別讓超長 stderr 灌爆 fanout。
+  selfUpdateFailure = text.length > 240 ? `${text.slice(0, 237)}…` : text;
+  selfUpdatePendingRestart = null;
+}
+
 /** 重置本模塊的交棒狀態。生產路徑不需要(閂與通知天生跟着進程走),單測用它隔離用例。 */
 export function resetSelfUpdateState(): void {
   selfUpdateHandedOff = false;
   selfUpdatePendingRestart = null;
+  selfUpdateFailure = null;
 }
 
 /**
- * installer 進程退出後的收尾(#773)。
- *  - 退出**非 0**(裝失敗):立刻放閂,用戶點重試就能真的再裝一次(既有行為,原樣保留)。
- *  - 退出**0**(裝成功):**不立刻**放閂——正常情況下服務重啟會把本進程殺掉,閂跟着進程一起消失。
- *    等 graceMs 後本進程還活着,才說明重啟沒生效 → 放閂 + 掛一句「已下載,重啟後生效」。
+ * installer 進程退出後的收尾(#773 / #791 / #888)。
+ *  - 退出**非 0**(裝失敗):立刻放閂 + 掛失敗原因,用戶點重試就能真的再裝一次。
+ *  - 退出 0 但**安裝樹沒動**(#888):同樣按失敗處理——見下方 `installedOnDisk` 的注釋。
+ *  - 退出**0** 且磁盤真的換代:**不立刻**放閂——正常情況下服務重啟會把本進程殺掉,閂跟着進程一起消失。
+ *    **立刻**掛「等待重啟」信息位(#791:別等 grace 才說話);graceMs 後本進程還活着,
+ *    才說明重啟沒生效 → 放閂 + 改成「重啟後生效」。
  */
 export function handleInstallerExit(
   code: number | null,
   version: string,
   graceMs: number = SELF_UPDATE_RESTART_GRACE_MS,
+  /** #768 寫入 installed-version-<kind> 標記，供 health 判「磁盤 > 進程」。 */
+  kind?: string,
+  /** #888 安裝樹根(單測注入);缺省 = 該 kind 的標準佈局。 */
+  appRoot?: string,
 ): void {
   if (code !== 0) {
     releaseSelfUpdateHandoff();
+    noteSelfUpdateFailure(
+      `更新安裝失敗(退出碼 ${code ?? "null"})，可重試；若反复失敗請在終端重跑安裝命令`,
+    );
+    console.error(`[self_update failed] installer exit ${code}`);
     return;
   }
+  /**
+   * #888 **退出碼不是憑據,磁盤才是。**
+   *
+   * 實踩:install.sh 的信任橋在 macOS 的 /bin/bash 3.2 上因空數組展開半路死掉,而它的
+   * EXIT trap 把退出碼洗成了 0。於是這裡「退 0 ＝ 裝好了」的假設整整三週都在說謊——
+   * 五台 Mac 卡在同一版本,app 卻顯示「更新已安裝，等待重啟」,重啟毫無作用;更糟的是
+   * 那條假 mark 文件寫下去就**永不失效**(readDiskConnectorVersion 優先讀它),用戶只能
+   * 手工刪文件才能脫困。
+   *
+   * 所以退 0 之後再問一次安裝樹自己的版本(繞開 mark,否則是自證):
+   *  - 樹已 ≥ 目標版 → 真裝上了,照 #773/#791 走「等重啟」。
+   *  - 樹還是舊版   → installer 沒幹活,**當失敗報**:放閂(用戶點重試能真的再裝一次)、
+   *                   說人話、且**絕不**寫 mark(不留永久假狀態)。
+   *  - 讀不到樹(開發 monorepo / 非標準佈局) → 不知道。保留 #773/#791 的既有行為,
+   *    但同樣不寫 mark:那是唯一會**卡死**的副作用,拿不準時不許留下它。
+   */
+  // 本函數跑在 child 的 'exit' 事件裡——這裡拋異常 = 掀掉整個連接器進程。讀盤與版本比較
+  // 一律兜住:兜不住時退回「不知道」,絕不因為一次讀盤失敗把連接器帶走。
+  let installedOnDisk: string | null = null;
+  let treeIsStale = false;
+  try {
+    installedOnDisk = kind ? readAppTreeConnectorVersion(kind, appRoot) : null;
+    treeIsStale = !!installedOnDisk && semverLt(installedOnDisk, version);
+  } catch {
+    installedOnDisk = null;
+    treeIsStale = false;
+  }
+  if (treeIsStale) {
+    releaseSelfUpdateHandoff();
+    noteSelfUpdateFailure(
+      `更新沒有真正安裝:安裝程序報成功，但磁盤上仍是 v${installedOnDisk}(目標 v${version})。` +
+        "可重試；若反复如此請在終端重跑安裝命令",
+    );
+    console.error(
+      `[self_update failed] installer exit 0 但安裝樹仍是 v${installedOnDisk}(目標 v${version})——不寫 installed-version 標記`,
+    );
+    return;
+  }
+  // #768:磁盤已是新版——先於 health tick 寫標記，client 可立刻看到 pendingRestart。
+  // #888:只有「樹確實換代了」才寫;讀不到樹時寧可不寫(假標記無法自愈)。
+  if (kind && installedOnDisk) noteInstalledVersionOnDisk(kind, version);
+  // #791:裝成功當下就讓 health 能說出「在等重啟」——client 不必乾等到 grace/看門狗。
+  selfUpdateFailure = null;
+  selfUpdatePendingRestart = `更新已安裝(v${version})，等待連接器重啟…`;
   const timer: unknown = setTimeout(() => {
     releaseSelfUpdateHandoff();
     selfUpdatePendingRestart = `更新已下載(v${version}),重啟連接器後生效`;
@@ -617,7 +707,11 @@ async function fetchBytes(url: string, maximum: number): Promise<Buffer> {
  * MACCHIATO_MANIFEST 傳入,install.sh 對每個安裝文件再驗 sha256。
  */
 export async function runVerifiedSelfUpdate(kind: string, currentVersion: string): Promise<void> {
-  if (!acquireSelfUpdateHandoff()) throw new Error("self_update 已在本进程启动，拒绝并发/重放安装");
+  if (!acquireSelfUpdateHandoff()) {
+    // 並發/重放:不覆蓋已有的 pending-restart / failure 文案——用戶看到的應是「為什麼第一次沒換代」
+    // 而不是「已在本進程啟動」這種內部話。
+    throw new Error("self_update 已在本进程启动，拒绝并发/重放安装");
+  }
   let spawned = false;
   try {
     const [manifestBytes, sigB64] = await Promise.all([
@@ -644,13 +738,18 @@ export async function runVerifiedSelfUpdate(kind: string, currentVersion: string
       detached: true,
       stdio: "ignore",
     });
-    child.once("error", () => {
+    child.once("error", (err) => {
       releaseSelfUpdateHandoff();
+      noteSelfUpdateFailure(`更新安裝無法啟動: ${err.message}`);
     });
     // #773 計時從 **installer 退出** 算起(不是 spawn),見 handleInstallerExit 的注釋。
-    child.once("exit", (code) => handleInstallerExit(code, m.version));
+    child.once("exit", (code) => handleInstallerExit(code, m.version, SELF_UPDATE_RESTART_GRACE_MS, kind));
     child.unref();
     spawned = true;
+  } catch (err) {
+    // #791:驗簽/非升級/下載失敗 → 寫進 health,client 才能 toast 真原因,而不是空白「重試」。
+    noteSelfUpdateFailure(`更新失敗: ${(err as Error).message}`);
+    throw err;
   } finally {
     // 成功交棒后本进程不再发第二个 installer（#773 起有一个例外：installer 退 0 但本进程
     // 没被重启替换 → 宽限期后放闩，否则更新按钮永久锁死）；下载/验签失败则允许安全重试。

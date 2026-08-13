@@ -1123,3 +1123,75 @@ describe("#377 cwd 限定與校驗(fail closed)", () => {
     delete process.env.MACCHIATO_CODEX_WORKDIR;
   });
 });
+
+describe("#895 回合看門狗(app-server)", () => {
+  it("無 turn/completed 且無通知 → stall 後 interrupted + 清 active + best-effort interrupt", async () => {
+    process.env.MACCHIATO_CODEX_TURN_STALL_MS = "50";
+    vi.useFakeTimers();
+    try {
+      const { d, client, linkb, sent } = make();
+      await linkb.deliver(tui("prompt.submit", SID, { text: "會卡住" }));
+      client.fire("turn/started", { threadId: TID, turn: { id: "t-stall" } });
+      expect((d as any).active.has(SID)).toBe(true);
+      await vi.advanceTimersByTimeAsync(80);
+      expect(client.requests.some((r) => r.method === "turn/interrupt")).toBe(true);
+      const evs = events(sent);
+      expect(evs.some((e) => e.type === "message.complete" && e.payload.status === "interrupted")).toBe(true);
+      expect(evs.some((e) => e.type === "review.summary" && String(e.payload.summary).includes("卡死"))).toBe(true);
+      expect((d as any).active.has(SID)).toBe(false);
+      const before = sent.length;
+      client.fire("turn/completed", { threadId: TID, turn: { id: "t-stall", status: "interrupted" } });
+      expect(sent.length).toBe(before);
+      vi.useRealTimers();
+      client.queueResponse("thread/resume", { thread: { id: TID } });
+      await linkb.deliver(tui("prompt.submit", SID, { text: "重試" }));
+      expect(client.requests.filter((r) => r.method === "turn/start").length).toBeGreaterThanOrEqual(2);
+    } finally {
+      vi.useRealTimers();
+      delete process.env.MACCHIATO_CODEX_TURN_STALL_MS;
+    }
+  });
+
+  it("通知續期 → 不誤殺", async () => {
+    process.env.MACCHIATO_CODEX_TURN_STALL_MS = "100";
+    vi.useFakeTimers();
+    try {
+      const { d, client, linkb, sent } = make();
+      await linkb.deliver(tui("prompt.submit", SID, { text: "慢但活着" }));
+      client.fire("turn/started", { threadId: TID, turn: { id: "t-live" } });
+      for (let i = 0; i < 3; i++) {
+        await vi.advanceTimersByTimeAsync(60);
+        client.fire("item/agentMessage/delta", { threadId: TID, itemId: "m1", delta: `x${i}` });
+      }
+      expect((d as any).active.has(SID)).toBe(true);
+      expect(events(sent).some((e) => e.type === "message.complete")).toBe(false);
+      client.fire("turn/completed", { threadId: TID, turn: { status: "completed" } });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(events(sent).find((e) => e.type === "message.complete")!.payload.status).toBe("complete");
+    } finally {
+      vi.useRealTimers();
+      delete process.env.MACCHIATO_CODEX_TURN_STALL_MS;
+    }
+  });
+
+  it("掛起審批豁免看門狗", async () => {
+    process.env.MACCHIATO_CODEX_TURN_STALL_MS = "50";
+    vi.useFakeTimers();
+    try {
+      const { d, client, linkb, sent } = make();
+      await linkb.deliver(tui("prompt.submit", SID, { text: "要審批" }));
+      client.fire("turn/started", { threadId: TID, turn: { id: "t-appr" } });
+      (d as any).approvals.set(SID, [{ id: "req1", resolve: () => {} }]);
+      await vi.advanceTimersByTimeAsync(120); // 遠超 stall,但審批掛起 → 豁免
+      expect((d as any).active.has(SID)).toBe(true);
+      expect(events(sent).some((e) => e.type === "message.complete")).toBe(false);
+      (d as any).approvals.delete(SID);
+      client.fire("turn/completed", { threadId: TID, turn: { status: "completed" } });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(events(sent).find((e) => e.type === "message.complete")!.payload.status).toBe("complete");
+    } finally {
+      vi.useRealTimers();
+      delete process.env.MACCHIATO_CODEX_TURN_STALL_MS;
+    }
+  });
+});
