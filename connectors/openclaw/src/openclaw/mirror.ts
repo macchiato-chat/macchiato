@@ -24,7 +24,10 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { LinkBClient } from "../_core/linkb/client";
+import { ThreadRegistry } from "../_core/threads/registry";
+import type { ThreadOrigin } from "../linkb/proto";
 import type { OpenClawGateway } from "./gateway";
+import { isHiddenOrigin, parseSessionOrigin, toThreadOrigin, type SessionOrigin } from "./origin";
 import type { E2EKeyStore } from "../_core/e2e/keys";
 
 const POLL_MS = Number(process.env.MACCHIATO_OPENCLAW_POLL_MS) || 5000;
@@ -128,6 +131,13 @@ export function sidForKey(key: string): string {
 function statePath(): string {
   return process.env.MACCHIATO_OPENCLAW_MIRROR || join(homedir(), ".macchiato/openclaw-mirror.json");
 }
+/**
+ * ⚠️ 已知邊界（#949，刻意不在本刀擴大範圍）：這裡**寫死了 `agents/main/sessions`**，其它 agent
+ * 目錄（`agents/<agentId>/sessions`）完全不看。gateway `sessions.list` 返回的是**合併後**的全 agent
+ * 列表，所以非 main agent 的行拿得到 key/sessionId，卻在這個目錄下找不到 .jsonl → 靜默跳過。
+ * 後果不是重複，而是**非 main agent 的活完全不可見**。要支持多 agent 目錄需要按 key 的 agentId
+ * 分別解析 store 路徑（上游 `resolveStoredSessionKeyForAgentStore`），另開 issue 再做。
+ */
 function sessionsDir(): string {
   return join(process.env.OPENCLAW_STATE_DIR || join(homedir(), ".openclaw"), "agents/main/sessions");
 }
@@ -319,11 +329,13 @@ export function isCommittedE2EBackfillResult(
 }
 
 /**
- * cron 會話（key 含 `:cron:`）：OpenClaw 已把 cron 輸出**插入 deliver target 的聊天記錄**, 
- * 單獨鏡像/導入會重複 → 跳過（與 Hermes 的 §16 cron feed 不同, OpenClaw 不需要合成 feed）。
+ * cron 會話（key 形如 `agent:<id>:cron:…`）：OpenClaw 已把 cron 輸出**插入 deliver target 的聊天
+ * 記錄**, 單獨鏡像/導入會重複 → 跳過（與 Hermes 的 §16 cron feed 不同, OpenClaw 不需要合成 feed）。
+ * ⚠️ #949 起判據統一搬到 `origin.ts`（連同子 agent / hook / node / heartbeat 一起判）；這裡保留
+ * 薄封裝只為向後兼容既有調用點的語義描述，新代碼一律用 `parseSessionOrigin`。
  */
 export function isCronSession(key: string | undefined): boolean {
-  return /:cron:/.test(key || "");
+  return parseSessionOrigin({ key }).reason === "cron";
 }
 
 /** 從 offset 起讀新內容, 按整行解析（剩半行留到下次）。返回消息 + 新 offset。
@@ -393,6 +405,11 @@ interface State {
    * #347 E2E identity aliases：同一 key 歷代所有 transcript sessionId。
    * fileIds 只代表當前檔；rotation 覆蓋後舊 .jsonl 仍留在磁碟，history import 只看 local UUID，
    * 故舊 UUID 也必須永久保留在保護集合。缺此字段的舊 schema 不可宣告 E2E identity 完整。
+   *
+   * ⚠️ #968 起這兩個字段是 `ThreadRegistry`（`connector-core/threads/registry`）的**落盤投影**，
+   * 內存真源在 registry。**磁盤格式一個字節都沒動**——連接器會自更新、也會在 15 分鐘試用期內
+   * 自動回退到舊版本，換 schema 等於讓回退後的舊版本讀不到 `fileIds` → identity 不可信 →
+   * E2E 全凍結。投影是**并集**（只增不刪，I3），所以任何路徑都不可能把既有別名寫沒。
    */
   fileIdAliases?: Record<string, string[]>;
   /**
@@ -418,8 +435,23 @@ export class Mirror {
   private state: State;
   /** key↔本地 transcript 身份只在主 mirror state 完整解析時可信。 */
   private identityStateTrusted = false;
+  /**
+   * #968 別名歷史的內存真源 —— `connector-core` 的公共 `ThreadRegistry`（#950 就是照 openclaw
+   * 這套抽出去的）。對話 id = gateway key（openclaw 的身份錨，永不輪換），歷代線程 =
+   * `[key, ...transcript sessionId]`，於是 `wireIdentityOf(key) === key`（I2）、
+   * `aliasesFor(localSid)` 首位就是 key —— 正是 K_S 的鍵。
+   */
+  private registry: ThreadRegistry;
+  /**
+   * registry 拒收過某條記錄（I1：同一 transcript 掛到兩個 key —— OpenClaw 改過 key 才可能出現）。
+   * 一旦為 false 就**持久** false：我們已經不能證明「一條 thread 恰好屬於一段對話」，
+   * 別名歷史按不可信處理（fail-closed），但**磁盤上的別名一條都不刪**。
+   */
+  private aliasHistorySound = true;
   /** 歷代 local UUID registry 只有新 schema 主檔可證明完整；舊 schema/backup 不得靠普通 save 自升。 */
-  private aliasHistoryTrusted = false;
+  private get aliasHistoryTrusted(): boolean {
+    return this.registry.historyTrusted && this.aliasHistorySound;
+  }
   private timer: ReturnType<typeof setInterval> | null = null;
   /** drive 驅動中的 key：live 路徑獨佔投遞文字;#147 鏡像只「打撈」tool/thinking(去正文),不發文字（防雙投）。 */
   private readonly drivenKeys = new Set<string>();
@@ -452,6 +484,10 @@ export class Mirror {
     mirrorErrors: 0,
     mirrorDirectionRewinds: 0,
     mirrorDropped: 0,
+    /** #949 派生會話（子 agent / cron / hook / node / heartbeat / 哨兵）沒建成用戶會話的次數。 */
+    mirrorDerivedSkipped: 0,
+    /** #949 gateway 給了我們**不認識**的 `kind` → fail-closed 隔離。持續 > 0 = 上游漂了，該去看。 */
+    mirrorQuarantined: 0,
   };
   private polling = false;
   /** #347 backfill send 不是提交成功；水位线/K_S 要等 server 事务 ACK。 */
@@ -466,6 +502,79 @@ export class Mirror {
       if (pending.key === key) return true;
     }
     return false;
+  }
+
+  /** #949 每個 key 只吼一次，別讓 5 秒一輪的 poll 把日誌刷成噪音。 */
+  private readonly loggedDerived = new Set<string>();
+
+  /**
+   * #949 這一行該不該成為用戶列表裡的一條會話。
+   *
+   * 命中即**不建會話、不推內容**；水位線也不碰（本輪整條 `continue`，與 cron 既有語義逐字一致）。
+   * 派生線程的正文並沒有丟——OpenClaw 的子 agent 完成後**自動把結果回報給父會話**（system prompt
+   * 原文：「Your sub-agents will announce their results back to you automatically」，完成事件以
+   * user message 落進父會話 transcript），所以有意義的產出本來就已經在父會話裡鏡像過了。把子檔的
+   * 整份 transcript 再灌進父會話只會多一份重複、並把父會話變成一堵工具調用的牆（#926 §2 引 Zed
+   * zed#57481 的結論：數據層保留、列表層不平鋪、父線程裡渲染卡片可下鑽）。卡片要等協議帶上
+   * `origin` 才畫得出來（#950），在那之前歸屬先算出來、記在日誌與計數裡。
+   *
+   * 三條例外，一條都不能少：
+   *  - **driven / macchiato 會話永不隱藏**：那是 app 自己建的對話，隱藏 = 用戶剛發的消息沒了。
+   *  - **E2E 只豁免「這條 key 自己就是一條 E2E 會話」**（#968 放開，判據見 `keepsLegacyE2EPath`）。
+   *  - **隔離只對還沒鏡像過的 key 生效**：已經有水位線 = 這條會話早就在用戶列表裡了，上游改個
+   *    `kind` 字面量不該讓它從此不再更新（#926 §5「未知 ≠ 沒有」的同一條安全閥）。
+   *    形狀上就是派生的（子 agent / cron / hook / node）不吃這條——它們從來就不是一段對話。
+   */
+  private isHiddenSession(key: string, origin: SessionOrigin): boolean {
+    if (!isHiddenOrigin(origin)) return false;
+    if (key.startsWith(MACCHIATO_PREFIX) || this.drivenKeys.has(key)) return false;
+    if (origin.quarantined) {
+      if (this.state.offsets[key] !== undefined) return false;
+      if (this.keepsLegacyE2EPath(key)) return false;
+      this.counters.mirrorQuarantined += 1;
+      if (!this.loggedDerived.has(key)) {
+        this.loggedDerived.add(key);
+        console.warn(
+          `⚠️ #949 ${key}:gateway 給了未知的 kind(${origin.reason})→ 隔離,不建新會話。` +
+            "OpenClaw 可能加了新的會話類別,該去看它改了什麼。",
+        );
+      }
+      return true;
+    }
+    // cron 是既有規則(OpenClaw 已把 cron 輸出插進 deliver target 的聊天記錄),無條件跳過、不看 E2E。
+    if (origin.reason !== "cron" && this.keepsLegacyE2EPath(key)) return false;
+    this.counters.mirrorDerivedSkipped += 1;
+    if (!this.loggedDerived.has(key)) {
+      this.loggedDerived.add(key);
+      console.log(
+        `· #949 ${key}:派生會話(${origin.kind}/${origin.reason ?? "?"})不進列表` +
+          (origin.conversationId !== key ? `,歸屬 ${origin.conversationId}` : ""),
+      );
+    }
+    return true;
+  }
+
+  /**
+   * #968 這條 key 是否維持 #949 落地時那條「E2E 一律走老路徑」。
+   *
+   * 為什麼當初要整體豁免：K_S 按 `hermesSessionId` 存，換身份會落進 #807 那條永久不可恢復；
+   * 而別名表就位（`ThreadRegistry` + `E2EKeyStore.setIdentityAliases`）之後，這個理由沒了。
+   * 於是收成兩條、只剩該留的：
+   *
+   *  1. **別名歷史不可信 → 整體維持老路徑**（fail-closed，逐字照 #347：只認顯式 `true`）。
+   *     我們連「這條會話的身份歷史」都證明不了，就不該拿它去改變任何 E2E 會話的可見性。
+   *  2. **可信之後只認「這條 key 自己持鑰 / 被 server 標保護」**——父會話是 E2E 不再連帶豁免它
+   *     的子線程。這正是 #592 的教訓：判據是對的，但 E2E 那條路徑繞過去就復發（「父會話每跑
+   *     一次子代理就多一個獨立會話」）。
+   *
+   * 順帶保住一條硬約束：被豁免的恰好是 `protectedSessionIds()` 裡那些 key，於是
+   * `assertE2EIdentitySafe` 要求的「每個 protected sid 都有 fileId」永遠不會因為隱藏而落空——
+   * 隱藏一條 protected 會話 = 它從此不再 `recordFileIdentity` = 下一輪 assert 直接凍結全部鏡像。
+   */
+  private keepsLegacyE2EPath(key: string): boolean {
+    if (!this.e2e) return false;
+    if (!this.aliasHistoryTrusted) return this.e2e.isE2E(key);
+    return this.protectedSessionIds().includes(key);
   }
 
   /** #161 墓碑:永不再鏡像/打撈此 key(持久;agent 側檔案不動)。 */
@@ -517,10 +626,25 @@ export class Mirror {
       changed = true;
     }
     if (previous !== localSid) {
+      // `fileIds` 仍是「當前那一檔」的指針（輪換偵測用），與別名歷史是兩件事。
       fileIds[key] = localSid;
       changed = true;
     }
+    // registry 是別名歷史的真源（落盤仍走上面那個投影，見 State.fileIdAliases 的註釋）。
+    this.recordThread(key, key);
+    if (previous) this.recordThread(key, previous);
+    this.recordThread(key, localSid);
     return changed;
+  }
+
+  /** registry.record 的容錯包裝：拒收不丟數據，只把別名歷史降級成不可信（見 markAliasHistoryUnsound）。 */
+  private recordThread(key: string, thread: string): boolean {
+    try {
+      return this.registry.record(key, thread);
+    } catch (error) {
+      this.markAliasHistoryUnsound(key, thread, error as Error);
+      return false;
+    }
   }
 
   private persistIdentityStateOrThrow(context: string): void {
@@ -557,20 +681,25 @@ export class Mirror {
     const protectedByKey = new Map(
       this.protectedSessionIds().map((sid) => [keyForSid(sid), sid] as const),
     );
-    const allKeys = new Set([
-      ...Object.keys(this.state.fileIds ?? {}),
-      ...Object.keys(this.state.fileIdAliases ?? {}),
-    ]);
-    for (const key of allKeys) {
-      const aliases = this.state.fileIdAliases?.[key] ?? [];
-      if (this.state.fileIds?.[key] !== identity && !aliases.includes(identity)) continue;
-      return (
-        protectedByKey.get(key.toLowerCase()) ??
-        this.driveIdentityResolver?.(key) ??
-        this.drivenSidByKey.get(key)
-      );
-    }
-    return undefined;
+    // #968 反查走 registry（對話 = key，線程 = key + 歷代 transcript）。**不經 `aliasesFor`**：
+    // 那條是 trust-gated 的（不可信時恒空），而這裡做的是正向分類，寧可多認出一條。
+    const key = this.registry.conversationOf(identity);
+    if (!key) return undefined;
+    return (
+      protectedByKey.get(key.toLowerCase()) ??
+      this.driveIdentityResolver?.(key) ??
+      this.drivenSidByKey.get(key)
+    );
+  }
+
+  /**
+   * #950/#968 交給 `E2EKeyStore.setIdentityAliases()` 的別名解析器。
+   *
+   * **trust-gated**：別名歷史不可信時恒返回空數組 —— keystore 於是逐字節退回改前行為（維持舊
+   * 身份），而不是拿一個猜的鍵去解密、更不會因為查不到就新生成 K_S（#347 / #807 的那條死循環）。
+   */
+  identityAliasResolver(): (sid: string) => readonly string[] {
+    return (sid) => (this.aliasHistoryTrusted ? this.registry.aliasesFor(sid) : []);
   }
 
   private protectedSessionIds(): string[] {
@@ -647,11 +776,9 @@ export class Mirror {
     );
     const protectedIdentities = new Set<string>();
     const knownIdentities = new Set<string>();
-    const allKeys = new Set([
-      ...Object.keys(this.state.fileIds ?? {}),
-      ...Object.keys(this.state.fileIdAliases ?? {}),
-    ]);
-    for (const key of allKeys) {
+    // #968 分類走 registry 的快照（每段對話 = key 自己 + 歷代 transcript）。同樣**不經**
+    // `aliasesFor`：那條 trust-gated，而這裡是正向分類——上面已經先把「歷史不可信」整條擋掉了。
+    for (const [key, threads] of Object.entries(this.registry.toJSON().threads)) {
       const protectedWireSid = protectedByKey.get(key.toLowerCase());
       const wireSid =
         protectedWireSid ??
@@ -664,12 +791,7 @@ export class Mirror {
       target.add(key);
       target.add(wireSid);
       if (protectedWireSid) target.add(protectedWireSid);
-      for (const localSid of new Set([
-        ...(this.state.fileIdAliases?.[key] ?? []),
-        ...(this.state.fileIds?.[key] ? [this.state.fileIds[key]!] : []),
-      ])) {
-        target.add(localSid);
-      }
+      for (const localSid of threads) target.add(localSid);
     }
     if (protectedIdentities.has(identity) || e2e.isE2E(identity)) return true;
     if (knownIdentities.has(identity)) return false;
@@ -697,7 +819,7 @@ export class Mirror {
       if (!s?.sessionId) return;
       const file = join(sessionsDir(), `${s.sessionId}.jsonl`);
       if (!existsSync(file)) return;
-      const built = this.salvageDriven(key, file);
+      const built = this.salvageDriven(key, file, parseSessionOrigin(s));
       if (built) this.sendOne(key, built.entry, built.endOffset);
       this.save();
     } catch {
@@ -718,7 +840,11 @@ export class Mirror {
   private salvageDriven(
     key: string,
     file: string,
-  ): { entry: { hermesSessionId: string; source: string; messages: any[] }; endOffset: number } | null {
+    origin?: SessionOrigin,
+  ): {
+    entry: { hermesSessionId: string; origin?: ThreadOrigin; source: string; messages: any[] };
+    endOffset: number;
+  } | null {
     if (this.isE2ETransitionLocked(key)) return null;
     const resolvedWireSid =
       this.driveIdentityResolver?.(key) ??
@@ -770,7 +896,14 @@ export class Mirror {
       return null;
     }
     return {
-      entry: { hermesSessionId: sid, source: "openclaw", messages: salvaged },
+      entry: {
+        hermesSessionId: sid,
+        // #968 driven 會話上報的身份是 server sid（不是 gateway key），origin 必須跟着它走——
+        // server 要求 `origin.threadId` 與 `hermesSessionId` 逐字相等，不等就整份退回老行為。
+        ...(origin ? { origin: toThreadOrigin(origin, sid) } : {}),
+        source: "openclaw",
+        messages: salvaged,
+      },
       endOffset: newOffset,
     };
   }
@@ -789,10 +922,52 @@ export class Mirror {
     const loaded = this.load();
     this.state = loaded.state;
     this.identityStateTrusted = loaded.identityStateTrusted;
-    this.aliasHistoryTrusted =
+    // 落盤投影 → registry。可信只認三個條件同時成立（與改前逐字一致）：主檔解析成功、
+    // `fileIdAliases` 存在、`aliasHistoryTrusted` **顯式** true。缺一律不可信。
+    this.registry = this.buildRegistry(
+      loaded.state,
       loaded.identityStateTrusted &&
-      loaded.state.fileIdAliases !== undefined &&
-      loaded.state.aliasHistoryTrusted === true;
+        loaded.state.fileIdAliases !== undefined &&
+        loaded.state.aliasHistoryTrusted === true,
+    );
+  }
+
+  /**
+   * 把 state 裡的 `fileIds` / `fileIdAliases` 灌進 registry：對話 = key，線程 = `[key, ...別名]`。
+   * registry 拒收（I1 衝突）時**不丟數據**——那條別名仍在 `state.fileIdAliases` 裡（投影是并集），
+   * 只把別名歷史標成不可信，讓所有 E2E 判定退回 fail-closed。
+   */
+  private buildRegistry(state: State, trusted: boolean): ThreadRegistry {
+    const registry = ThreadRegistry.empty();
+    const keys = new Set([
+      ...Object.keys(state.fileIds ?? {}),
+      ...Object.keys(state.fileIdAliases ?? {}),
+    ]);
+    for (const key of keys) {
+      const threads = [
+        key,
+        ...(state.fileIdAliases?.[key] ?? []),
+        ...(state.fileIds?.[key] ? [state.fileIds[key]!] : []),
+      ];
+      for (const thread of threads) {
+        try {
+          registry.record(key, thread);
+        } catch (error) {
+          this.markAliasHistoryUnsound(key, thread, error as Error);
+        }
+      }
+    }
+    registry.adoptHistory(trusted && this.aliasHistorySound);
+    return registry;
+  }
+
+  private markAliasHistoryUnsound(key: string, thread: string, error: Error): void {
+    if (!this.aliasHistorySound) return;
+    this.aliasHistorySound = false;
+    console.error(
+      `⚠️ #968 別名表自相矛盾（${key} ← ${thread}）：${error.message}；` +
+        "別名歷史按不可信處理（E2E 全部 fail-closed），磁盤上的別名一條都不會刪。",
+    );
   }
 
   start(): void {
@@ -1070,7 +1245,10 @@ export class Mirror {
     for (const s of sessions) {
       const key: string | undefined = s.key;
       const sessionId: string | undefined = s.sessionId;
-      if (!key || !sessionId || isCronSession(key)) continue; // cron 不鏡像（已在目標聊天裡）
+      if (!key || !sessionId) continue;
+      // #949 派生線程不成為獨立會話（cron 的既有語義併進來了：cron 輸出已在目標聊天裡）。
+      const origin = parseSessionOrigin(s);
+      if (this.isHiddenSession(key, origin)) continue;
       if (this.state.tombstones?.includes(key)) continue; // #161 app 刪過 → 永不再撈(含打撈)
       if (this.isE2ETransitionLocked(key)) continue; // #347 ACK 前不得由 poll/fastForward 旁路推进
       // #211 文件輪換偵測:同一 key 換了 sessionId(gateway 升級/會話重置)→ 舊字節水位線作廢,
@@ -1096,7 +1274,7 @@ export class Mirror {
         // #348：有內容走 durable outbox，ACK 前不推 committed 水位。
         const f = join(dir, `${sessionId}.jsonl`);
         if (existsSync(f)) {
-          const built = this.salvageDriven(key, f);
+          const built = this.salvageDriven(key, f, origin);
           if (built) this.sendOne(key, built.entry, built.endOffset);
         }
         continue;
@@ -1128,10 +1306,18 @@ export class Mirror {
         }
         continue;
       }
+      // #968 血緣照實上報（元數據非正文 → E2E 會話一樣帶得動）。連接器**繼續**本地判定，
+      // 這裡只是把已經算出來的歸屬多報一份：判定權收到 server 之後才是一次 deploy 就生效。
+      const wireOrigin = toThreadOrigin(origin, key);
+      // #983 `label`（子 agent 名 / 路徑）是 origin 裡唯一的自由文本。加密會話上不明文帶出去
+      // ——其餘字段都是 id / 枚舉 / 數字。出站閘也會兜底攔（`encryptedMirrorSessionIssue`），
+      // 但攔下來是整幀丟棄，所以生產者這裡就要省掉，別讓正文陪葬。
+      const { label: _e2eLabel, ...e2eOrigin } = wireOrigin;
       const entry = this.e2e?.isE2E(key)
         ? {
             // §19：原生會話（如 Discord）被標 E2E → 標題+內容加密、打 e2e, server 盲存
             hermesSessionId: key,
+            origin: e2eOrigin,
             title: this.e2e.encryptText(key, deriveTitle(s)),
             source: deriveSource(s),
             e2e: true,
@@ -1149,6 +1335,7 @@ export class Mirror {
           }
         : {
             hermesSessionId: key,
+            origin: wireOrigin,
             title: deriveTitle(s),
             source: deriveSource(s),
             messages: messages.map((m) => ({ ...m, srcId: srcIdFor(m) })), // §9
@@ -1306,15 +1493,18 @@ export class Mirror {
       if (canMigrateAliases && !this.aliasHistoryTrusted) {
         // 沒有任何 E2E 保護承諾時，舊 schema 可安全升級：至少把當前映射種進歷代 registry。
         // 有 protected sid 時絕不走此路，否則一次普通 poll 就會把已遺失的舊 alias 冒充完整。
-        this.state.fileIdAliases = {};
         for (const [key, localSid] of Object.entries(this.state.fileIds ?? {})) {
-          this.state.fileIdAliases[key] = [localSid];
+          this.recordThread(key, key);
+          this.recordThread(key, localSid);
         }
-        this.state.aliasHistoryTrusted = true;
-      } else if (!this.aliasHistoryTrusted) {
-        // protected 下補出的 aliases 只能作正向安全分類，不能冒充「歷史完整」；重啟後仍須全擋 unknown。
-        this.state.aliasHistoryTrusted = false;
       }
+      // registry → 落盤投影（并集，只增不刪：任何一條歷史別名都不可能被寫沒）。
+      // `aliasHistoryTrusted` 只在「此刻可安全遷移」或「本來就可信」時寫 true——protected 下
+      // 補出的 aliases 只能作正向安全分類，不能冒充「歷史完整」，重啟後仍須全擋 unknown。
+      // 別名表自相矛盾過（unsound）則永遠寫 false：不可信一旦發生就必須**持久**不可信。
+      this.projectRegistryOntoState(
+        this.aliasHistorySound && (canMigrateAliases || this.aliasHistoryTrusted),
+      );
       // #262 dirty 判斷:與上次落盤相同 → 跳過(每輪 poll 無條件雙寫傷 SD 卡)。
       const json = JSON.stringify(this.state);
       if (!force && json === this.lastSaved) return true;
@@ -1333,12 +1523,34 @@ export class Mirror {
       // 歸檔 E2E transcript 的 aliases；本進程保持 fail-closed，待人工恢復或無 E2E 時重建。
       if (canMigrateAliases) {
         this.identityStateTrusted = true;
-        this.aliasHistoryTrusted = true;
+        // `adoptHistory` 只升不降，且只在**落盤成功之後**才敢宣告——寫失敗時歷史仍是不可信的。
+        this.registry.adoptHistory(this.aliasHistorySound);
       }
       return true;
     } catch {
       /* 持久化失敗不致命 */
       return false;
     }
+  }
+
+  /**
+   * registry → `state.fileIdAliases` / `state.aliasHistoryTrusted` 的落盤投影。
+   *
+   * **并集，只增不刪**（I3：歷代 threadId 全部永久保留）：既有數組原樣保留、registry 裡多出來的
+   * 才追加。所以 registry 因 I1 衝突拒收過某條記錄時，磁盤上那條別名照樣在——降級的是「可不可信」，
+   * 從來不是「還在不在」。key 自己不寫進別名數組：磁盤格式與 #347 逐字節一致（見 State 註釋）。
+   */
+  private projectRegistryOntoState(trusted: boolean): void {
+    const snapshot = this.registry.toJSON().threads;
+    const aliases: Record<string, string[]> = { ...(this.state.fileIdAliases ?? {}) };
+    for (const [key, threads] of Object.entries(snapshot)) {
+      const merged = [...(aliases[key] ?? [])];
+      for (const thread of threads) {
+        if (thread !== key && !merged.includes(thread)) merged.push(thread);
+      }
+      if (merged.length) aliases[key] = merged;
+    }
+    this.state.fileIdAliases = aliases;
+    this.state.aliasHistoryTrusted = trusted;
   }
 }

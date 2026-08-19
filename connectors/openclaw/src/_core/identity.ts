@@ -45,6 +45,27 @@ export function installIdPath(): string {
   return join(stateDir(), "install-id");
 }
 
+/**
+ * #940 supervisor 自己的狀態檔（`supervise-<kind>.state`）——心跳的**反向**：那邊是連接器寫、
+ * supervisor 讀；這邊是 supervisor 寫、連接器讀去上報。
+ *
+ * ⚠️ 根目錄故意不是 `stateDir()`：supervisor 用的是 `MACCHIATO_SUPERVISE_STATE_DIR`（默認
+ * `~/.macchiato`），與連接器的 `MACCHIATO_STATE_DIR` 是兩個 env。多 profile 時連接器的狀態根會被
+ * 指到別處，而 supervisor 的狀態檔仍在 `~/.macchiato`——照 `stateDir()` 找會找不到，然後靜默地
+ * 上報「沒有 supervisor」，正好是本 issue 最不該再犯一次的那種錯。
+ */
+export function supervisorStateFilePath(kind: string): string {
+  const raw = (process.env.MACCHIATO_SUPERVISE_STATE_DIR || "").trim();
+  const root = !raw
+    ? join(homedir(), ".macchiato")
+    : raw === "~"
+      ? homedir()
+      : raw.startsWith("~/")
+        ? join(homedir(), raw.slice(2))
+        : raw;
+  return join(root, `supervise-${kind}.state`);
+}
+
 /** UI / 配对文案用展示名（可被 MACCHIATO_PAIR_GROUP 覆盖）。 */
 export const DISPLAY_NAME: Record<ConnectorKind, string> = {
   "claude-code": "Claude Code",

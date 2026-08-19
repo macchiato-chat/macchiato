@@ -7,13 +7,16 @@
 import type { LinkBClient } from "../_core/linkb/client";
 import type { E2EKeyStore } from "../_core/e2e/keys";
 import { foldEntries, readEntries, type CCMessage } from "./transcripts";
-import { discoverSessions, toImportMessage } from "./mirror";
+import { discoverSessions, toImportMessage, type ThreadOriginWire } from "./mirror";
+import { readTranscriptOrigin } from "./lineage";
 
 /** 單帧字節預算：server maxPayload 8MiB,更關鍵是慢上行——大帧上傳期間 pong 排隊,帧越小越穩。 */
 const FRAME_BUDGET = Number(process.env.MACCHIATO_CC_IMPORT_FRAME_BYTES) || 2 * 1024 * 1024;
 
 interface BuiltSession {
   hermesSessionId: string;
+  /** #967 血緣（只在能證明「這條 transcript 就是一段對話的根」時才帶；見 `withRootOrigins`）。 */
+  origin?: ThreadOriginWire;
   title: string;
   source: string;
   messages: ReturnType<typeof toImportMessage>[];
@@ -32,9 +35,44 @@ function withoutE2ESessions(built: BuiltSession[], e2e: E2EStatus): BuiltSession
   return built.filter((session) => !e2e.isE2E(session.hermesSessionId));
 }
 
+/**
+ * #967 給導入的會話補上 `ImportSession.origin`。
+ *
+ * 只在**能證明這條 transcript 就是一段對話的根**時才帶 `kind:"root"`：
+ *  - 行內聲明自己是別段對話的續接 → 不帶；
+ *  - 對話指紋（根消息 uuid / 首條 `last-prompt` 的 leafUuid）跟本次枚舉裡**別的檔**撞上 →
+ *    那是終端 `--resume` 複製出來的副本，**同樣不帶**。
+ *
+ * 不帶 = server 走老行為（`evidence:"absent"`），與改前逐字節一致。導入側的續接歸併要改成
+ * 「連接器報事實、server 決定歸屬」，那是切換判定權那一刀的事，本刀只多報一份能證得住的事實。
+ */
+function withRootOrigins(built: BuiltSession[], files: Map<string, string>): BuiltSession[] {
+  const origins = new Map(
+    built.map((s) => [s.hermesSessionId, readTranscriptOrigin(files.get(s.hermesSessionId)!, s.hermesSessionId)]),
+  );
+  const fpOwners = new Map<string, number>();
+  for (const o of origins.values()) for (const fp of o.fingerprints) fpOwners.set(fp, (fpOwners.get(fp) ?? 0) + 1);
+  return built.map((s) => {
+    const o = origins.get(s.hermesSessionId)!;
+    const shared = o.fingerprints.some((fp) => (fpOwners.get(fp) ?? 0) > 1);
+    if (o.kind !== "user" || o.evidence === "absent" || shared) return s;
+    return {
+      ...s,
+      origin: {
+        threadId: s.hermesSessionId,
+        conversationId: s.hermesSessionId,
+        kind: "root",
+        evidence: o.evidence,
+      },
+    };
+  });
+}
+
 export function collectImportSessions(): BuiltSession[] {
   const out: BuiltSession[] = [];
+  const files = new Map<string, string>();
   for (const { sid, file } of discoverSessions()) {
+    files.set(sid, file);
     try {
       const { entries, endOffset } = readEntries(file, 0);
       if (!entries.length) continue;
@@ -55,7 +93,7 @@ export function collectImportSessions(): BuiltSession[] {
       console.error(`[import] skip ${sid}: ${(e as Error).message}`);
     }
   }
-  return out;
+  return withRootOrigins(out, files);
 }
 
 /** #154 按 project 聚合計數(數量降序;client 渲染多選)。 */

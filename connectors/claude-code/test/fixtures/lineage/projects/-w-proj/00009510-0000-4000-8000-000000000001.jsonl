@@ -1,0 +1,7 @@
+{"type":"queue-operation","operation":"start","sessionId":"00009510-0000-4000-8000-000000000001","timestamp":"2026-08-14T10:00:00.000Z"}
+{"type":"mode","mode":"default","sessionId":"00009510-0000-4000-8000-000000000001"}
+{"type":"permission-mode","permissionMode":"default","sessionId":"00009510-0000-4000-8000-000000000001"}
+{"type":"file-history-snapshot","isSnapshotUpdate":false,"messageId":"msg-snapshot","snapshot":{}}
+{"parentUuid":null,"isSidechain":false,"cwd":"/w/proj","entrypoint":"cli","gitBranch":"main","userType":"external","version":"2.1.212","type":"user","message":{"role":"user","content":"脫敏語料：主會話 A 的第一句"},"promptId":"p-00009510-1111-4000-8000-000000000001","sessionId":"00009510-0000-4000-8000-000000000001","uuid":"00009510-1111-4000-8000-000000000001","timestamp":"2026-08-14T10:00:00.000Z"}
+{"parentUuid":"00009510-1111-4000-8000-000000000001","isSidechain":false,"cwd":"/w/proj","entrypoint":"cli","gitBranch":"main","userType":"external","version":"2.1.212","type":"assistant","requestId":"req-00009510-1111-4000-8000-000000000002","message":{"id":"msg-00009510-1111-4000-8000-000000000002","role":"assistant","content":[{"type":"text","text":"脫敏語料：回答"}]},"sessionId":"00009510-0000-4000-8000-000000000001","uuid":"00009510-1111-4000-8000-000000000002","timestamp":"2026-08-14T10:00:00.000Z"}
+{"type":"last-prompt","lastPrompt":"<脫敏>","leafUuid":"00009510-1111-4000-8000-000000000001","sessionId":"00009510-0000-4000-8000-000000000001"}

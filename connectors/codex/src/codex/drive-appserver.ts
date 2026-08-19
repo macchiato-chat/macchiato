@@ -105,6 +105,21 @@ function turnStallMs(): number {
   return 30 * 60_000;
 }
 
+/**
+ * #945 審批卡的壽命。掛起的審批**豁免**回合看門狗(等人點一下不叫卡死,#895),於是一張沒人點的卡
+ * 會把回合永遠釘在 active 裡:會話一直顯示在跑、`busy`/`pendingApproval` 恆真——而後者正是自動
+ * 更新的閒時判據,結果是「app 裡有一張沒點的卡 = 這台機器永遠不再自動更新」(#940 根因)。
+ *
+ * 2 小時是產品判斷:比「離開一會兒回來再點」長得多,又遠短於「今晚不會再看了」。到點自動 decline
+ * (agent 收到拒絕、把這一回合正常收尾),並明確告訴用戶發生了什麼——比一張轉到天荒地老的卡誠實。
+ * 0 = 關閉(逃生門)。
+ */
+function approvalTimeoutMs(): number {
+  const v = Number(process.env.MACCHIATO_APPROVAL_TIMEOUT_MS);
+  if (Number.isFinite(v) && v >= 0) return v;
+  return 2 * 3600_000;
+}
+
 /** #153 同款工具卡,v2 item 形狀(camelCase:aggregatedOutput/exitCode;schema 0.144.1)。 */
 export function toolCardForV2(it: any): { name: string; args: Record<string, unknown>; resultText: string; error?: string } {
   const type = String(it?.type ?? "tool");
@@ -170,6 +185,12 @@ interface ActiveTurn {
   lastError?: string;
   /** #245 interrupt 點在 turnId 未到位的窗口 → 掛起,turnId 到位即補發。 */
   interruptPending?: boolean;
+  /**
+   * #992 turnId 還沒到位時收到的注入（steer）——同 `interruptPending` 的窗口、同樣的補發套路。
+   * 沒有它的話這些跟進消息會**靜默落到 `runTurn` 起新回合**：用戶在回合剛開跑那一瞬追加一句，
+   * 本該注入同一回合，實際另起一輪。假 agent 測不到（`turn/start` 立即返回），真 CLI 必踩。
+   */
+  steerPending?: Array<{ input: UserInput[]; firstText: string }>;
   /** 本回合完整 input(模型版本失敗時可靜默換模重試,不讓用戶重發)。 */
   input?: UserInput[];
   /** 本回合 turn/start 實際帶上的 model(空 = 未指定,走 CLI 默認)。 */
@@ -227,11 +248,13 @@ interface PendingApproval {
   sourceParams?: Record<string, unknown>;
   kind?: CodexApprovalKind;
   resolve: (decision: string) => void;
+  /** #945 到點自動 decline 的定時器;任何一條解掛路徑(respond / 回合收尾 / 引擎重啟)都會清掉。 */
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 export class AppServerDrive {
   /** #10:累計計數(與 v1 同鍵位,健康上報帶出)。engineAppServer=1 是引擎標記(v1 無此鍵)。 */
-  readonly counters: Record<string, number> = { driveErrors: 0, approvalsRequested: 0, steers: 0, engineAppServer: 1, unknownNotifications: 0 };
+  readonly counters: Record<string, number> = { driveErrors: 0, approvalsRequested: 0, approvalsExpired: 0, steers: 0, engineAppServer: 1, unknownNotifications: 0 };
   /** #310 認證失效持續態:auth 類回合失敗置 true(health 上報 authOk=false),成功回合恢復。 */
   authFailed = false;
   /** #669 心跳:有進行中回合(在途 sid 集非空)。為「閒時更新」預留,本階段只寫進 health.json。 */
@@ -947,7 +970,8 @@ export class AppServerDrive {
           try {
             const rf = discoverRollouts().rollouts.find((r) => r.threadId === tid);
             if (!rf || !existsSync(rf.file)) return;
-            const { title } = deriveMeta(readFileSync(rf.file, "utf8"));
+            // #946 優先用 Codex 自己起的名字（session_index.jsonl），拿不到才截斷首條消息。
+            const { title } = deriveMeta(readFileSync(rf.file, "utf8"), tid);
             if (title && title !== "Codex") {
               this.emit(sid, "session.title", { title });
               console.log(`· #257 session.retitle ${shortId(sid)} len=${textLen(title)}`);
@@ -1110,6 +1134,13 @@ export class AppServerDrive {
       }
       return;
     }
+    // #992 回合在跑、但 turn/start 還沒返回 → 掛起等 turnId（對齊 #245 的 interrupt 補發）。
+    // 掉進下面 runTurn 的話就是「本該注入，卻另起一輪」，而且一行日誌都不打。
+    if (running && !running.turnId && !running.finalized) {
+      (running.steerPending ??= []).push({ input, firstText });
+      console.log(`· turn/steer 掛起(turnId 未到位,到位即補發)→ ${sid}`);
+      return;
+    }
     if (running?.turnId) {
       try {
         await this.client.request("turn/steer", { threadId: running.threadId, expectedTurnId: running.turnId, input });
@@ -1127,6 +1158,9 @@ export class AppServerDrive {
       } catch (e) {
         console.log(`· steer 未命中(${(e as Error).message.slice(0, 120)})→ 起新回合`);
       }
+    } else if (running) {
+      // 走到這裡＝回合已定稿但還沒從 active 摘掉，按新回合處理是對的；只是別再靜默。
+      console.log(`· 跟進消息落成新回合(原回合已定稿)→ ${sid}`);
     }
     await this.runTurn(sid, input, firstText, requireDelivery);
   }
@@ -1193,6 +1227,7 @@ export class AppServerDrive {
       if (turn.finalized || this.active.get(sid) !== turn) return;
       // turn/start 立即返回(探針);turnId 也會隨 turn/started 通知到,這裡先記省一拍。
       if (res?.turn?.id) turn.turnId = String(res.turn.id);
+      if (turn.turnId && turn.steerPending?.length) void this.fireDeferredSteer(sid, turn); // #992（先注入）
       if (turn.turnId && turn.interruptPending) void this.fireDeferredInterrupt(sid, turn); // #245
     } catch (e) {
       // runTurn 失敗路徑:若看門狗已收尾(active 已空),別再潑第二條錯誤。
@@ -1235,6 +1270,7 @@ export class AppServerDrive {
     switch (method) {
       case "turn/started": {
         if (turn && !turn.turnId) turn.turnId = String(p.turn?.id ?? "");
+        if (turn?.turnId && turn.steerPending?.length) void this.fireDeferredSteer(sid, turn); // #992（先注入）
         if (turn?.turnId && turn.interruptPending) void this.fireDeferredInterrupt(sid, turn); // #245
         return;
       }
@@ -1389,6 +1425,15 @@ export class AppServerDrive {
   private finishTurn(sid: string, turn: ActiveTurn, turnObj: any): void {
     if (turn.finalized) return; // #895 看門狗已收尾 / 防雙份
     turn.finalized = true;
+    // #992 turnId 沒等到就收尾了（回合秒完 / 出錯 / 看門狗強收）：掛起的注入轉入隊列，
+    // 由本函數尾部續投成下一回合。晚一個回合可以，吞掉用戶的話不行。
+    if (turn.steerPending?.length) {
+      const q = this.queuedInputs.get(sid) ?? [];
+      q.push(...turn.steerPending);
+      this.queuedInputs.set(sid, q);
+      console.log(`· 掛起的注入未及補發(回合已收尾)→ 轉入隊列 ${turn.steerPending.length} 條 → ${sid}`);
+      turn.steerPending = undefined;
+    }
     this.clearTurnWatchdog(turn);
     this.active.delete(sid);
     this.pending.delete(sid);
@@ -1527,6 +1572,48 @@ export class AppServerDrive {
   // ============================== 審批橋 ==============================
 
   /** #245:補發掛起的 interrupt(點停止時 turn/start 尚未返回)。 */
+  /**
+   * #992 turnId 到位後補發掛起的注入。**契約串與即時路徑一字不差**——回歸與 localchain 都認它，
+   * 補發也是「注入成功」，不該讓斷言看出兩條路。
+   *
+   * 補發失敗 / 回合已定稿 → 把消息挪進 `queuedInputs`，由 `finishTurn` 尾部續投成下一回合：
+   * 寧可晚一個回合，也**絕不把用戶已經發出去的話吞掉**。
+   */
+  private async fireDeferredSteer(sid: string, turn: ActiveTurn): Promise<void> {
+    const pending = turn.steerPending ?? [];
+    turn.steerPending = undefined;
+    for (const item of pending) {
+      const requeue = (why: string): void => {
+        console.error(`[#992 補發 steer 未成(${why}) ${sid}] → 轉入隊列,回合結束後續投`);
+        const q = this.queuedInputs.get(sid) ?? [];
+        q.push(item);
+        this.queuedInputs.set(sid, q);
+      };
+      if (turn.finalized || !turn.turnId) {
+        requeue(turn.finalized ? "原回合已定稿" : "turnId 仍缺");
+        continue;
+      }
+      try {
+        await this.client.request("turn/steer", {
+          threadId: turn.threadId,
+          expectedTurnId: turn.turnId,
+          input: item.input,
+        });
+        this.counters.steers += 1;
+        if (item.firstText.trim()) {
+          const injected = this.injectedTexts.get(sid) ?? [];
+          injected.push(item.firstText.trim());
+          while (injected.length > 8) injected.shift();
+          this.injectedTexts.set(sid, injected);
+        }
+        // ⚠️ 回歸契約:與即時路徑同一條串,改動需同步
+        console.log(`· turn/steer 注入跟進消息 → ${sid}`);
+      } catch (e) {
+        requeue((e as Error).message.slice(0, 120));
+      }
+    }
+  }
+
   private async fireDeferredInterrupt(sid: string, turn: ActiveTurn): Promise<void> {
     turn.interruptPending = false;
     try {
@@ -1613,17 +1700,63 @@ export class AppServerDrive {
     });
     return new Promise((resolve) => {
       const list = this.approvals.get(sid) ?? [];
-      list.push({
+      const entry: PendingApproval = {
         sid,
         requestId,
         requestDigest,
         executionSnapshot,
         sourceParams: executionSnapshot ? sourceParams : undefined,
         kind: executionSnapshot ? kind : undefined,
-        resolve: (decision) => resolve({ decision }),
-      });
+        // #945 定時器掛在 entry 上,由 resolve 自己清——解掛路徑有三條(respond / finishTurn /
+        // onServerRestart),讓每條都記得 clearTimeout 遲早會漏一條,而漏掉的那條會在兩小時後
+        // 對一個早已結束的回合 emit 一句莫名其妙的提示。
+        resolve: (decision) => {
+          if (entry.timer) clearTimeout(entry.timer);
+          entry.timer = undefined;
+          resolve({ decision });
+        },
+      };
+      list.push(entry);
       this.approvals.set(sid, list);
+      const ttl = approvalTimeoutMs();
+      if (ttl > 0) {
+        entry.timer = setTimeout(() => this.expireApproval(sid, entry), ttl);
+        entry.timer.unref?.(); // 純超時,絕不因此拖住進程退出
+      }
     });
+  }
+
+  /**
+   * #945 審批到點沒人管:自動 decline 並說人話。agent 收到拒絕後會把這一回合正常收尾,
+   * 於是 `pending`/`approvals` 清空、`busy` 落回 false,自動更新的閒時判據不再被永久釘住。
+   */
+  private expireApproval(sid: string, entry: PendingApproval): void {
+    const list = this.approvals.get(sid);
+    const i = list?.indexOf(entry) ?? -1;
+    if (!list || i < 0) return; // 已被 respond / 回合收尾摘走
+    list.splice(i, 1);
+    if (!list.length) this.approvals.delete(sid);
+    // ⚠️ 必須先給回合續期,再 resolve。#895 看門狗豁免的是「有掛起審批」這個狀態,而 `lastActivityAt`
+    // 只由 app-server **通知**續期——審批走的是反向 RPC,所以掛卡期間它一直停在收卡那一刻。
+    // 卡掛滿 stall(默認 30 min)之後看門狗每 25ms 重排一次、靠豁免撐着;一旦這裡把最後一張卡摘走,
+    // 下一次(≤25ms 後)豁免不再成立、而 `now - lastActivityAt` 已是兩小時 → 立刻 forceFinalizeStuck:
+    // 用戶會在「已自動拒絕」後面緊跟一句「判定卡死並中斷」,回合被殺,codex 根本來不及處理這個 decline。
+    // 續期等於把完整的 stall 窗口讓給引擎收尾——這正是本功能承諾的「agent 正常收尾」。
+    const turn = this.active.get(sid);
+    if (turn) {
+      turn.lastActivityAt = Date.now();
+      this.armTurnWatchdog(sid, turn);
+    }
+    this.counters.approvalsExpired += 1;
+    const minutes = Math.round(approvalTimeoutMs() / 60_000);
+    console.log(`· #945 審批 ${shortId(sid)} 掛起超過 ${minutes} 分鐘無人回應 → 自動拒絕`);
+    // E2E 會話不投明文提示(§19);用戶會從 agent 自己的回覆裡看到這一步沒做成。
+    if (!this.e2e?.isE2E(sid)) {
+      this.emit(sid, "review.summary", {
+        summary: `⏳ 这条审批等了 ${minutes} 分钟没人回应，已自动拒绝这一步——需要的话再发一次。`,
+      });
+    }
+    entry.resolve("decline");
   }
 
   // ============================== 其餘(與 v1 對齊) ==============================

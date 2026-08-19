@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { foldEntries, projectsDir, readEntries, scanInitialTitle } from "../src/cc/transcripts";
+import { foldEntries, projectsDir, readEntries, scanInitialTitle, titleFromText } from "../src/cc/transcripts";
 import { discoverSessions } from "../src/cc/mirror";
 
 // —— 合成 fixture（形狀對齊 2026-07-05 CLI 2.1.201 真實 transcript；內容為虛構）——
@@ -163,6 +163,36 @@ describe("scanInitialTitle", () => {
       userLine("real question"),
     ]);
     expect(scanInitialTitle(file)).toBe("real question");
+  });
+
+  it("#947 命令 / IDE 注入包裝不當標題:剝完不是人話就往後找", () => {
+    const { file } = parse([
+      userLine("<ide_opened_file>The user opened /a/b/c.ts</ide_opened_file>"),
+      userLine("<ide_opened_file>The user opened /a/b/c.ts</ide_opened_file>\n真正的問題"),
+    ]);
+    // 第一條剝完是空的 → 跳過;第二條剝完剩人話 → 用它
+    expect(scanInitialTitle(file)).toBe("真正的問題");
+  });
+});
+
+describe("#947 titleFromText", () => {
+  it("剝掉命令包裝;只剩斜杠命令的不算標題", () => {
+    expect(titleFromText("<command-name>/model</command-name>")).toBeUndefined();
+    expect(titleFromText("<command-name>/model</command-name>\n<command-args>opus</command-args>")).toBeUndefined();
+    expect(titleFromText("/model")).toBeUndefined();
+    expect(titleFromText("/model opus")).toBeUndefined();
+  });
+
+  it("不誤傷真人消息:路徑、尖括號代碼、正常提問都保留", () => {
+    expect(titleFromText("/Users/jimmy/code/web/macchiato 這個目錄看一下")).toBe(
+      "/Users/jimmy/code/web/macchiato 這個目錄看一下",
+    );
+    expect(titleFromText("幫我把 <div> 換成 <section>")).toBe("幫我把 <div> 換成 <section>");
+    expect(titleFromText("  修一下登錄  ")).toBe("修一下登錄");
+  });
+
+  it("包裝之後跟著人話 → 只留人話", () => {
+    expect(titleFromText("<command-message>compact</command-message>\n接著把測試補齊")).toBe("接著把測試補齊");
   });
 });
 

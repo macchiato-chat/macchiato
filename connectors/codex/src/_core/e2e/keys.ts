@@ -520,6 +520,8 @@ export class E2EKeyStore {
   private sessionDeviceCaps = new Map<string, { clarify?: true; secret?: true }>();
   /** #731 上一次 wrap 因授權失敗被跳過的 deviceId（由連接器取走回報 server）。 */
   private deviceAuthRejected: string[] = [];
+  /** #950 身份別名解析器（見 `setIdentityAliases`）；null = 不解析，行為與改前逐字節一致。 */
+  private identityAliases: ((sid: string) => readonly string[]) | null = null;
 
   constructor(private readonly path: string) {
     withE2EKeyStoreLock(this.path, () => this.load());
@@ -704,6 +706,41 @@ export class E2EKeyStore {
     this.serverE2E = committed.protected;
   }
 
+  /**
+   * #950 注入身份別名解析器（一般是 `ThreadRegistry.identityAliasResolver()`）。
+   *
+   * 背景：K_S 的鍵 = **上報給 server 的 `hermesSessionId`**。#926 那套把會話身份從「執行線程
+   * id」換成「對話 id」，於是**存量已開 E2E 的會話，K_S 還壓在舊鍵下**——直查必然 miss，
+   * 連接器會被判成「說密文、DB 說明文」，落進 #807 那條**永久不可恢復**的死循環
+   * （重讀重編只會原樣再生成一次，重試是不動點）。
+   *
+   * 解析器只在直查落空時用，且**只做讀側的認親，不改盤上的鍵**：keystore 的兩檔原子快照
+   * 保持原樣，遷移期任一方向回退都不需要動它。
+   *
+   * fail-closed 在解析器那一側：`ThreadRegistry` 在別名歷史不可信時恒返回空數組，於是這裡
+   * 逐字節退回改前行為（維持舊身份），而不是拿一個猜的鍵去解密。
+   * 不注入（默認 null）＝ 完全沒有這條路徑。
+   */
+  setIdentityAliases(resolve: ((sid: string) => readonly string[]) | null): void {
+    this.identityAliases = resolve;
+  }
+
+  /** 直查落空時，按別名找出這條會話**真正持鑰/受保護**的那個 sid。 */
+  private aliasWithKey(sid: string): string | undefined {
+    if (!this.identityAliases) return undefined;
+    for (const alias of this.identityAliases(sid)) {
+      if (alias !== sid && this.keys.has(alias)) return alias;
+    }
+    return undefined;
+  }
+
+  private aliasProtected(sid: string): boolean {
+    if (!this.identityAliases) return false;
+    return this.identityAliases(sid).some(
+      (alias) => alias !== sid && (this.keys.has(alias) || this.serverE2E.has(alias)),
+    );
+  }
+
   requireKey(sid: string): Buffer {
     this.assertUsable();
     if (this.quarantined.has(sid)) {
@@ -711,7 +748,15 @@ export class E2EKeyStore {
         `[e2e] session ${sid} 处于 quarantine（server 快照省略但本地仍持钥），拒绝处理内容`,
       );
     }
-    const key = this.keys.get(sid);
+    // #950 別名認親（見 setIdentityAliases）：舊鍵下的 K_S 照樣用得上。隔離狀態跟著別名走——
+    // 別名被隔離就等於這條會話被隔離，不許繞過去。
+    const canonical = this.keys.has(sid) ? sid : this.aliasWithKey(sid);
+    if (canonical && canonical !== sid && this.quarantined.has(canonical)) {
+      throw new E2EKeyStoreStateError(
+        `[e2e] session ${sid}（別名 ${canonical}）处于 quarantine，拒绝处理内容`,
+      );
+    }
+    const key = canonical ? this.keys.get(canonical) : undefined;
     if (!key) {
       throw new E2EKeyStoreStateError(
         `[e2e] no E2E key for session ${sid}（缺少本地 K_S，fail-closed）`,
@@ -722,7 +767,9 @@ export class E2EKeyStore {
 
   isE2E(sid: string): boolean {
     this.assertUsable();
-    return this.keys.has(sid) || this.serverE2E.has(sid);
+    // 別名命中同樣算「這條會話是 E2E」——這是**收緊**方向：寧可多保護一條，也不能讓換過
+    // 身份的 E2E 會話被當成明文發出去。
+    return this.keys.has(sid) || this.serverE2E.has(sid) || this.aliasProtected(sid);
   }
 
   /** 本地持鑰與 server protection floor 的完整 wire sid 集，供身份映射做 fail-closed 對賬。 */
@@ -739,7 +786,9 @@ export class E2EKeyStore {
 
   hasKey(sid: string): boolean {
     this.assertUsable();
-    return this.keys.has(sid);
+    // #950 別名下的舊鍵同樣算「本地持鑰」：否則遷移後這條會話會被當成「沒鑰匙」重新走一遍
+    // enable，把已有密文變成解不開的孤兒。
+    return this.keys.has(sid) || this.aliasWithKey(sid) !== undefined;
   }
 
   /**
@@ -1194,6 +1243,10 @@ export class E2EKeyStore {
     }
     const existing = this.keys.get(sid);
     if (existing) return Buffer.from(existing);
+    // #950 這條會話換過身份、K_S 壓在舊鍵下 → **復用舊鑰，絕不新生成一把**：
+    // 新 K_S 會讓這條會話此前的全部密文永久解不開。
+    const aliased = this.aliasWithKey(sid);
+    if (aliased) return Buffer.from(this.keys.get(aliased)!);
     if (this.serverStateSynced && this.serverE2E.get(sid) !== "enable") {
       throw new E2EKeyStoreStateError(
         `[e2e] session ${sid} 并非 server pending-enable，禁止隐式生成新 K_S（fail-closed）`,

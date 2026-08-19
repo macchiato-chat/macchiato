@@ -1,0 +1,135 @@
+{
+  "connector": "claude-code",
+  "capturedAt": "2026-08-14",
+  "capturedFrom": "本機 552 個真實 transcript 的行形態盤點（#926/#947）：正文、路徑、git 信息全部脫敏重寫，只保留結構",
+  "parser": "src/cc/lineage.ts readTranscriptOrigin() + src/cc/mirror.ts resolveNewOrigins()",
+  "projectsRoot": "projects",
+  "thresholds": {
+    "maxAbsentRatioOverall": 0.2,
+    "maxAbsentRatioCurrentEra": 0
+  },
+  "cases": [
+    {
+      "file": "projects/-w-proj/00009510-0000-4000-8000-000000000001.jsonl",
+      "era": "current",
+      "role": "root",
+      "sid": "00009510-0000-4000-8000-000000000001",
+      "shape": "普通主會話（prelude + user + assistant + last-prompt）",
+      "expect": {
+        "kind": "user",
+        "evidence": "declared",
+        "parent": null
+      }
+    },
+    {
+      "file": "projects/-w-proj/00009510-0000-4000-8000-000000000002.jsonl",
+      "era": "current",
+      "role": "root",
+      "sid": "00009510-0000-4000-8000-000000000002",
+      "shape": "多回合主會話（rewind 截斷副本的父）",
+      "expect": {
+        "kind": "user",
+        "evidence": "declared",
+        "parent": null
+      }
+    },
+    {
+      "file": "projects/-w-proj/00009510-0000-4000-8000-000000000003.jsonl",
+      "era": "legacy",
+      "role": "root",
+      "sid": "00009510-0000-4000-8000-000000000003",
+      "shape": "老形態：子 agent 的行內聯在主會話裡（整檔一見 isSidechain 就判 = 把真人會話抹掉）",
+      "expect": {
+        "kind": "user",
+        "evidence": "declared",
+        "parent": null
+      }
+    },
+    {
+      "file": "projects/-w-proj/00009510-0000-4000-8000-000000000004.jsonl",
+      "era": "legacy",
+      "role": "root",
+      "sid": "00009510-0000-4000-8000-000000000004",
+      "shape": "老格式：行內沒有 uuid / leafUuid → 沒有指紋（evidence=absent，行為不變）",
+      "expect": {
+        "kind": "user",
+        "evidence": "absent",
+        "parent": null
+      }
+    },
+    {
+      "file": "projects/-w-proj/00009510-0000-4000-8000-000000000001/subagents/agent-00009510-0000-4000-8000-000000000011.jsonl",
+      "era": "current",
+      "role": "derived",
+      "sid": "agent-00009510-0000-4000-8000-000000000011",
+      "shape": "新佈局：<project>/<父會話 id>/subagents/agent-*.jsonl（行內 isSidechain + agentId + sessionId=父）",
+      "expect": {
+        "kind": "subagent",
+        "evidence": "declared",
+        "declaredParent": "00009510-0000-4000-8000-000000000001",
+        "agentId": "agent-a1"
+      }
+    },
+    {
+      "file": "projects/-w-proj/agent-9510aa01.jsonl",
+      "era": "current",
+      "role": "derived",
+      "sid": "agent-9510aa01",
+      "shape": "老佈局：項目目錄頂層的 agent-*.jsonl，但行內照樣有聲明",
+      "expect": {
+        "kind": "subagent",
+        "evidence": "declared",
+        "declaredParent": "00009510-0000-4000-8000-000000000001",
+        "agentId": "agent-a2"
+      }
+    },
+    {
+      "file": "projects/-w-proj/00009510-0000-4000-8000-000000000012.jsonl",
+      "era": "current",
+      "role": "derived",
+      "sid": "00009510-0000-4000-8000-000000000012",
+      "shape": "**本刀的重點**：CC 哪天把子 agent 檔名改成普通 <uuid>.jsonl——只認文件名的實現會把它當一條新會話",
+      "expect": {
+        "kind": "subagent",
+        "evidence": "declared",
+        "declaredParent": "00009510-0000-4000-8000-000000000002",
+        "agentId": "agent-b1"
+      }
+    },
+    {
+      "file": "projects/-w-proj/agent-9510legacy.jsonl",
+      "era": "legacy",
+      "role": "derived",
+      "sid": "agent-9510legacy",
+      "shape": "老版本子 agent：行裡什麼血緣都沒寫，只剩文件名兜底（evidence=inferred）",
+      "expect": {
+        "kind": "subagent",
+        "evidence": "inferred"
+      }
+    },
+    {
+      "file": "projects/-w-proj/00009510-0000-4000-8000-000000000021.jsonl",
+      "era": "current",
+      "role": "continuation",
+      "sid": "00009510-0000-4000-8000-000000000021",
+      "shape": "終端 `claude --resume`：新開 <uuid>.jsonl，父會話歷史整段複製（sessionId 被改寫、uuid 原樣保留）",
+      "expect": {
+        "kind": "user",
+        "evidence": "declared",
+        "parent": "00009510-0000-4000-8000-000000000001"
+      }
+    },
+    {
+      "file": "projects/-w-proj/00009510-0000-4000-8000-000000000022.jsonl",
+      "era": "current",
+      "role": "continuation",
+      "sid": "00009510-0000-4000-8000-000000000022",
+      "shape": "終端 rewind：父檔的**截斷**副本（實測 705→149 行）——指紋仍在頭部，照樣接得回去",
+      "expect": {
+        "kind": "user",
+        "evidence": "declared",
+        "parent": "00009510-0000-4000-8000-000000000002"
+      }
+    }
+  ]
+}

@@ -29,6 +29,18 @@ import { basename, dirname, join } from "node:path";
 import type { LinkBClient } from "../_core/linkb/client";
 import type { E2EKeyStore } from "../_core/e2e/keys";
 import {
+  ThreadRegistry,
+  type ThreadRegistrySnapshot,
+} from "../_core/threads/registry";
+import {
+  isHiddenKind,
+  parseOrigin,
+  resolveConversationId,
+  toWireOrigin,
+  type ThreadOrigin,
+} from "./origin";
+import { threadName } from "./session-index";
+import {
   isCodexInternalHistoryText,
   messagesWithTurns,
   nextOrdAtEof,
@@ -137,8 +149,31 @@ export function discoverRollouts(root = sessionsRoot()): { rollouts: RolloutFile
   return { rollouts, compressed };
 }
 
-/** 從 rollout 內容派生標題(首條 user 消息截斷)與 cwd(session_meta)。 */
-export function deriveMeta(content: string): { title: string; cwd?: string } {
+/**
+ * #946 IDE 注入塊剝離。VS Code / Cursor 這類宿主會把上下文塞進**首條 user 消息**：
+ *
+ *   # Context from my IDE setup:      （本機 152 條）
+ *   ## Open tabs: …
+ *   ## My request for Codex:
+ *   修改我的插件版本号为1.0.0          ← 用戶真正說的話
+ *
+ * 生產庫裡 117 條會話的標題就是這種機器文本開頭——同一個項目下好幾條長得一模一樣，
+ * 用戶連「哪條是哪條」都分不出來。真請求永遠在 `## My request for Codex:` 之後。
+ * 取不到正文（用戶只貼了附件、沒寫字）→ 返回空串，調用方換下一條消息取標題。
+ */
+export function stripIdeContext(message: string): string {
+  const marker = /(?:^|\n)##[ \t]*My request for Codex:[ \t]*\r?\n?/.exec(message);
+  return marker ? message.slice(marker.index + marker[0].length) : message;
+}
+
+/**
+ * 從 rollout 內容派生標題與 cwd(session_meta)。
+ *
+ * #946 標題優先用源系統自己起的名字（`~/.codex/session_index.jsonl` 的 `thread_name`），
+ * 拿不到才回退首條 user 消息截斷（並剝掉上面的 IDE 注入塊）。`threadId` 傳的是**對話**的 id
+ * ——派生線程要拿父會話的名字，不是自己的。
+ */
+export function deriveMeta(content: string, threadId?: string): { title: string; cwd?: string } {
   let cwd: string | undefined;
   let title = "";
   for (const line of content.split("\n")) {
@@ -153,85 +188,30 @@ export function deriveMeta(content: string): { title: string; cwd?: string } {
     if (o.type === "session_meta") cwd = (o.payload ?? o).cwd;
     if (!title && o.type === "event_msg" && o.payload?.type === "user_message" && typeof o.payload.message === "string") {
       if (isCodexInternalHistoryText(o.payload.message)) continue;
-      title = o.payload.message.replace(/\s+/g, " ").trim().slice(0, 56);
+      const text = stripIdeContext(o.payload.message).replace(/\s+/g, " ").trim();
+      if (!text) continue; // 純 IDE 上下文塊 → 換下一條真人消息
+      title = [...text].slice(0, 56).join(""); // 按碼點截,不劈開 emoji
     }
     if (cwd && title) break;
   }
-  return { title: title || "Codex", cwd };
+  return { title: threadName(threadId) || title || "Codex", cwd };
 }
 
 /**
- * #789 / #918: Codex 內部 thread 不得鏡像成用戶可見會話。
+ * #789 / #918 / #946: 非用戶頂層線程不得成為用戶可見會話。
  *
- * 真實 rollout 的 `session_meta.payload` 有結構化來源字段（本機 ~1300 條樣本驗證）：
- *   - `thread_source`: `"user"` | `"subagent"`（未來可能有 `"internal"`）
- *   - `source`: 字串（`"vscode"` / `"cli"` / `"exec"`）或標籤聯合
- *       `{ subagent: { other: "guardian" } }`  ← guardian review（審批風險評估）
- *       `{ subagent: { thread_spawn: {…} } }` ← 子 agent
- *   - `forked_from_id`: 非空 = ephemeral fork
+ * 判據已上移到 `origin.ts` 的 `parseOrigin`（源系統聲明優先、正文啟發式降級成兜底），
+ * 這裡只是它的布爾投影，**語義與 reason 逐字保持** #789 的舊行為：
+ * subagent / internal / fork（`forked_from_id` 等派生歸屬）一律跳。
  *
- * 策略：
- *   - `thread_source` ∈ {internal, subagent} → 跳
- *   - `source` 物件帶 `internal` / `subagent` / `thread_spawn` 標籤 → 跳
- *   - `forked_from_id` 非空字串 → 跳
- *   - 首條 user_message 命中 guardian 穩定前綴 → 跳
- *     （舊 Codex 沒上面字段時，#789 的 fail-open 會把整條評估轉儲當用戶會話）
- *
- * 單條混進普通用戶會話的續評由 `isCodexInternalHistoryText` 在解析層再丟一次。
+ * ⚠️ 鏡像已**不再**用這個口徑（見 `Mirror.metadataFor`）：fork 在鏡像裡改走「歸屬父會話」，
+ * 整檔丟掉會讓用戶在終端 rewind 後那條會話靜默停更。歷史導入仍用這裡的保守口徑——
+ * 導入是整檔灌庫，把 fork 併進父會話會把 fork 複製的那段歷史再灌一遍。
  */
 export function shouldSkipRollout(content: string): { skip: boolean; reason?: string } {
-  for (const line of content.split("\n")) {
-    const s = line.trim();
-    if (!s) continue;
-    let o: { type?: string; payload?: Record<string, unknown> } & Record<string, unknown>;
-    try {
-      o = JSON.parse(s);
-    } catch {
-      continue;
-    }
-    if (o.type === "session_meta") {
-      const p = (o.payload ?? o) as Record<string, unknown>;
-
-      const threadSource = p.thread_source;
-      if (threadSource === "internal") return { skip: true, reason: "thread_source=internal" };
-      if (threadSource === "subagent") return { skip: true, reason: "thread_source=subagent" };
-
-      const source = p.source;
-      if (source && typeof source === "object" && !Array.isArray(source)) {
-        const tags = source as Record<string, unknown>;
-        if ("internal" in tags) return { skip: true, reason: "source.internal" };
-        if ("subagent" in tags) {
-          const sub = tags.subagent;
-          if (sub && typeof sub === "object" && !Array.isArray(sub) && (sub as Record<string, unknown>).other === "guardian") {
-            return { skip: true, reason: "source.subagent.other=guardian" };
-          }
-          return { skip: true, reason: "source.subagent" };
-        }
-        if ("thread_spawn" in tags) return { skip: true, reason: "source.thread_spawn" };
-      }
-
-      const forked = p.forked_from_id;
-      if (typeof forked === "string" && forked.trim()) {
-        return { skip: true, reason: "forked_from_id" };
-      }
-      // 用戶態 / 舊版 meta：還要看首條 user 是不是 guardian 提示詞
-      continue;
-    }
-    if (o.type === "event_msg") {
-      const payload = o.payload;
-      if (
-        payload
-        && payload.type === "user_message"
-        && typeof payload.message === "string"
-      ) {
-        if (isCodexInternalHistoryText(payload.message)) {
-          return { skip: true, reason: "codex-internal-history" };
-        }
-        return { skip: false };
-      }
-    }
-  }
-  return { skip: false };
+  const origin = parseOrigin(content);
+  if (origin.kind === "user") return { skip: false };
+  return { skip: true, ...(origin.reason ? { reason: origin.reason } : {}) };
 }
 
 /** §9 去重身份:rollout 行無 uuid → 內容指紋(role+text+ord 的 sha256 前綴),確定性、逐字節穩定。 */
@@ -248,6 +228,11 @@ interface State {
   tombstones?: string[];
   /** #236 首掃已建基線(持久,對齊 CC #154):此後新發現的 rollout 才從頭鏡像。 */
   seeded?: boolean;
+  /**
+   * #966 `ThreadRegistry` 快照（對話 ↔ 歷代執行線程）。持久化借用本狀態檔——它已經有原子寫、
+   * fsync、.bak，再造一份只會多一處不一致（registry 模塊刻意不落盤，見其註釋）。
+   */
+  threadRegistry?: ThreadRegistrySnapshot;
   /** #348/#350 WAL：送出前已落盤；ACK 才把候選 offsets/ords 提交。 */
   pendingMirrors?: Array<{
     batchId: string;
@@ -272,11 +257,25 @@ interface State {
 interface RolloutMetadata {
   title: string;
   cwd?: string;
-  skip: { skip: boolean; reason?: string };
+  /** #946 源系統聲明的身份與歸屬。 */
+  origin: ThreadOrigin;
+  /** 鏡像口徑的整檔跳過：只有 subagent / internal（fork 改走歸屬，見 `pollOnce`）。 */
+  skip: { skip: boolean; reason?: string; inferred?: boolean };
 }
 
 export class Mirror {
   private state: State;
+  /**
+   * #966 對話 ↔ 歷代執行線程（`connector-core` 的公共設施，四家共用；此前 codex 自己沒有這張表，
+   * 每輪都靠重掃 rollout 現算歸屬）。它管兩件事：
+   *
+   *  1. **上報身份不隨檔案消失而漂移**：`resolveConversationId` 靠父 rollout 在盤上才走得通，
+   *     父檔被壓縮成 .zst / 被裁掉之後同一條派生線程會解到另一個 id ——那就是一次身份輪換，
+   *     server 另起一行、K_S 查不到（#807）。登記過的線程一律用登記時確立的那個身份。
+   *  2. **E2E 別名認親**：身份換過的會話，K_S 還壓在舊鍵下，`E2EKeyStore` 靠這張表的
+   *     `aliasesFor` 找回來（`setIdentityAliases`）。別名歷史不可信時它恒為空 → 逐字節退回老行為。
+   */
+  private registry: ThreadRegistry;
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly drivenIds = new Set<string>();
   /** title/cwd/internal 判據只來自 rollout 頭部；每個活躍文件在進程內最多掃一次。 */
@@ -318,6 +317,15 @@ export class Mirror {
     mirrorDirectionRewinds: 0, // E2E 方向翻轉導致丟棄凍結批、回退重編的次數
     mirrorDropped: 0, // server 判畸形/毒批而丟棄跳過的批次數(非 0 = 有內容沒進 app)
     mirrorInternalSkipped: 0, // #789: guardian / subagent / fork 等內部 rollout 被整檔跳過的次數
+    // #946 兜底判據的用量：源系統沒聲明、只能靠正文啟發式認出的內部 rollout。
+    // 與上面那個分開記才看得出「上游還寫不寫聲明」——這個數字漲 = 又有一批老格式/新形態在靠猜。
+    mirrorInferredSkipped: 0,
+    // #946 派生線程掛回父會話的次數（終端 rewind/fork 後續聊不再靜默停更）。
+    mirrorForkAdopted: 0,
+    // #966 E2E 身份閘攔下的次數：派生線程自己持鑰、且對話身份下查不到同一把 → 維持舊身份
+    // （＝老行為整檔跳過）。**非 0 = 有 E2E 會話沒享受到 rewind 修復**，但絕不誤把密文降級明文，
+    // 也絕不新生成 K_S（那會讓此前的密文永久解不開，#807）。
+    mirrorE2EIdentityHeld: 0,
   };
   private polling = false;
 
@@ -334,21 +342,176 @@ export class Mirror {
     private readonly plaintextLocalAllowed?: () => boolean,
   ) {
     this.state = this.load();
+    try {
+      this.registry = ThreadRegistry.parse(this.state.threadRegistry);
+    } catch (error) {
+      // 快照非法 **絕不能**當成「這些對話沒有別名」放行（#347 那一刀）：空且不可信才是對的，
+      // 於是 aliasesFor 恒空 → 身份閘維持舊身份，不會拿一個猜的鍵去解密。
+      console.error(`[mirror] thread registry 快照非法 → 按空且不可信重建：${(error as Error).message}`);
+      this.registry = ThreadRegistry.empty();
+    }
+    // #950 keystore 的別名認親（只讀側，不改盤上的鍵）。不可信時解析器恒返回空數組 ⇒ 與注入前
+    // 逐字節等價，所以無條件注入是安全的。
+    this.e2e?.setIdentityAliases?.(this.registry.identityAliasResolver());
+  }
+
+  /**
+   * #966/#347 宣告「別名歷史完整」。判據照抄 openclaw：**權威 server 快照已套用 ∧ 此刻一條受
+   * 保護的 E2E 會話都沒有** —— 沒有 K_S 就沒有東西可丟，從此刻起這張表確實涵蓋完整歷史。
+   *
+   * 反過來一旦錯過（機器上已經有 E2E 會話），就**持久 false、永不自升**：`aliasHistoryTrusted`
+   * 不可由「字段存在」推斷，這正是 #347 的原話。不可信 ⇒ 別名恒空 ⇒ 身份閘維持舊身份。
+   *
+   * 由 Link B ready（`applyServerState` 之後）調用——那是唯一能保證快照權威的時點。
+   */
+  adoptThreadHistoryIfProvable(): void {
+    if (this.registry.historyTrusted) return;
+    if (!this.e2e?.hasServerStateSnapshot?.()) return;
+    if (this.e2e.protectedSessionIds().length > 0) return;
+    if (!this.registry.adoptHistory(true)) return;
+    this.save(true);
+    console.log("· #966 thread registry 別名歷史已標記可信（零受保護 E2E 會話 + 權威快照已套用）");
   }
 
   private metadataFor(file: string): RolloutMetadata {
     const cached = this.rolloutMetadata.get(file);
     if (cached) return cached;
     const preamble = readRolloutPreamble(file);
-    const metadata = {
-      ...deriveMeta(preamble.content),
-      skip: shouldSkipRollout(preamble.content),
+    const origin = parseOrigin(preamble.content, threadIdFromFile(basename(file)) ?? "");
+    const metadata: RolloutMetadata = {
+      // 標題取**對話**的名字：派生線程掛回父會話時顯示父會話的名字，不是子線程自己的。
+      ...deriveMeta(preamble.content, origin.conversationId),
+      origin,
+      skip: isHiddenKind(origin.kind)
+        ? {
+            skip: true,
+            ...(origin.reason ? { reason: origin.reason } : {}),
+            ...(origin.evidence === "inferred" ? { inferred: true } : {}),
+          }
+        : { skip: false },
     };
     // 空 rollout 之後可能才出現首條 user message；標題尚未確定時不把 Codex fallback 鎖死。
     if (preamble.hasUserMessage || metadata.skip.skip) {
       this.rolloutMetadata.set(file, metadata);
     }
     return metadata;
+  }
+
+  /**
+   * #946 這條 rollout 的內容該落到哪段對話。
+   *
+   * 根線程（`session_id === id`、或老格式什麼都沒聲明）解出來就是 `threadId` 自己——本機
+   * 825/1399、生產 478/671 的正常會話一個字節都不變，這是本改動最重要的性質。
+   * 派生線程則沿判據鏈解到**根**（fork 的 fork 只認直接父會歸到一個 app 裡從不存在的中間
+   * 線程上，等於又建一條新會話）。父 rollout 已被壓縮/刪除時就地停下，直接父就是最好的答案。
+   */
+  private conversationSidFor(
+    threadId: string,
+    origin: ThreadOrigin,
+    rollouts: RolloutFile[],
+  ): string {
+    // #966 登記過的線程直接用登記時確立的身份：判據鏈要沿着**盤上的父 rollout** 走，父檔被
+    // 壓縮/裁掉之後同一條線程會解出另一個 id ——那是一次靜默的身份輪換（server 另起一行、
+    // K_S 查不到）。登記表就是為了讓這件事不可能發生。
+    const known = this.registry.conversationOf(threadId);
+    if (known) return this.registry.wireIdentityOf(known) ?? known;
+    if (origin.conversationId === threadId) return threadId; // 根線程：不佔登記表（見下）
+    const resolved = resolveConversationId(origin, (id) => {
+      const rf = rollouts.find((r) => r.threadId === id);
+      if (!rf) return undefined;
+      try {
+        return this.metadataFor(rf.file).origin;
+      } catch {
+        return undefined;
+      }
+    });
+    if (resolved === threadId) return threadId;
+    // 判據鏈只走得到盤上還在的那一環——同一段對話在不同時刻可能停在不同的中間線程上。
+    // 登記表知道那一環屬於哪段對話，先歸一化過去，別為同一段對話另立一份。
+    const conversationId = this.registry.conversationOf(resolved) ?? resolved;
+    // **只登記真的發生了歸屬的線程**：根線程身份恒等於自己、不會輪換，全登記進去只是讓這張
+    // 表跟着 rollout 數量無界長（#9 治理過同一個病）。先把對話 id 自己登記成首個線程，確立的
+    // 上報身份就是它——與 #946 落地時的行為逐字節相同，不因為誰先被發現而改變。
+    try {
+      this.registry.record(conversationId, conversationId);
+      this.registry.record(conversationId, threadId);
+    } catch (error) {
+      // I1 被打破（上游給的血緣自相矛盾）：響亮記一筆，本輪按解析結果走，不靜默改歸屬。
+      console.error(`[mirror] thread registry 拒絕登記 ${threadId} → ${conversationId}：${(error as Error).message}`);
+      return conversationId;
+    }
+    return this.registry.wireIdentityOf(conversationId) ?? conversationId;
+  }
+
+  /**
+   * #966 這條本地 thread 當前的 E2E 身份（wire sid）：app-driven 會話走 ULID 映射，
+   * 終端側被 app 開啟 E2E 的會話就是它自己。`undefined` = 這條線程不受 E2E 保護。
+   *
+   * `isE2E` 內部會走 keystore 的別名認親（見 `setIdentityAliases`），所以身份換過的會話同樣認得出。
+   */
+  private e2eSidFor(sid: string): string | undefined {
+    const mapped = this.e2eWireSidForLocal?.(sid);
+    if (mapped) return mapped;
+    return this.e2e?.isE2E(sid) ? sid : undefined;
+  }
+
+  /**
+   * #966 這條本地 thread **自己**（不經別名）持有的 E2E 身份。
+   *
+   * 為什麼不能用 `e2eSidFor`：`isE2E` 會走別名認親，於是「同一段對話裡有任何一條線程持鑰」
+   * 就會讓**每條兄弟線程**都答 true —— 拿它做身份閘，剛 fork 出來的空線程也會被判成「自己
+   * 有鑰匙」，閘門永遠關着，rewind 修復對真正的 E2E 用戶等於沒做。身份閘要問的是**直接**
+   * 持有：app-driven 的 wire 映射，或它本身就在 keystore 的受保護集合裡。
+   */
+  private directE2ESidFor(sid: string, protectedSids: ReadonlySet<string>): string | undefined {
+    const mapped = this.e2eWireSidForLocal?.(sid);
+    if (mapped) return mapped;
+    return protectedSids.has(sid) ? sid : undefined;
+  }
+
+  /**
+   * keystore 直接持鑰 / server protection floor 的完整身份集（每輪取一次快照）。
+   * keystore 已 poison 時這裡會拋 —— 交給 `poll` 的 catch 記 lastError（與 encryptText 拋出
+   * 同一條路），**不吞**：吞掉就等於在一個看不見保護狀態的 keystore 上放行身份切換。
+   */
+  private protectedSidSnapshot(): ReadonlySet<string> {
+    return new Set(this.e2e?.protectedSessionIds?.() ?? []);
+  }
+
+  /**
+   * #946 fork 檔的分叉點：fork 出來的 rollout 開頭是父會話歷史的**逐字副本**，這段內容
+   * app 裡已經有了。與父 rollout 逐條比 (role, text) 求最長公共前綴，水位坐到其後。
+   *
+   * 讀不到父檔（已壓縮成 .zst / 已刪 / 已裁）→ 保守坐到 EOF：寧可丟掉這一瞬間的尾巴，
+   * 也不能把幾百條歷史複製進用戶會話（#926 截圖裡的「305 條被複製三份」就是這麼來的）。
+   */
+  private forkBaseline(
+    content: string,
+    origin: ThreadOrigin,
+    rollouts: RolloutFile[],
+  ): { offset: number; ord: number } {
+    const eof = { offset: Buffer.byteLength(content, "utf8"), ord: nextOrdAtEof(content) };
+    const parentId = origin.parentThreadId ?? origin.conversationId;
+    const parentFile = rollouts.find((r) => r.threadId === parentId)?.file;
+    if (!parentFile) return eof;
+    let parentMessages: CodexMessage[];
+    try {
+      parentMessages = readNewMessages(readFileSync(parentFile, "utf8"), 0, 0).messages;
+    } catch {
+      return eof;
+    }
+    const own = readNewMessages(content, 0, 0).messages;
+    let shared = 0;
+    while (
+      shared < own.length
+      && shared < parentMessages.length
+      && own[shared]!.role === parentMessages[shared]!.role
+      && own[shared]!.text === parentMessages[shared]!.text
+    ) {
+      shared += 1;
+    }
+    const cut = readNewMessages(content, 0, 0, shared);
+    return { offset: cut.newOffset, ord: cut.lineCount };
   }
 
   /** #161 墓碑:永不再鏡像此 thread(持久;rollout 不動)。 */
@@ -369,7 +532,7 @@ export class Mirror {
 
   /** 該本地 thread 當前是否受 E2E 保護（有 wire 映射或本地直接持鑰）。 */
   private isE2ESession(threadId: string): boolean {
-    return !!this.e2eWireSidForLocal?.(threadId) || this.e2e?.isE2E(threadId) === true;
+    return !!this.e2eSidFor(threadId);
   }
 
   /**
@@ -795,9 +958,11 @@ export class Mirror {
       }
       return;
     }
-    const { rollouts: all } = discoverRollouts();
-    if (!scope) this.pruneState(new Set(all.map((r) => r.threadId)));
-    const rollouts = scope ? all.filter((r) => scope.has(r.threadId)) : all;
+    const { rollouts: allRollouts } = discoverRollouts();
+    // #966 身份閘要的「直接持鑰身份」快照：每輪取一次，別在循環裡反覆問 keystore。
+    const protectedSids = this.protectedSidSnapshot();
+    if (!scope) this.pruneState(new Set(allRollouts.map((r) => r.threadId)));
+    const rollouts = scope ? allRollouts.filter((r) => scope.has(r.threadId)) : allRollouts;
     for (const { file, threadId } of rollouts) {
       if (this.state.tombstones?.includes(threadId)) continue; // #161 app 刪過 → 永不再撈
       // 影子兜底(對齊 CC `drivenUuids`):曾被驅動過、且當前沒有 E2E wire 映射的 thread,鏡像永不
@@ -854,15 +1019,53 @@ export class Mirror {
         }
       }
 
+      // #946 會話身份 = 源系統聲明的歸屬（`session_meta.session_id` 判據鏈），文件名只用來定位。
+      // 根線程（本機 825/1399、生產 478/671）解出來就是它自己，一個字節都不變。
+      // 只有真的派生時才去解析鏈路——不然 574 條子 agent 每 5s 都要遞歸查一遍父，純浪費。
+      const conversationSid = metadata.skip.skip
+        ? threadId
+        : this.conversationSidFor(threadId, metadata.origin, allRollouts);
+      // #966 E2E 身份閘（取代 #946 的「E2E 一律走老路徑」）。
+      //
+      // K_S 按**上報身份**存（`e2e/keys.ts`），所以把派生線程改掛父會話 = 換鍵。要不要換，判據
+      // 只有一條、且必須可證明：**這段對話裡所有直接持鑰的身份，是不是就是對話身份那一把。**
+      //   - 剛 fork 出來的線程自己沒有鑰匙（終端 rewind 的常態，也正是本 issue 要修的那個）→
+      //     換，用對話那把鑰匙加密投回父會話。這就是「rewind 之後正文恢復鏡像」的全部機制。
+      //   - 對話裡有線程持着**別的**鑰匙（存量：#946 之前它自己是一條獨立 E2E 會話）→
+      //     **維持舊身份**（＝老行為整檔跳過）。絕不把密文會話降級成明文、絕不新生成 K_S
+      //     ——後者會讓此前的密文永久解不開（#807）。
+      // 別名歷史不可信時 keystore 的 `aliasesFor` 恒空 ⇒ 認不出「換過身份的同一把」⇒ 落到
+      // 後一檔，維持舊身份（#347 的 fail-closed 原樣照抄）。
+      const conversationE2ESid = this.e2eSidFor(conversationSid);
+      const conversationThreads = this.registry.threadsOf(
+        this.registry.conversationOf(threadId) ?? conversationSid,
+      );
+      const e2eHoldsIdentity =
+        conversationSid !== threadId
+        && [threadId, conversationSid, ...conversationThreads].some((id) => {
+          const direct = this.directE2ESidFor(id, protectedSids);
+          return !!direct && direct !== conversationE2ESid;
+        });
+      // #161 墓碑對父會話同樣有效：用戶刪掉的那段對話，不許被它的派生線程借屍還魂。
+      const parentTombstoned =
+        conversationSid !== threadId && !!this.state.tombstones?.includes(conversationSid);
+
       // #789:內部 thread 只消費本輪新增尾部，不建用戶會話。它的正文不投遞，
       // 因此可直接把 byte/ord 水位推到本次 snapshot EOF。
-      if (metadata.skip.skip) {
+      if (metadata.skip.skip || e2eHoldsIdentity || parentTombstoned) {
         this.state.offsets[threadId] = endOffset;
         this.state.ords[threadId] =
           (this.state.ords[threadId] ?? 0) + nextOrdAtEof(content);
+        const reason = e2eHoldsIdentity
+          ? `${metadata.origin.reason ?? "derived"}/e2e-hold`
+          : parentTombstoned
+            ? `${metadata.origin.reason ?? "derived"}/parent-tombstoned`
+            : metadata.skip.reason;
+        if (metadata.skip.inferred) this.counters.mirrorInferredSkipped += 1;
+        if (e2eHoldsIdentity) this.counters.mirrorE2EIdentityHeld += 1;
         this.counters.mirrorInternalSkipped += 1;
         console.log(
-          `· #789 skip internal rollout ${threadId} (${metadata.skip.reason}; mirrorInternalSkipped=${this.counters.mirrorInternalSkipped})`,
+          `· #789 skip internal rollout ${threadId} (${reason}; mirrorInternalSkipped=${this.counters.mirrorInternalSkipped})`,
         );
         continue;
       }
@@ -880,6 +1083,20 @@ export class Mirror {
           this.state.ords[threadId] = nextOrdAtEof(content);
           continue;
         }
+        // #946 派生線程首次出現:它掛回父會話,而 fork 檔案開頭是**父會話歷史的逐字副本**
+        // (rewind 保留的那幾個回合)——從 0 投遞等於把已經在 app 裡的消息再灌一遍(srcId 含
+        // 行號,跨檔對不上,server 去重救不了)。所以先與父 rollout 對齊公共前綴,水位坐到
+        // 分叉點,只投**分叉之後**的新內容。與 `adoptForked`(我們自己的 rewind)同一道理。
+        if (conversationSid !== threadId) {
+          const base = this.forkBaseline(content as string, metadata.origin, allRollouts);
+          this.state.offsets[threadId] = base.offset;
+          this.state.ords[threadId] = base.ord;
+          this.counters.mirrorForkAdopted += 1;
+          console.log(
+            `· #946 派生線程 ${threadId} → 會話 ${conversationSid}(${metadata.origin.reason}; 水位坐到分叉點 ${base.offset}B; mirrorForkAdopted=${this.counters.mirrorForkAdopted})`,
+          );
+          continue;
+        }
       }
       const ordBase = this.state.ords[threadId] ?? 0;
       const relativeAll = readNewMessages(content, 0, ordBase);
@@ -894,12 +1111,18 @@ export class Mirror {
         // app-driven E2E 的 key/session identity 掛在 wire ULID，rollout 則以本地 UUID 命名。
         // unsetDriven 後 terminal 續聊必須仍回到 wire session 並用 wire key 加密，不能另建
         // local UUID 的 plaintext shadow session。
-        const mappedWireSid = this.e2eWireSidForLocal?.(threadId);
-        const e2eSid = mappedWireSid ?? (this.e2e?.isE2E(threadId) ? threadId : undefined);
+        // #966 派生線程走**對話**的 E2E 身份：終端裡 rewind 出來的 fork 檔自己沒有映射也沒有
+        // 鑰匙，但它屬於的那條會話有——上面的身份閘已經確認過兩者是同一把（不是就整檔跳過了）。
+        const e2eSid = conversationE2ESid;
+        // #966 上報血緣（元數據非正文 → E2E 會話一樣帶得動）。連接器仍按本地判定工作，
+        // 這只是把事實一併報上去；判定權切換是後續（形狀與理由見 `toWireOrigin`）。
+        const origin = toWireOrigin(metadata.origin, e2eSid ?? conversationSid);
+        const wireOrigin = origin ? { origin } : {};
         const makeEntry = (picked: CodexMessage[]): Record<string, unknown> => {
           if (e2eSid) {
             return {
             hermesSessionId: e2eSid,
+            ...wireOrigin,
             title: this.e2e!.encryptText(e2eSid, title),
             source: "codex",
             ...folder,
@@ -912,7 +1135,10 @@ export class Mirror {
             };
           }
           return {
-            hermesSessionId: threadId,
+            ...wireOrigin,
+            // #946 身份 = 源系統聲明的歸屬（根線程 = threadId 自己）；srcId 仍按**本地
+            // thread**算，它只是本會話內的去重鍵，換了會讓已投遞過的消息重新長出一份。
+            hermesSessionId: conversationSid,
             title,
             source: "codex",
             ...folder,
@@ -1198,6 +1424,8 @@ export class Mirror {
       }
     }
     for (const id of Object.keys(ma)) if (!(id in this.state.offsets)) delete ma[id];
+    // ⚠️ #966 `threadRegistry` **不跟着裁**：別名只增不刪（I3）。裁掉一環等於讓一條換過身份的
+    // E2E 會話再也認不出自己的舊鍵（#807），而它只登記真正發生過歸屬的線程，量級遠小於水位表。
     if (pruned) console.log(`· #9 裁剪 ${pruned} 個已消失 rollout 的水位線(剩 ${Object.keys(this.state.offsets).length})`);
   }
 
@@ -1219,6 +1447,9 @@ export class Mirror {
             s.pendingE2EBackfills && typeof s.pendingE2EBackfills === "object"
               ? s.pendingE2EBackfills
               : {},
+          // #966 原樣交給 ThreadRegistry.parse 嚴格校驗（構造函數裡），這裡不做寬鬆兜底：
+          // 「解析失敗 = 這些對話沒有別名」正是 #347 要防的那一刀。
+          threadRegistry: s.threadRegistry,
         };
       } catch {
         /* 下一個候選 */
@@ -1229,6 +1460,9 @@ export class Mirror {
   private lastSaved = "";
   private save(strict = false): void {
     try {
+      // #966 registry 是內存權威，落盤前同步回狀態檔（**必須在發送本線程內容之前**——崩在中間
+      // 會讓別名少一環，而 aliasHistoryTrusted 是持久 true 的，丟了就再也發現不了）。
+      this.state.threadRegistry = this.registry.toJSON();
       // #262 dirty 判斷:與上次落盤相同 → 跳過(每 5s 無條件雙寫傷 SD 卡;Pi OOM/SD 前科)。
       const json = JSON.stringify(this.state);
       if (json === this.lastSaved) return;

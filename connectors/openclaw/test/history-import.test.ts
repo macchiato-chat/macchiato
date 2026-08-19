@@ -110,6 +110,25 @@ describe("history-import（深度：全文件 + 清洗 + 合併 + 過濾）", ()
     expect(ss[0].messages.filter((m: any) => m.role === "user").map((m: any) => m.text)).toEqual(["三月舊問", "現在新問"]);
   });
 
+  it("#968 import_batch 帶血緣：活躍會話報 root，歸檔會話不報（沒證據就別猜）", async () => {
+    writeFileSync(join(sdir, "act.jsonl"), metaUser("999", "#crypto", "現在新問", 3));
+    writeFileSync(join(sdir, "archived.jsonl"), metaUser("888", "#other", "舊問", 1));
+    const sent = await collect([
+      { sessionId: "act", key: "agent:main:discord:channel:999", channel: "discord", kind: "group" },
+    ]);
+    const byId = new Map(
+      sent.filter((m) => m.t === "import_batch").flatMap((b) => b.sessions).map((s: any) => [s.hermesSessionId, s]),
+    );
+    expect(byId.get("agent:main:discord:channel:999").origin).toEqual({
+      threadId: "agent:main:discord:channel:999",
+      conversationId: "agent:main:discord:channel:999",
+      kind: "root",
+      evidence: "declared",
+    });
+    // 歸檔那份 gateway 已經不認得了 —— 不帶 origin = server 按 absent 走老行為。
+    expect(byId.get("agent:main:discord:channel:888").origin).toBeUndefined();
+  });
+
   it("活躍 cron key 跳過", async () => {
     writeFileSync(join(sdir, "c.jsonl"), metaUser("1", "#x", "hi"));
     const sent = await collect([{ sessionId: "c", key: "agent:main:cron:abc", channel: undefined }]);
@@ -261,6 +280,100 @@ describe("history-import（深度：全文件 + 清洗 + 合併 + 過濾）", ()
     expect(restarted.localSessionE2EStatus().isE2E(oldLocalSid)).toBe(true);
     expect(restarted.localSessionE2EStatus().isE2E(newLocalSid)).toBe(true);
     expect((restarted as any).aliasHistoryTrusted).toBe(true);
+  });
+
+  it("#968 別名歷史遷進 ThreadRegistry：舊 state 的每一條別名都認得回同一把 K_S", async () => {
+    const wireSid = "agent:main:discord:channel:968-migrate";
+    const key = keyForSid(wireSid);
+    const oldLocalSid = "migrate-old-local";
+    const olderLocalSid = "migrate-older-local";
+    const newLocalSid = "migrate-new-local";
+    writeFileSync(
+      process.env.MACCHIATO_OPENCLAW_MIRROR!,
+      JSON.stringify({
+        offsets: { [key]: 0 },
+        missingAt: {},
+        tombstones: [],
+        fileIds: { [key]: oldLocalSid },
+        fileIdAliases: { [key]: [olderLocalSid, oldLocalSid] },
+        aliasHistoryTrusted: true,
+      }),
+    );
+    writeFileSync(join(sdir, `${newLocalSid}.jsonl`), plainUser("migrated secret"));
+    const e2e = new E2EKeyStore(join(root, "migrate-e2e.json"));
+    e2e.createForEnable(wireSid);
+    const gw = {
+      sessionsList: async () => ({ sessions: [{ key, sessionId: newLocalSid }] }),
+    } as any;
+    const mirror = new Mirror(gw, { agentLinkId: "al", isReady: true, send: () => {} } as any, e2e);
+
+    // 別名解析器：對話 = key（K_S 的鍵，永不輪換），歷代 transcript 全部認得回它。
+    const resolve = mirror.identityAliasResolver();
+    expect(resolve(olderLocalSid)).toContain(key);
+    expect(resolve(oldLocalSid)).toContain(key);
+    e2e.setIdentityAliases(resolve);
+    expect(e2e.hasKey(olderLocalSid)).toBe(true); // 別名下的舊鍵照樣算「本地持鑰」
+
+    // 輪換 + 落盤：老別名一條都不許少（只增不刪）。
+    await (mirror as any).pollOnce();
+    const onDisk = JSON.parse(readFileSync(process.env.MACCHIATO_OPENCLAW_MIRROR!, "utf8"));
+    expect(onDisk.fileIdAliases[key]).toEqual([olderLocalSid, oldLocalSid, newLocalSid]);
+    expect(onDisk.aliasHistoryTrusted).toBe(true);
+    expect(onDisk.fileIds[key]).toBe(newLocalSid); // key 自己不進別名數組，磁盤格式一個字節沒動
+    expect(mirror.identityAliasResolver()(newLocalSid)).toContain(key);
+  });
+
+  it("#968 fail-closed：舊 schema 沒有別名歷史 → 解析器恒空，逐字節退回改前行為", async () => {
+    const wireSid = "agent:main:discord:channel:968-untrusted";
+    const key = keyForSid(wireSid);
+    const localSid = "untrusted-local";
+    writeFileSync(
+      process.env.MACCHIATO_OPENCLAW_MIRROR!,
+      JSON.stringify({
+        offsets: { [key]: 0 },
+        missingAt: {},
+        tombstones: [],
+        // 故意沒有 fileIdAliases/aliasHistoryTrusted：舊 schema 可能早已丟過 rotation alias。
+        fileIds: { [key]: localSid },
+      }),
+    );
+    const e2e = new E2EKeyStore(join(root, "untrusted-e2e.json"));
+    e2e.createForEnable(wireSid);
+    const gw = { sessionsList: async () => ({ sessions: [{ key, sessionId: localSid }] }) } as any;
+    const mirror = new Mirror(gw, { agentLinkId: "al", isReady: true, send: () => {} } as any, e2e);
+    expect((mirror as any).aliasHistoryTrusted).toBe(false);
+    expect(mirror.identityAliasResolver()(localSid)).toEqual([]);
+    // 有 protected 會話在時，普通 save 不得把「補出來的別名」冒充成完整歷史。
+    await mirror.reconcileIdentityPreflight();
+    expect((mirror as any).aliasHistoryTrusted).toBe(false);
+    expect(
+      JSON.parse(readFileSync(process.env.MACCHIATO_OPENCLAW_MIRROR!, "utf8")).aliasHistoryTrusted,
+    ).toBe(false);
+  });
+
+  it("#968 別名表自相矛盾（同一 transcript 掛兩個 key）→ 降級成不可信，但一條別名都不刪", async () => {
+    const keyA = "agent:main:discord:channel:conflict-a";
+    const keyB = "agent:main:discord:channel:conflict-b";
+    const shared = "conflict-shared-local";
+    writeFileSync(
+      process.env.MACCHIATO_OPENCLAW_MIRROR!,
+      JSON.stringify({
+        offsets: {},
+        missingAt: {},
+        tombstones: [],
+        fileIds: { [keyA]: shared, [keyB]: shared },
+        fileIdAliases: { [keyA]: [shared], [keyB]: [shared] },
+        aliasHistoryTrusted: true,
+      }),
+    );
+    const gw = { sessionsList: async () => ({ sessions: [] }) } as any;
+    const mirror = new Mirror(gw, { agentLinkId: "al", isReady: true, send: () => {} } as any);
+    expect((mirror as any).aliasHistoryTrusted).toBe(false); // 證明不了 I1 → 一律 fail-closed
+    expect(mirror.identityAliasResolver()(shared)).toEqual([]);
+    (mirror as any).save(true);
+    const onDisk = JSON.parse(readFileSync(process.env.MACCHIATO_OPENCLAW_MIRROR!, "utf8"));
+    expect(onDisk.fileIdAliases).toEqual({ [keyA]: [shared], [keyB]: [shared] });
+    expect(onDisk.aliasHistoryTrusted).toBe(false);
   });
 
   it("#347 runImport 等 gateway 期间并发 enable 后动态重判 floor，不沿用零 E2E 的旧 closure", async () => {

@@ -9,6 +9,8 @@
  * #677:summary 與主回合並發冷啟時可能慢/失敗——maybeTitle 先發 firstmsg 截斷,再異步升級摘要,
  * 側欄不再卡「新會話」等 LLM。
  * env `MACCHIATO_CC_TITLE_MODE`:summary(默認)/ firstmsg(零 LLM)/ off。
+ * #997：`ANTHROPIC_BASE_URL` 指向 OpenRouter 時，默認 haiku 會 403，summary 不再冷啟
+ * 那個 20s 並行 query（跟主回合搶額度）；顯式 `MACCHIATO_CC_TITLE_MODEL` 仍尊重。
  */
 import { query, type Query } from "@anthropic-ai/claude-agent-sdk";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
@@ -24,6 +26,27 @@ export function titleMode(): TitleMode {
   if (m === "summary" || m === "firstmsg" || m === "off") return m;
   if (m) console.error(`[titles] 忽略非法 MACCHIATO_CC_TITLE_MODE=${m}(summary/firstmsg/off)`);
   return "summary"; // #590 默認真生成(haiku 輕量檔);#346 的原始風險已結構性消除,escape 保留
+}
+
+/**
+ * 標題 LLM 用哪條路。#997：默認 haiku 只在直連 Anthropic 上成立。
+ * 狗糧/公開用戶走 OpenRouter 時，haiku 會 403（帳號 TOS 擋 Anthropic 系），
+ * 卻仍會冷啟一個 20s 的並行 query，跟主回合搶額度——2026-08-17 狗糧
+ * `interrupt:回合1未開跑` 的現場就是主通道已 Channel open，標題先燒了 20s。
+ * 顯式 `MACCHIATO_CC_TITLE_MODEL` 仍尊重（人要打哪個就打哪個）。
+ */
+export function titleLlmChoice(): { skip: true; reason: string } | { skip: false } {
+  const explicit = process.env.MACCHIATO_CC_TITLE_MODEL?.trim();
+  if (explicit) return { skip: false };
+  const base = process.env.ANTHROPIC_BASE_URL ?? "";
+  if (/openrouter\.ai/i.test(base)) {
+    return {
+      skip: true,
+      reason:
+        "OpenRouter 兼容端點上默認 haiku 會 403，跳過 summary LLM、用首條截斷（設 MACCHIATO_CC_TITLE_MODEL 可強制生成）",
+    };
+  }
+  return { skip: false };
 }
 
 /** 首條消息截斷兜底標題。按碼點截(而非 UTF-16 單元),emoji/增補面字符不被劈成孤代理項。 */
@@ -107,6 +130,12 @@ export async function generateTitle(firstUserText: string): Promise<string> {
   const fallback = fallbackTitle(firstUserText);
   if (mode === "firstmsg") return fallback;
 
+  const llm = titleLlmChoice();
+  if (llm.skip) {
+    console.error(`[titles] ${llm.reason}`);
+    return fallback;
+  }
+
   // persistSession:false 防垃圾標題會話進鏡像；cwd 只是一個空工作目錄，不暴露 HOME/真項目。
   // 不覆寫 CLAUDE_CONFIG_DIR：直接共用 agent 的 canonical 帳號 store，避免第二份可獨立刷新的認證；
   // settingSources:[] 仍隔離 user/project hooks 與設定。
@@ -124,9 +153,8 @@ export async function generateTitle(firstUserText: string): Promise<string> {
       options: {
         abortController,
         cwd: isolatedCwd,
-        // #590 Brian 拍板:標題固定走輕量檔 haiku(不帶 effort;haiku 本就不宣告 effort 檔位)——
-        // CC 恆 Anthropic、haiku 是 CLI 官方別名全帳號可解。這不違背「不寫死 model」鐵律:
-        // 會話本體仍走用戶配置,這裡只挑「生成一行標題」的廉價檔;env 逃生門可換,失敗照舊回退截斷。
+        // #590 直連 Anthropic 走輕量檔 haiku。OpenRouter 在上面 titleLlmChoice 已 skip。
+        // 顯式 MACCHIATO_CC_TITLE_MODEL 永遠優先。護欄只放行 `env || 檔位別名` 這種形狀。
         model: process.env.MACCHIATO_CC_TITLE_MODEL || "haiku",
         // #677:關 thinking,標題一行字不需要推理預算(更快、更少超時誤殺)
         thinking: { type: "disabled" },

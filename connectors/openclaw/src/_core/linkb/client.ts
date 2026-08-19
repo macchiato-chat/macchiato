@@ -12,6 +12,115 @@ export type FrameHandler = (msg: Record<string, unknown>) => void;
 export type E2EStateApplier = (state: unknown) => readonly string[];
 export type E2EProtectionCheck = (sid: string) => boolean;
 
+// ── E2E 鏡像批次的出站形狀（#983 起是**單一真源**）────────────────────────────────
+// 這張表是「加密會話允許出門的字段」的唯一定義：`filterBlockedOutbound` 用它把關，各連接器
+// 的單測也拿**自己真造出來的條目**對着它跑（`cc/mirror` 的 `entry()`、openclaw 的實時條目）。
+// 兩邊共用一份，是因為分開維護已經出過一次事故：
+//
+// 🩸 #983：`entry()` 在 #659（2026-08-01 加 `cwd`）和 #973/#968（2026-08-14 加 `origin`）先後
+//    多帶了兩個字段，這張表沒跟上 → 每一幀加密實時鏡像都被整幀丟掉、**而且那條分支當時不打
+//    日誌**。表現是「開了 E2E 之後發出去的消息永遠沒有回覆」：加密回合其實跑完了（agent 收到
+//    解密明文、也回了），只是正文回不來——`sendE2ETurn` 早在 #348 就改成只走鏡像 WAL，鏡像一
+//    斷，加密會話就完全啞了。CC 用戶自 2026-08-01 起、openclaw 自 2026-08-14 起都在裸奔，
+//    整整兩週沒人看得出來，因為日誌裡它和「agent 沒回」完全同形。
+//
+// 所以這裡有兩條硬規矩，別再違反：
+//   ① **加字段先加這張表**（連接器單測會替你紅，見各家 `*-e2e-wire.test.ts`）；
+//   ② **丟幀必須說得出丟的是哪一種**——所以判定函數回的是「原因字符串」而不是 boolean。
+const E2E_SESSION_KEYS = [
+  "hermesSessionId", "title", "source", "startedAt", "archived", "e2e", "messages",
+  // #659 會話工作目錄：**刻意明文**的元數據（server 用靜態層 KEK 加密落庫），否則加密會話
+  // 永遠沒有文件夾。與 `source`/`archived` 同性質。
+  "cwd",
+  // #950/#967 血緣：元數據不是正文。E2E 下 server 看不見密文，這是唯一還能做歸屬判定的憑據。
+  "origin",
+] as const;
+// `origin` 裡唯一的自由文本是 `label`（子 agent 名 / 路徑，#952 的父會話卡片用）。加密會話上
+// **不放行**：其餘字段都是 id / 枚舉 / 數字，`label` 是唯一能把人話明文帶出去的口子。生產者
+// 自己在 E2E 分支省掉它（見 openclaw mirror），這裡是兜底。
+const E2E_ORIGIN_KEYS = [
+  "threadId", "conversationId", "kind", "parentThreadId", "depth", "evidence",
+] as const;
+const E2E_MESSAGE_KEYS = ["role", "text", "reasoning", "tools", "createdAt", "srcId", "enc"] as const;
+
+function extraKeys(value: Record<string, unknown>, allowed: readonly string[]): string[] {
+  return Object.keys(value).filter((key) => !allowed.includes(key));
+}
+
+function isCiphertext(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 40 &&
+    value.length % 4 === 0 &&
+    /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)
+  );
+}
+
+function originIssue(value: unknown): string | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return "origin 不是對象";
+  const origin = value as Record<string, unknown>;
+  const extra = extraKeys(origin, E2E_ORIGIN_KEYS);
+  if (extra.length) {
+    // label 走到這裡 = 生產者忘了在 E2E 分支省掉它，說清楚別讓人以為是形狀壞了。
+    return extra.includes("label")
+      ? "origin.label 是自由文本，加密會話不得明文帶出（生產者應在 E2E 分支省掉）"
+      : `origin 多了字段 ${extra.join(",")}`;
+  }
+  for (const key of ["threadId", "conversationId", "kind", "evidence"] as const) {
+    if (typeof origin[key] !== "string" || !origin[key]) return `origin.${key} 缺失或非字符串`;
+  }
+  if (origin.parentThreadId !== undefined && typeof origin.parentThreadId !== "string") {
+    return "origin.parentThreadId 非字符串";
+  }
+  if (origin.depth !== undefined && typeof origin.depth !== "number") return "origin.depth 非數字";
+  return null;
+}
+
+/**
+ * 一條 `mirror_append` 會話條目能不能在**加密會話**上出門：`null` ＝ 可以，否則是人話原因。
+ *
+ * 回原因而不是 boolean 是刻意的（#983 的教訓）：丟幀時日誌要說得出丟的是哪一種，否則
+ * 「發了消息但永遠沒有回覆」在日誌裡和「agent 沒回」完全同形，只能靠人一行行讀源碼去撞。
+ */
+export function encryptedMirrorSessionIssue(value: unknown): string | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return "session 不是對象";
+  const session = value as Record<string, unknown>;
+  const extra = extraKeys(session, E2E_SESSION_KEYS);
+  if (extra.length) return `多了未經審核的字段 ${extra.join(",")}（加字段要先進 E2E_SESSION_KEYS）`;
+  if (typeof session.hermesSessionId !== "string" || !session.hermesSessionId) {
+    return "hermesSessionId 缺失";
+  }
+  if (session.e2e !== true) return "e2e 標記不是 true";
+  if (session.title !== undefined && !isCiphertext(session.title)) return "title 不是密文";
+  if (session.cwd !== undefined && typeof session.cwd !== "string") return "cwd 非字符串";
+  if (session.source !== undefined && typeof session.source !== "string") return "source 非字符串";
+  if (session.origin !== undefined) {
+    const issue = originIssue(session.origin);
+    if (issue) return issue;
+  }
+  if (!Array.isArray(session.messages)) return "messages 不是數組";
+  for (const [i, value] of session.messages.entries()) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      return `messages[${i}] 不是對象`;
+    }
+    const message = value as Record<string, unknown>;
+    const extraMsg = extraKeys(message, E2E_MESSAGE_KEYS);
+    if (extraMsg.length) return `messages[${i}] 多了字段 ${extraMsg.join(",")}`;
+    if (message.role !== "user" && message.role !== "agent" && message.role !== "system") {
+      return `messages[${i}].role 非法`;
+    }
+    if (!isCiphertext(message.enc)) return `messages[${i}].enc 不是密文`;
+    if (message.text !== undefined && message.text !== "") return `messages[${i}] 帶明文 text`;
+    if (message.reasoning !== undefined && message.reasoning !== "") {
+      return `messages[${i}] 帶明文 reasoning`;
+    }
+    if (message.tools !== undefined && !(Array.isArray(message.tools) && !message.tools.length)) {
+      return `messages[${i}] 帶明文 tools`;
+    }
+  }
+  return null;
+}
+
 export class LinkBClient {
   private ws: WebSocket | null = null;
   private closed = false;
@@ -479,32 +588,7 @@ export class LinkBClient {
   }
 
   private static safeEncryptedSession(value: unknown): boolean {
-    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-    const session = value as Record<string, unknown>;
-    if (
-      !LinkBClient.onlyKeys(session, [
-        "hermesSessionId", "title", "source", "startedAt", "archived", "e2e", "messages",
-      ]) ||
-      typeof session.hermesSessionId !== "string" ||
-      !session.hermesSessionId ||
-      session.e2e !== true ||
-      (session.title !== undefined && !LinkBClient.looksLikeCiphertext(session.title)) ||
-      !Array.isArray(session.messages)
-    ) return false;
-    return session.messages.every((value) => {
-      if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-      const message = value as Record<string, unknown>;
-      return (
-        LinkBClient.onlyKeys(message, [
-          "role", "text", "reasoning", "tools", "createdAt", "srcId", "enc",
-        ]) &&
-        (message.role === "user" || message.role === "agent" || message.role === "system") &&
-        LinkBClient.looksLikeCiphertext(message.enc) &&
-        (message.text === undefined || message.text === "") &&
-        (message.reasoning === undefined || message.reasoning === "") &&
-        (message.tools === undefined || (Array.isArray(message.tools) && message.tools.length === 0))
-      );
-    });
+    return encryptedMirrorSessionIssue(value) === null;
   }
 
   private static safeProtectedTui(raw: Record<string, any>): boolean {
@@ -678,7 +762,18 @@ export class LinkBClient {
               : undefined;
           if (typeof sid === "string" && this.blockedSessionIds.has(sid)) return false;
           if (!this.sessionIsProtected(sid)) return true;
-          return raw.t === "mirror_append" && LinkBClient.safeEncryptedSession(session);
+          // #983 這條分支此前**一條日誌都不打**，於是「加密會話發了消息永遠沒回覆」在日誌裡
+          // 和「agent 沒回」完全同形，白名單漏字段整整兩週沒人看得出來。丟就得說原因。
+          if (raw.t !== "mirror_append") {
+            console.error(`[E2E outbound dropped] ${String(raw.t)} 不得攜帶加密會話 ${String(sid)}`);
+            return false;
+          }
+          const issue = encryptedMirrorSessionIssue(session);
+          if (issue) {
+            console.error(`[E2E outbound dropped] mirror_append ${String(sid)}：${issue}`);
+            return false;
+          }
+          return true;
         });
         if (sessions.length !== raw.sessions.length) {
           if (!sessions.length && !(raw.t === "import_batch" && raw.done === true)) return null;
@@ -713,7 +808,14 @@ export class LinkBClient {
               LinkBClient.safeEncryptedSession(raw.session)))
         ) return msg;
       }
-      console.error(`[E2E outbound dropped] protected session frame ${String(raw.t)}`);
+      // 丟幀必須說得出「丟的是哪一種」：只印 `t=tui` 時，加密會話裡「發了消息但永遠沒有回覆」
+      // 這種症狀在日誌裡和「agent 沒回」完全同形，#971 就是這麼查了半天才定位到白名單。
+      // tui 幀的判別信息在 `frame.params.type`，一併帶上（只帶類型名，不帶 payload）。
+      const tuiType =
+        raw.t === "tui" && raw.frame?.params && typeof raw.frame.params === "object"
+          ? `:${String((raw.frame.params as { type?: unknown }).type)}`
+          : "";
+      console.error(`[E2E outbound dropped] protected session frame ${String(raw.t)}${tuiType}`);
       return null;
     } catch (error) {
       // keystore poison/并发不确定时，宁可停掉这一帧，也不能让内容路径降成明文。

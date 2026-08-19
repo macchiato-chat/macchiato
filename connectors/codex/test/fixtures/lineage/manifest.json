@@ -1,0 +1,229 @@
+{
+  "connector": "codex",
+  "capturedAt": "2026-08-14",
+  "capturedFrom": "本機 1399 個真實 rollout 的 session_meta 形態盤點（#926/#946）；正文與路徑全部脫敏重寫，只保留結構",
+  "parser": "src/codex/origin.ts parseOrigin()",
+  "roots": {
+    "ROOT_A": "019f9510-0000-7000-8000-000000000001",
+    "ROOT_B": "019f9510-0000-7000-8000-000000000002",
+    "ROOT_C": "019f9510-0000-7000-8000-000000000003",
+    "ROOT_D": "019f9510-0000-7000-8000-000000000004",
+    "ROOT_E": "019f9510-0000-7000-8000-000000000005",
+    "ROOT_F": "019f9510-0000-7000-8000-000000000006"
+  },
+  "thresholds": {
+    "maxAbsentRatioOverall": 0.25,
+    "maxAbsentRatioCurrentEra": 0
+  },
+  "cases": [
+    {
+      "file": "rollout-2026-08-14T00-00-01-019f9510-0000-7000-8000-000000000001.jsonl",
+      "era": "current",
+      "role": "root",
+      "shape": "新格式 VS Code 根線程：session_id === id + thread_source=user（本機 34+37 條）",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000001",
+        "conversationId": "019f9510-0000-7000-8000-000000000001",
+        "kind": "user",
+        "evidence": "declared"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-02-019f9510-0000-7000-8000-000000000002.jsonl",
+      "era": "current",
+      "role": "root",
+      "shape": "新格式 CLI 根線程：session_id === id（本機 9 條）",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000002",
+        "conversationId": "019f9510-0000-7000-8000-000000000002",
+        "kind": "user",
+        "evidence": "declared"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-03-019f9510-0000-7000-8000-000000000006.jsonl",
+      "era": "current",
+      "role": "root",
+      "shape": "只有 thread_source=user、沒有 session_id 的過渡格式（本機 84 條）",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000006",
+        "conversationId": "019f9510-0000-7000-8000-000000000006",
+        "kind": "user",
+        "evidence": "declared"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-04-019f9510-0000-7000-8000-000000000003.jsonl",
+      "era": "legacy",
+      "role": "root",
+      "shape": "老格式 VS Code 根線程：什麼都不聲明（本機 166 條）——行為必須逐字節不變",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000003",
+        "conversationId": "019f9510-0000-7000-8000-000000000003",
+        "kind": "user",
+        "evidence": "absent"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-05-019f9510-0000-7000-8000-000000000004.jsonl",
+      "era": "legacy",
+      "role": "root",
+      "shape": "老格式 CLI 根線程：連 source 都沒有（本機 62 條）",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000004",
+        "conversationId": "019f9510-0000-7000-8000-000000000004",
+        "kind": "user",
+        "evidence": "absent"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-06-019f9510-0000-7000-8000-000000000005.jsonl",
+      "era": "legacy",
+      "role": "root",
+      "shape": "`codex exec` 一次性線程（本機 3 條）：source=exec、無 thread_source",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000005",
+        "conversationId": "019f9510-0000-7000-8000-000000000005",
+        "kind": "user",
+        "evidence": "absent"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-07-019f9510-0000-7000-8000-000000000011.jsonl",
+      "era": "current",
+      "role": "derived",
+      "shape": "thread_spawn 子 agent（本機最常見形態，231 條）：session_id 指父 + agent_nickname",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000011",
+        "conversationId": "019f9510-0000-7000-8000-000000000001",
+        "kind": "subagent",
+        "parentThreadId": "019f9510-0000-7000-8000-000000000001",
+        "label": "Mill",
+        "evidence": "declared",
+        "reason": "thread_source=subagent"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-08-019f9510-0000-7000-8000-000000000012.jsonl",
+      "era": "current",
+      "role": "derived",
+      "shape": "thread_spawn 子 agent 的 dynamic_tools 變體（本機 62 條）——多一個字段不影響判定",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000012",
+        "conversationId": "019f9510-0000-7000-8000-000000000001",
+        "kind": "subagent",
+        "parentThreadId": "019f9510-0000-7000-8000-000000000001",
+        "label": "Vale",
+        "evidence": "declared"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-09-019f9510-0000-7000-8000-000000000013.jsonl",
+      "era": "current",
+      "role": "derived",
+      "shape": "guardian 審批評估線程（本機 177 條）：source.subagent.other=guardian + session_id 指父",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000013",
+        "conversationId": "019f9510-0000-7000-8000-000000000001",
+        "kind": "subagent",
+        "parentThreadId": "019f9510-0000-7000-8000-000000000001",
+        "evidence": "declared",
+        "reason": "thread_source=subagent"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-10-019f9510-0000-7000-8000-000000000014.jsonl",
+      "era": "current",
+      "role": "derived",
+      "shape": "guardian 老一點的版本（本機 27 條）：沒有 session_id，只有 parent_thread_id",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000014",
+        "conversationId": "019f9510-0000-7000-8000-000000000002",
+        "kind": "subagent",
+        "parentThreadId": "019f9510-0000-7000-8000-000000000002",
+        "evidence": "declared"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-11-019f9510-0000-7000-8000-000000000015.jsonl",
+      "era": "current",
+      "role": "derived",
+      "shape": "guardian 孤兒檔（本機 32 條）：定得出「是派生」、定不出父 → 隔離而非歸位",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000015",
+        "conversationId": "019f9510-0000-7000-8000-000000000015",
+        "kind": "subagent",
+        "evidence": "declared"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-12-019f9510-0000-7000-8000-000000000016.jsonl",
+      "era": "current",
+      "role": "derived",
+      "shape": "thread_source=internal（枚舉裡有、本機這批樣本沒出現）——上游一旦開始寫，判定必須已經對",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000016",
+        "conversationId": "019f9510-0000-7000-8000-000000000001",
+        "kind": "internal",
+        "parentThreadId": "019f9510-0000-7000-8000-000000000001",
+        "evidence": "declared",
+        "reason": "thread_source=internal"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-13-019f9510-0000-7000-8000-000000000017.jsonl",
+      "era": "legacy",
+      "role": "derived",
+      "shape": "老格式 guardian（#918）：session_meta 什麼都沒聲明，只能靠正文猜 → evidence=inferred",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000017",
+        "conversationId": "019f9510-0000-7000-8000-000000000017",
+        "kind": "internal",
+        "evidence": "inferred",
+        "reason": "codex-internal-history"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-14-019f9510-0000-7000-8000-000000000021.jsonl",
+      "era": "current",
+      "role": "continuation",
+      "shape": "終端裡 rewind/fork 後續聊：thread_source=user + session_id/forked_from_id 指父（歷史是父檔逐字副本）",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000021",
+        "conversationId": "019f9510-0000-7000-8000-000000000001",
+        "kind": "fork",
+        "parentThreadId": "019f9510-0000-7000-8000-000000000001",
+        "evidence": "declared",
+        "reason": "session_id"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-15-019f9510-0000-7000-8000-000000000022.jsonl",
+      "era": "legacy",
+      "role": "continuation",
+      "shape": "老格式續接：只有 parent_thread_id",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000022",
+        "conversationId": "019f9510-0000-7000-8000-000000000002",
+        "kind": "fork",
+        "parentThreadId": "019f9510-0000-7000-8000-000000000002",
+        "evidence": "declared",
+        "reason": "parent_thread_id"
+      }
+    },
+    {
+      "file": "rollout-2026-08-14T00-00-16-019f9510-0000-7000-8000-000000000023.jsonl",
+      "era": "legacy",
+      "role": "continuation",
+      "shape": "老格式續接：只有 forked_from_id（#789 此前整檔丟棄 → 那條會話在 app 裡靜默停更）",
+      "expect": {
+        "threadId": "019f9510-0000-7000-8000-000000000023",
+        "conversationId": "019f9510-0000-7000-8000-000000000003",
+        "kind": "fork",
+        "parentThreadId": "019f9510-0000-7000-8000-000000000003",
+        "evidence": "declared",
+        "reason": "forked_from_id"
+      }
+    }
+  ]
+}

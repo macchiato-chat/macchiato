@@ -9,6 +9,7 @@
 import type { ConnectorHealthState } from "./linkb/proto";
 import type { LinkBClient } from "./_core/linkb/client";
 import type { HeartbeatWriter } from "./_core/heartbeat";
+import { supervisorUpdateReport } from "./_core/heartbeat";
 import type { OpenClawGateway } from "./openclaw/gateway";
 import type { Drive } from "./openclaw/drive";
 import type { Mirror } from "./openclaw/mirror";
@@ -90,6 +91,7 @@ export function buildHealth(gw: OpenClawGateway, mirror: Mirror, version: string
     kind: "openclaw",
     connectorVersion: version,
     installedVersion: reportInstalledVersion(version, "openclaw"),
+    update: supervisorUpdateReport("openclaw"), // #940 supervisor 上次更新決策(沒有 supervisor 就報 supervised:false)
     stt: false,
     counters: { ...mirror.counters, ...(drive?.counters ?? {}) }, // #10
   };

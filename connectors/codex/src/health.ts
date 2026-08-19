@@ -10,6 +10,7 @@ import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { LinkBClient } from "./_core/linkb/client";
 import type { HeartbeatWriter } from "./_core/heartbeat";
+import { supervisorUpdateReport } from "./_core/heartbeat";
 import type { Mirror } from "./codex/mirror";
 import { sessionsRoot } from "./codex/transcripts";
 import { checkCompat } from "./codex/compat";
@@ -136,6 +137,7 @@ export class HealthLoop {
       kind: "codex",
       connectorVersion: this.version,
       installedVersion: reportInstalledVersion(this.version, "codex"),
+      update: supervisorUpdateReport("codex"), // #940 supervisor 上次更新決策(沒有 supervisor 就報 supervised:false)
       stt: false,
       ...(this.cliVersion ? { cliVersion: this.cliVersion } : {}),
       authOk: !this.drive?.authFailed, // #310:auth 失效上浮降級,成功回合自動恢復

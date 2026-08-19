@@ -395,7 +395,71 @@ class E2EKeyStore:
         self._persist_authorized = None  # optional callable(dict)
         self._device_auth_legacy_warned = False
         self._device_auth_rejected: list[str] = []
+        # #950 身份別名解析器（見 set_identity_aliases）；None ＝ 不解析，行為與改前逐字節一致。
+        self._identity_aliases = None
+        # #969 權威 server E2E 快照（ready 的 e2eState）是否已套用；別名歷史立基線的前置之一。
+        self._server_state_synced = False
         self._load()
+
+    # ── #950 身份別名（K_S 的鍵 ＝ 上報給 server 的 hermesSessionId）────────────
+    def set_identity_aliases(self, resolve) -> None:
+        """注入身份別名解析器（一般是 `ThreadRegistry.identity_alias_resolver()`）。
+
+        背景：K_S 的鍵 ＝ **上報給 server 的 `hermesSessionId`**。#926 那套把會話身份從「執行
+        線程 id」換成「對話 id」，於是**存量已開 E2E 的會話，K_S 還壓在舊鍵下**——直查必然
+        miss，連接器會被判成「說密文、DB 說明文」，落進 #807 那條**永久不可恢復**的死循環
+        （重讀重編只會原樣再生成一次，重試是不動點）。
+
+        解析器只在直查落空時用，且**只做讀側的認親，不改盤上的鍵**：兩檔原子快照保持原樣，
+        遷移期任一方向回退都不需要動它。fail-closed 在解析器那一側：`ThreadRegistry` 在別名
+        歷史不可信時恆返回空，於是這裡逐字節退回改前行為（維持舊身份），而不是拿一個猜的鍵
+        去解密。不注入（默認 None）＝ 完全沒有這條路徑。
+
+        ⚠️ 解析器會在**持鎖狀態下**被調用（本類的鎖不可重入）：它必須是對別名表的純查詢，
+        絕不可回調本 keystore 的任何公開方法。
+        """
+        self._identity_aliases = resolve
+
+    def _aliases_of(self, sid: str):
+        if self._identity_aliases is None:
+            return ()
+        try:
+            return tuple(a for a in self._identity_aliases(sid) or () if a and a != sid)
+        except Exception as exc:  # 解析器壞了 ＝ 沒有別名（fail-closed，退回改前行為）
+            print(f"[e2e] identity alias resolver failed for {sid}: {exc!r}", file=sys.stderr)
+            return ()
+
+    def _alias_with_key(self, sid: str):
+        """直查落空時，按別名找出這條會話**真正持鑰**的那個 sid。"""
+        for alias in self._aliases_of(sid):
+            if alias in self._keys:
+                return alias
+        return None
+
+    def _alias_protected(self, sid: str) -> bool:
+        return any(
+            alias in self._keys or alias in self._protected for alias in self._aliases_of(sid)
+        )
+
+    def _key_for(self, sid: str):
+        """本會話可用的 K_S：先直查，再按別名認親（見 set_identity_aliases）。"""
+        key = self._keys.get(sid)
+        if key is not None:
+            return key
+        alias = self._alias_with_key(sid)
+        return self._keys.get(alias) if alias else None
+
+    def mark_server_state_synced(self) -> None:
+        """ready 的權威 e2eState 已套用（server-positive floor 已單調落盤）。
+
+        只作為「別名歷史可否立為基線」的前置（見連接器的 `_maybe_adopt_alias_history`）：
+        沒有權威快照就宣告「此刻沒有任何東西可丟」是自欺——server 可能正持有一份我們還沒
+        看到的保護域。
+        """
+        self._server_state_synced = True
+
+    def has_server_state_snapshot(self) -> bool:
+        return self._server_state_synced
 
     def configure_device_auth(
         self,
@@ -686,12 +750,21 @@ class E2EKeyStore:
         with self._lock:
             # poisoned 時由 is_protected 把所有會話提升為 quarantine；這裡不能讓 stale K_S
             # 繼續被當成可安全收發的當前 epoch。
-            return not self._poisoned and sid in self._keys
+            # #950 別名下的舊鍵同樣算「本地持鑰」：否則換過身份的會話會被當成「沒鑰匙」，
+            # 重新走一遍 enable，把已有密文變成解不開的孤兒。
+            return not self._poisoned and (sid in self._keys or self._alias_with_key(sid) is not None)
 
     def is_protected(self, sid: str) -> bool:
         """本地有 K_S 或曾由 server-positive ready 提升过的会话都必须走 fail-closed。"""
         with self._lock:
-            return self._poisoned or sid in self._keys or sid in self._protected
+            # #950 別名命中同樣算「這條會話受保護」——這是**收緊**方向：寧可多保護一條，
+            # 也不能讓換過身份的 E2E 會話被當成明文發出去。
+            return (
+                self._poisoned
+                or sid in self._keys
+                or sid in self._protected
+                or self._alias_protected(sid)
+            )
 
     def protected_session_ids(self) -> set[str]:
         """返回当前可定位的保护域；poisoned 时调用方还必须停止全局内容输出。"""
@@ -812,7 +885,7 @@ class E2EKeyStore:
         """返回既有 K_S；控制认证等安全边界绝不能在缺钥时偷偷创建新钥。"""
         with self._lock:
             self._assert_usable()
-            key = self._keys.get(sid)
+            key = self._key_for(sid)  # #950 別名認親：舊鍵下的 K_S 照樣用得上
             if key is None:
                 raise KeyError(f"no E2E key for session {sid}")
             return bytes(key)
@@ -828,6 +901,11 @@ class E2EKeyStore:
                     "cannot reuse E2E key while authenticated disable is pending"
                 )
             if sid not in self._keys:
+                # #950 這條會話換過身份、K_S 壓在舊鍵下 → **復用舊鑰，絕不新生成一把**：
+                # 新 K_S 會讓這條會話此前的全部密文永久解不開（#807）。
+                aliased = self._alias_with_key(sid)
+                if aliased is not None:
+                    return self._keys[aliased]
                 self._keys[sid] = ec.new_session_key()
                 self._protected.add(sid)
                 # 首次建钥 = enable 路径；标 pending-enable 直到 backfill ACK / 权威 abort。
@@ -1123,7 +1201,7 @@ class E2EKeyStore:
 
     def decrypt_content(self, sid: str, blob_b64: str):
         """解密密文塊還原內容對象。會話未開 E2E（無 K_S）→ KeyError。"""
-        k_s = self._keys.get(sid)
+        k_s = self._key_for(sid)  # #950 別名認親：換過身份的會話仍解得開舊密文
         if k_s is None:
             raise KeyError(f"no E2E key for session {sid}")
         return json.loads(ec.decrypt(k_s, blob_b64))
@@ -1133,7 +1211,7 @@ class E2EKeyStore:
         return ec.encrypt(self.get_or_create_key(sid), text)
 
     def decrypt_text(self, sid: str, blob_b64: str) -> str:
-        k_s = self._keys.get(sid)
+        k_s = self._key_for(sid)  # #950 別名認親（同 decrypt_content）
         if k_s is None:
             raise KeyError(f"no E2E key for session {sid}")
         return ec.decrypt(k_s, blob_b64)

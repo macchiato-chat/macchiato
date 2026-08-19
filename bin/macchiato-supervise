@@ -81,6 +81,13 @@ readonly SNAPSHOT_RETRY_S="${MACCHIATO_SUPERVISE_SNAPSHOT_RETRY_S:-3600}"
 # 而且沒有審計痕跡;簽名策略天然是一次可審計的操作。
 # 這裡這個變量只是**本機急停**(排障/事故時 0 掉它),不是產品開關。
 readonly AUTO_UPDATE_S="${MACCHIATO_SUPERVISE_AUTO_UPDATE_S:-21600}"  # 6h;0 = 本機停掉自動檢查
+# #940 暫時性跳過(忙 / 心跳未知 / 拉不到源站)後的重問間隔。取 15 min:比一個回合長、比整個週期
+# 短兩個數量級——既不會在用戶連續工作時每分鐘打一次源站,也不會為一次「恰好在跑」賠掉半天。
+readonly UPDATE_RETRY_S="${MACCHIATO_SUPERVISE_UPDATE_RETRY_S:-900}"
+# #940 活着的印章:每小時往狀態檔蓋一次。連接器據它判「這台現在有沒有 supervisor 在管」——
+# 光看檔案存在不夠:被 install.sh 靜默降級成直跑之後,那個檔案還躺在原地,連接器會一直上報
+# 「有人管着,理由是三週前的 busy」,而那批機器正是這幾列要撈出來的。
+readonly ALIVE_STAMP_S="${MACCHIATO_SUPERVISE_ALIVE_STAMP_S:-3600}"
 readonly RELEASE_BASE="${MACCHIATO_RELEASE_BASE:-https://raw.githubusercontent.com/macchiato-chat/macchiato/main}"
 # 驗簽的公鑰(K0)不在本腳本——它嵌在冷凍的 release_verify.py 裡,由 heal 調用。
 # 這裡刻意不放第二份副本:兩處公鑰遲早漂移,而漂移的那份會顯得「也在把關」。
@@ -164,6 +171,17 @@ sanitize_version_var() { # $1 = 變數名
   fi
 }
 
+# #940 決策理由碼(update_decider 的 12 個常量都是 `[a-z][a-z0-9-]*`)。同上:狀態檔會被 `.` 進來,
+# 值域必須自己收死,絕不把來路不明的字串放行到後面的 printf / 上報鏈路裡。
+sanitize_reason_var() { # $1 = 變數名
+  local v="${!1:-}"
+  if [[ "$v" =~ ^[a-z][a-z0-9-]{0,39}$ ]]; then
+    printf -v "$1" '%s' "$v"
+  else
+    printf -v "$1" '%s' ""
+  fi
+}
+
 read_state() {
   FAILS=0
   WINDOW_START=0
@@ -177,6 +195,12 @@ read_state() {
   LAST_SNAP_TRY=0
   LAST_UPDATE_CHECK=0
   UPDATE_STOPPED=0
+  UPDATE_RETRY_AT=0
+  UPDATE_RETRY_N=0
+  SUPERVISE_ALIVE_AT=0
+  LAST_UPDATE_REASON=""
+  LAST_UPDATE_TARGET=""
+  LAST_UPDATE_AT=0
   if [ -f "$STATE_FILE" ]; then
     # shellcheck disable=SC1090
     # 狀態文件只含上面那幾個 KEY=value 行(整數,或嚴格 X.Y.Z 的版本字串)
@@ -202,11 +226,21 @@ read_state() {
   # #669 階段 4:上次查版本的時刻。跨進程持久——只存內存的話每次重啟都會立刻再查一次源站。
   LAST_UPDATE_CHECK="${LAST_UPDATE_CHECK:-0}"
   UPDATE_STOPPED="${UPDATE_STOPPED:-0}"
+  # #940:UPDATE_RETRY_AT = 「上一輪因暫時性原因(忙/心跳未知/拉不到源站)跳過,到這個時刻可以提早再問一次」。
+  # LAST_UPDATE_*：上一次決策的留痕。它們的用途不是本腳本自己——是給連接器讀去上報,讓
+  # 「這台為什麼沒升」在服務端可查(此前 12 個理由碼只落本機日誌,誰都看不見)。
+  UPDATE_RETRY_AT="${UPDATE_RETRY_AT:-0}"
+  UPDATE_RETRY_N="${UPDATE_RETRY_N:-0}"
+  SUPERVISE_ALIVE_AT="${SUPERVISE_ALIVE_AT:-0}"
+  LAST_UPDATE_AT="${LAST_UPDATE_AT:-0}"
   sanitize_version_var GOOD_VERSION
   sanitize_version_var TRIAL_VERSION
-  case "$FAILS$WINDOW_START$LAST_HEAL$LAST_DC_HEAL$TRIAL_START$TRIAL_SEEN$LAST_ROLLBACK$LAST_SNAP_TRY$LAST_UPDATE_CHECK" in
+  sanitize_version_var LAST_UPDATE_TARGET
+  sanitize_reason_var LAST_UPDATE_REASON
+  case "$FAILS$WINDOW_START$LAST_HEAL$LAST_DC_HEAL$TRIAL_START$TRIAL_SEEN$LAST_ROLLBACK$LAST_SNAP_TRY$LAST_UPDATE_CHECK$UPDATE_RETRY_AT$UPDATE_RETRY_N$SUPERVISE_ALIVE_AT$LAST_UPDATE_AT" in
     *[!0-9]*) FAILS=0; WINDOW_START=0; LAST_HEAL=0; LAST_DC_HEAL=0
-              TRIAL_START=0; TRIAL_SEEN=0; LAST_ROLLBACK=0; LAST_SNAP_TRY=0; LAST_UPDATE_CHECK=0 ;;
+              TRIAL_START=0; TRIAL_SEEN=0; LAST_ROLLBACK=0; LAST_SNAP_TRY=0; LAST_UPDATE_CHECK=0
+              UPDATE_RETRY_AT=0; UPDATE_RETRY_N=0; SUPERVISE_ALIVE_AT=0; LAST_UPDATE_AT=0 ;;
   esac
   [ "$UPDATE_STOPPED" = "1" ] || UPDATE_STOPPED=0
 }
@@ -220,6 +254,11 @@ write_state() {
     "$GOOD_VERSION" "$TRIAL_VERSION" "$TRIAL_START" "$TRIAL_SEEN" >>"$tmp"
   printf 'LAST_ROLLBACK=%s\nLAST_SNAP_TRY=%s\nUPDATE_STOPPED=%s\nLAST_UPDATE_CHECK=%s\n' \
     "$LAST_ROLLBACK" "$LAST_SNAP_TRY" "$UPDATE_STOPPED" "$LAST_UPDATE_CHECK" >>"$tmp"
+  # #940 決策留痕(供連接器上報;值域受 sanitize_* 約束,不會把奇怪字串寫進一個會被 source 的檔案)
+  printf 'UPDATE_RETRY_AT=%s\nUPDATE_RETRY_N=%s\nSUPERVISE_ALIVE_AT=%s\n' \
+    "$UPDATE_RETRY_AT" "$UPDATE_RETRY_N" "$SUPERVISE_ALIVE_AT" >>"$tmp"
+  printf 'LAST_UPDATE_REASON=%s\nLAST_UPDATE_TARGET=%s\nLAST_UPDATE_AT=%s\n' \
+    "$LAST_UPDATE_REASON" "$LAST_UPDATE_TARGET" "$LAST_UPDATE_AT" >>"$tmp"
   mv -f "$tmp" "$STATE_FILE"
 }
 
@@ -970,48 +1009,117 @@ print("ok")
 # 順序上刻意把 record_policy_sequence 放在**決策之前**(只要防重放檢查一過就記):
 # 剎車那份策略(rolloutPercent 改 0)本身是「不升」的決策,如果只在升級時才記序號,
 # 攻擊者就能永遠重放剎車**之前**那份高比例策略——剎車等於白按。
-auto_update_tick() {
-  [ "${MACCHIATO_SUPERVISE_DISABLE_HEAL:-0}" = "1" ] && return 0
-  [ "$AUTO_UPDATE_S" -le 0 ] 2>/dev/null && return 0
+# #940 記下這一輪的決策,並決定要不要短退避。
+#
+# 兩件事一起做是刻意的:它們的輸入是同一個理由碼,分兩處寫遲早會漂(一處認得 busy、另一處不認)。
+# `reason` 只可能來自 update_decider 的 12 個常量或本函數調用點寫死的幾個,故形狀天然安全;
+# 仍走 sanitize,因為它會被寫進一個之後會被 `.` 進來的檔案。
+note_update_decision() { # $1=reason  $2=target version(可空)
+  LAST_UPDATE_REASON="$1"
+  LAST_UPDATE_TARGET="${2:-}"
+  LAST_UPDATE_AT="$(now_s)"
+  sanitize_reason_var LAST_UPDATE_REASON
+  sanitize_version_var LAST_UPDATE_TARGET
+  case "$LAST_UPDATE_REASON" in
+    # 暫時性:本機此刻不方便 / 拿不到判斷所需的東西。過一小會兒重問,別賠掉整個週期。
+    #
+    # 但**要退避**:一台整天在跑回合的機器每次都判忙,固定 15 min 重問就是每天 96 次打源站
+    # (原作者擔心的「自製 DDoS」換了個形狀)。連續命中就翻倍,封頂到正常週期——
+    # 偶爾撞一次的機器 15 分鐘就補上,長期忙的機器自然收斂回今天的節奏,兩頭都不虧。
+    busy|heartbeat-unknown|download-failed|no-verdict)
+      if [ "$UPDATE_RETRY_N" -lt 8 ]; then UPDATE_RETRY_N=$(( UPDATE_RETRY_N + 1 )); fi
+      local backoff=$(( UPDATE_RETRY_S << (UPDATE_RETRY_N - 1) ))
+      [ "$backoff" -gt "$AUTO_UPDATE_S" ] && backoff="$AUTO_UPDATE_S"
+      UPDATE_RETRY_AT=$(( $(now_s) + backoff )) ;;
+    # 其餘(策略說不升、已是最新、被黑名單擋、輸入畸形…)都不是「等一會兒就會變」的,按正常週期。
+    *) UPDATE_RETRY_AT=0; UPDATE_RETRY_N=0 ;;
+  esac
+  write_state
+}
 
+auto_update_tick() {
   local t; t="$(now_s)"
   read_state
-  [ "$UPDATE_STOPPED" = "1" ] && return 0
+  # #940 「我還在管着這台」的印章。**折在這裡而不是另起一個循環鉤子**:狀態已經讀好了,蓋章
+  # 不多花一次讀盤;每 ALIVE_STAMP_S 最多寫一次。它必須在下面那幾道早退**之前**——「有沒有人
+  # 管這台」與「更新開沒開」是兩個問題,本機急停關掉自動更新不等於 supervisor 不在了。
+  if [ $(( t - SUPERVISE_ALIVE_AT )) -ge "$ALIVE_STAMP_S" ]; then
+    SUPERVISE_ALIVE_AT="$t"
+    write_state
+  fi
+  # 兩個本機急停開關也要留痕:否則「這台把自動更新關了」與「上次決策是 X」在服務端長得一模一樣,
+  # 而運維最想先排除的恰恰是前者。同樣只在理由變化時寫一次。
+  [ "${MACCHIATO_SUPERVISE_DISABLE_HEAL:-0}" = "1" ] && {
+    [ "$LAST_UPDATE_REASON" = "heal-disabled" ] || note_update_decision "heal-disabled"
+    return 0
+  }
+  [ "$AUTO_UPDATE_S" -le 0 ] 2>/dev/null && {
+    [ "$LAST_UPDATE_REASON" = "auto-update-off" ] || note_update_decision "auto-update-off"
+    return 0
+  }
+
+  # 下面三道是**永久性**早退(自己不會隨時間解除),也正是 #940 裡最要命的三種「悄悄不升」。
+  # 它們在節流之前,所以只在理由**變化時**寫一次狀態——否則每個輪詢週期都在寫盤。
+  [ "$UPDATE_STOPPED" = "1" ] && {
+    [ "$LAST_UPDATE_REASON" = "update-stopped" ] || note_update_decision "update-stopped"
+    return 0
+  }
   # 正在試用一個版本時不再開新的:先讓它出結果(提交或回退),否則會疊成兩層試用,
   # 而 N-1 只有一個槽位——第二次升級會把「還沒被證明的版本」當成基線快照下去。
-  [ -n "$TRIAL_VERSION" ] && return 0
+  [ -n "$TRIAL_VERSION" ] && {
+    [ "$LAST_UPDATE_REASON" = "trial-pending" ] || note_update_decision "trial-pending" "$TRIAL_VERSION"
+    return 0
+  }
   # 沒有已知良好版本 = 還沒觀測到一次健康運行,談不上「升級」,也沒有可退的東西。
-  [ -n "$GOOD_VERSION" ] || return 0
+  [ -n "$GOOD_VERSION" ] || {
+    [ "$LAST_UPDATE_REASON" = "no-good-version" ] || note_update_decision "no-good-version"
+    return 0
+  }
 
   # 節流 + 每機穩定抖動:全網不在同一分鐘醒來(否則發布一版就是一次自製的 DDoS,
   # 而且所有機器同時重啟)。抖動種子與分批分桶同源(install-id),但獨立取模。
   local jitter=0 due
   jitter="$(auto_update_jitter)" || jitter=0
   due=$(( LAST_UPDATE_CHECK + AUTO_UPDATE_S + jitter ))
-  if [ "$LAST_UPDATE_CHECK" -gt 0 ] && [ "$t" -lt "$due" ]; then return 0; fi
+  if [ "$LAST_UPDATE_CHECK" -gt 0 ] && [ "$t" -lt "$due" ]; then
+    # #940 短退避:上一輪不是「策略說不升」,而是**暫時性**原因(那一刻在跑回合 / 心跳讀不到 /
+    # 源站拉不動)。此前這種跳過照樣把整個週期用掉,於是一次撞上忙 = 白等 6–12 小時(週期 6h +
+    # 每機固定抖動 0–6h),而「忙」在天天在用的機器上一點都不罕見。到點就允許提早再問一次。
+    { [ "$UPDATE_RETRY_AT" -gt 0 ] && [ "$t" -ge "$UPDATE_RETRY_AT" ]; } || return 0
+  fi
   # 先落「查過了」再動手:網路慢/進程被殺都不該變成每個輪詢週期打一次源站。
   LAST_UPDATE_CHECK="$t"
+  UPDATE_RETRY_AT=0
   write_state
 
   local rv dec py work
   rv="$(find_release_verify || true)"
   dec="$(find_update_decider || true)"
   py="$(command -v python3 || command -v python || true)"
-  [ -n "$py" ] || return 0
-  [ -n "$rv" ] && [ -n "$dec" ] || { log "auto-update: verifier/decider not found — skipping"; return 0; }
+  [ -n "$py" ] || { note_update_decision "no-python"; return 0; }
+  [ -n "$rv" ] && [ -n "$dec" ] || {
+    log "auto-update: verifier/decider not found — skipping"
+    note_update_decision "decider-missing"
+    return 0
+  }
 
   work="$(mktemp -d "${TMPDIR:-/tmp}/macchiato-au.XXXXXX")" || return 0
   # shellcheck disable=SC2064
   trap "rm -rf '$work'" RETURN
 
   local base="${RELEASE_BASE%/}"
-  [[ "$base" == https://* ]] || { log "auto-update: REFUSING non-https RELEASE_BASE"; return 0; }
+  [[ "$base" == https://* ]] || {
+    log "auto-update: REFUSING non-https RELEASE_BASE"
+    note_update_decision "bad-release-base"
+    return 0
+  }
   local f
   for f in release.json release.json.sig release-policy.json release-policy.json.sig; do
     # 策略檔不存在是**正常狀態**(還沒開自動更新),靜默跳過而不是報錯刷屏。
+    # 但這條路也吃掉「網路抖了一下」——#940 起它走短退避,不再賠掉整個週期。
     command curl --disable --silent --show-error --fail --proto '=https' --tlsv1.2 \
       --max-redirs 0 --connect-timeout 15 --max-time 60 --max-filesize 1048576 \
-      --output "$work/$f" "$base/$f" 2>/dev/null || return 0
+      --output "$work/$f" "$base/$f" 2>/dev/null || { note_update_decision "download-failed"; return 0; }
   done
 
   local out
@@ -1043,7 +1151,7 @@ try:
     rv = load("release_verify", rv_path)
     dec = load("update_decider", dec_path)
 except Exception as exc:
-    out("SKIP cannot load verifier/decider: %r" % (exc,))
+    out("SKIP verifier-unloadable — cannot load verifier/decider: %r" % (exc,))
 
 # ── 1. 清單:先驗簽,再談版本。絕不拿未驗證的輸入去做任何判斷。 ──────────────
 try:
@@ -1052,7 +1160,7 @@ try:
     with open(os.path.join(work, "release.json.sig"), "r", encoding="ascii") as fh:
         manifest = rv.verify_manifest(manifest_bytes, fh.read().strip())
 except Exception as exc:
-    out("SKIP manifest rejected: %r" % (exc,))
+    out("SKIP manifest-rejected — %r" % (exc,))
 
 # ── 2. 策略:驗簽 → 防重放 → **立刻記下序號** ────────────────────────────────
 # 記錄放在決策**之前**是刻意的:剎車那份策略(rolloutPercent 改 0)的決策是「不升」,
@@ -1063,9 +1171,9 @@ try:
     with open(os.path.join(work, "release-policy.json.sig"), "r", encoding="ascii") as fh:
         policy = rv.verify_policy(policy_bytes, fh.read().strip())
 except rv.PolicyExpiredError as exc:
-    out("SKIP policy stale: %s" % (exc,))
+    out("SKIP policy-expired — %s" % (exc,))
 except Exception as exc:
-    out("SKIP policy rejected: %r" % (exc,))
+    out("SKIP policy-rejected — %r" % (exc,))
 
 # 舊版驗簽器沒有防重放 API(supervisor 的查找順序裡包含連接器 app 樹,那份可能比 bin/ 舊)。
 # 缺了就**不升**:沒有防重放保護的自動更新,等於把剎車閘交給任何能重放舊策略的人。
@@ -1073,14 +1181,14 @@ except Exception as exc:
 # 把一個「該安全跳過」的情形變成未捕獲異常。
 if not all(hasattr(rv, n) for n in
            ("assert_policy_not_replayed", "read_seen_policy_sequence", "record_policy_sequence")):
-    out("SKIP verifier predates anti-replay (no sequence support) — refusing to auto-update")
+    out("SKIP verifier-too-old — predates anti-replay (no sequence support), refusing to auto-update")
 try:
     rv.assert_policy_not_replayed(policy, rv.read_seen_policy_sequence())
     rv.record_policy_sequence(policy["sequence"])
 except Exception as exc:
     if type(exc).__name__ == "PolicyReplayError":
-        out("SKIP %s" % (exc,))
-    out("SKIP policy sequence check failed: %r" % (exc,))
+        out("SKIP policy-replayed — %s" % (exc,))
+    out("SKIP policy-sequence-failed — %r" % (exc,))
 
 # ── 3. 本機輸入 ──────────────────────────────────────────────────────────────
 try:
@@ -1137,16 +1245,25 @@ PY
     UPDATE\ *)
       local target="${out#UPDATE }"
       log "auto-update: policy authorises v$GOOD_VERSION → v$target — installing"
+      note_update_decision "update" "$target"
       # require_newer = 本機已知良好版本 ⇒ 天然只向前;黑名單/UPDATE_STOPPED 由 heal 內的
       # install_allowed 再把一次關。決策器已經查過同樣的閘,這裡是第二道——它們獨立實現,
       # 任何一道說不就不裝。
       heal "auto update to v$target" "$GOOD_VERSION" || true
       ;;
-    SKIP\ *)  log "auto-update: ${out#SKIP }" ;;
+    SKIP\ *)
+      log "auto-update: ${out#SKIP }"
+      # `SKIP <reason> — <detail>`:只取理由碼那一段(detail 是人話,可能帶空格/引號,不進狀態檔)。
+      local skipped="${out#SKIP }"
+      note_update_decision "${skipped%% *}"
+      ;;
     # 決策器內部出錯 → 不升(fail-safe 方向永遠如此),但**必須留痕**:整套理由碼(#686 的 12 個)
     # 存在的意義就是回答「為什麼這台沒升」。靜默跳過會讓放量期間最要緊的那個問題無從查起
     # ——而排查它的人手上只有這台機器的日誌。stderr 也不再丟掉,落到 heal 日誌裡備查。
-    *)        log "auto-update: decider produced no verdict — staying put (see $HEAL_LOG)" ;;
+    *)
+      log "auto-update: decider produced no verdict — staying put (see $HEAL_LOG)"
+      note_update_decision "no-verdict"
+      ;;
   esac
   return 0
 }

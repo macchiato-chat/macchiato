@@ -1,0 +1,2 @@
+{"timestamp":"2026-08-14T00:00:00.000Z","type":"session_meta","payload":{"cwd":"/w/proj","originator":"codex_cli_rs","cli_version":"0.98.0","git":{"commit_hash":"0000000000000000000000000000000000000000","branch":"main","repository_url":null},"id":"019f9510-0000-7000-8000-000000000004","instructions":"<stripped>","timestamp":"2026-08-14T00:00:00.000Z"}}
+{"timestamp":"2026-08-14T00:00:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"脫敏語料：更老的 CLI 會話"}}

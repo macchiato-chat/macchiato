@@ -622,6 +622,86 @@ describe("#132 v2 審批橋", () => {
     expect(await p3).toEqual({ decision: "accept" });
   });
 
+  it("#940 審批到點沒人回 → 自動 decline + 說人話,且 busy/pendingApproval 落回 false", async () => {
+    process.env.MACCHIATO_APPROVAL_TIMEOUT_MS = "30"; // 單測不真等兩小時
+    try {
+      const { d, client, linkb, sent } = make();
+      await linkb.deliver(tui("prompt.submit", SID, { text: "刪點東西" }));
+      client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+      const h = client.reverse.get("item/commandExecution/requestApproval")!;
+      const p = h({ threadId: TID, turnId: "t1", itemId: "e1", command: "rm -rf build", cwd: "/w" });
+      await tick();
+      // 掛起期間:兩個閒時判據都為真——這正是自動更新被釘死的那個狀態
+      expect(d.hasPendingApproval).toBe(true);
+      expect(d.busy).toBe(true);
+
+      expect(await p).toEqual({ decision: "decline" }); // 到點自己回,不需要任何人點
+      const note = events(sent).findLast((e) => e.type === "review.summary")!;
+      expect(note.payload.summary).toContain("自动拒绝");
+      expect(d.hasPendingApproval).toBe(false);
+      expect(d.counters.approvalsExpired).toBe(1);
+
+      // 回合正常收尾後 busy 也落回 false（釘死解除）
+      client.fire("turn/completed", { threadId: TID, turn: { id: "t1" } });
+      await tick();
+      expect(d.busy).toBe(false);
+    } finally {
+      delete process.env.MACCHIATO_APPROVAL_TIMEOUT_MS;
+    }
+  });
+
+  it("#940 超時拒絕之後看門狗不得立刻把回合判成卡死(兩句自相矛盾的提示 + 回合被殺)", async () => {
+    // stall < 審批壽命:掛卡期間 stall 早已跑滿,看門狗全靠「有掛起審批」這個豁免撐着。
+    // 摘走最後一張卡的那一刻豁免消失,若不給回合續期,下一次重排(≤25ms)就會判卡死。
+    process.env.MACCHIATO_CODEX_TURN_STALL_MS = "100";
+    process.env.MACCHIATO_APPROVAL_TIMEOUT_MS = "250";
+    try {
+      const { d, client, linkb, sent } = make();
+      await linkb.deliver(tui("prompt.submit", SID, { text: "刪點東西" }));
+      client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+      const h = client.reverse.get("item/commandExecution/requestApproval")!;
+      const p = h({ threadId: TID, turnId: "t1", itemId: "e1", command: "rm -rf build", cwd: "/w" });
+      expect(await p).toEqual({ decision: "decline" });
+
+      // 續期買回一個完整的 stall 窗口(生產上是 30 分鐘)——引擎處理這個 decline 綽綽有餘。
+      await new Promise((r) => setTimeout(r, 50));
+      const notes = () => events(sent).filter((e) => e.type === "review.summary").map((e) => String(e.payload.summary));
+      expect(notes().some((t) => t.includes("自动拒绝"))).toBe(true);
+      expect(notes().some((t) => t.includes("判定卡死"))).toBe(false);
+      expect((d as any).active.get(SID)).toBeDefined();
+      expect(client.requests.some((r) => r.method === "turn/interrupt")).toBe(false);
+
+      // 引擎照常收尾 → 回合正常結束(這正是本功能承諾的形狀)
+      client.fire("turn/completed", { threadId: TID, turn: { id: "t1" } });
+      await tick();
+      expect((d as any).active.get(SID)).toBeUndefined();
+      expect(d.busy).toBe(false);
+      expect(notes().some((t) => t.includes("判定卡死"))).toBe(false);
+    } finally {
+      delete process.env.MACCHIATO_APPROVAL_TIMEOUT_MS;
+      delete process.env.MACCHIATO_CODEX_TURN_STALL_MS;
+    }
+  });
+
+  it("#940 用戶按時回話 → 超時定時器作廢,不會事後補一句莫名其妙的提示", async () => {
+    process.env.MACCHIATO_APPROVAL_TIMEOUT_MS = "40";
+    try {
+      const { d, client, linkb, sent } = make();
+      await linkb.deliver(tui("prompt.submit", SID, { text: "q" }));
+      client.fire("turn/started", { threadId: TID, turn: { id: "t1" } });
+      const h = client.reverse.get("item/commandExecution/requestApproval")!;
+      const p = h({ threadId: TID, turnId: "t1", itemId: "e1", command: "ls", cwd: "/w" });
+      await tick();
+      await linkb.deliver(tui("approval.respond", SID, { choice: "allow", request_id: "e1" }));
+      expect(await p).toEqual({ decision: "accept" });
+      await new Promise((r) => setTimeout(r, 80)); // 越過原定超時
+      expect(events(sent).some((e) => e.type === "review.summary")).toBe(false);
+      expect(d.counters.approvalsExpired).toBe(0);
+    } finally {
+      delete process.env.MACCHIATO_APPROVAL_TIMEOUT_MS;
+    }
+  });
+
   it("#359 審批選擇映射:yes/allow/always 放行、no/deny/未知拒絕;always 免 all 也持久", async () => {
     const { client, linkb } = make();
     await linkb.deliver(tui("prompt.submit", SID, { text: "q" }));
@@ -1193,5 +1273,70 @@ describe("#895 回合看門狗(app-server)", () => {
       vi.useRealTimers();
       delete process.env.MACCHIATO_CODEX_TURN_STALL_MS;
     }
+  });
+});
+
+describe("#992 turnId 未到位窗口裡的跟進消息（真 CLI 才踩得到的競態）", () => {
+  // 假 agent 的 `turn/start` 立即帶 turnId 返回，所以 localchain 永遠綠；真 codex app-server
+  // 的 turn/start 有耗時，turnId 靠隨後的 `turn/started` 通知才到位。這個窗口裡來的跟進消息
+  // 此前**靜默落到 runTurn 起新回合**——用戶在回合剛開跑那一瞬追加一句，本該注入同一回合。
+  // 2026-08-17 狗糧上表現為 `等 /turn\/steer 注入跟進消息/ 超時`，連一行日誌都沒有。
+  const starts = (c: any) => c.requests.filter((r: any) => r.method === "turn/start");
+  const steers = (c: any) => c.requests.filter((r: any) => r.method === "turn/steer");
+
+  it("窗口內的跟進消息掛起等 turnId，不另起回合；turnId 一到就補發注入", async () => {
+    const { d, client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "數到 40" }));
+    await tick();
+    expect(starts(client)).toHaveLength(1);
+    expect((d as any).active.get(SID)?.turnId).toBeFalsy(); // 竊態前提成立：turnId 還沒到
+
+    await linkb.deliver(tui("prompt.submit", SID, { text: "STOP，改回 TAKEOVER" }));
+    await tick();
+    expect(starts(client)).toHaveLength(1); // ← 修前這裡是 2：另起了一輪
+    expect(steers(client)).toHaveLength(0); // 還發不出去，掛着
+
+    client.fire("turn/started", { threadId: TID, turn: { id: "t-42" } });
+    await tick();
+    expect(steers(client)).toHaveLength(1);
+    expect(steers(client)[0].params).toMatchObject({ threadId: TID, expectedTurnId: "t-42" });
+    expect(starts(client)).toHaveLength(1); // 補發不等於再起一輪
+  });
+
+  it("turnId 沒等到回合就收尾（秒完 / 出錯 / 看門狗）→ 轉隊列續投，絕不吞消息", async () => {
+    const { d, client, linkb } = make();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "數到 40" }));
+    await tick();
+    await linkb.deliver(tui("prompt.submit", SID, { text: "跟進的話不許丟" }));
+    await tick();
+    const turn = (d as any).active.get(SID);
+    expect(turn.steerPending).toHaveLength(1);
+
+    // turnId 始終沒來，回合直接定稿
+    (d as any).finishTurn(SID, turn, {});
+    await tick();
+    // 續投成下一回合：turn/start 第二次，且帶的就是那句跟進
+    const all = starts(client);
+    expect(all).toHaveLength(2);
+    expect(JSON.stringify(all[1].params.input)).toContain("跟進的話不許丟");
+  });
+
+  it("契約串與即時路徑一字不差（回歸與 localchain 都認它，補發不該讓斷言看出兩條路）", async () => {
+    const { client, linkb } = make();
+    const logs: string[] = [];
+    const orig = console.log;
+    console.log = (...a: unknown[]) => void logs.push(a.join(" "));
+    try {
+      await linkb.deliver(tui("prompt.submit", SID, { text: "數到 40" }));
+      await tick();
+      await linkb.deliver(tui("prompt.submit", SID, { text: "跟進" }));
+      await tick();
+      client.fire("turn/started", { threadId: TID, turn: { id: "t-9" } });
+      await tick();
+    } finally {
+      console.log = orig;
+    }
+    expect(logs.join("\n")).toContain("turn/steer 注入跟進消息");
+    expect(logs.join("\n")).toContain("turn/steer 掛起(turnId 未到位,到位即補發)");
   });
 });

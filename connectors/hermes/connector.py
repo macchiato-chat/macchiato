@@ -84,14 +84,21 @@ from backfill import (
     enumerate_importable,
     changed_sessions,
     sessions_meta,
+    conversation_origins,  # #948
+    continuation_baseline,  # #948
+    self_origin,  # #948
+    lineage_supported,  # #969
     tail_session,
     turn_rows,
     current_max_id,
     keepable,
     cron_feed_target,
     session_snapshot,
+    journal_mode as state_db_journal_mode,  # #930
+    lock_counters as state_db_lock_counters,  # #930
 )
 from cwd import resolve_cwd
+from threads import ThreadRegistry, ThreadRegistryParseError, merge_snapshot  # #950/#969
 from media import (
     MEDIA_MAX,  # noqa: F401 - 見下方 re-export 註釋:測試讀 connector.MEDIA_MAX
     extract_media_files as _media_extract,
@@ -112,7 +119,7 @@ LINK_B_PROTO = 5  # 對齊 server（packages/protocol：B=5，#348/#368 可靠 A
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.80"
+CONNECTOR_VERSION = "1.5.81"
 
 # #768 安裝目錄版本標記（對齊 TS connector-core/disk-version.ts）。
 _INSTALLED_VERSION_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
@@ -1038,11 +1045,9 @@ def _smoke_parse_state_db() -> str | None:
     """#112 解析冒煙(對齊 CC smokeParseLatest):按鏡像/導入同款 schema 讀最新一條 assistant 消息、
     跑同款 tool_calls 解析——Hermes 升級改 state.db schema / tool_calls 格式時,在靜默丟消息之前
     把降級亮出來。無庫/空庫不判失敗(新機器)。返回 None=通過,str=降級原因。"""
-    try:
-        import backfill as _bf
+    import backfill as _bf  # 模塊頂部已 import 過,這裡只取別名(拿私有讀取工具)
 
-        if not os.path.exists(_bf.STATE_DB):
-            return None
+    def _probe() -> None:
         con = _bf._connect()
         try:
             # schema 漂移(列改名/表改名)→ OperationalError;tool_calls 格式漂移 → 解析拋錯
@@ -1054,9 +1059,57 @@ def _smoke_parse_state_db() -> str | None:
                 _bf._parse_tool_calls(row[3], {})
         finally:
             con.close()
+
+    try:
+        if not os.path.exists(_bf.STATE_DB):
+            return None
+        _bf._retry_locked(_probe)  # #930 撞鎖先等一等,別把並發讀當成漂移
         return None
     except Exception as exc:
+        # #930 DELETE journal 的庫被 Hermes 寫者擋住 ≠ schema 漂移。這裡若照報,用戶會看到
+        # compatOk=false + 「schema/格式漂移?」——一個既嚇人又指錯方向的降級。鎖是暫態,
+        # 下一輪健康循環(30s)自然重試。
+        if _bf._is_locked(exc):
+            return None
         return f"state.db 解析冒煙失敗(schema/格式漂移?): {exc!r}"
+
+
+def _clarify_is_multi_select(payload: dict) -> bool:
+    """#931 clarify.request 是不是多選——兩種來源取或。
+
+    - Hermes 0.20 起在 payload **頂層**帶 `multi_select`(只有 True 才出現,單選 payload
+      形狀一字不變),原生 `choices` 是一個字符串數組,塞不進標記;
+    - `choices.multiSelect` 是 Macchiato 約定(#109/#121,CC 連接器也發這個)。
+    兩者都認,任一為 True 即多選;都沒有 → False(與 0.19 行為逐字節一致)。
+    """
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("multi_select") is True:
+        return True
+    choices = payload.get("choices")
+    return isinstance(choices, dict) and choices.get("multiSelect") is True
+
+
+def _clarify_payload_for_wire(payload: dict) -> dict:
+    """#931 非 E2E 出站:把頂層 `multi_select` 落到 server 唯一認的位置 `choices.multiSelect`。
+
+    server 的 ingest 只從 `payload.choices.multiSelect` 取多選標記(#121 多選卡),而 Hermes
+    原生 `choices` 是數組——數組帶不了這個鍵,所以按 Macchiato 約定包一層 `{options, multiSelect}`
+    (server 對 `choices.options` 裡的裸字符串與數組形態的映射結果完全相同,選項渲染不變)。
+    非多選、或沒有選項可選時原樣返回,不碰任何字節。
+    """
+    if not isinstance(payload, dict) or not _clarify_is_multi_select(payload):
+        return payload
+    choices = payload.get("choices")
+    if isinstance(choices, dict):
+        if choices.get("multiSelect") is True:
+            return payload
+        choices = {**choices, "multiSelect": True}
+    elif isinstance(choices, list):
+        choices = {"options": choices, "multiSelect": True}
+    else:
+        return payload  # 沒有選項 → 多選無從談起,保持原樣
+    return {**payload, "choices": choices}
 
 
 class Connector:
@@ -1153,6 +1206,11 @@ class Connector:
         self._on_fatal = lambda: sys.exit(1)  # #246 auth_error 終端態 → 退出交 supervisor(測試可覆蓋)
         self._on_fatal_revoked = lambda: sys.exit(78)  # #387 app 解綁:EX_CONFIG,新版 unit 不再拉起(測試可覆蓋)
         self._e2e = E2EKeyStore()  # §19 per-session E2E 密鑰管理（持 K_S、封裝給設備、加解密內容）
+        # #950/#969「對話 ↔ 執行線程」別名表。真源在內存（mirror.json 只是它的投影），所以
+        # **不能**傳 `registry.identity_alias_resolver()`——那會把當下這張表焊死；要捕獲 self，
+        # 讓 keystore 永遠問到當前那張。別名歷史不可信時解析器恆空 → keystore 逐字節退回改前行為。
+        self._threads: ThreadRegistry | None = None
+        self._e2e.set_identity_aliases(lambda sid: self._thread_registry().aliases_for(sid))
         self._e2e_control = E2EControlVerifier(self._e2e)  # #370 设备认证控制 + 持久防重放
         # Hermes gateway 的原生 approval.respond 只有 session FIFO。E2E 下自行赋 request id +
         # digest，并严格只允许签封响应消费队首，绝不把“第二张卡的批准”错批给第一张。
@@ -1223,10 +1281,16 @@ class Connector:
                         loop.create_task(self._emit_media_from_text(server_sid, text))  # 媒體放行
                     self._projects_check_turn_end()  # #227 回合末惰性版本化
                 return
+            out_params = {**params, "session_id": server_sid}
+            if out_params.get("type") == "clarify.request" and isinstance(
+                out_params.get("payload"), dict
+            ):
+                # #931 Hermes 0.20 的多選標記在頂層,server 只認 choices.multiSelect。
+                out_params["payload"] = _clarify_payload_for_wire(out_params["payload"])
             frame = {
                 "jsonrpc": "2.0",
                 "method": "event",
-                "params": {**params, "session_id": server_sid},
+                "params": out_params,
             }
             loop.create_task(self._to_server(server_sid, frame))
             # #302:追蹤 live 在途回合(start→complete),gateway 死亡時據此定稿 error。
@@ -2080,9 +2144,9 @@ class Connector:
             digest = request_digest(self._e2e.require_key(server_sid), execution_request)
             question = str(request_snapshot.get("question") or "")
             choices = request_snapshot.get("choices")
-            multi = False
-            if isinstance(choices, dict) and choices.get("multiSelect") is True:
-                multi = True
+            # #931 頂層 multi_select(Hermes 0.20)與 choices.multiSelect 取或;凍結的
+            # execution_request 仍是 gateway 原樣 payload(digest 綁定的是它,不能改)。
+            multi = _clarify_is_multi_select(request_snapshot)
             plaintext_obj = {
                 "question": question,
                 "choices": choices if choices is not None else {},
@@ -2728,6 +2792,55 @@ class Connector:
 
     # ── §15 全渠道持續鏡像（tail state.db → mirror_append）──────────────────
 
+    # ── #950/#969 ThreadRegistry：對話 ↔ 執行線程的別名表 ─────────────────────
+    def _thread_registry(self) -> ThreadRegistry:
+        """當前的別名表。裸構造（測試）與 mirror 狀態未載入時 ＝ 空且**不可信**
+        （＝ 沒有別名、不換身份，行為與改前逐字節一致）。"""
+        reg = getattr(self, "_threads", None)
+        if reg is None:
+            reg = ThreadRegistry.empty()
+            self._threads = reg
+        return reg
+
+    def _build_thread_registry(self, st: dict) -> None:
+        """從 mirror 狀態重建別名表。
+
+        快照非法一律回落到「空且不可信」（`ThreadRegistry.parse` 的契約）：**絕不可**把
+        「解析失敗」當成「這段對話沒有別名」，那正是 #347 要防的那一刀。盤上的原始數據不動
+        （落盤取並集，見 `merge_snapshot`），只是這一輪不信它。
+        """
+        try:
+            self._threads = ThreadRegistry.parse(st.get("registry"))
+        except ThreadRegistryParseError as exc:
+            print(
+                f"[mirror] thread registry 快照非法 → 按「空且不可信」重建（維持舊身份）：{exc}",
+                file=sys.stderr,
+            )
+            self._threads = ThreadRegistry.empty()
+
+    def _maybe_adopt_alias_history(self) -> None:
+        """別名歷史可信度（判據照抄 openclaw #347）：**零受保護會話 ∧ 已套用權威 server 快照**
+        的那一刻，這張表裡沒有任何東西可丟 → 可以立為基線；此後只增不減（歸屬先落盤再發送），
+        所以信任一旦建立就一直成立。
+
+        反過來，**一旦已經有 E2E 會話就再也不許自升**：舊 schema / 狀態檔恢復都可能早就丟過
+        一環，而丟了就再也發現不了。不可信 → `aliases_for` 恆空 → keystore 逐字節退回改前
+        行為、續接也維持舊身份（fail-closed）。
+        """
+        reg = self._thread_registry()
+        if reg.history_trusted:
+            return
+        e2e = self._e2e
+        if not hasattr(e2e, "protected_session_ids") or not hasattr(e2e, "has_server_state_snapshot"):
+            return  # 測試替身 / 老 keystore → 維持不可信
+        try:
+            if e2e.protected_session_ids() or not e2e.has_server_state_snapshot():
+                return
+        except Exception:
+            return  # keystore 隔離/不可用 → 維持不可信
+        if reg.adopt_history(True):
+            print("· #969 thread registry 別名歷史立為基線（此刻零受保護會話，沒有任何東西可丟）")
+
     def _load_mirror_state(self) -> dict:
         # #6:主文件損壞/丟失 → 先試 .bak(每次保存輪替的上一版,最多落後一批)。
         # 直接重設基線會把「舊水位線→現在」之間的消息永久跳過;.bak 只是舊一點,
@@ -2748,6 +2861,10 @@ class Connector:
                         "如是有意重置請連 .bak 一併刪除。",
                         file=sys.stderr,
                     )
+                # 別名表只在首次載入時從盤上重建：內存那份是真源（落盤取並集），
+                # 二次載入不許把本進程已登記的歸屬洗掉。
+                if getattr(self, "_threads", None) is None:
+                    self._build_thread_registry(st)
                 return st
             except (FileNotFoundError, ValueError) as exc:
                 if not isinstance(exc, FileNotFoundError):
@@ -2762,6 +2879,12 @@ class Connector:
 
     def _save_mirror_state(self, st: dict, *, strict: bool = False) -> None:
         try:
+            # #950/#969 別名表投影：**磁盤 schema 只增字段、取並集、只增不刪**（I3）。
+            # 連接器有 15 分鐘試用期自動回退——換 schema / 少寫一條 = 回退後的舊版本讀不到
+            # 別名 → identity 不可信 → E2E 全凍結。
+            reg = getattr(self, "_threads", None)
+            if reg is not None:
+                st["registry"] = merge_snapshot(st.get("registry"), reg.to_json())
             # #262 dirty 判斷:與上次落盤相同 → 跳過(鏡像每 2s 輪詢,無條件雙寫傷 SD 卡;Pi 前科)。
             data = json.dumps(st, sort_keys=True)
             if data == getattr(self, "_mirror_last_saved", None):
@@ -2847,7 +2970,15 @@ class Connector:
             "installedVersion": _report_installed_version(CONNECTOR_VERSION),
             "kind": "hermes",  # #94：client gate 專屬功能（如 AI 重命名）
             "stt": _stt_available(),  # #89：語音轉錄能力位（false → server 走雲端 BYOK STT）
-            "counters": dict(getattr(self, "_counters", {}) or {}),  # #10：累計計數（進程生命週期）
+            # #930 state.db 的 journal_mode（"wal" / "delete"；None = 還沒讀過庫）。DELETE 庫
+            # （Hermes 0.20 新建）的讀寫不能並發 → 排查「鏡像慢/被擋」時第一眼要看的就是它。
+            "stateDbJournalMode": state_db_journal_mode(),
+            # #10：累計計數（進程生命週期）；#930 的 dbLockRetries/dbLockFailures 併進來——
+            # 狀態快照看不見「被鎖擋了多少次」，只有計數器看得見。
+            "counters": {
+                **(dict(getattr(self, "_counters", {}) or {})),
+                **state_db_lock_counters(),
+            },
         }
 
     def _self_update(self) -> None:
@@ -3184,11 +3315,17 @@ class Connector:
             file=sys.stderr,
         )
 
-    def _mirror_entry(self, sid, title, source, archived, msgs, e2e):
-        """構造一個鏡像批次條目。E2E 會話（方案 A）：標題 + 各消息內容加密、打 e2e 標記，server 盲存。"""
+    def _mirror_entry(self, sid, title, source, archived, msgs, e2e, *, origin=None):
+        """構造一個鏡像批次條目。E2E 會話（方案 A）：標題 + 各消息內容加密、打 e2e 標記，server 盲存。
+
+        `origin`（#950/#969 `ThreadOrigin`）**是元數據不是正文，所以 E2E 會話一樣帶**——server
+        看不見密文，但看得見歸屬，那正是 E2E 下唯一還能做判定的憑據。缺省不帶 ＝ server 按
+        `evidence:"absent"` 走老行為（E2E 回灌那條路不帶：它替換的是一條已經存在的會話）。
+        """
         if not e2e:
             return {
                 "hermesSessionId": sid,
+                **({"origin": origin} if origin else {}),
                 "title": title,
                 "source": source,
                 "archived": bool(archived),
@@ -3196,6 +3333,7 @@ class Connector:
             }
         return {
             "hermesSessionId": sid,
+            **({"origin": origin} if origin else {}),
             "title": self._e2e.encrypt_text(sid, title or ""),  # 標題也加密
             "source": source,
             "archived": bool(archived),
@@ -3331,16 +3469,112 @@ class Connector:
         # 收窄後,無新消息的已鏡像會話不再出現 → 純標題更新(Hermes 回合後才取名)用主鍵
         # IN 輕量補查 meta,maxid=None 走下面的 has_new=False 分支,行為與收窄前一致。
         missing = [s for s in wm if s not in seen]
-        rows += [(s, src, t, a, None) for s, src, t, a in await sessions_meta(missing)]
-        for sid, source, title, archived, maxid in rows:
+        rows += [(s, src, t, a, None, *lin) for s, src, t, a, *lin in await sessions_meta(missing)]
+        # #948 血緣：只有「有父 / 自報派生」的行才值得上溯（一次批量查詢）；沒有父的行是
+        # 絕大多數，走 self_origin 快路徑、一步庫都不打——正常用戶的會話身份逐字節不變。
+        need_origin = [
+            r[0] for r in rows
+            if (len(r) > 5 and r[5]) or (r[1] or "").lower() == "subagent"
+        ]
+        origins = await conversation_origins(need_origin) if need_origin else {}
+        # #969 上報 evidence 要分得開「源系統聲明了」與「這個版本壓根沒這概念」。老 schema
+        # （血緣列都沒有）→ absent，**顯式帶上**：沉默和「明確說不知道」在 server 的
+        # sessions_resolved_total{evidence} 上分不開，而那是判斷何時可切換判定權的關鍵（#961）。
+        lineage_ev = "declared" if (not rows or await lineage_supported()) else "absent"
+        # #969 別名歷史可否立為基線（零受保護會話 ∧ 已套用權威 server 快照）——每輪問一次，
+        # 因為「零受保護」這個窗口是一次性的，錯過就持久不可信。
+        self._maybe_adopt_alias_history()
+        reg = self._thread_registry()
+        # 身份閘問的是**直接**持鑰（不走別名認親）：`is_protected` 已經會沿別名回答「這段對話
+        # 是 E2E」，拿它當閘門會讓閘永遠關着（codex #966 實踩）。
+        direct_protected = set()
+        if hasattr(self._e2e, "protected_session_ids"):
+            try:
+                direct_protected = set(self._e2e.protected_session_ids())
+            except Exception:
+                direct_protected = set()
+        for row in rows:
+            sid, source, title, archived, maxid = row[:5]
+            origin = origins.get(sid) or self_origin(sid, lineage_ev)
+            if origin["kind"] == "derived":
+                # #948 派生（子代理 / 委派）＝ 父會話的執行細節，**永不**成為獨立會話。
+                # 判據是結構化的（`model_config.$._delegate_from` / `source='subagent'`，都是
+                # Hermes 自己聲明的），而且擋在**所有**豁免之前：#592 那條「E2E + 已建立就
+                # 放行」的特判曾讓已鏡像過的 subagent 子會話從 source 黑名單底下繞過去
+                # （2026-07-31 實踩：兩個 subagent ＝ 兩個殭屍會話）。這一刀把那條路堵死。
+                self._count("mirrorDerivedSkipped")
+                continue
             # sid = state.db 會話 id。自驅會話（Macchiato 新建）的 state.db id（= gateway
             # session_key，經 _stored 持久映射）≠ server 持久化 hermesSessionId；K_S 按持久化
             # id 鍵控、mirror 也須用持久化 id 才能落回原會話 → 先映射回 pid（運行時 _rev 或
             # 持久 _stored_rev）判 E2E / 加密 / 標識。讀消息與水位線仍按 state.db 的 sid。
-            pid = self._rev.get(sid) or self._stored_rev.get(sid, sid)
+            own_pid = self._rev.get(sid) or self._stored_rev.get(sid, sid)
+            # #948 這條 session 行屬於哪段對話（壓縮鏈的根）。根 ＝ 自己時，以下全部逐字不變。
+            conv = origin["conversationId"]
+            conv_pid = self._rev.get(conv) or self._stored_rev.get(conv, conv)
+            pinned = reg.conversation_of(own_pid)
+            if pinned is not None:
+                # #969 I2：**登記過的線程身份永不輪換**。父會話那幾行從 state.db 消失（清庫 /
+                # 換 profile / 上游裁舊會話）時血緣會現算出另一個根——那就是一次靜默的身份輪換：
+                # server 另起一行、K_S 按舊鍵存着查不到（#807）。登記時確立的那個才算數。
+                identity = reg.wire_identity_of(pinned) or pinned
+                if identity != conv_pid:
+                    self._count("mirrorIdentityPinned")
+                conv_pid = identity
+                conv_owner = pinned
+            else:
+                # 這段對話的身份可能早就確立過（根自己也曾是別人的續接）→ 用確立的那個，
+                # 別讓同一段對話在表裡長出第二個身份。
+                conv_owner = reg.conversation_of(conv_pid)
+                if conv_owner is not None:
+                    conv_pid = reg.wire_identity_of(conv_owner) or conv_pid
+            if pinned is None and conv_pid != own_pid and (
+                self._e2e.is_protected(own_pid) or self._e2e.is_protected(conv_pid)
+            ):
+                # #969 E2E 身份歸屬放開（別名表就位前是「父子任一端沾 E2E → 整條走老路徑」）。
+                # 判據嚴格照 #347：
+                #  - 別名歷史不可信 → 維持舊身份（fail-closed）。keystore 的 aliases_for 同時
+                #    恆空，所以「查不到舊鍵就新生成一把 K_S」這條路根本不存在（那會讓此前的
+                #    密文永久解不開）。
+                #  - 這條續接**自己直接持着另一把鑰匙**（存量：它曾作為獨立 E2E 會話被鏡像過）
+                #    → 也維持舊身份：改投等於把它已有的密文歷史丟在一條沒人看的會話裡。
+                # 兩條都不成立時才換——換過去用的是**對話那把鑰匙**（conv_pid 直接持鑰），
+                # 於是 E2E 對話壓縮後的續接終於能加密着回到原來那條會話，而不是明文另起一條。
+                held = None
+                if not reg.history_trusted:
+                    held = "別名歷史不可信"
+                elif own_pid != conv_pid and own_pid in direct_protected:
+                    held = "續接自己持着另一把 K_S"
+                if held:
+                    self._count("mirrorLineageE2eHeld")
+                    print(
+                        f"· #969 {sid} 是 {conv_pid} 的續接，但{held} → 維持舊身份"
+                        "（fail-closed；不換 K_S 的鍵）",
+                        file=sys.stderr,
+                    )
+                    conv, conv_pid = sid, own_pid
+                else:
+                    self._count("mirrorLineageE2eAdopted")
+            adopted = conv_pid != own_pid
+            pid = conv_pid
+            if adopted and pinned is None:
+                # #950 歸屬**先落表**（下面發批前 `_save_mirror_state(strict=True)` 落盤，
+                # 早於任何內容離開本機）：崩在中間會讓別名少一環，而 aliasHistoryTrusted 是
+                # 持久 true 的——丟了就再也發現不了。只登記**真的發生過歸屬**的線程：根線程
+                # 身份恆等於自己、不會輪換，全登進去只會讓表跟着會話數無界長。
+                try:
+                    if conv_owner is None:
+                        reg.record(conv_pid, conv_pid)
+                        conv_owner = conv_pid
+                    reg.record(conv_owner, own_pid)
+                except ValueError as exc:
+                    # I1 被打破（同一條線程被記到兩段對話）：維持現狀（不改投），響亮記一筆。
+                    print(f"[mirror] 血緣登記失敗 {own_pid} → {conv_pid}：{exc}", file=sys.stderr)
+                    conv, conv_pid, pid, adopted = sid, own_pid, own_pid, False
             # #161 墓碑:app 側刪過 → 鏡像永不再撈(不刪 agent 側檔案;水位線照推免積壓)。
+            # #948 墓碑對續接同樣算數:用戶刪掉的對話,不許被它壓縮出來的子會話借屍還魂。
             tombs = st.get("tombstones", [])
-            if sid in tombs or pid in tombs:
+            if sid in tombs or pid in tombs or own_pid in tombs or conv in tombs:
                 # 直接推水位線(免拉低 global_min 掃描下界),不入 touched(那是「本批投遞的新水位」,
                 # 值語義是 new_wm 非 bool——入錯會污染 advance);持久化搭下次 save 的車。
                 if maxid is not None and maxid > wm.get(sid, 0):
@@ -3356,13 +3590,16 @@ class Connector:
                 )
                 continue
             e2e = protected  # §19：E2E 會話走加密鏡像（方案 A），不跳過
-            if (
-                sid in self._rev
-                or sid in self._fwd
-                or sid in self._stored_rev
+            if any(
+                d in self._rev
+                or d in self._fwd
+                or d in self._stored_rev
                 # #656 收到 prompt.submit 起就算「本端驅動中」——上面三張表要等 _ensure_session
                 # 跑完才有,那段窗口正是雙投的來源(見 self._driving 的註)。
-                or self._is_driving(sid)
+                or self._is_driving(d)
+                # #948 續接同樣要問**這段對話**是不是本端驅動的:壓縮出來的子會話不在任何映射
+                # 表裡,只認 sid 會讓一條 live 獨佔投遞的對話從壓縮點起被鏡像重投一遍。
+                for d in ((sid, conv) if adopted else (sid,))
             ) and not e2e:
                 # 續聊 Discord 會話（source=discord，經 tui 驅動）：運行時 id ≠ 持久化 id、消息落
                 # 持久化 id 下、鏡像看到的是它，故連 _fwd 一起查,否則重複投遞。macchiato 新建會話
@@ -3373,6 +3610,16 @@ class Connector:
                 # 不推水位、不入 batch,下一輪(2s)再看——回填落地後同源行被唯一索引吃掉。
                 continue
             floor = wm[sid] if sid in wm else default_floor
+            if adopted and sid not in wm and any(a in wm for a in origin.get("ancestors", ())):
+                # #948 首次看到這條續接、而這段對話**我們已經鏡像過**：`publish_compression_child()`
+                # 把壓縮結果（摘要 + `protect_last_n` 默認 20 條**逐字保留**的近期消息）當新行插進
+                # 子會話——新 id ＝ 新 dedup_key，server 認不出是舊消息的副本。原樣投出去 ＝ 用戶
+                # 對話尾部憑空多出約 20 條重複。切掉交接塊，只投它之後真正的新消息。
+                # （這段對話還沒鏡像過 → 沒有可重複的東西，照常從頭投，別把歷史也砍了。）
+                cut = await continuation_baseline(sid)
+                if cut and cut > floor:
+                    floor = wm[sid] = cut  # 落地這個決定，免得每輪重算
+                    self._count("mirrorHandoffTrimmed")
             has_new = maxid is not None and maxid > floor
             job = cron_feed_target(source, title)
             if job is not None:
@@ -3387,6 +3634,14 @@ class Connector:
                     if reports:
                         batch.append({
                             "hermesSessionId": f"cron:{job}",
+                            # #969 合成 feed 不是一條源系統線程（多次運行併成一條），沒有血緣
+                            # 可言 → 顯式 absent（＝ server 走老行為），不硬猜也不沉默。
+                            "origin": {
+                                "threadId": f"cron:{job}",
+                                "conversationId": f"cron:{job}",
+                                "kind": "root",
+                                "evidence": "absent",
+                            },
                             "title": job,
                             "source": "cron_feed",
                             "archived": False,
@@ -3394,27 +3649,58 @@ class Connector:
                         })
                     touched[sid] = new_wm
                 continue
+            # 續接：過濾與展示都按**這段對話**（根就是用戶在 app 裡看到的那條）來判，
+            # 而不是壓縮出來的那一環——否則鏈尾的機器標題會把用戶的會話改名。
+            eff_source = (origin.get("source") or source) if adopted else source
+            eff_title = (origin.get("title") or title) if adopted else title
             # §19：E2E 自驅會話 source=tui，會被 keepable 的 SKIP_SOURCES 濾掉——但它的內容
             # **只有**加密鏡像這一條路（live 被抑制），必須豁免；非 E2E 照常過濾。
-            # #592 豁免只給**已建立**的會話(自驅映射 pid≠sid / 已鏡像過 sid in wm)——E2E 下
-            # 新冒出來的 skip 源(subagent 子會話/system…)不因加密而獲得建會話權,否則父會話
-            # 每跑一次子代理就多一個獨立會話(2026-07-31 實踩,兩個 subagent = 兩個殭屍會話)。
+            # #592 豁免只給**已建立**的會話(自驅映射 pid≠sid / 已鏡像過 sid in wm)。
+            # #969 這裡看的是**這段對話**的身份 pid（不是 own_pid）：續接被接回一條已在
+            # server 上的 E2E 對話時，pid ≠ sid 天然成立——否則 app 建的 E2E 對話一壓縮，
+            # 續接就會被 SKIP_SOURCES 濾掉、那條會話從此靜默停更（正文只有加密鏡像這一條路）。
+            # 未採納時 pid ≡ own_pid，與改前逐字節相同。
             established = (pid != sid) or (sid in wm)
-            if not keepable(source, title) and not (e2e and established):
+            if not keepable(eff_source, eff_title) and not (e2e and established):
                 continue
+            # #969 上報血緣：**只能報 root**——協議規定 `origin.threadId` ≡ `hermesSessionId`
+            # 所指的那條線程，而判定權今天仍在連接器：續接在這裡就已經併進 `pid` 那條對話、
+            # 派生直接不鏡像，所以這批消息對 server 而言就是那條對話自己的內容。報
+            # continuation / derived 會讓 server 當場改行為（定不出父就 quarantine），違反
+            # 「落地當天行為不變」；真報要等判定權交回 server（#961）。
+            # 當天的收益不是零：新會話落 origin_kind='root'，#945 那條「標題像機器文本就隔離」
+            # 的兜底啟發式從此沒機會誤傷真實用戶會話，且 sessions_resolved 有了對賬口徑。
+            wire_origin = {
+                "threadId": pid,
+                "conversationId": pid,
+                "kind": "root",
+                "evidence": origin.get("evidence") or lineage_ev,
+            }
+            if wire_origin["evidence"] == "absent":
+                self._count("mirrorOriginsAbsent")
             if has_new:
                 msgs, new_wm = await tail_session(sid, floor)
                 if msgs:
-                    batch.append(self._mirror_entry(pid, title, source, archived, msgs, e2e))
+                    if adopted:
+                        self._count("mirrorContinuationAdopted")
+                    batch.append(
+                        self._mirror_entry(
+                            pid, eff_title, eff_source, archived, msgs, e2e, origin=wire_origin
+                        )
+                    )
                     touched[sid] = new_wm
-                    title_updates[sid] = title
-            elif sid in wm and (title or "").strip() and titles.get(sid) != title:
+                    title_updates[sid] = eff_title
+            elif sid in wm and (eff_title or "").strip() and titles.get(sid) != eff_title:
                 # 已鏡像過（server 上存在）、無新消息、但標題變了（Hermes 回合後才取名）→
                 # 純標題更新（空消息）；server 據此把占位「(鏡像會話)」改成真標題。用 sid in wm
                 # 而非 titles，使升級前**積壓**的卡住會話（titles 尚無記錄）首輪也補上。
                 # 不入 touched（不推水位線）。server 對非占位的會話自會 no-op。
-                batch.append(self._mirror_entry(pid, title, source, archived, [], e2e))
-                title_updates[sid] = title
+                batch.append(
+                    self._mirror_entry(
+                        pid, eff_title, eff_source, archived, [], e2e, origin=wire_origin
+                    )
+                )
+                title_updates[sid] = eff_title
         if batch:
             self._mirror_batch_id += 1
             bid = self._mirror_batch_id
@@ -4081,6 +4367,10 @@ class Connector:
                     sid for sid, op in server_e2e.items() if op == "enable"
                 }
                 self._e2e.protect_sessions(set(server_e2e), pending_enable=pe_from_ready)
+                # #969 權威快照已套用：別名歷史能否立為基線的兩個前置之一（另一個是「此刻零
+                # 受保護會話」）。沒有它就宣告「沒有任何東西可丟」是自欺——server 可能正持有
+                # 一份我們還沒看到的保護域。
+                self._e2e.mark_server_state_synced()
                 # #818：本地仍标 pending-enable、权威快照却省略 → enable 已被中止，按权威收敛。
                 for sid in list(self._e2e.pending_enable_sessions()):
                     if sid not in server_e2e:

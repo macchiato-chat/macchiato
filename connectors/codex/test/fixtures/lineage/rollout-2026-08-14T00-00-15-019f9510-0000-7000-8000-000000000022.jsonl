@@ -1,0 +1,3 @@
+{"timestamp":"2026-08-14T00:00:00.000Z","type":"session_meta","payload":{"cwd":"/w/proj","originator":"codex_vscode","cli_version":"0.144.1","model_provider":"openai","git":{"commit_hash":"0000000000000000000000000000000000000000","branch":"main","repository_url":null},"timestamp":"2026-08-14T00:00:00.000Z","id":"019f9510-0000-7000-8000-000000000022","parent_thread_id":"019f9510-0000-7000-8000-000000000002","source":"vscode","base_instructions":"<stripped>"}}
+{"timestamp":"2026-08-14T00:00:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"脫敏語料：CLI 根線程的第一問"}}
+{"timestamp":"2026-08-14T00:00:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"脫敏語料：CLI 根線程的第一答"}}

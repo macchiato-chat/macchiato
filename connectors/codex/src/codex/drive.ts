@@ -727,7 +727,8 @@ export class Drive {
           try {
             const rf = discoverRollouts().rollouts.find((r) => r.threadId === tid);
             if (!rf || !existsSync(rf.file)) return;
-            const { title } = deriveMeta(readFileSync(rf.file, "utf8"));
+            // #946 優先用 Codex 自己起的名字（session_index.jsonl），拿不到才截斷首條消息。
+            const { title } = deriveMeta(readFileSync(rf.file, "utf8"), tid);
             if (title && title !== "Codex") this.emit(sid, "session.title", { title });
           } catch (e) {
             console.error(`[#257 retitle failed ${sid}] ${(e as Error).message}`);

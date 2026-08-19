@@ -563,24 +563,33 @@ install_supervisor
 find_hermes_python() {
   if [ -n "${HERMES_PYTHON:-}" ]; then echo "$HERMES_PYTHON"; return; fi
   local cand
+  # #927: Hermes 0.20+ 的官方安裝器把 agent 和它的 venv 放在 $HERMES_HOME/hermes-agent
+  # (默認 ~/.hermes);升級後 pipx 目錄常留著 0.19 的殘骸,先命中它就會綁錯解釋器。
+  # 新佈局排最前,pipx 留作回退(從沒搬過家的機器)。
   for cand in \
+    "${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv/bin/python" \
+    "$HOME/.hermes/hermes-agent/venv/bin/python" \
     /usr/local/lib/hermes-agent/venv/bin/python \
     "$HOME/.local/lib/hermes-agent/venv/bin/python" \
     "$HOME/.local/share/pipx/venvs/hermes-agent/bin/python" \
     "$HOME/.local/pipx/venvs/hermes-agent/bin/python"; do
     [ -x "$cand" ] && { echo "$cand"; return; }
   done
+  # #937: 自愈跑在 env -i 的最小 PATH 下(刻意的硬化,不放寬),~/.local/bin 不在裡面 →
+  # command -v 看不見啟動器。上游 get_command_link_dir() 只有兩個落點:root FHS 的
+  # /usr/local/bin(已在最小 PATH 上)和非 root 的 $HOME/.local/bin——後者按絕對路徑補一條。
+  # 啟動器 shim 裡寫死了安裝目錄,自定義位置(--install-dir / 手工 clone + setup-hermes.sh)
+  # 也順着它解析得出解釋器,零 PATH 改動。
   local h target py
-  h="$(command -v hermes 2>/dev/null || true)"
-  if [ -n "$h" ] && [ -f "$h" ]; then
+  for h in "$(command -v hermes 2>/dev/null || true)" "$HOME/.local/bin/hermes"; do
+    [ -n "$h" ] && [ -f "$h" ] || continue
     target="$(sed -n 's/^exec "\{0,1\}\([^" ]*\)"\{0,1\}.*/\1/p' "$h" | head -1)"
     [ -z "$target" ] && target="$(sed -n '1s/^#!//p' "$h" | awk '{print $1}')"
-    if [ -n "$target" ]; then
-      py="$(dirname "$target")/python"
-      [ -x "$py" ] && { echo "$py"; return; }
-      case "$target" in *python*) [ -x "$target" ] && { echo "$target"; return; } ;; esac
-    fi
-  fi
+    [ -n "$target" ] || continue
+    py="$(dirname "$target")/python"
+    [ -x "$py" ] && { echo "$py"; return; }
+    case "$target" in *python*) [ -x "$target" ] && { echo "$target"; return; } ;; esac
+  done
   echo ""
 }
 

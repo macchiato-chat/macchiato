@@ -99,6 +99,34 @@ function isHumanUserText(t: string): boolean {
   return !NON_HUMAN_PREFIXES.some((p) => s.startsWith(p));
 }
 
+/** 開頭的一整塊 XML 式注入（`<command-name>…</command-name>` / `<ide_opened_file>…</ide_opened_file>` …）。 */
+const LEADING_WRAPPER_RE = /^<([a-z][a-z0-9_-]*)>[\s\S]*?<\/\1>\s*/i;
+/** 純斜杠命令（`/model`、`/model opus`）——是操作，不是對話標題。 */
+const SLASH_COMMAND_RE = /^\/[a-z][a-z0-9_-]*(?:\s+[^\s\n]+)?$/i;
+
+/**
+ * #947 標題淨化：剝掉命令 / IDE 注入的包裝，只有剩下人話才算標題。
+ *
+ * 為什麼要有這一層：`isMeta` / `isSidechain` / `isCompactSummary` 過濾的是「這行是不是真人說的」，
+ * 而**標題**還多一層——同一條真人 user 行的正文開頭可能被 CC 或 IDE 塞了整塊機器文本
+ * （`<command-name>/model</command-name>`、`<ide_opened_file>…`）。拿它當標題的結果就是生產庫裡
+ * 一堆同名、看不懂的會話（本機 26 條 `/model` 開頭、12 條 `<ide_opened_file>` 開頭）。
+ * 剝完是空 / 還是標籤 / 只剩一條斜杠命令 → 這行不配當標題，往後找下一條。
+ */
+export function titleFromText(text: string): string | undefined {
+  let s = text.trim();
+  for (let i = 0; i < 8; i++) {
+    const next = s.replace(LEADING_WRAPPER_RE, "").trimStart();
+    if (next === s) break;
+    s = next;
+  }
+  s = s.trim();
+  if (!s) return undefined;
+  if (s.startsWith("<")) return undefined; // 認不出的注入塊（沒閉合 / 未知形態）
+  if (SLASH_COMMAND_RE.test(s)) return undefined;
+  return s.slice(0, 60);
+}
+
 function textBlocks(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -285,7 +313,8 @@ export function scanInitialTitle(file: string): string | undefined {
       if (d.type === "custom-title" && typeof d.customTitle === "string") return d.customTitle.trim();
       if (!title && d.type === "user" && !d.isMeta && !d.isSidechain && !d.isCompactSummary) {
         const text = textBlocks(d.message?.content).trim();
-        if (isHumanUserText(text)) title = text.slice(0, 60);
+        // #947 剝掉命令 / IDE 注入包裝；剝完不是人話就往後找下一條，別讓機器文本當標題。
+        if (isHumanUserText(text)) title = titleFromText(text);
       }
     }
     return title;

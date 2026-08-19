@@ -5,13 +5,20 @@
 import { readFileSync } from "node:fs";
 import type { E2EKeyStore } from "../_core/e2e/keys";
 import type { LinkBClient } from "../_core/linkb/client";
+import type { ThreadOrigin as WireThreadOrigin } from "../linkb/proto";
 import { deriveMeta, discoverRollouts, shouldSkipRollout } from "./mirror";
+import { parseOrigin, toWireOrigin } from "./origin";
 import { readNewMessages } from "./transcripts";
 
 const FRAME_BUDGET = 3 * 1024 * 1024;
 
 interface BuiltSession {
   hermesSessionId: string;
+  /**
+   * #966 源系統聲明的血緣（形狀與理由見 `toWireOrigin`）。導入口徑下派生線程整檔不進來，
+   * 所以恒是 `kind:"root"`；老格式（`evidence:"absent"`）不帶這個字段。
+   */
+  origin?: WireThreadOrigin;
   title: string;
   source: string;
   messages: Record<string, unknown>[];
@@ -44,9 +51,14 @@ export function collectImportSessions(): { built: BuiltSession[]; compressed: nu
     if (shouldSkipRollout(content).skip) continue;
     const { messages } = readNewMessages(content, 0, 0);
     if (!messages.length) continue; // 純工具/空會話跳過
-    const { title, cwd } = deriveMeta(content);
+    // #946 標題優先用 Codex 自己起的名字（session_index.jsonl），回退首條消息截斷。
+    const { title, cwd } = deriveMeta(content, threadId);
+    // #966 上報事實。導入身份仍是文件名裡的 thread id（老 server 兼容、與存量會話對得上），
+    // 所以 origin 也按這個 id 報——協議規定 `origin.threadId` ≡ `hermesSessionId` 所指的線程。
+    const origin = toWireOrigin(parseOrigin(content, threadId), threadId);
     built.push({
       hermesSessionId: threadId,
+      ...(origin ? { origin } : {}),
       title,
       source: "codex",
       messages: messages.map((m) => ({ role: m.role, text: m.text })),

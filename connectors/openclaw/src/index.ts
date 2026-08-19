@@ -19,6 +19,7 @@ import { authorizeE2EDisableResume } from "./_core/e2e/control";
 import { CommandsReporter } from "./openclaw/commands";
 import { HealthLoop } from "./health";
 import { HeartbeatWriter } from "./_core/heartbeat";
+import { ensureAutostartOnStartup, yieldToRunningInstance } from "./_core/autostart";
 import { installProcessFaultHandlers } from "./_core/runtime-faults";
 import { CONNECTOR_VERSION } from "./linkb/proto";
 import { runVerifiedSelfUpdate } from "./_core/selfupdate";
@@ -141,6 +142,9 @@ function runSelfUpdate(): void {
 }
 
 async function main(): Promise<void> {
+  // #977 本機已經有一個活著的同 kind 連接器（多半是開機自啟的那個）→ 手起的這個讓位退出。
+  // 兩條 Link B 會在 server 端互踢（4001 superseded → 重連 → 再踢），用戶側就是會話一路抖。
+  if (yieldToRunningInstance(KIND) !== null) process.exit(0);
   // 1. 憑證 / 配對
   let creds = loadCreds(KIND);
   if (!creds) {
@@ -151,6 +155,10 @@ async function main(): Promise<void> {
     console.log("Pairing complete (MACCHIATO_PAIR_ONLY) — exiting; start the service to run.");
     process.exit(0);
   }
+
+  // #977 手動起來的連接器（裝的時候沒落上單元、或裝的是還沒有這一步的老版本）自己把
+  // launchd/systemd 單元補上——只落盤、不拉起，下次開機用戶就不用再敲一遍。
+  ensureAutostartOnStartup(KIND);
 
   // #347 密鑰檔先於任何 agent/gateway 事件校驗；損壞時直接離線退出，沒有明文退化窗口。
   const e2e = new E2EKeyStore(e2eStorePath(KIND));
@@ -197,6 +205,10 @@ async function main(): Promise<void> {
   const mirrorMain = process.env.MACCHIATO_OPENCLAW_MIRROR || join(homedir(), ".macchiato/openclaw-mirror.json");
   const freshInstall = !existsSync(mirrorMain) && !existsSync(mirrorMain + ".bak");
   mirror = new Mirror(gw, linkb, e2e);
+  // #950/#968 K_S 的鍵 = 上報給 server 的身份；把 mirror 的 `ThreadRegistry` 接進 keystore，
+  // 讓歷代 transcript id 都認得回同一把鑰匙。別名歷史不可信時解析器恒返回空數組 —— keystore
+  // 逐字節退回改前行為（維持舊身份），絕不會因為查不到就新生成 K_S（#347 / #807）。
+  e2e.setIdentityAliases(mirror.identityAliasResolver());
   // #256 / F-14 #498:OpenClaw **故意不做 Projects**(產品+安全邊界,見 docs/projects.md §3.1)。
   // gateway 無 per-session cwd 通道;web PROJECT_CAPABLE_KINDS 已排除。**不**接線 project_op
   // handler——否則 server 被攻破可驅動本不該存在的路徑,往任意目錄寫 AGENTS.md/CLAUDE.md
@@ -355,6 +367,7 @@ async function main(): Promise<void> {
   // 的機器會永遠停在這行——而那恰好是本心跳唯一要觀測的故障（#210 同形狀）。
   const heartbeat = new HeartbeatWriter(KIND, () => ({
     version: CONNECTOR_VERSION,
+    agentLinkId: linkb.agentLinkId, // #991 讓位判據要它：只有同一條 agent link 才互踢
     linkConnected: linkb.isReady,
     lastConnectedAtMs: linkb.lastConnectedAtMs,
     busy: drive?.busy ?? false,

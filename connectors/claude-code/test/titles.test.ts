@@ -52,7 +52,13 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   },
 }));
 
-const ENV_KEYS = ["MACCHIATO_CC_TITLE_MODE", "CLAUDE_CONFIG_DIR", "TMPDIR"] as const;
+const ENV_KEYS = [
+  "MACCHIATO_CC_TITLE_MODE",
+  "MACCHIATO_CC_TITLE_MODEL",
+  "ANTHROPIC_BASE_URL",
+  "CLAUDE_CONFIG_DIR",
+  "TMPDIR",
+] as const;
 const ORIGINAL_ENV = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
 const REAL_TMP = tmpdir();
 let testTmp = "";
@@ -96,6 +102,31 @@ describe("titleMode (env 開關)", () => {
   });
 });
 
+describe("titleLlmChoice (#997 OpenRouter 上默認 haiku 會 403)", () => {
+  it("直連 Anthropic（無 OpenRouter base）走 haiku", async () => {
+    delete process.env.ANTHROPIC_BASE_URL;
+    delete process.env.MACCHIATO_CC_TITLE_MODEL;
+    const { titleLlmChoice } = await fresh();
+    expect(titleLlmChoice()).toEqual({ skip: false });
+  });
+
+  it("OpenRouter 兼容端點默認跳過 LLM，不冷啟 20s 的 doomed haiku", async () => {
+    process.env.ANTHROPIC_BASE_URL = "https://openrouter.ai/api";
+    delete process.env.MACCHIATO_CC_TITLE_MODEL;
+    const { titleLlmChoice } = await fresh();
+    const c = titleLlmChoice();
+    expect(c.skip).toBe(true);
+    if (c.skip) expect(c.reason).toMatch(/403/);
+  });
+
+  it("顯式 TITLE_MODEL 在 OpenRouter 上仍尊重（人要打哪個就打哪個）", async () => {
+    process.env.ANTHROPIC_BASE_URL = "https://openrouter.ai/api";
+    process.env.MACCHIATO_CC_TITLE_MODEL = "deepseek/deepseek-v4-flash";
+    const { titleLlmChoice } = await fresh();
+    expect(titleLlmChoice()).toEqual({ skip: false });
+  });
+});
+
 describe("generateTitle", () => {
   it("顯式 firstmsg 本地截斷，不啟動第二個 agent 回合", async () => {
     process.env.MACCHIATO_CC_TITLE_MODE = "firstmsg";
@@ -126,9 +157,22 @@ describe("generateTitle", () => {
     expect(sdk.calls).toHaveLength(0);
   });
 
+  it("#997 OpenRouter + summary：不調 query，回退首條截斷（別讓 doomed haiku 跟主回合搶額）", async () => {
+    process.env.MACCHIATO_CC_TITLE_MODE = "summary";
+    process.env.ANTHROPIC_BASE_URL = "https://openrouter.ai/api";
+    delete process.env.MACCHIATO_CC_TITLE_MODEL;
+    const { generateTitle } = await fresh();
+    const text = "Reply with exactly: MIRROR_PING_OK";
+    const title = await generateTitle(text);
+    expect(title).toBe(text);
+    expect(sdk.calls).toHaveLength(0);
+  });
+
   it("summary 禁用工具、隔離 cwd/設定;#590 標題固定輕量檔 haiku(可 env 覆蓋),不帶 effort;#677 env=sdkEnv + thinking off", async () => {
     vi.useFakeTimers();
     process.env.MACCHIATO_CC_TITLE_MODE = "summary";
+    delete process.env.ANTHROPIC_BASE_URL;
+    delete process.env.MACCHIATO_CC_TITLE_MODEL;
     const canonicalConfig = join(testTmp, "canonical-config");
     mkdirSync(canonicalConfig);
     const fakeCredential = join(canonicalConfig, ".credentials.json");

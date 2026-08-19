@@ -1,6 +1,12 @@
 /**
  * §15 鏡像：tail Claude Code 的 transcript（~/.claude/projects/<slug>/<sessionId>.jsonl）→ mirror_append。
- *  - 發現：掃 projects/ 下全部 <uuid>.jsonl（agent-*.jsonl = 子 agent 轉錄，跳過）。
+ *  - 發現：掃 projects/ 下全部 <uuid>.jsonl；**子 agent 檔按行內聲明排除**（`isSidechain`/`agentId`，
+ *    文件名 `agent-*` 只作兜底），**續接檔（終端 `--resume`/rewind）按對話指紋接回父會話**——
+ *    見 `lineage.ts`（#947）。
+ *  - #967 血緣別名下沉到 `connector-core` 的 `ThreadRegistry`（四家共用）：對話 → 歷代所有
+ *    transcript uuid，首次確立的身份永不輪換；別名同時交給 E2E keystore（`setIdentityAliases`），
+ *    於是換身份的會話也查得到壓在舊鍵下的 K_S。每批 `mirror_append` 另帶 `ImportSession.origin`
+ *    上報血緣事實（判定權仍在連接器本地，切換是後續那一刀）。
  *  - 未知會話從 0 全量鏡像完整歷史（自動看到所有會話 = 相對官方 remote control 的核心賣點,
  *    不依賴手動 import）；分批發（batchMax 條/帧，單帧單會話）防超 server maxPayload。
  *  - 字節偏移水位線 + in-flight 保留（見 transcripts.foldEntries）。durable outbox（#348）：幀落盤
@@ -32,7 +38,17 @@ import { dirname, join, basename } from "node:path";
 import type { LinkBClient } from "../_core/linkb/client";
 import type { E2EKeyStore } from "../_core/e2e/keys";
 import type { E2EDisableReceiptV1 } from "../_core/e2e/control";
-import { foldEntries, projectsDir, readEntries, type CCMessage } from "./transcripts";
+import {
+  ThreadRegistry,
+  type ThreadRegistrySnapshot,
+} from "../_core/threads/registry";
+import { foldEntries, projectsDir, readEntries, titleFromText, type CCMessage } from "./transcripts";
+import {
+  isSubagentTranscript,
+  lineageCounters,
+  readTranscriptOrigin,
+  type OriginEvidence,
+} from "./lineage";
 
 /**
  * 鏡像狀態檔的耐久寫（0600 + fsync + 原子 rename + 目錄 fsync）。
@@ -105,8 +121,27 @@ export interface ImportMessage {
   enc?: string;
 }
 
+/**
+ * #950 `ThreadOrigin`（鏡像 `packages/protocol` 的 wire shape——公開 connector 不依賴私有包）。
+ *
+ * 是**元數據不是正文**，所以 E2E 會話一樣帶得動（server 看不見密文，這是加密會話下唯一還能
+ * 做歸屬判定的憑據）。三個字段分工不能混：`conversationId` 決定歸屬、`kind` 決定可見性、
+ * `evidence` 決定信誰與告警口徑。
+ */
+export interface ThreadOriginWire {
+  threadId: string;
+  conversationId: string;
+  kind: "root" | "continuation" | "derived" | (string & {});
+  parentThreadId?: string;
+  label?: string;
+  depth?: number;
+  evidence: OriginEvidence;
+}
+
 interface ImportSession {
   hermesSessionId: string;
+  /** #967 血緣（可選）；不帶 = server 按 `evidence:"absent"` 走老行為。 */
+  origin?: ThreadOriginWire;
   title?: string;
   source?: string;
   /** #659 會話工作目錄（transcript 條目的 cwd）；server 落 chat_sessions.cwd → 側欄文件夾。 */
@@ -168,14 +203,24 @@ export function toImportMessage(m: CCMessage): ImportMessage {
   };
 }
 
-/** <uuid>.jsonl 才是主會話轉錄（agent-* 為子 agent；其它雜檔跳過）。 */
+/** <uuid>.jsonl 是主會話轉錄的候選（真正是不是子 agent，由行內聲明說了算——見 lineage.ts）。 */
 const SESSION_FILE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/;
+/** agent-*.jsonl：子 agent 檔的**文件名兜底**——照樣過一遍血緣判定（讓聲明優先、兜底可觀測）。 */
+const AGENT_FILE_RE = /^agent-[^/]*\.jsonl$/;
 
 export interface SessionFile {
   sid: string;
   file: string;
 }
 
+/**
+ * 發現「一段對話」的轉錄檔。
+ *
+ * #947：子 agent 的排除從**文件名約定**（`agent-*.jsonl`）改成**讀行內聲明**
+ * （`isSidechain` / `agentId`），文件名降級為兜底。CC 已經改過一次子 agent 的形態
+ * （內聯 `isSidechain` → 獨立 `agent-*.jsonl` → `<父會話 id>/subagents/agent-*.jsonl`），
+ * 只認文件名的話，下次再改就是又一輪「列表裡冒出一堆同名會話」。
+ */
 export function discoverSessions(root = projectsDir()): SessionFile[] {
   const out: SessionFile[] = [];
   let dirs: string[];
@@ -193,7 +238,11 @@ export function discoverSessions(root = projectsDir()): SessionFile[] {
       continue;
     }
     for (const f of files) {
-      if (SESSION_FILE_RE.test(f)) out.push({ sid: basename(f, ".jsonl"), file: join(dir, f) });
+      if (!SESSION_FILE_RE.test(f) && !AGENT_FILE_RE.test(f)) continue;
+      const sid = basename(f, ".jsonl");
+      const file = join(dir, f);
+      if (isSubagentTranscript(file, sid)) continue; // 子 agent 是父會話的執行單元，不是一段對話
+      out.push({ sid, file });
     }
   }
   return out;
@@ -208,6 +257,27 @@ interface State {
   tombstones?: string[];
   /** #154 首掃基線已建(true 之後新發現的會話才 from-zero)。舊安裝(offsets 非空)載入時視為已建。 */
   seeded?: boolean;
+  /**
+   * #947 血緣：本地 sid → 這條 transcript 的**證據等級**（每個 sid 只解一次，持久化跨重啟）。
+   *
+   * ⚠️ `parent` 是 #947 的老字段，#967 起歸屬改由 `registry` 記（一張表一個真源）。載入時遷移
+   * 過去、之後不再寫；留在類型裡只為讀得懂舊狀態檔。
+   */
+  origins?: Record<string, { parent?: string; evidence: OriginEvidence }>;
+  /**
+   * #947 對話指紋 → **conversationId**（`u:<根消息 uuid>` / `l:<首條 last-prompt 的 leafUuid>`）。
+   * 續接檔複製父檔歷史時原樣保留行的 uuid，所以父子兩檔指紋相同——這張表就是「接回父會話」
+   * 的索引。每個會話最多兩條，不隨消息數增長。
+   *
+   * #967：值的語義從「規範會話的本地 sid」改成 conversationId —— 兩者恆等（conversationId ＝
+   * 這段對話**首次確立身份**的那個本地 sid），所以舊狀態檔不需要轉換。
+   */
+  heads?: Record<string, string>;
+  /**
+   * #967 `ThreadRegistry` 快照（conversation → 歷代所有 threadId + `aliasHistoryTrusted`）。
+   * 別名表下沉到 `connector-core` 後，「這條 transcript 屬於哪段對話」由它作主。
+   */
+  registry?: ThreadRegistrySnapshot;
   pendingMirrors?: Array<{
     batchId: string;
     frame: Record<string, unknown>;
@@ -232,6 +302,11 @@ interface State {
 
 export class Mirror {
   private state: State;
+  /**
+   * #967 對話 ↔ 執行線程的別名表（`connector-core` 的公共設施，四家共用）。
+   * 「這條 transcript 屬於哪段對話」「這段對話對外報哪個身份」都問它，不再各留一份。
+   */
+  private registry: ThreadRegistry;
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly drivenSids = new Set<string>();
   private readonly sentBatchAt = new Map<string, number>();
@@ -298,6 +373,12 @@ export class Mirror {
     mirrorGhostBlocked: 0, // 影子 session 兜底:攔下的「為 driven CLI 會話憑空建會話」次數(正常應恆 0)
     mirrorDirectionRewinds: 0, // E2E 方向翻轉導致丟棄凍結批、回退重編的次數
     mirrorDropped: 0, // server 判畸形/毒批而丟棄跳過的批次數(非 0 = 有內容沒進 app)
+    mirrorContinuationsMerged: 0, // #947 認出並接回父會話的續接檔數（終端 --resume / rewind）
+    mirrorOriginsAbsent: 0, // #947 連對話指紋都取不到的檔（續接認不出來的盲區，正常應極少）
+    mirrorSubagentDeclared: 0, // #947 靠 CC 行內聲明認出的子 agent 檔
+    mirrorSubagentInferred: 0, // #947 只能靠文件名猜的子 agent 檔(持續>0 = 上游不再寫聲明,該去看)
+    mirrorE2EContinuationsMerged: 0, // #967 受 E2E 保護的續接靠別名認親接回父會話的次數
+    mirrorE2EIdentityHeld: 0, // #967 別名歷史不可信 → 維持舊身份(fail-closed;持續>0 = 這台機器永遠不會遷)
   };
   private polling = false;
   /** #308 MACCHIATO_MIRROR=off:停鏡像輪詢(終端側活動不進 app)。⚠️ 只停這一樣——
@@ -317,6 +398,62 @@ export class Mirror {
     private readonly plaintextLocalAllowed?: (localSid: string) => boolean,
   ) {
     this.state = this.load();
+    this.registry = this.buildRegistry();
+    // #950/#967 把別名交給 keystore：身份換成對話根之後，存量會話的 K_S 還壓在舊鍵（threadId）
+    // 下，直查必然 miss。**不用 `identityAliasResolver()`**——prune 掉死對話時 registry 會被整個
+    // 重建，捕獲 `this` 才能永遠指向當前那張表。別名歷史不可信時 `aliasesFor` 恆空 → keystore
+    // 行為與注入前逐字節一致（fail-closed）。
+    const store = this.e2e as Partial<E2EKeyStore> | undefined;
+    store?.setIdentityAliases?.((sid) => this.registry.aliasesFor(sid));
+  }
+
+  /**
+   * 從狀態檔重建 `ThreadRegistry`，並把 #947 的 `origins[sid].parent` 鏈**一次性遷移**進去。
+   *
+   * 快照非法一律回落到「空且不可信」（`ThreadRegistry.parse` 的契約）：**絕不可**把「解析失敗」
+   * 當成「這段對話沒有別名」，那正是 #347 要防的那一刀。
+   */
+  private buildRegistry(): ThreadRegistry {
+    let registry: ThreadRegistry;
+    try {
+      registry = ThreadRegistry.parse(this.state.registry);
+    } catch (error) {
+      console.error(
+        `[mirror] thread registry 快照非法 → 按「空且不可信」重建（維持舊身份）：${(error as Error).message}`,
+      );
+      registry = ThreadRegistry.empty();
+    }
+    const origins = this.state.origins ?? {};
+    const rootOf = (sid: string): string => {
+      let cur = sid;
+      for (let i = 0; i < 8; i++) {
+        const parent = origins[cur]?.parent;
+        if (!parent || parent === cur) break;
+        cur = parent;
+      }
+      return cur;
+    };
+    const record = (conversationId: string, threadId: string): boolean => {
+      try {
+        registry.record(conversationId, threadId);
+        return true;
+      } catch (error) {
+        // I1 被打破（同一條線程被記到兩段對話）：保守跳過，寧可維持它現在的歸屬。
+        console.error(`[mirror] 血緣遷移跳過 ${threadId}：${(error as Error).message}`);
+        return false;
+      }
+    };
+    // 只遷 registry 還不認識的（新狀態檔每輪都會走到這裡，不能每次重記一遍）。
+    const pending = Object.keys(origins).filter((sid) => !registry.conversationOf(sid));
+    // 兩趟：先確立每段對話的身份（鏈根 = `wireIdentityOf` 取的 `threads[0]`），再掛子檔。
+    for (const sid of pending) {
+      const conversationId = rootOf(sid);
+      if (!registry.conversationOf(conversationId)) record(conversationId, conversationId);
+    }
+    for (const sid of pending) {
+      if (record(rootOf(sid), sid)) delete origins[sid]!.parent; // 歸屬只留一個真源
+    }
+    return registry;
   }
 
   start(): void {
@@ -573,7 +710,13 @@ export class Mirror {
     // 水位推過後常規 poll 不再重讀；agent 帶 srcId，server 冪等索引兜底可見重複。
     const sent = this.sendOne(
       localSid,
-      this.entry(targetSid, title, agents, this.cwdBySid.get(localSid)),
+      this.entry(
+        targetSid,
+        title,
+        agents,
+        this.cwdBySid.get(localSid),
+        this.originFor(localSid, targetSid),
+      ),
       folded.consumedUpTo,
       undefined,
     );
@@ -794,6 +937,158 @@ export class Mirror {
     return offset;
   }
 
+  /**
+   * #947 血緣解析：一個檔只解一次，歸屬進 `registry`、證據等級進 `state.origins`（都持久化）。
+   *
+   * 判定順序（**聲明優先、啟發式兜底**）：
+   *  1. 行內顯式續接聲明（`sessionId` 指向別的會話）；
+   *  2. 對話指紋（根消息 uuid / 首條 `last-prompt` 的 leafUuid）撞上**已登記**的對話 → 續接檔；
+   *  3. 都沒撞上 → 它自己就是一段對話，把指紋登記到它名下。
+   *
+   * 🚨 E2E（#947 → #967 放開）：K_S 按上報的 `hermesSessionId` 存鍵，改身份 = 改鍵，查不到就落進
+   * #807 那條「connector-ahead：連接器已加密、DB 仍明文 → 永久不可恢復」。#950 的
+   * `setIdentityAliases` 讓 keystore 在直查落空時按別名認親，於是這裡可以放開——但**判據嚴格照
+   * #347**：只有 `aliasHistoryTrusted` 顯式為真才敢換身份，不可信時維持舊身份（fail-closed），
+   * 絕不因為查不到就新生成一把 K_S（那會讓此前的密文永久解不開）。
+   */
+  private resolveOrigin(sid: string, file: string): void {
+    if (this.state.origins?.[sid]) return;
+    const origin = readTranscriptOrigin(file, sid);
+    // 檔剛建、還沒寫出任何行 → 先不下結論（下輪 poll 再解，避免把「暫時沒指紋」焊死成獨立會話）。
+    if (origin.parsedLines === 0) return;
+
+    const origins = (this.state.origins ??= {});
+    const heads = (this.state.heads ??= {});
+    /** 這個檔歸屬的對話（＝該對話首次確立身份的那個本地 sid）；undefined = 它自己就是一段對話。 */
+    let conversationId: string | undefined;
+    let evidence: OriginEvidence = origin.evidence;
+
+    if (origin.kind === "continuation" && origin.declaredParent && origin.declaredParent !== sid) {
+      conversationId = this.registry.conversationOf(origin.declaredParent) ?? origin.declaredParent;
+    } else {
+      for (const fp of origin.fingerprints) {
+        const owner = heads[fp];
+        if (owner && owner !== sid) {
+          conversationId = owner;
+          evidence = "declared";
+          break;
+        }
+      }
+    }
+
+    if (conversationId) {
+      const identity = this.registry.wireIdentityOf(conversationId) ?? conversationId;
+      // #967 E2E 放開的唯一閘：別名歷史可信才敢換身份（見上）。
+      const e2eInvolved = !!this.e2e && (this.e2e.isE2E(sid) || this.e2e.isE2E(identity));
+      const e2eHeld = e2eInvolved && !this.registry.historyTrusted;
+      // **升級前就已經鏡像出去的檔**（`titles[sid]` 有值 = app 裡已經有這條會話了）也不改投：
+      // 半路把它的正文改投到另一條會話，用戶看到的是「我剛才那段對話不見了」——比留著一條
+      // 存量重複更傷。本刀只保證**從此以後**的 `--resume` 不再多長一條；存量清理是另一件事。
+      if (e2eHeld || this.state.titles[sid]) {
+        if (e2eHeld) {
+          this.counters.mirrorE2EIdentityHeld += 1;
+          console.warn(
+            `· #967 ${sid} 是 ${identity} 的續接，但別名歷史不可信 → 維持舊身份（fail-closed；不換 K_S 的鍵）`,
+          );
+        }
+        conversationId = undefined;
+      } else if (e2eInvolved) {
+        this.counters.mirrorE2EContinuationsMerged += 1;
+      }
+    }
+
+    // 歸屬**先落表再用**：崩在中間會讓別名少一環，而 `aliasHistoryTrusted` 是持久 true 的——
+    // 丟了就再也發現不了。（本函數的調用方 `resolveNewOrigins` 解完即 save，早於任何發送。）
+    const conversation = conversationId ?? sid;
+    try {
+      this.registry.record(conversation, sid);
+    } catch (error) {
+      // I1 被打破：上游給的血緣自相矛盾。維持現狀（不改投），響亮記一筆。
+      console.error(`[mirror] 血緣登記失敗 ${sid} → ${conversation}：${(error as Error).message}`);
+      conversationId = undefined;
+    }
+    for (const fp of origin.fingerprints) if (!heads[fp]) heads[fp] = conversation;
+
+    const parent = conversationId ? this.identitySid(sid) : undefined;
+    origins[sid] = { evidence };
+    if (evidence === "absent") this.counters.mirrorOriginsAbsent += 1;
+    if (parent) {
+      this.counters.mirrorContinuationsMerged += 1;
+      // 父會話已發過的標題就是這段對話的標題——續接檔別再拿複製來的首條 user 消息覆蓋它
+      // （用戶在 app 裡改過名的會話尤其不能被打回原形）。
+      const parentTitle = this.state.titles[parent];
+      if (parentTitle && !this.state.titles[sid]) this.state.titles[sid] = parentTitle;
+      console.log(
+        `· #947 續接接回父會話：${sid} → ${parent}（evidence=${evidence}；不再另建帶歷史副本的重複會話）`,
+      );
+    }
+  }
+
+  /**
+   * 本輪新出現的檔逐個解血緣。按 mtime 升序解——先登記的那個成為這段對話的規範會話，
+   * 而續接檔總是後於它的父檔誕生，所以順序天然正確（首裝一次性掃到父子同時出現時也一樣）。
+   */
+  private resolveNewOrigins(found: SessionFile[]): void {
+    this.maybeAdoptAliasHistory(); // #967 先看能不能立基線，再解本輪的新檔
+    const fresh = found.filter(
+      (s) => !this.state.origins?.[s.sid] && !this.state.tombstones?.includes(s.sid),
+    );
+    if (!fresh.length) return;
+    const withTime = fresh.map((s) => {
+      let mtimeMs = 0;
+      try {
+        mtimeMs = statSync(s.file).mtimeMs;
+      } catch {
+        /* 讀不到就排最前，反正只影響同批的登記先後 */
+      }
+      return { ...s, mtimeMs };
+    });
+    withTime.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    for (const s of withTime) this.resolveOrigin(s.sid, s.file);
+    // #967 歸屬先落盤、再發任何一批：別名少一環而信任還是 true，就再也發現不了。
+    this.save();
+    // 子 agent 的判定發生在 discoverSessions 裡（模塊級記憶化），計數在此彙總進健康上報。
+    this.counters.mirrorSubagentDeclared = lineageCounters.subagentDeclared;
+    this.counters.mirrorSubagentInferred = lineageCounters.subagentInferred;
+  }
+
+  /**
+   * 這個本地檔對外用哪個身份：續接檔用父會話的身份，其餘用自己。
+   * （水位線 / 標題 / pendingMirrors 仍按**本地檔** sid 記——身份只影響發給 server 的 sid。）
+   *
+   * #967 起答案來自 `ThreadRegistry`：對話**首次確立**的那條線程就是永久身份（I2），源系統換
+   * 檔只映射、不另建。
+   */
+  private identitySid(sid: string): string {
+    const conversationId = this.registry.conversationOf(sid);
+    if (!conversationId) return sid;
+    return this.registry.wireIdentityOf(conversationId) ?? conversationId;
+  }
+
+  /**
+   * #967 別名歷史可信度（判據照抄 openclaw #347，與 `drive.ts` 的 `saveMap` 同款）：
+   * **零受保護會話 ∧ 已套用權威 server 快照**的那一刻，這張表裡沒有任何東西可丟 → 可以立為
+   * 基線；此後只增不減（歸屬先落盤再發送），所以信任一旦建立就一直成立。
+   *
+   * 反過來，**一旦已經有 E2E 會話就再也不許自升**：舊 schema / 狀態檔恢復都可能早就丟過一環，
+   * 而丟了就再也發現不了。不可信 → `aliasesFor` 恆空 → keystore 逐字節退回改前行為、續接也
+   * 維持舊身份（fail-closed）。
+   */
+  private maybeAdoptAliasHistory(): void {
+    if (this.registry.historyTrusted) return;
+    const store = this.e2e as Partial<E2EKeyStore> | undefined;
+    if (!store?.protectedSessionIds || !store.hasServerStateSnapshot) return;
+    try {
+      if (store.protectedSessionIds().length || !store.hasServerStateSnapshot()) return;
+    } catch {
+      return; // keystore 隔離/不可用 → 維持不可信
+    }
+    if (this.registry.adoptHistory(true)) {
+      this.save();
+      console.log("· #967 thread registry 別名歷史立為基線（此刻零受保護會話，沒有任何東西可丟）");
+    }
+  }
+
   private pendingTitle(sid: string): string | undefined {
     let title = this.state.titles[sid];
     for (const pending of this.state.pendingMirrors ?? []) {
@@ -850,8 +1145,12 @@ export class Mirror {
     const all = discoverSessions();
     const found = scope ? all.filter((s) => scope.has(s.sid)) : all;
     if (!scope) this.prune(new Set(all.map((s) => s.sid)), now);
+    this.resolveNewOrigins(found); // #947 血緣：只解沒解過的檔（一次性），不每輪重掃
     for (const { sid, file } of found) {
       if (this.state.tombstones?.includes(sid)) continue; // #161 app 刪過 → 永不再撈
+      // #161 × #947：終端 `--resume` 一條**已被 app 刪掉**的對話，是同一段對話回來了，
+      // 不是新會話——墓碑照樣算數，別讓它換個文件名復活。
+      if (this.state.tombstones?.includes(this.identitySid(sid))) continue;
       let size: number;
       try {
         size = statSync(file).size;
@@ -944,7 +1243,13 @@ export class Mirror {
         // **沒有** wire 反向映射的 CLI uuid 永不單獨建會話(防影子)。有映射時(app ULID / 同源
         // uuid / E2E wire)終端續聊掛回原 wire——#389+#394 後此路徑不再「極少見」,必須回流;
         // 歷史 live 內容靠 #393 srcId 撞唯一索引去重,在途回合仍由 drivenSids 讓路。
-        const mappedWireSid = this.e2eWireSidForLocal?.(sid);
+        // #947 續接檔（終端 --resume / rewind 新開的 <uuid>.jsonl，裡面是父會話歷史的副本）
+        // 對外用**父會話**的身份：正文接回原會話（複製來的那段靠 srcId 撞 server 唯一索引去重），
+        // app 裡不再多出一條帶整段歷史副本的重複會話。水位/標題仍按本地檔記，不受影響。
+        const identitySid = this.identitySid(sid);
+        const mappedWireSid =
+          this.e2eWireSidForLocal?.(sid) ??
+          (identitySid !== sid ? this.e2eWireSidForLocal?.(identitySid) : undefined);
         const knownTitle = this.pendingTitle(sid);
         if (
           !knownTitle &&
@@ -957,12 +1262,17 @@ export class Mirror {
         this.internalAt.delete(sid);
         // 標題優先級：流裡 custom-title > 已記標題 > 首條 user 截斷（分批時首批可能沒讀到 custom-title,
         // 先用 fallback，後續批讀到 custom-title 再更新）。
-        const firstUser = messages.find((m) => m.role === "user")?.text.slice(0, 60);
+        // #947 標題不拿命令 / IDE 注入的機器文本（`<command-name>/model</command-name>` …）：
+        // 剝完包裝還是人話的第一條 user 消息才算，剝不出就往後找。
+        const firstUser = messages.reduce<string | undefined>(
+          (acc, m) => acc ?? (m.role === "user" ? titleFromText(m.text) : undefined),
+          undefined,
+        );
         const candidate = title ?? (knownTitle ? undefined : firstUser);
         const newTitle = candidate && candidate !== knownTitle ? candidate : undefined;
         if (messages.length || newTitle) {
-          const directE2ESid = this.e2e?.isE2E(sid) ? sid : undefined;
-          const targetSid = mappedWireSid ?? directE2ESid ?? sid;
+          const directE2ESid = this.e2e?.isE2E(identitySid) ? identitySid : undefined;
+          const targetSid = mappedWireSid ?? directE2ESid ?? identitySid;
           if (!mappedWireSid && !directE2ESid && this.plaintextLocalAllowed?.(sid) === false) {
             console.error(
               `[mirror] E2E identity map 不可信，凍結未知 CC transcript ${sid}，不推水位/不發明文`,
@@ -980,7 +1290,13 @@ export class Mirror {
           } else {
             const sent = this.sendOne(
               sid,
-              this.entry(targetSid, newTitle ?? knownTitle ?? "Claude Code", messages, this.cwdBySid.get(sid)),
+              this.entry(
+                targetSid,
+                newTitle ?? knownTitle ?? "Claude Code",
+                messages,
+                this.cwdBySid.get(sid),
+                this.originFor(sid, targetSid),
+              ),
               consumedUpTo,
               newTitle,
             );
@@ -1070,19 +1386,43 @@ export class Mirror {
     if (found) this.cwdBySid.set(localSid, (found.obj!.cwd as string).trim());
   }
 
+  /**
+   * #967 這批消息要上報的血緣（`ImportSession.origin`）。
+   *
+   * 報的是**這批消息實際掛的那條對話**：server 的 `classifyThreadOrigin` 要求
+   * `origin.threadId === hermesSessionId`，對不上一律退回老行為。續接檔已經由 `identitySid`
+   * 在本地併進父會話，所以發出去的身份就是這段對話的根 —— `kind: "root"`。
+   *
+   * **本刀只多報一份事實，不交判定權**（expand-contract 的 expand）：連接器仍按本地判據工作，
+   * 切換到「連接器報事實、server 決定可見性」是後續那一刀。故 `evidence:"absent"`（連對話指紋
+   * 都取不到）一律不帶 origin——server 對「沒帶」與「absent」都走老路徑，少發一個字段更誠實。
+   */
+  private originFor(localSid: string, wireSid: string): ThreadOriginWire | undefined {
+    const identity = this.identitySid(localSid);
+    const evidence =
+      this.state.origins?.[identity]?.evidence ?? this.state.origins?.[localSid]?.evidence;
+    if (!evidence || evidence === "absent") return undefined;
+    return { threadId: wireSid, conversationId: wireSid, kind: "root", evidence };
+  }
+
   private entry(
     sid: string,
     title: string,
     messages: CCMessage[],
     cwd?: string,
+    origin?: ThreadOriginWire,
   ): Record<string, unknown> {
     const mapped = messages.map((m) => toImportMessage(m));
+    // 血緣是**元數據不是正文**（同 cwd/source）：E2E 會話照常帶，server 看不見密文，
+    // 這是加密會話下唯一還能做歸屬判定的憑據。
+    const lineage = origin ? { origin } : {};
     // cwd 是**元數據不是正文**（同 source/archived）：E2E 會話也照常帶明文路徑，否則
     // 加密會話永遠沒有文件夾。server 用靜態層 KEK 加密落庫，側欄分組讀得出來。
     const folder = cwd?.trim() ? { cwd: cwd.trim() } : {};
     if (this.e2e?.isE2E(sid)) {
       return {
         hermesSessionId: sid,
+        ...lineage,
         title: this.e2e.encryptText(sid, title),
         source: "claude-code",
         ...folder,
@@ -1095,7 +1435,7 @@ export class Mirror {
         })),
       };
     }
-    return { hermesSessionId: sid, title, source: "claude-code", ...folder, messages: mapped };
+    return { hermesSessionId: sid, ...lineage, title, source: "claude-code", ...folder, messages: mapped };
   }
 
   /** §19 D2：E2E 開啟/關閉時全量歷史回灌（enable=密文、disable=明文；ACK 后才删 K_S）。 */
@@ -1274,11 +1614,41 @@ export class Mirror {
         delete this.state.offsets[sid];
         delete this.state.titles[sid];
         delete ma[sid];
+        delete this.state.origins?.[sid];
+        // #947/#967 別名一併裁——但**只在整段對話的線程全部消失時整條丟**。丟到一半 =
+        // 換過身份的會話再也查不回舊鍵下的 K_S，正是 #347 那條 fail-closed 要防的；而
+        // 「父檔被 CC 清理、續接檔還在」恰恰是常見形態。
+        const conversationId = this.registry.conversationOf(sid);
+        if (conversationId && !this.registry.threadsOf(conversationId).some((t) => liveSids.has(t))) {
+          this.forgetConversation(conversationId);
+        }
         pruned += 1;
       }
     }
     for (const sid of Object.keys(ma)) if (!(sid in this.state.offsets)) delete ma[sid];
     if (pruned) console.log(`· #9 裁剪 ${pruned} 個已消失轉錄的水位線(剩 ${Object.keys(this.state.offsets).length})`);
+  }
+
+  /**
+   * 整條丟掉一段**已經全部消失**的對話（#9 的裁剪落到別名表上）。
+   *
+   * `ThreadRegistry` 刻意不提供刪除（別名只增不減是它的 I3），所以這裡走「改快照 + 重解析」——
+   * `aliasHistoryTrusted` 隨快照原樣帶過去。整條丟不破壞信任：這段對話的線程一個都不在盤上了，
+   * 而 CC 的 transcript uuid 不復用，不會有人再拿舊 id 來查。
+   */
+  private forgetConversation(conversationId: string): void {
+    const snapshot = this.registry.toJSON();
+    if (!(conversationId in snapshot.threads)) return;
+    delete snapshot.threads[conversationId];
+    try {
+      this.registry = ThreadRegistry.parse(snapshot);
+    } catch (error) {
+      console.error(`[mirror] 別名表裁剪失敗（保留原表）：${(error as Error).message}`);
+      return;
+    }
+    for (const [fp, owner] of Object.entries(this.state.heads ?? {})) {
+      if (owner === conversationId) delete this.state.heads![fp];
+    }
   }
 
   private load(): State {
@@ -1295,6 +1665,21 @@ export class Mirror {
           tombstones: s.tombstones ?? [], // #161
           // #154:舊安裝(有水位線,歷史已全量鏡過)視為已 seeded;白名單漏字段的教訓——顯式帶上。
           seeded: s.seeded ?? Object.keys(s.offsets ?? {}).length > 0,
+          // #947 血緣：舊狀態檔沒有這兩張表，缺就是空——首輪 poll 會把現存會話重新登記一遍。
+          origins: s.origins && typeof s.origins === "object" ? s.origins : {},
+          heads: s.heads && typeof s.heads === "object" ? s.heads : {},
+          // #967 別名表：原樣交給 `ThreadRegistry.parse` 嚴格校驗（形狀不對 → 空且**不可信**，
+          // 絕不當成「這段對話沒有別名」放行；缺字段的舊檔同理）。
+          // ⚠️ **從 .bak 恢復一律降為不可信**（同 `drive.ts` 的 loadState）：.bak 是上一代快照，
+          // 它之後記下的別名已經丟了，而「歷史完整」一旦持久 true 就再也發現不了。
+          ...(s.registry !== undefined
+            ? {
+                registry:
+                  isBak && s.registry && typeof s.registry === "object"
+                    ? { ...s.registry, aliasHistoryTrusted: false }
+                    : s.registry,
+              }
+            : {}),
           pendingMirrors: Array.isArray(s.pendingMirrors) ? s.pendingMirrors : [],
           pendingE2EBackfills:
             s.pendingE2EBackfills && typeof s.pendingE2EBackfills === "object"
@@ -1309,6 +1694,8 @@ export class Mirror {
       offsets: {},
       titles: {},
       missingAt: {},
+      origins: {},
+      heads: {},
       pendingMirrors: [],
       pendingE2EBackfills: {},
     };
@@ -1316,6 +1703,9 @@ export class Mirror {
   private lastSaved = "";
   private save(strict = false): void {
     try {
+      // #967 別名表隨狀態檔一起落盤（`ThreadRegistry` 自己不碰磁盤——那張原子寫 + .bak 的網
+      // 這裡已經有了，再造一份只會多一處不一致）。
+      this.state.registry = this.registry.toJSON();
       // #262 dirty 判斷:序列化與上次落盤相同 → 跳過(每 5s 無條件寫盤兩份=主+.bak,≈3.4 萬次/天
       // 傷 SD 卡)。JSON.stringify 遠比兩次 write+rename 便宜。
       const json = JSON.stringify(this.state);

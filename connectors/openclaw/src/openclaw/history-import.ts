@@ -16,21 +16,29 @@ import {
   deriveSource,
   deriveTitle,
   extractChannelMeta,
-  isCronSession,
   lineToMessage,
   MACCHIATO_PREFIX,
   rawUserText,
   type MirrorMessage,
 } from "./mirror";
+import { isHiddenOrigin, parseSessionOrigin, toThreadOrigin } from "./origin";
+import type { ThreadOrigin } from "../linkb/proto";
 
 const IMPORT_BATCH = 20;
 
+/** ⚠️ 同 mirror.ts：只看 `agents/main/sessions`，其它 agent 目錄不掃（已知邊界，見那邊的註釋）。 */
 function sessionsDir(): string {
   return join(process.env.OPENCLAW_STATE_DIR || join(homedir(), ".openclaw"), "agents/main/sessions");
 }
 
 interface ImportSession {
   hermesSessionId: string;
+  /**
+   * #968 血緣（可選）：只有 gateway 還認得的活躍會話報得出來——歸檔 transcript 沒有任何一行
+   * 說得清它屬於誰，硬猜就是把 `inferred` 當 `declared` 用。缺省 = server 按 `evidence:"absent"`
+   * 走老行為，這正是「未知 ≠ 沒有」那條安全閥要的結果。
+   */
+  origin?: ThreadOrigin;
   title: string;
   source: string;
   messages: MirrorMessage[];
@@ -47,6 +55,11 @@ interface ActiveMeta {
   displayName?: string;
   channel?: string;
   origin?: { provider?: string };
+  /** #949 血緣判據（gateway `sessions.list` 原樣帶出，見 openclaw/origin.ts）。 */
+  kind?: string;
+  spawnedBy?: string;
+  parentSessionKey?: string;
+  subagentRole?: string;
 }
 
 /** gateway 活躍會話 sessionId → 元數據。拿不到就只靠文件。 */
@@ -148,14 +161,19 @@ async function collectImportSessions(gw: OpenClawGateway): Promise<ImportSession
     let hermesSessionId: string;
     let title: string;
     let source: string;
+    let origin: ThreadOrigin | undefined;
     const a = active.get(sessionId);
     if (a) {
-      if (isCronSession(a.key)) continue;
+      // #949 派生線程（子 agent / cron / hook / node / 未知 kind）不成為可導入會話——與鏡像同一判據，
+      // 否則「導入歷史」會把一堆執行單元一次性倒進用戶列表（比鏡像慢慢長出來更刺眼）。
+      const parsed = parseSessionOrigin(a);
+      if (isHiddenOrigin(parsed)) continue;
       // #113 macchiato: 前綴會話不導入——driven 會話 live 已入庫(再導=重複);titlegen 是隱藏會話。
       if (a.key?.toLowerCase().startsWith(MACCHIATO_PREFIX)) continue;
       hermesSessionId = a.key;
       title = deriveTitle(a);
       source = deriveSource(a);
+      origin = toThreadOrigin(parsed, hermesSessionId); // #968 照實上報
     } else {
       const meta = extractChannelMeta(firstUserRaw);
       if (meta.channelId) {
@@ -170,8 +188,13 @@ async function collectImportSessions(gw: OpenClawGateway): Promise<ImportSession
     }
 
     const existing = byKey.get(hermesSessionId);
-    if (existing) existing.messages.push(...messages);
-    else byKey.set(hermesSessionId, { hermesSessionId, title, source, messages });
+    if (existing) {
+      existing.messages.push(...messages);
+      // 同頻道的歸檔檔先到、活躍行後到時，血緣以活躍行為準（歸檔那份根本沒有血緣可言）。
+      if (origin && !existing.origin) existing.origin = origin;
+    } else {
+      byKey.set(hermesSessionId, { hermesSessionId, ...(origin ? { origin } : {}), title, source, messages });
+    }
   }
   const out = [...byKey.values()];
   for (const s of out) s.messages.sort((x, y) => (x.createdAt ?? 0) - (y.createdAt ?? 0));

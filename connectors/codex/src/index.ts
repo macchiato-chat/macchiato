@@ -30,6 +30,7 @@ import { AppServerDrive } from "./codex/drive-appserver";
 import { LoginFlow } from "./codex/login";
 import { HealthLoop } from "./health";
 import { HeartbeatWriter } from "./_core/heartbeat";
+import { ensureAutostartOnStartup, yieldToRunningInstance } from "./_core/autostart";
 import { installProcessFaultHandlers } from "./_core/runtime-faults";
 import { CONNECTOR_VERSION } from "./linkb/proto";
 import { runVerifiedSelfUpdate } from "./_core/selfupdate";
@@ -230,6 +231,9 @@ export function handleE2EControlFrame(
 }
 
 async function main(): Promise<void> {
+  // #977 本機已經有一個活著的同 kind 連接器（多半是開機自啟的那個）→ 手起的這個讓位退出。
+  // 兩條 Link B 會在 server 端互踢（4001 superseded → 重連 → 再踢），用戶側就是會話一路抖。
+  if (yieldToRunningInstance(KIND) !== null) process.exit(0);
   let creds = loadCreds(KIND);
   if (!creds) {
     console.log("Not paired — starting pairing (enter the code below at macchiato.chat):");
@@ -239,6 +243,10 @@ async function main(): Promise<void> {
     console.log("Pairing complete (MACCHIATO_PAIR_ONLY) — exiting; start the service to run.");
     process.exit(0);
   }
+
+  // #977 手動起來的連接器（裝的時候沒落上單元、或裝的是還沒有這一步的老版本）自己把
+  // launchd/systemd 單元補上——只落盤、不拉起，下次開機用戶就不用再敲一遍。
+  ensureAutostartOnStartup(KIND);
 
   const e2e = new E2EKeyStore(e2eStorePath(KIND));
   // #731 設備授權：有配對 secret 才 enforce wrap proof；舊配對降級。
@@ -256,6 +264,9 @@ async function main(): Promise<void> {
     creds,
     (state) => {
       const blocked = e2e.applyServerState(state);
+      // #966/#347 別名歷史可信與否，只有在**權威快照剛套用**的這一刻才判得出來（零受保護
+      // E2E 會話 = 沒有東西可丟）。錯過就持久 false，永不自升。
+      mirror.adoptThreadHistoryIfProvable();
       const sessions =
         (state as {
           sessions?: Array<{
@@ -443,6 +454,7 @@ async function main(): Promise<void> {
   // 的機器會永遠停在這行——而那恰好是本心跳唯一要觀測的故障（#210 同形狀）。
   const heartbeat = new HeartbeatWriter(KIND, () => ({
     version: CONNECTOR_VERSION,
+    agentLinkId: linkb.agentLinkId, // #991 讓位判據要它：只有同一條 agent link 才互踢
     linkConnected: linkb.isReady,
     lastConnectedAtMs: linkb.lastConnectedAtMs,
     busy: drive?.busy ?? false,

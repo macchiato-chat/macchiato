@@ -10,6 +10,7 @@ import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { LinkBClient } from "./_core/linkb/client";
 import type { HeartbeatWriter } from "./_core/heartbeat";
+import { supervisorUpdateReport } from "./_core/heartbeat";
 import type { Drive } from "./cc/drive";
 import type { Mirror } from "./cc/mirror";
 import { projectsDir } from "./cc/transcripts";
@@ -104,6 +105,7 @@ export class HealthLoop {
       connectorVersion: this.version,
       // #768 磁盤版（裝完未重啟時 > 進程版）
       installedVersion: reportInstalledVersion(this.version, "claude-code"),
+      update: supervisorUpdateReport("claude-code"), // #940 supervisor 上次更新決策(沒有 supervisor 就報 supervised:false)
       stt: false,
       ...(this.cliVersion ? { cliVersion: this.cliVersion } : {}),
       authOk: !this.drive?.authFailed, // #310:auth 失效上浮降級,成功回合自動恢復
