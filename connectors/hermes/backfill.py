@@ -568,31 +568,55 @@ def _count_sync() -> int:
         con.close()
 
 
+def to_wire_origin(sid: str, origin: dict | None, *, merged: bool) -> dict:
+    """#969/#985 本地血緣 → 協議 `ThreadOrigin`。
+
+    `sid` = 這批消息的源 thread id。協議要求 `origin.threadId` ≡ 實際上報的
+    `hermesSessionId`；`merged=True` 表示已經在本地併進別人（鏡像把壓縮續接掛到根），
+    那批內容對 server 就是那條對話自己的 → 只能報 root。
+
+    獨立 session（`merged=False`）據實報 kind。**導入例外**：壓縮續接的檔裡帶着交接塊
+    （父歷史的副本），報 `continuation` 會讓新 server 把那段歷史再灌進父會話一遍——
+    比列表裡多一行更傷。導入對非 root 因此仍走 `evidence: absent`（見 `import_origin`），
+    不是謊報 root。鏡像側用 `continuation_baseline` 切掉交接塊之後才併，那是另一條路。
+    """
+    o = origin or {}
+    evidence = o.get("evidence") or "declared"
+    kind = o.get("kind") or "root"
+    if evidence == "absent" or merged or kind == "root":
+        return {
+            "threadId": sid,
+            "conversationId": sid,
+            "kind": "root",
+            "evidence": "absent" if evidence == "absent" else evidence,
+        }
+    conversation_id = o.get("conversationId") or sid
+    ancestors = o.get("ancestors") or ()
+    parent = ancestors[0] if ancestors else (conversation_id if conversation_id != sid else None)
+    out = {
+        "threadId": sid,
+        "conversationId": conversation_id,
+        "kind": kind,
+        "evidence": evidence,
+    }
+    if parent and parent != sid:
+        out["parentThreadId"] = parent
+    return out
+
+
 def import_origin(sid: str, origin: dict | None) -> dict:
-    """#969 導入路徑上報的 `ThreadOrigin`（協議 `packages/protocol/src/import.ts`）。
+    """#969 導入路徑上報的 `ThreadOrigin`。
 
-    **只報 `root`**：協議規定 `origin.threadId` ≡ `hermesSessionId` 所指的那條線程，而判定權
-    今天仍在連接器。導入路徑不做任何合併（每條 session 行照舊各自導入），所以：
-
-    - 它自己就是一段對話（沒有父）→ `root` / `declared`，這是實話，也是當天就有收益的那半：
-      新導入的會話落 `origin_kind='root'`，`findSubsumedCopySessions`（#945）那條「標題像機器
-      文本就隔離」的兜底啟發式從此沒機會誤傷它。
-    - 它是壓縮續接 / 派生 → **`evidence: "absent"`**（顯式帶，不省略；口徑見 #961）。報 `root`
-      是撒謊（我們明知道它有父），報 `continuation` 會讓 server 當天就改行為（定不出父就
-      quarantine），兩個都不許——所以誠實的說法只有「我這條路給不出聲明」，等判定權切到
-      server 那一刀再報真值。
-    - 老 schema 連血緣列都沒有 → `_origins_with_con` 已經給的就是 `absent`。
+    獨立根會話據實報 `root`。壓縮續接 / 派生**不報真 kind**：導入讀的是整檔（含交接塊
+    副本），新 server 若按 continuation 並進父會話，用戶會在同一條對話裡看到雙份歷史。
+    所以顯式 `evidence: absent`——「這條路給不出能讓 server 改行為的聲明」。
+    老 schema 連血緣列都沒有 → `_origins_with_con` 已經給的就是 `absent`。
     """
     kind = (origin or {}).get("kind")
     evidence = (origin or {}).get("evidence", "declared")
     if kind is not None and kind != "root":
         evidence = "absent"
-    return {
-        "threadId": sid,
-        "conversationId": sid,
-        "kind": "root",
-        "evidence": evidence,
-    }
+    return to_wire_origin(sid, {**(origin or {}), "evidence": evidence, "kind": "root"}, merged=False)
 
 
 def _enumerate_sync() -> list:

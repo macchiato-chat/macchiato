@@ -6,7 +6,7 @@
  *  - #967 血緣別名下沉到 `connector-core` 的 `ThreadRegistry`（四家共用）：對話 → 歷代所有
  *    transcript uuid，首次確立的身份永不輪換；別名同時交給 E2E keystore（`setIdentityAliases`），
  *    於是換身份的會話也查得到壓在舊鍵下的 K_S。每批 `mirror_append` 另帶 `ImportSession.origin`
- *    上報血緣事實（判定權仍在連接器本地，切換是後續那一刀）。
+ *    上報血緣事實（#985：獨立 session 據實報 kind；本地 `identitySid` 合併仍在，舊 server 兼容）。
  *  - 未知會話從 0 全量鏡像完整歷史（自動看到所有會話 = 相對官方 remote control 的核心賣點,
  *    不依賴手動 import）；分批發（batchMax 條/帧，單帧單會話）防超 server maxPayload。
  *  - 字節偏移水位線 + in-flight 保留（見 transcripts.foldEntries）。durable outbox（#348）：幀落盤
@@ -47,7 +47,9 @@ import {
   isSubagentTranscript,
   lineageCounters,
   readTranscriptOrigin,
+  toWireOrigin,
   type OriginEvidence,
+  type ThreadOriginWire,
 } from "./lineage";
 
 /**
@@ -123,20 +125,9 @@ export interface ImportMessage {
 
 /**
  * #950 `ThreadOrigin`（鏡像 `packages/protocol` 的 wire shape——公開 connector 不依賴私有包）。
- *
- * 是**元數據不是正文**，所以 E2E 會話一樣帶得動（server 看不見密文，這是加密會話下唯一還能
- * 做歸屬判定的憑據）。三個字段分工不能混：`conversationId` 決定歸屬、`kind` 決定可見性、
- * `evidence` 決定信誰與告警口徑。
+ * 形狀與判定見 `lineage.ts` 的 `toWireOrigin`。
  */
-export interface ThreadOriginWire {
-  threadId: string;
-  conversationId: string;
-  kind: "root" | "continuation" | "derived" | (string & {});
-  parentThreadId?: string;
-  label?: string;
-  depth?: number;
-  evidence: OriginEvidence;
-}
+export type { ThreadOriginWire } from "./lineage";
 
 interface ImportSession {
   hermesSessionId: string;
@@ -1387,22 +1378,20 @@ export class Mirror {
   }
 
   /**
-   * #967 這批消息要上報的血緣（`ImportSession.origin`）。
+   * #967/#985 這批消息要上報的血緣（`ImportSession.origin`）。
    *
-   * 報的是**這批消息實際掛的那條對話**：server 的 `classifyThreadOrigin` 要求
-   * `origin.threadId === hermesSessionId`，對不上一律退回老行為。續接檔已經由 `identitySid`
-   * 在本地併進父會話，所以發出去的身份就是這段對話的根 —— `kind: "root"`。
+   * 續接檔已經由 `identitySid` 在本地併進父（舊 server 兼容，且 E2E 的 K_S 綁在上報
+   * 身份上）→ `wireSid !== localSid`，只能報父的 root。獨立 session（這條就是自己）據實
+   * 報 kind；今天 origins 不存 kind、E2E 身份閘沒合併的續接也被清成「自己」，所以走
+   * user/root——把綁了獨立 K_S 的續接報成 continuation，新 server 會把密文並進父會話。
    *
-   * **本刀只多報一份事實，不交判定權**（expand-contract 的 expand）：連接器仍按本地判據工作，
-   * 切換到「連接器報事實、server 決定可見性」是後續那一刀。故 `evidence:"absent"`（連對話指紋
-   * 都取不到）一律不帶 origin——server 對「沒帶」與「absent」都走老路徑，少發一個字段更誠實。
+   * `evidence:"absent"` 不帶 origin。
    */
   private originFor(localSid: string, wireSid: string): ThreadOriginWire | undefined {
     const identity = this.identitySid(localSid);
     const evidence =
       this.state.origins?.[identity]?.evidence ?? this.state.origins?.[localSid]?.evidence;
-    if (!evidence || evidence === "absent") return undefined;
-    return { threadId: wireSid, conversationId: wireSid, kind: "root", evidence };
+    return toWireOrigin(wireSid, evidence, { threadId: localSid, kind: "user" });
   }
 
   private entry(

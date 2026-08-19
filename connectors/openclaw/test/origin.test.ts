@@ -233,4 +233,13 @@ describe("#968 toThreadOrigin：本地血緣 → 協議 ThreadOrigin", () => {
       evidence: "declared",
     });
   });
+
+  it("#985 本地仍隱藏派生，但 toThreadOrigin 已經據實（停過濾時 server 立刻收得到）", () => {
+    const parsed = parseSessionOrigin({
+      key: "agent:main:subagent:9f1e",
+      parentSessionKey: "agent:main:discord:channel:123",
+    });
+    expect(isHiddenOrigin(parsed)).toBe(true);
+    expect(toThreadOrigin(parsed, parsed.threadId).kind).toBe("derived");
+  });
 });

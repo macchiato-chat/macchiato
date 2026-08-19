@@ -10,7 +10,7 @@
 export const LINK_B_PROTO = 5;
 
 /** Connector release version (mirrors packages/protocol CONNECTOR_VERSION; sync-public 再生,永不漂移). */
-export const CONNECTOR_VERSION = "1.5.81";
+export const CONNECTOR_VERSION = "1.5.82";
 
 /**
  * 連接器 → server（健康上報）：定期上報自身狀態，讓 server 看出「在線但降級」

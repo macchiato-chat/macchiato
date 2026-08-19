@@ -2090,6 +2090,164 @@ describe("#118 streaming-input 長活通道", () => {
     delete process.env.MACCHIATO_CC_IDLE_S;
   });
 
+  it("#1005 掛起審批時看門狗豁免(等用戶點卡不是卡死)", async () => {
+    process.env.MACCHIATO_CC_TURN_STALL_MS = "50";
+    process.env.MACCHIATO_CC_IDLE_S = "10";
+    vi.useFakeTimers();
+    try {
+      turnScripts = [[init, { __wait: 400 }, { type: "result", subtype: "success", result: "永遠到不了" }]];
+      const { linkb, sent, fire } = fakeLinkb();
+      const d = new Drive(linkb);
+      d.wire();
+      fire(tuiFrame(CC_SID, "prompt.submit", { text: "要審批" }));
+      await flushDriveTimers();
+      const ch = (d as any).channels.get(CC_SID);
+      expect(ch?.watchdog).toBeTruthy(); // 正控:看門狗已 arm
+      expect(ch?.turn).toBeTruthy();
+      expect((d as any).pending.has(CC_SID)).toBe(true); // 正控:回合仍在途
+
+      let resolved: boolean | undefined;
+      (d as any).approvals.set(CC_SID, [{
+        toolName: "Bash",
+        resolve: (allow: boolean) => {
+          resolved = allow;
+        },
+      }]);
+
+      await vi.advanceTimersByTimeAsync(200); // 遠超 50ms stall,靠掛起審批豁免
+      expect(
+        sent.some(
+          (f: any) => f.frame?.params?.type === "message.complete" && f.frame.params.payload.status === "error",
+        ),
+      ).toBe(false);
+      expect(sent.some((f: any) => JSON.stringify(f).includes("卡死"))).toBe(false);
+      expect((d as any).pending.has(CC_SID)).toBe(true);
+      expect((d as any).channels.size).toBe(1);
+      expect(resolved).toBeUndefined(); // 審批沒被 resolve(false)
+      expect((d as any).approvals.get(CC_SID)?.length).toBe(1);
+      d.dispose();
+    } finally {
+      vi.useRealTimers();
+      delete process.env.MACCHIATO_CC_TURN_STALL_MS;
+      delete process.env.MACCHIATO_CC_IDLE_S;
+    }
+  });
+
+  it("#1005 掛起提問(clarifies)時看門狗豁免", async () => {
+    process.env.MACCHIATO_CC_TURN_STALL_MS = "50";
+    process.env.MACCHIATO_CC_IDLE_S = "10";
+    vi.useFakeTimers();
+    try {
+      turnScripts = [[init, { __wait: 400 }, { type: "result", subtype: "success", result: "永遠到不了" }]];
+      const { linkb, sent, fire } = fakeLinkb();
+      const d = new Drive(linkb);
+      d.wire();
+      fire(tuiFrame(CC_SID, "prompt.submit", { text: "要提問" }));
+      await flushDriveTimers();
+      const ch = (d as any).channels.get(CC_SID);
+      expect(ch?.watchdog).toBeTruthy();
+      expect((d as any).pending.has(CC_SID)).toBe(true);
+
+      let recorded: string | null | undefined = undefined;
+      (d as any).clarifies.set("ask#0", {
+        sid: CC_SID,
+        record: (answer: string | null) => {
+          recorded = answer;
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(200);
+      expect(
+        sent.some(
+          (f: any) => f.frame?.params?.type === "message.complete" && f.frame.params.payload.status === "error",
+        ),
+      ).toBe(false);
+      expect(sent.some((f: any) => JSON.stringify(f).includes("卡死"))).toBe(false);
+      expect((d as any).pending.has(CC_SID)).toBe(true);
+      expect((d as any).channels.size).toBe(1);
+      expect(recorded).toBeUndefined(); // 提問沒被 record(null) 跳過
+      expect((d as any).clarifies.has("ask#0")).toBe(true);
+      d.dispose();
+    } finally {
+      vi.useRealTimers();
+      delete process.env.MACCHIATO_CC_TURN_STALL_MS;
+      delete process.env.MACCHIATO_CC_IDLE_S;
+    }
+  });
+
+  it("#1005 同一 sid 無審批無提問 → stall 後仍被殺", async () => {
+    process.env.MACCHIATO_CC_TURN_STALL_MS = "50";
+    process.env.MACCHIATO_CC_IDLE_S = "10";
+    vi.useFakeTimers();
+    try {
+      turnScripts = [[init, { __wait: 400 }, { type: "result", subtype: "success", result: "永遠到不了" }]];
+      const { linkb, sent, fire } = fakeLinkb();
+      const d = new Drive(linkb);
+      d.wire();
+      fire(tuiFrame(CC_SID, "prompt.submit", { text: "會卡住的回合" }));
+      await flushDriveTimers();
+      expect((d as any).channels.get(CC_SID)?.watchdog).toBeTruthy();
+      expect((d as any).pending.has(CC_SID)).toBe(true);
+      // 別的 sid 掛着提問不得豁免本回合(clarifies 按 requestId 索引,必須掃 sid)
+      (d as any).clarifies.set("other#0", { sid: "other-session", record: () => {} });
+
+      await vi.advanceTimersByTimeAsync(200);
+      const done = sent.find(
+        (f: any) => f.frame?.params?.type === "message.complete" && f.frame.params.payload.status === "error",
+      );
+      expect(done).toBeTruthy();
+      expect(sent.some((f: any) => JSON.stringify(f).includes("卡死"))).toBe(true);
+      expect((d as any).pending.has(CC_SID)).toBe(false);
+      expect((d as any).channels.size).toBe(0);
+      d.dispose();
+    } finally {
+      vi.useRealTimers();
+      delete process.env.MACCHIATO_CC_TURN_STALL_MS;
+      delete process.env.MACCHIATO_CC_IDLE_S;
+    }
+  });
+
+  it("#1005 等人答完後續期,不在 25ms 內誤殺;之後無事件仍會被抓", async () => {
+    process.env.MACCHIATO_CC_TURN_STALL_MS = "50";
+    process.env.MACCHIATO_CC_IDLE_S = "10";
+    vi.useFakeTimers();
+    try {
+      turnScripts = [[init, { __wait: 400 }, { type: "result", subtype: "success", result: "永遠到不了" }]];
+      const { linkb, sent, fire } = fakeLinkb();
+      const d = new Drive(linkb);
+      d.wire();
+      fire(tuiFrame(CC_SID, "prompt.submit", { text: "要審批" }));
+      await flushDriveTimers();
+      const p = (d as any).requestApproval(CC_SID, "Bash", { command: "ls" });
+      await vi.advanceTimersByTimeAsync(200); // stall 已過,靠掛起審批豁免
+      expect((d as any).channels.size).toBe(1);
+      expect((d as any).pending.has(CC_SID)).toBe(true);
+
+      fire(tuiFrame(CC_SID, "approval.respond", { choice: "allow" }));
+      await p;
+      await vi.advanceTimersByTimeAsync(30); // >25ms 重排地板,< stall
+      expect(
+        sent.some(
+          (f: any) => f.frame?.params?.type === "message.complete" && f.frame.params.payload.status === "error",
+        ),
+      ).toBe(false);
+      expect((d as any).channels.size).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(80); // 完整 stall 過了、CLI 仍無事件 → 真該殺
+      expect(
+        sent.some(
+          (f: any) => f.frame?.params?.type === "message.complete" && f.frame.params.payload.status === "error",
+        ),
+      ).toBe(true);
+      expect((d as any).channels.size).toBe(0);
+      d.dispose();
+    } finally {
+      vi.useRealTimers();
+      delete process.env.MACCHIATO_CC_TURN_STALL_MS;
+      delete process.env.MACCHIATO_CC_IDLE_S;
+    }
+  });
+
   it("#212 result 後才收到 task_started → 撤銷既有 idle timer，不競態誤殺", async () => {
     // #427 假時鐘:同組 wall-clock 競態窗
     vi.useFakeTimers();

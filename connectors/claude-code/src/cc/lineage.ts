@@ -223,3 +223,57 @@ export function resetLineageMemo(): void {
   lineageCounters.subagentDeclared = 0;
   lineageCounters.subagentInferred = 0;
 }
+
+/** 協議 `ThreadOrigin` 的 wire 形狀（公開 connector 不依賴私有包）。 */
+export interface ThreadOriginWire {
+  threadId: string;
+  conversationId: string;
+  kind: "root" | "continuation" | "derived" | (string & {});
+  parentThreadId?: string;
+  label?: string;
+  depth?: number;
+  evidence: OriginEvidence;
+}
+
+/**
+ * #985：獨立 session 據實報 kind；已經併進別人的批次只能報 root。
+ *
+ * `wireSid` = 這批消息實際上報的 `hermesSessionId`。協議要求 `origin.threadId ≡ wireSid`，
+ * 對不上 server 整份退回 legacy。
+ *
+ * 續接若以**自己的 id** 上報且帶 `conversationId` 指向父 → `continuation`。
+ * ⚠️ caller 不得在「這條線程自己持着一把獨立 K_S」時走 continuation——新 server 會把
+ * 密文並進父會話，父那把鑰匙解不開。E2E 身份閘沒合併的路徑繼續報 root。
+ */
+export function toWireOrigin(
+  wireSid: string,
+  evidence: OriginEvidence | undefined,
+  local?: { threadId: string; kind?: OriginKind; conversationId?: string; parentThreadId?: string },
+): ThreadOriginWire | undefined {
+  if (!evidence || evidence === "absent") return undefined;
+  if (!local || local.threadId !== wireSid) {
+    return { threadId: wireSid, conversationId: wireSid, kind: "root", evidence };
+  }
+  if (!local.kind || local.kind === "user") {
+    return { threadId: wireSid, conversationId: wireSid, kind: "root", evidence };
+  }
+  const parent = local.conversationId && local.conversationId !== wireSid ? local.conversationId : undefined;
+  if (local.kind === "subagent") {
+    return {
+      threadId: wireSid,
+      conversationId: parent ?? wireSid,
+      kind: "derived",
+      ...(local.parentThreadId ?? parent ? { parentThreadId: local.parentThreadId ?? parent } : {}),
+      evidence,
+    };
+  }
+  // continuation
+  if (!parent) return { threadId: wireSid, conversationId: wireSid, kind: "root", evidence };
+  return {
+    threadId: wireSid,
+    conversationId: parent,
+    kind: "continuation",
+    parentThreadId: local.parentThreadId ?? parent,
+    evidence,
+  };
+}

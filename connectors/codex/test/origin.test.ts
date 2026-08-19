@@ -9,7 +9,7 @@
  *   - 老格式：`session_meta` 只有 cwd/timestamp，什麼都沒聲明（496 條）——**行為必須不變**
  */
 import { describe, expect, it } from "vitest";
-import { parseOrigin, resolveConversationId, type ThreadOrigin } from "../src/codex/origin";
+import { parseOrigin, resolveConversationId, toWireKind, toWireOrigin, type ThreadOrigin } from "../src/codex/origin";
 
 const ROOT = "019efa54-f264-7120-a1b2-0a78c24d4af9";
 const CHILD = "019f497d-6f8e-7e72-85b1-961382e83d7f";
@@ -149,5 +149,82 @@ describe("#946 resolveConversationId：鏈式 fork 解到根", () => {
   it("成環也不轉圈", () => {
     const table = new Map([["B", origin("B", "C")], ["C", origin("C", "B")]]);
     expect(resolveConversationId(origin("A", "B"), (id) => table.get(id))).toBeTruthy();
+  });
+});
+
+describe("#985 toWireOrigin：獨立 session 據實報 kind，併進父的批次仍是 root", () => {
+  const declared = (partial: Partial<ThreadOrigin> & Pick<ThreadOrigin, "threadId" | "kind">): ThreadOrigin => ({
+    conversationId: partial.conversationId ?? partial.threadId,
+    evidence: partial.evidence ?? "declared",
+    ...partial,
+  });
+
+  it("詞彙對照：user→root、fork→continuation、subagent/internal→derived", () => {
+    expect(toWireKind("user")).toBe("root");
+    expect(toWireKind("fork")).toBe("continuation");
+    expect(toWireKind("subagent")).toBe("derived");
+    expect(toWireKind("internal")).toBe("derived");
+  });
+
+  it("獨立根線程 → root，threadId ≡ wireSid", () => {
+    expect(toWireOrigin(declared({ threadId: ROOT, kind: "user" }), ROOT)).toEqual({
+      threadId: ROOT,
+      conversationId: ROOT,
+      kind: "root",
+      evidence: "declared",
+    });
+  });
+
+  it("獨立 fork（以自己的 id 上報）→ continuation，帶父", () => {
+    const o = declared({
+      threadId: CHILD,
+      conversationId: ROOT,
+      kind: "fork",
+      parentThreadId: ROOT,
+    });
+    expect(toWireOrigin(o, CHILD)).toEqual({
+      threadId: CHILD,
+      conversationId: ROOT,
+      kind: "continuation",
+      parentThreadId: ROOT,
+      evidence: "declared",
+    });
+  });
+
+  it("獨立子 agent（以自己的 id 上報）→ derived，帶 label", () => {
+    const o = declared({
+      threadId: CHILD,
+      conversationId: ROOT,
+      kind: "subagent",
+      parentThreadId: ROOT,
+      label: "Mill",
+    });
+    expect(toWireOrigin(o, CHILD)).toEqual({
+      threadId: CHILD,
+      conversationId: ROOT,
+      kind: "derived",
+      parentThreadId: ROOT,
+      label: "Mill",
+      evidence: "declared",
+    });
+  });
+
+  it("已經併進父會話（wireSid ≠ threadId）→ 只能報父的 root（協議 threadId ≡ hermesSessionId）", () => {
+    const o = declared({
+      threadId: CHILD,
+      conversationId: ROOT,
+      kind: "fork",
+      parentThreadId: ROOT,
+    });
+    expect(toWireOrigin(o, ROOT)).toEqual({
+      threadId: ROOT,
+      conversationId: ROOT,
+      kind: "root",
+      evidence: "declared",
+    });
+  });
+
+  it("evidence=absent → 整個字段不上線", () => {
+    expect(toWireOrigin(declared({ threadId: ROOT, kind: "user", evidence: "absent" }), ROOT)).toBeUndefined();
   });
 });

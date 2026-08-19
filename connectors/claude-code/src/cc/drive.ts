@@ -321,8 +321,9 @@ function srcIdRetryMs(): number {
 }
 
 /** #253 回合看門狗:回合內連續**無任何 SDK 事件**達此毫秒數 → 判定卡死、強制收尾。
- * 活動式(每個事件續期)故不誤殺長回合;後台任務在跑時也豁免。默認 30min(對齊鏡像
- * transcripts.ts STALE_TURN_MS);env MACCHIATO_CC_TURN_STALL_MS 可調(0=關)。 */
+ * 活動式(每個事件續期)故不誤殺長回合;後台任務在跑、掛起審批 / AskUserQuestion
+ * 等人時也豁免(#1005)。默認 30min(對齊鏡像 transcripts.ts STALE_TURN_MS);
+ * env MACCHIATO_CC_TURN_STALL_MS 可調(0=關)。 */
 function turnStallMs(): number {
   const v = Number(process.env.MACCHIATO_CC_TURN_STALL_MS);
   if (Number.isFinite(v) && v >= 0) return v;
@@ -1128,11 +1129,28 @@ export class Drive {
     return (this.sessionTasks.get(sid)?.size ?? 0) > 0;
   }
 
+  /** #1005 AskUserQuestion 按 requestId 索引,必須掃 sid。 */
+  private hasPendingClarify(sid: string): boolean {
+    for (const c of this.clarifies.values()) if (c.sid === sid) return true;
+    return false;
+  }
+
+  /**
+   * #1005 用戶剛答完審批/提問 → 給回合一個完整 stall 窗。
+   * 豁免靠「有掛起卡」撐着,lastActivityAt 停在發卡那一刻;不續期的話看門狗
+   * 下一次重排(≤25ms)會立刻 forceFinalizeStuck(#940 同款口子)。
+   */
+  private renewTurnActivity(sid: string): void {
+    const ch = this.channels.get(sid);
+    if (ch?.turn && !ch.turn.completed) ch.turn.lastActivityAt = Date.now();
+  }
+
   /**
    * #253 回合看門狗:回合在途但連續無任何 SDK 事件達 turnStallMs → 判定卡死。CLI 掛住(有事件無
    * result)或 startContinuationTurn 合成回合無後續時,回合永久在途——通道不回收(CLI 進程滯留)、
    * sid 卡 #200 pending(重啟誤發「請重發」)。鏡像側有 STALE_TURN_MS 兜底,drive 側此前沒有。
-   * 活動式(每事件續期,見 handleMessage)故不誤殺長回合;後台任務在跑時豁免(hasRunningTasks)。
+   * 活動式(每事件續期,見 handleMessage)故不誤殺長回合;後台任務在跑時豁免(hasRunningTasks);
+   * 掛起審批 / AskUserQuestion 等人時豁免(#1005,對齊 codex app-server #895)。
    */
   private armTurnWatchdog(ch: Channel): void {
     this.clearTurnWatchdog(ch);
@@ -1143,8 +1161,13 @@ export class Drive {
       ch.watchdog = undefined;
       const turn = ch.turn;
       if (!turn || turn.completed || ch.closing) return;
-      // 後台任務在跑 / 期間有活動(lastActivityAt 被續期)→ 沒卡,重排
-      if (this.hasRunningTasks(ch.sid) || Date.now() - turn.lastActivityAt < stall) {
+      // 後台任務在跑 / 等用戶點卡或答題 / 期間有活動(lastActivityAt 被續期)→ 沒卡,重排
+      if (
+        this.hasRunningTasks(ch.sid) ||
+        (this.approvals.get(ch.sid)?.length ?? 0) > 0 ||
+        this.hasPendingClarify(ch.sid) ||
+        Date.now() - turn.lastActivityAt < stall
+      ) {
         this.armTurnWatchdog(ch);
         return;
       }
@@ -1740,6 +1763,7 @@ export class Drive {
             answer = typeof params.answer === "string" ? params.answer : "";
           }
           this.clarifies.delete(reqId);
+          this.renewTurnActivity(pending.sid); // #1005
           pending.record(answer || null);
           return;
         }
@@ -1777,6 +1801,7 @@ export class Drive {
             pending ??= list.shift();
           }
           if (!pending) return;
+          this.renewTurnActivity(sid); // #1005
           const choice = String(params.choice ?? "deny");
           const allow = choice === "allow" || choice === "always" || choice === "yes";
           const always = allow && (params.all === true || choice === "always");

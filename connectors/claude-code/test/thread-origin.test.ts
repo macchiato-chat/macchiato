@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Mirror, discoverSessions } from "../src/cc/mirror";
 import { collectImportSessions } from "../src/cc/history-import";
-import { resetLineageMemo } from "../src/cc/lineage";
+import { resetLineageMemo, toWireOrigin } from "../src/cc/lineage";
 
 let seq = 0;
 const uuid = (): string => {
@@ -364,6 +364,78 @@ describe("#967 ③ E2E 身份歸屬：別名可信才放開，不可信維持舊
     );
     m.doPoll();
     expect(m.identitySid(child)).toBe(parent);
+  });
+});
+
+describe("#985 toWireOrigin：獨立 session 據實報 kind，併進父的批次仍是 root", () => {
+  it("evidence 缺席 / absent → 不上線", () => {
+    expect(toWireOrigin("s1", undefined, { threadId: "s1", kind: "user" })).toBeUndefined();
+    expect(toWireOrigin("s1", "absent", { threadId: "s1", kind: "user" })).toBeUndefined();
+  });
+
+  it("獨立頂層會話 → root", () => {
+    expect(toWireOrigin("s1", "declared", { threadId: "s1", kind: "user" })).toEqual({
+      threadId: "s1",
+      conversationId: "s1",
+      kind: "root",
+      evidence: "declared",
+    });
+  });
+
+  it("獨立續接（以自己的 id 上報）→ continuation，帶父", () => {
+    expect(
+      toWireOrigin("child", "declared", {
+        threadId: "child",
+        kind: "continuation",
+        conversationId: "parent",
+      }),
+    ).toEqual({
+      threadId: "child",
+      conversationId: "parent",
+      kind: "continuation",
+      parentThreadId: "parent",
+      evidence: "declared",
+    });
+  });
+
+  it("獨立子 agent → derived", () => {
+    expect(
+      toWireOrigin("agent-1", "declared", {
+        threadId: "agent-1",
+        kind: "subagent",
+        conversationId: "parent",
+      }),
+    ).toEqual({
+      threadId: "agent-1",
+      conversationId: "parent",
+      kind: "derived",
+      parentThreadId: "parent",
+      evidence: "declared",
+    });
+  });
+
+  it("已經併進父（wireSid ≠ threadId）→ 只能報父的 root", () => {
+    expect(
+      toWireOrigin("parent", "declared", {
+        threadId: "child",
+        kind: "continuation",
+        conversationId: "parent",
+      }),
+    ).toEqual({
+      threadId: "parent",
+      conversationId: "parent",
+      kind: "root",
+      evidence: "declared",
+    });
+  });
+
+  it("獨立續接但沒有父 id → 不猜，報 root（避免把綁了獨立 K_S 的線程並進一個不存在的父）", () => {
+    expect(toWireOrigin("child", "declared", { threadId: "child", kind: "continuation" })).toEqual({
+      threadId: "child",
+      conversationId: "child",
+      kind: "root",
+      evidence: "declared",
+    });
   });
 });
 

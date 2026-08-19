@@ -10,7 +10,7 @@
 export const LINK_B_PROTO = 5;
 
 /** Connector release version (mirrors packages/protocol CONNECTOR_VERSION; sync-public 再生,永不漂移). */
-export const CONNECTOR_VERSION = "1.5.81";
+export const CONNECTOR_VERSION = "1.5.82";
 
 /**
  * #950（父 #926）執行線程的**血緣**。open enum：線路格式上寬容（未知值原樣保留、不解析失敗），

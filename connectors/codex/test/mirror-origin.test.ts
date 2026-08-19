@@ -429,8 +429,8 @@ describe("#966 E2E 會話 rewind 之後正文恢復鏡像", () => {
 });
 
 /**
- * #966 上報血緣。連接器**繼續**按本地判定工作（老 server 兼容），只是多報一份事實 ——
- * 判定權切回 server 是後續（expand-contract 的 expand 那一步）。
+ * #966/#985 上報血緣。連接器**繼續**按本地判定工作（老 server 兼容）：獨立 session 據實
+ * 報 kind，已經併進父的批次仍是 root。真正停本地過濾要等生產 server 已跑判定 + 熔斷。
  */
 describe("#966 mirror_append 帶 ThreadOrigin", () => {
   it("根線程：threadId ≡ conversationId ≡ 上報身份，kind=root、evidence=declared（server 認得）", () => {

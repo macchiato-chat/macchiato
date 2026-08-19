@@ -15,8 +15,9 @@ const FRAME_BUDGET = 3 * 1024 * 1024;
 interface BuiltSession {
   hermesSessionId: string;
   /**
-   * #966 源系統聲明的血緣（形狀與理由見 `toWireOrigin`）。導入口徑下派生線程整檔不進來，
-   * 所以恒是 `kind:"root"`；老格式（`evidence:"absent"`）不帶這個字段。
+   * #966/#985 源系統聲明的血緣（形狀與理由見 `toWireOrigin`）。導入口徑下派生線程整檔
+   * 不進來（`shouldSkipRollout`），能走到這裡的是獨立 session，據實報 kind；今天幾乎
+   * 都是 `root`。老格式（`evidence:"absent"`）不帶這個字段。
    */
   origin?: WireThreadOrigin;
   title: string;

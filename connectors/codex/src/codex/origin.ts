@@ -198,26 +198,45 @@ export function isHiddenKind(kind: OriginKind): boolean {
   return kind === "subagent" || kind === "internal";
 }
 
+/** 本地 kind → 協議 `ThreadOrigin.kind`（server 判定表的值域）。 */
+export function toWireKind(kind: OriginKind): WireThreadOriginKind {
+  if (kind === "user") return "root";
+  if (kind === "fork") return "continuation";
+  return "derived"; // subagent / internal
+}
+
 /**
- * #966 把已經算出來的血緣填成協議的 `ImportSession.origin`（`wireSid` = 這批內容實際掛的
- * `hermesSessionId`）。與 claude-code（#967）同一形狀。
+ * #966 / #985 把已經算出來的血緣填成協議的 `ImportSession.origin`
+ * （`wireSid` = 這批內容實際掛的 `hermesSessionId`）。
  *
- * 為什麼**恒是 `root`**、而不是把 `fork`/`subagent` 原樣報上去：協議規定
- * `origin.threadId` ≡ `hermesSessionId` 所指的那條線程，而**判定權今天仍在連接器**——派生
- * 線程在本地就已經並進父會話了（#946），所以這批內容對 server 而言就是**那條頂層對話自己的
- * 內容**，據實報成 root。真報 `continuation`/`derived` 要等判定權交回 server（那時
- * `hermesSessionId` 換成線程自己的 id）；現在報了只會被 `classifyThreadOrigin` 判成自相矛盾
- * 的元數據原地丟掉（threadId ≠ 掛載身份 → `legacy`），既沒用、還污染 `evidence` 那條漂移告警。
+ * 兩條不變式：
+ *   1. `origin.threadId` **必須** ≡ `wireSid`，否則 server `classifyThreadOrigin` 整份退回
+ *      `legacy`（自相矛盾的元數據，不是「上游發明了新東西」）。
+ *   2. 這批若已經在本地並進別人（`wireSid !== origin.threadId`）——派生線程併進父、fork
+ *      歸屬到對話根——對 server 而言這就是**那條頂層對話自己的內容**，只能報 `root`。
+ *      真報 `continuation`/`derived` 要這條線程以**自己的 id** 作為 `hermesSessionId`
+ *      出現在 wire 上；今天本地 `isHiddenKind` / 歸屬合併還在（舊 server 沒判定表，停
+ *      本地過濾會讓列表爆出重複），所以這條路徑仍是 root。
  *
- * 落地當天的收益不是零：新會話落 `origin_kind='root'` + `origin_evidence='declared'`，
- * #945 那條「標題像機器文本就隔離」的兜底啟發式從此不會有機會誤傷真實用戶會話（用戶轉貼過
- * 那段英文的會話就是這麼被誤判的），且 `sessions_resolved{kind,evidence}` 有了對賬口徑。
+ * 已經是獨立 session（`wireSid === origin.threadId`）→ **據實報 kind**，不再謊報 root。
+ * 今天進得了這條路徑的幾乎都是 `user`（hidden/fork 在本地被跳過或併走了），所以生產
+ * wire 形狀不變；打開這條路是為了判定權交回 server 時不必再改一次映射。
  *
- * `evidence: "absent"`（老版本 Codex 壓根沒這概念）→ 返回 `undefined`，整個字段不上線：
- * 與 server 的 `legacy` 逐字節等價，少發一個字段。
+ * `evidence: "absent"` → 整個字段不上線，與 server `legacy` 等價。
  */
 export function toWireOrigin(origin: ThreadOrigin, wireSid: string): WireThreadOrigin | undefined {
   if (origin.evidence === "absent") return undefined;
-  const kind: WireThreadOriginKind = "root";
-  return { threadId: wireSid, conversationId: wireSid, kind, evidence: origin.evidence };
+  if (wireSid !== origin.threadId) {
+    return { threadId: wireSid, conversationId: wireSid, kind: "root", evidence: origin.evidence };
+  }
+  const kind = toWireKind(origin.kind);
+  const own = origin.conversationId === origin.threadId;
+  return {
+    threadId: wireSid,
+    conversationId: own ? wireSid : origin.conversationId,
+    kind,
+    ...(origin.parentThreadId ? { parentThreadId: origin.parentThreadId } : {}),
+    ...(origin.label ? { label: origin.label } : {}),
+    evidence: origin.evidence,
+  };
 }

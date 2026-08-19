@@ -195,9 +195,9 @@ export function parseSessionOrigin(row: GatewaySessionRow): SessionOrigin {
 /**
  * #968 本地血緣 → 協議 `ThreadOrigin`（上報給 server 的那份**事實**）。
  *
- * 連接器仍按本地判據工作（老 server 兼容），這裡只是把已經算出來的歸屬多報一份：判定權
- * 交回 server 之後，上游再發明一種線程類型是一次 server deploy，而不是一輪連接器發版 +
- * `rolloutPercent` + 等 6 小時（生產實測：放量 14 小時後 8 台活躍機器裡 7 台還在舊版）。
+ * #985：映射本身已經據實（`user→root` / `subagent|internal→derived` / 未知 kind 加前綴）。
+ * 連接器**仍按本地 `isHiddenOrigin` 過濾**（老 server 沒判定表，停本地隱藏會讓列表爆出
+ * cron/子 agent）。判定權交回 server 要等生產 server 已跑 #926 判定 + #985 熔斷，再開後續。
  *
  * 詞彙對照（左 = 四家連接器共用的說法，右 = server 判定表的值域）：
  *   - `user`     → `root`     頂層用戶對話 → 進列表
@@ -232,7 +232,10 @@ export function toThreadOrigin(origin: SessionOrigin, wireId: string): ThreadOri
   };
 }
 
-/** 鏡像口徑：只有 `user` 進用戶列表；`subagent` / `internal` 是執行單元，不佔一行。 */
+/**
+ * 鏡像口徑：只有 `user` 進用戶列表；`subagent` / `internal` 是執行單元，不佔一行。
+ * #985 先不拆這道閘——舊 server / 當前 prod 還沒判定表，拆了就是列表裡多出一堆機器線程。
+ */
 export function isHiddenOrigin(origin: SessionOrigin): boolean {
   return origin.kind !== "user" || origin.quarantined === true;
 }

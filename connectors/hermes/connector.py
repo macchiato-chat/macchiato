@@ -88,6 +88,7 @@ from backfill import (
     continuation_baseline,  # #948
     self_origin,  # #948
     lineage_supported,  # #969
+    to_wire_origin,  # #985
     tail_session,
     turn_rows,
     current_max_id,
@@ -119,7 +120,7 @@ LINK_B_PROTO = 5  # 對齊 server（packages/protocol：B=5，#348/#368 可靠 A
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.81"
+CONNECTOR_VERSION = "1.5.82"
 
 # #768 安裝目錄版本標記（對齊 TS connector-core/disk-version.ts）。
 _INSTALLED_VERSION_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
@@ -790,7 +791,9 @@ def _open_validated_download(url: str, timeout: float = 30.0):
 def _materialize_attachment(ref: dict) -> str:
     """下載 presigned GET url 到本地文件（連接器與 gateway 同機，落盤即可讓 gateway 讀）。
     #383:0700/0600;O_EXCL|O_NOFOLLOW 臨時寫 + 原子 replace;Content-Length 早拒;
-    全局配額 + 並發上限;失敗 finally unlink partial。"""
+    全局配額 + 並發上限;失敗 finally unlink partial。
+    #1006:先占住 .part 再走網絡——health GC 每 30s 會拆空目錄,舊順序 mkdir→DNS/TLS/GET
+    (秒級)→os.open,中間被 rmdir 就 ENOENT(「偶發看不到附件」)。"""
     global _ATTACH_INFLIGHT
     _validate_download_url(str(ref.get("url") or ""))  # 審計 #12：下載前早拒（file:// / 字面私網）
 
@@ -807,9 +810,12 @@ def _materialize_attachment(ref: dict) -> str:
     path = os.path.join(d, name)
     tmp = os.path.join(d, f".{name}.{os.urandom(8).hex()}.part")
     published = False
+    fd = -1
     try:
         _ensure_private_dir(ATTACH_DIR)
         _ensure_private_dir(d)
+        # #1006:目錄不再是空的,GC 拆不掉。失敗路徑 finally unlink。
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW, 0o600)
 
         used = _du_attach_root(ATTACH_DIR)
         if used >= ATTACH_QUOTA_BYTES:
@@ -830,29 +836,27 @@ def _materialize_attachment(ref: dict) -> str:
                     if used + cl > ATTACH_QUOTA_BYTES:
                         raise ValueError(f"附件將超過磁盤配額 {used}+{cl}/{ATTACH_QUOTA_BYTES}")
 
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW, 0o600)
             written = 0
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    fd = -1  # 所有權交給 fdopen
-                    while True:
-                        chunk = r.read(1 << 16)
-                        if not chunk:
-                            break
-                        written += len(chunk)
-                        if written > DOWNLOAD_MAX:
-                            raise ValueError(f"下載超過上限 {DOWNLOAD_MAX} 字節，已中止")
-                        f.write(chunk)
-            except Exception:
-                if fd >= 0:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-                raise
+            with os.fdopen(fd, "wb") as f:
+                fd = -1  # 所有權交給 fdopen
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > DOWNLOAD_MAX:
+                        raise ValueError(f"下載超過上限 {DOWNLOAD_MAX} 字節，已中止")
+                    f.write(chunk)
         os.replace(tmp, path)
         published = True
         return path
+    except Exception:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
     finally:
         with _ATTACH_INFLIGHT_LOCK:
             _ATTACH_INFLIGHT = max(0, _ATTACH_INFLIGHT - 1)
@@ -3663,19 +3667,17 @@ class Connector:
             established = (pid != sid) or (sid in wm)
             if not keepable(eff_source, eff_title) and not (e2e and established):
                 continue
-            # #969 上報血緣：**只能報 root**——協議規定 `origin.threadId` ≡ `hermesSessionId`
-            # 所指的那條線程，而判定權今天仍在連接器：續接在這裡就已經併進 `pid` 那條對話、
-            # 派生直接不鏡像，所以這批消息對 server 而言就是那條對話自己的內容。報
-            # continuation / derived 會讓 server 當場改行為（定不出父就 quarantine），違反
-            # 「落地當天行為不變」；真報要等判定權交回 server（#961）。
-            # 當天的收益不是零：新會話落 origin_kind='root'，#945 那條「標題像機器文本就隔離」
-            # 的兜底啟發式從此沒機會誤傷真實用戶會話，且 sessions_resolved 有了對賬口徑。
-            wire_origin = {
-                "threadId": pid,
-                "conversationId": pid,
-                "kind": "root",
-                "evidence": origin.get("evidence") or lineage_ev,
-            }
+            # #969/#985 上報血緣。鏡像一律當「已在本地判定過」：續接併進 `pid`、派生
+            # 不建會話。E2E 身份閘沒合併的續接也必須報 root——據實報 continuation 會讓
+            # 新 server 把密文並進父會話，而 K_S 還綁在這條 child 上。
+            wire_origin = to_wire_origin(
+                pid,
+                {
+                    **origin,
+                    "evidence": origin.get("evidence") or lineage_ev,
+                },
+                merged=True,
+            )
             if wire_origin["evidence"] == "absent":
                 self._count("mirrorOriginsAbsent")
             if has_new:

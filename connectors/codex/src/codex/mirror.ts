@@ -1114,8 +1114,8 @@ export class Mirror {
         // #966 派生線程走**對話**的 E2E 身份：終端裡 rewind 出來的 fork 檔自己沒有映射也沒有
         // 鑰匙，但它屬於的那條會話有——上面的身份閘已經確認過兩者是同一把（不是就整檔跳過了）。
         const e2eSid = conversationE2ESid;
-        // #966 上報血緣（元數據非正文 → E2E 會話一樣帶得動）。連接器仍按本地判定工作，
-        // 這只是把事實一併報上去；判定權切換是後續（形狀與理由見 `toWireOrigin`）。
+        // #966/#985 上報血緣（元數據非正文 → E2E 會話一樣帶得動）。派生仍在本地隱藏 /
+        // 併進父（舊 server 兼容），所以掛在父身份上的批次仍是 root；獨立 session 據實報 kind。
         const origin = toWireOrigin(metadata.origin, e2eSid ?? conversationSid);
         const wireOrigin = origin ? { origin } : {};
         const makeEntry = (picked: CodexMessage[]): Record<string, unknown> => {

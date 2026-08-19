@@ -7,6 +7,7 @@
  * SSRF / 本地文件防护(#12 / #249 / #379)：只允许 https；生产默认拒 loopback；dev 须
  * MACCHIATO_ATTACH_ALLOW_LOCALHOST=1；https 目标解析后不得落私网/环回/link-local/保留段；
  * 下载 100MB 封顶。落盘硬化：root/文件 0700/0600；O_EXCL|O_NOFOLLOW 临时写 + 原子 rename；
+ * **先占住 .part 再走网络**（#1006：GC 会拆空目录，mkdir→GET 之间被 rmdir 就 ENOENT）；
  * Content-Length 早拒；全局磁盘配额 + 并发上限；失败 finally unlink partial；GC 用 lstat
  * 不跟随 symlink。
  *
@@ -189,6 +190,15 @@ export async function materializeAttachment(
   try {
     ensurePrivateDir(root);
     ensurePrivateDir(dir);
+    // #1006:先占住 .part 再走网络。GC 见空 id 目录就拆；旧顺序 mkdir→GET(秒级)→open
+    // 会被并发 GC rmdir，回来 ENOENT（Hermes 现场；CC/Codex 同构，节流 10min 只是更少中）。
+    try {
+      fd = openSync(tmpPath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
+    } catch (e) {
+      throw new Error(
+        `無法創建附件臨時文件:${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`,
+      );
+    }
 
     const used = duAttachRoot(kind, root);
     const quota = attachQuotaBytes(kind);
@@ -234,14 +244,7 @@ export async function materializeAttachment(
       }
     }
 
-    try {
-      fd = openSync(tmpPath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
-    } catch (e) {
-      res.resume();
-      throw new Error(
-        `無法創建附件臨時文件:${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`,
-      );
-    }
+    if (fd == null) throw new Error("無法創建附件臨時文件");
     out = createWriteStream(tmpPath, { fd, autoClose: true, mode: 0o600 });
     fd = undefined; // 所有权交给 stream
     out.on("error", () => {
