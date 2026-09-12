@@ -21,7 +21,7 @@ import {
   rawUserText,
   type MirrorMessage,
 } from "./mirror";
-import { isHiddenOrigin, parseSessionOrigin, toThreadOrigin } from "./origin";
+import { parseSessionOrigin, toThreadOrigin } from "./origin";
 import type { ThreadOrigin } from "../linkb/proto";
 
 const IMPORT_BATCH = 20;
@@ -167,7 +167,8 @@ async function collectImportSessions(gw: OpenClawGateway): Promise<ImportSession
       // #949 派生線程（子 agent / cron / hook / node / 未知 kind）不成為可導入會話——與鏡像同一判據，
       // 否則「導入歷史」會把一堆執行單元一次性倒進用戶列表（比鏡像慢慢長出來更刺眼）。
       const parsed = parseSessionOrigin(a);
-      if (isHiddenOrigin(parsed)) continue;
+      // #1010：派生照樣導入（自己的 key + 據實 origin）；server 判 nested / quarantined。
+      // 仍跳過的只有 macchiato 前綴（下面）——那是 app 已在線的會話，再導會重複。
       // #113 macchiato: 前綴會話不導入——driven 會話 live 已入庫(再導=重複);titlegen 是隱藏會話。
       if (a.key?.toLowerCase().startsWith(MACCHIATO_PREFIX)) continue;
       hermesSessionId = a.key;

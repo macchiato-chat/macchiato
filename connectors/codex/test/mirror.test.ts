@@ -230,14 +230,16 @@ describe("#789 mirror poll 不投遞內部 rollout", () => {
       } as any);
       m.pollOnce();
 
-      expect(sent.filter((f) => f.t === "mirror_append")).toHaveLength(0);
+      const batches = sent.filter((f) => f.t === "mirror_append");
+      expect(batches).toHaveLength(1);
+      expect(batches[0].sessions[0].hermesSessionId).toBe(tid);
+      expect(batches[0].sessions[0].origin.kind).toBe("derived");
+      expect(m.counters.mirrorInternalSkipped).toBe(0);
+      m.handleAck(batches[0].batchId);
       expect(m.state.offsets[tid]).toBe(statSync(file).size);
-      expect(m.counters.mirrorInternalSkipped).toBe(1);
 
-      // 再 poll 不重複計數、仍不投遞
       m.pollOnce();
-      expect(sent.filter((f) => f.t === "mirror_append")).toHaveLength(0);
-      expect(m.counters.mirrorInternalSkipped).toBe(1);
+      expect(sent.filter((f) => f.t === "mirror_append")).toHaveLength(1);
     } finally {
       rmSync(root, { recursive: true, force: true });
       if (prevSessions === undefined) delete process.env.MACCHIATO_CODEX_SESSIONS_DIR;
@@ -297,11 +299,24 @@ describe("#789 mirror poll 不投遞內部 rollout", () => {
         send: (f: unknown) => sent.push(f),
       } as any);
       m.pollOnce();
+      const drain = (): void => {
+        for (let i = 0; i < 8; i++) {
+          const fresh = sent.filter((f) => f.t === "mirror_append").slice(-1);
+          if (!fresh.length) break;
+          const last = fresh[0];
+          if (last.batchId) m.handleAck(last.batchId);
+          m.pollOnce();
+        }
+      };
+      drain();
       const batches = sent.filter((f) => f.t === "mirror_append");
-      expect(batches).toHaveLength(1);
-      expect(batches[0].sessions[0].hermesSessionId).toBe(uTid);
-      expect(batches[0].sessions[0].messages[0].text).toBe("正常用戶問題");
-      expect(m.counters.mirrorInternalSkipped).toBe(1);
+      const sids = batches.flatMap((b) => b.sessions.map((s: any) => s.hermesSessionId));
+      expect(new Set(sids)).toEqual(new Set([gTid, uTid]));
+      const userSess = batches.flatMap((b) => b.sessions).find((s: any) => s.hermesSessionId === uTid);
+      expect(userSess.messages[0].text).toBe("正常用戶問題");
+      const derivedSess = batches.flatMap((b) => b.sessions).find((s: any) => s.hermesSessionId === gTid);
+      expect(derivedSess.origin.kind).toBe("derived");
+      expect(m.counters.mirrorInternalSkipped).toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
       if (prevSessions === undefined) delete process.env.MACCHIATO_CODEX_SESSIONS_DIR;
@@ -355,9 +370,13 @@ describe("#789 mirror poll 不投遞內部 rollout", () => {
       } as any);
       m.pollOnce();
 
-      expect(sent.filter((f) => f.t === "mirror_append")).toHaveLength(0);
+      const batches = sent.filter((f) => f.t === "mirror_append");
+      expect(batches).toHaveLength(1);
+      expect(batches[0].sessions[0].hermesSessionId).toBe(tid);
+      expect(batches[0].sessions[0].origin.kind).toBe("derived");
+      m.handleAck(batches[0].batchId);
       expect(m.state.offsets[tid]).toBe(statSync(file).size);
-      expect(m.counters.mirrorInternalSkipped).toBe(1);
+      expect(m.counters.mirrorInternalSkipped).toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
       if (prevSessions === undefined) delete process.env.MACCHIATO_CODEX_SESSIONS_DIR;

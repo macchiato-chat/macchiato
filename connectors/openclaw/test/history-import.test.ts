@@ -129,10 +129,13 @@ describe("history-import（深度：全文件 + 清洗 + 合併 + 過濾）", ()
     expect(byId.get("agent:main:discord:channel:888").origin).toBeUndefined();
   });
 
-  it("活躍 cron key 跳過", async () => {
+  it("活躍 cron key 以 derived 導入（#1010，server 判 quarantined）", async () => {
     writeFileSync(join(sdir, "c.jsonl"), metaUser("1", "#x", "hi"));
     const sent = await collect([{ sessionId: "c", key: "agent:main:cron:abc", channel: undefined }]);
-    expect(sent).toEqual([{ t: "import_batch", sessions: [], done: true }]);
+    const sessions = sent.filter((m) => m.t === "import_batch").flatMap((b) => b.sessions);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].hermesSessionId).toBe("agent:main:cron:abc");
+    expect(sessions[0].origin.kind).toBe("derived");
   });
 
   it("無文件 → 空 import_batch done:true", async () => {

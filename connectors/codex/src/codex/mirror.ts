@@ -382,13 +382,8 @@ export class Mirror {
       // 標題取**對話**的名字：派生線程掛回父會話時顯示父會話的名字，不是子線程自己的。
       ...deriveMeta(preamble.content, origin.conversationId),
       origin,
-      skip: isHiddenKind(origin.kind)
-        ? {
-            skip: true,
-            ...(origin.reason ? { reason: origin.reason } : {}),
-            ...(origin.evidence === "inferred" ? { inferred: true } : {}),
-          }
-        : { skip: false },
+      // #1010：派生不再本地整檔跳過。E2E 父會話下沒有獨立鑰匙的派生仍在 poll 裡攔。
+      skip: { skip: false },
     };
     // 空 rollout 之後可能才出現首條 user message；標題尚未確定時不把 Codex fallback 鎖死。
     if (preamble.hasUserMessage || metadata.skip.skip) {
@@ -1022,9 +1017,7 @@ export class Mirror {
       // #946 會話身份 = 源系統聲明的歸屬（`session_meta.session_id` 判據鏈），文件名只用來定位。
       // 根線程（本機 825/1399、生產 478/671）解出來就是它自己，一個字節都不變。
       // 只有真的派生時才去解析鏈路——不然 574 條子 agent 每 5s 都要遞歸查一遍父，純浪費。
-      const conversationSid = metadata.skip.skip
-        ? threadId
-        : this.conversationSidFor(threadId, metadata.origin, allRollouts);
+      const conversationSid = this.conversationSidFor(threadId, metadata.origin, allRollouts);
       // #966 E2E 身份閘（取代 #946 的「E2E 一律走老路徑」）。
       //
       // K_S 按**上報身份**存（`e2e/keys.ts`），所以把派生線程改掛父會話 = 換鍵。要不要換，判據
@@ -1050,22 +1043,27 @@ export class Mirror {
       const parentTombstoned =
         conversationSid !== threadId && !!this.state.tombstones?.includes(conversationSid);
 
-      // #789:內部 thread 只消費本輪新增尾部，不建用戶會話。它的正文不投遞，
-      // 因此可直接把 byte/ord 水位推到本次 snapshot EOF。
-      if (metadata.skip.skip || e2eHoldsIdentity || parentTombstoned) {
+      // #1010：派生以自己的 id 進 wire。仍跳過的只有兩種：
+      //   · 父會話已墓碑（不許借屍還魂）
+      //   · E2E 父會話下這條派生自己沒有 K_S（落地明文 = 把加密對話的內部執行洩到 server）
+      const ownDirect = this.directE2ESidFor(threadId, protectedSids);
+      const derivedNoKey =
+        isHiddenKind(metadata.origin.kind) && !!conversationE2ESid && !ownDirect;
+      // 對話裡有另一把 K_S、這條自己又沒有 → 維持舊身份（不投），避免明文洩密或換錯鍵。
+      const e2eHoldSkip = e2eHoldsIdentity && !ownDirect;
+      if (parentTombstoned || derivedNoKey || e2eHoldSkip) {
         this.state.offsets[threadId] = endOffset;
         this.state.ords[threadId] =
           (this.state.ords[threadId] ?? 0) + nextOrdAtEof(content);
-        const reason = e2eHoldsIdentity
-          ? `${metadata.origin.reason ?? "derived"}/e2e-hold`
-          : parentTombstoned
-            ? `${metadata.origin.reason ?? "derived"}/parent-tombstoned`
-            : metadata.skip.reason;
-        if (metadata.skip.inferred) this.counters.mirrorInferredSkipped += 1;
-        if (e2eHoldsIdentity) this.counters.mirrorE2EIdentityHeld += 1;
+        const reason = parentTombstoned
+          ? `${metadata.origin.reason ?? "derived"}/parent-tombstoned`
+          : e2eHoldSkip
+            ? `${metadata.origin.reason ?? "derived"}/e2e-hold`
+            : `${metadata.origin.reason ?? "derived"}/e2e-parent`;
+        if (e2eHoldSkip) this.counters.mirrorE2EIdentityHeld += 1;
         this.counters.mirrorInternalSkipped += 1;
         console.log(
-          `· #789 skip internal rollout ${threadId} (${reason}; mirrorInternalSkipped=${this.counters.mirrorInternalSkipped})`,
+          `· #1010 skip rollout ${threadId} (${reason}; mirrorInternalSkipped=${this.counters.mirrorInternalSkipped})`,
         );
         continue;
       }
@@ -1083,11 +1081,10 @@ export class Mirror {
           this.state.ords[threadId] = nextOrdAtEof(content);
           continue;
         }
-        // #946 派生線程首次出現:它掛回父會話,而 fork 檔案開頭是**父會話歷史的逐字副本**
-        // (rewind 保留的那幾個回合)——從 0 投遞等於把已經在 app 裡的消息再灌一遍(srcId 含
-        // 行號,跨檔對不上,server 去重救不了)。所以先與父 rollout 對齊公共前綴,水位坐到
-        // 分叉點,只投**分叉之後**的新內容。與 `adoptForked`(我們自己的 rewind)同一道理。
-        if (conversationSid !== threadId) {
+        // #946 fork 首次出現：檔開頭是父會話歷史的逐字副本，從 0 投等於再灌一遍。
+        // 只對 continuation（fork）切分叉點。#1010 派生以自己的 id 進 wire，整檔是它自己的
+        // 正文，不切。
+        if (conversationSid !== threadId && metadata.origin.kind === "fork") {
           const base = this.forkBaseline(content as string, metadata.origin, allRollouts);
           this.state.offsets[threadId] = base.offset;
           this.state.ords[threadId] = base.ord;
@@ -1099,7 +1096,8 @@ export class Mirror {
         }
       }
       const ordBase = this.state.ords[threadId] ?? 0;
-      const relativeAll = readNewMessages(content, 0, ordBase);
+      const includeInternal = isHiddenKind(metadata.origin.kind);
+      const relativeAll = readNewMessages(content, 0, ordBase, Number.POSITIVE_INFINITY, includeInternal);
       const all = {
         ...relativeAll,
         newOffset: startOff + relativeAll.newOffset,
@@ -1108,20 +1106,27 @@ export class Mirror {
       if (messages.length) {
         const { title, cwd } = metadata; // #659 文件夾：rollout 的 session_meta.cwd
         const folder = cwd?.trim() ? { cwd: cwd.trim() } : {};
-        // app-driven E2E 的 key/session identity 掛在 wire ULID，rollout 則以本地 UUID 命名。
-        // unsetDriven 後 terminal 續聊必須仍回到 wire session 並用 wire key 加密，不能另建
-        // local UUID 的 plaintext shadow session。
-        // #966 派生線程走**對話**的 E2E 身份：終端裡 rewind 出來的 fork 檔自己沒有映射也沒有
-        // 鑰匙，但它屬於的那條會話有——上面的身份閘已經確認過兩者是同一把（不是就整檔跳過了）。
-        const e2eSid = conversationE2ESid;
-        // #966/#985 上報血緣（元數據非正文 → E2E 會話一樣帶得動）。派生仍在本地隱藏 /
-        // 併進父（舊 server 兼容），所以掛在父身份上的批次仍是 root；獨立 session 據實報 kind。
-        const origin = toWireOrigin(metadata.origin, e2eSid ?? conversationSid);
+        // #1010：派生 / 明文續接以**自己的 id** 進 wire，據實報 kind。
+        // E2E 續接若自己沒有獨立 K_S，仍掛回父身份（密文必須用父那把鑰匙，且 server
+        // 會把 continuation 並進父行——報自己的 id 卻用父鑰匙，客戶端對不上）。
+        // 自己持着另一把 K_S（e2eHoldsIdentity）→ 報自己的 id + root，絕不報 continuation。
+        const sendOwn =
+          isHiddenKind(metadata.origin.kind) ||
+          conversationSid === threadId ||
+          !conversationE2ESid ||
+          e2eHoldsIdentity;
+        const wireSid = sendOwn ? (ownDirect ?? threadId) : (conversationE2ESid ?? conversationSid);
+        const originForWire =
+          e2eHoldsIdentity && metadata.origin.kind === "fork"
+            ? { ...metadata.origin, kind: "user" as const, conversationId: threadId }
+            : metadata.origin;
+        const origin = toWireOrigin(originForWire, wireSid);
         const wireOrigin = origin ? { origin } : {};
+        const e2eSid = ownDirect ?? (sendOwn ? undefined : conversationE2ESid);
         const makeEntry = (picked: CodexMessage[]): Record<string, unknown> => {
           if (e2eSid) {
             return {
-            hermesSessionId: e2eSid,
+            hermesSessionId: wireSid,
             ...wireOrigin,
             title: this.e2e!.encryptText(e2eSid, title),
             source: "codex",
@@ -1136,9 +1141,7 @@ export class Mirror {
           }
           return {
             ...wireOrigin,
-            // #946 身份 = 源系統聲明的歸屬（根線程 = threadId 自己）；srcId 仍按**本地
-            // thread**算，它只是本會話內的去重鍵，換了會讓已投遞過的消息重新長出一份。
-            hermesSessionId: conversationSid,
+            hermesSessionId: wireSid,
             title,
             source: "codex",
             ...folder,
@@ -1163,7 +1166,7 @@ export class Mirror {
         const batchId = randomUUID();
         while (lo <= hi) {
           const take = Math.floor((lo + hi) / 2);
-          const relative = readNewMessages(content, 0, ordBase, take);
+          const relative = readNewMessages(content, 0, ordBase, take, includeInternal);
           const partial = {
             ...relative,
             newOffset: startOff + relative.newOffset,

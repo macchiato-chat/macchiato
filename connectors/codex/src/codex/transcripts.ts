@@ -138,14 +138,14 @@ export function isCodexInternalHistoryText(text: string): boolean {
 }
 
 /** 一行 rollout envelope → 消息(user_message / agent_message);其餘 → null。 */
-function lineToMessage(o: unknown, ord: number): CodexMessage | null {
+function lineToMessage(o: unknown, ord: number, includeInternal = false): CodexMessage | null {
   if (!o || typeof o !== "object") return null;
   const env = o as { type?: string; payload?: { type?: string; message?: unknown; phase?: string } };
   if (env.type !== "event_msg" || !env.payload) return null;
   const p = env.payload;
   if (p.type === "user_message" && typeof p.message === "string") {
     const text = p.message.trim();
-    if (!text || isCodexInternalHistoryText(text)) return null;
+    if (!text || (!includeInternal && isCodexInternalHistoryText(text))) return null;
     return { role: "user", text, ord };
   }
   if (p.type === "agent_message" && typeof p.message === "string") {
@@ -181,6 +181,7 @@ export function readNewMessages(
   offset: number,
   ordBase: number,
   maxMessages = Number.POSITIVE_INFINITY,
+  includeInternal = false,
 ): { messages: CodexMessage[]; newOffset: number; lineCount: number } {
   const buf = Buffer.isBuffer(content) ? content : Buffer.from(content, "utf8");
   if (buf.length <= offset) return { messages: [], newOffset: offset, lineCount: 0 };
@@ -197,7 +198,7 @@ export function readNewMessages(
     const s = line.trim();
     if (s) {
       try {
-        const m = lineToMessage(JSON.parse(s), ord);
+        const m = lineToMessage(JSON.parse(s), ord, includeInternal);
         if (m) {
           if (messages.length >= maxMessages) {
             return {

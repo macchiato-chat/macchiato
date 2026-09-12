@@ -1,12 +1,11 @@
 /**
  * §15 鏡像：tail Claude Code 的 transcript（~/.claude/projects/<slug>/<sessionId>.jsonl）→ mirror_append。
- *  - 發現：掃 projects/ 下全部 <uuid>.jsonl；**子 agent 檔按行內聲明排除**（`isSidechain`/`agentId`，
- *    文件名 `agent-*` 只作兜底），**續接檔（終端 `--resume`/rewind）按對話指紋接回父會話**——
- *    見 `lineage.ts`（#947）。
+ *  - 發現：掃 projects/ 下全部 <uuid>.jsonl 與 `<父>/subagents/agent-*.jsonl`。
+ *    子 agent 以自己的 id 進 wire（#1010），**續接檔按對話指紋接回父會話**——見 `lineage.ts`。
  *  - #967 血緣別名下沉到 `connector-core` 的 `ThreadRegistry`（四家共用）：對話 → 歷代所有
  *    transcript uuid，首次確立的身份永不輪換；別名同時交給 E2E keystore（`setIdentityAliases`），
  *    於是換身份的會話也查得到壓在舊鍵下的 K_S。每批 `mirror_append` 另帶 `ImportSession.origin`
- *    上報血緣事實（#985：獨立 session 據實報 kind；本地 `identitySid` 合併仍在，舊 server 兼容）。
+ *    上報血緣事實（#1010：派生 / 明文續接以自己的 id 進 wire，據實報 kind）。
  *  - 未知會話從 0 全量鏡像完整歷史（自動看到所有會話 = 相對官方 remote control 的核心賣點,
  *    不依賴手動 import）；分批發（batchMax 條/帧，單帧單會話）防超 server maxPayload。
  *  - 字節偏移水位線 + in-flight 保留（見 transcripts.foldEntries）。durable outbox（#348）：幀落盤
@@ -207,10 +206,9 @@ export interface SessionFile {
 /**
  * 發現「一段對話」的轉錄檔。
  *
- * #947：子 agent 的排除從**文件名約定**（`agent-*.jsonl`）改成**讀行內聲明**
- * （`isSidechain` / `agentId`），文件名降級為兜底。CC 已經改過一次子 agent 的形態
- * （內聯 `isSidechain` → 獨立 `agent-*.jsonl` → `<父會話 id>/subagents/agent-*.jsonl`），
- * 只認文件名的話，下次再改就是又一輪「列表裡冒出一堆同名會話」。
+ * #1010：子 agent 也要被發現——以自己的 id 進 wire，server 判 nested。
+ * 仍讀行內聲明（`isSidechain` / `agentId`）來報 kind，文件名只是兜底。
+ * 新版路徑 `<父會話 id>/subagents/agent-*.jsonl` 也掃進去。
  */
 export function discoverSessions(root = projectsDir()): SessionFile[] {
   const out: SessionFile[] = [];
@@ -220,23 +218,31 @@ export function discoverSessions(root = projectsDir()): SessionFile[] {
   } catch {
     return out;
   }
-  for (const d of dirs) {
-    const dir = join(root, d);
-    let files: string[];
-    try {
-      files = readdirSync(dir);
-    } catch {
+  for (const d of dirs) collectSessionFiles(join(root, d), out);
+  return out;
+}
+
+function collectSessionFiles(dir: string, out: SessionFile[]): void {
+  let files: string[];
+  try {
+    files = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const f of files) {
+    const path = join(dir, f);
+    if (SESSION_FILE_RE.test(f) || AGENT_FILE_RE.test(f)) {
+      out.push({ sid: basename(f, ".jsonl"), file: path });
       continue;
     }
-    for (const f of files) {
-      if (!SESSION_FILE_RE.test(f) && !AGENT_FILE_RE.test(f)) continue;
-      const sid = basename(f, ".jsonl");
-      const file = join(dir, f);
-      if (isSubagentTranscript(file, sid)) continue; // 子 agent 是父會話的執行單元，不是一段對話
-      out.push({ sid, file });
+    if (f === "subagents" || /^[0-9a-f-]{36}$/i.test(f)) {
+      try {
+        if (statSync(path).isDirectory()) collectSessionFiles(path, out);
+      } catch {
+        /* ignore */
+      }
     }
   }
-  return out;
 }
 
 interface State {
@@ -254,7 +260,10 @@ interface State {
    * ⚠️ `parent` 是 #947 的老字段，#967 起歸屬改由 `registry` 記（一張表一個真源）。載入時遷移
    * 過去、之後不再寫；留在類型裡只為讀得懂舊狀態檔。
    */
-  origins?: Record<string, { parent?: string; evidence: OriginEvidence }>;
+  origins?: Record<
+    string,
+    { parent?: string; evidence: OriginEvidence; kind?: "user" | "subagent" | "continuation" }
+  >;
   /**
    * #947 對話指紋 → **conversationId**（`u:<根消息 uuid>` / `l:<首條 last-prompt 的 leafUuid>`）。
    * 續接檔複製父檔歷史時原樣保留行的 uuid，所以父子兩檔指紋相同——這張表就是「接回父會話」
@@ -950,11 +959,16 @@ export class Mirror {
 
     const origins = (this.state.origins ??= {});
     const heads = (this.state.heads ??= {});
+    if (origin.kind === "subagent") isSubagentTranscript(file, sid); // 計數 / 記憶化
     /** 這個檔歸屬的對話（＝該對話首次確立身份的那個本地 sid）；undefined = 它自己就是一段對話。 */
     let conversationId: string | undefined;
     let evidence: OriginEvidence = origin.evidence;
 
-    if (origin.kind === "continuation" && origin.declaredParent && origin.declaredParent !== sid) {
+    if (
+      (origin.kind === "continuation" || origin.kind === "subagent") &&
+      origin.declaredParent &&
+      origin.declaredParent !== sid
+    ) {
       conversationId = this.registry.conversationOf(origin.declaredParent) ?? origin.declaredParent;
     } else {
       for (const fp of origin.fingerprints) {
@@ -1001,7 +1015,17 @@ export class Mirror {
     for (const fp of origin.fingerprints) if (!heads[fp]) heads[fp] = conversation;
 
     const parent = conversationId ? this.identitySid(sid) : undefined;
-    origins[sid] = { evidence };
+    const storedKind: "user" | "subagent" | "continuation" =
+      origin.kind === "subagent"
+        ? "subagent"
+        : conversationId && conversationId !== sid
+          ? "continuation"
+          : "user";
+    origins[sid] = {
+      evidence,
+      kind: storedKind,
+      ...(conversationId ? { parent: conversationId } : {}),
+    };
     if (evidence === "absent") this.counters.mirrorOriginsAbsent += 1;
     if (parent) {
       this.counters.mirrorContinuationsMerged += 1;
@@ -1238,6 +1262,8 @@ export class Mirror {
         // 對外用**父會話**的身份：正文接回原會話（複製來的那段靠 srcId 撞 server 唯一索引去重），
         // app 裡不再多出一條帶整段歷史副本的重複會話。水位/標題仍按本地檔記，不受影響。
         const identitySid = this.identitySid(sid);
+        const rec = this.state.origins?.[sid];
+        const isDerived = rec?.kind === "subagent";
         const mappedWireSid =
           this.e2eWireSidForLocal?.(sid) ??
           (identitySid !== sid ? this.e2eWireSidForLocal?.(identitySid) : undefined);
@@ -1262,8 +1288,22 @@ export class Mirror {
         const candidate = title ?? (knownTitle ? undefined : firstUser);
         const newTitle = candidate && candidate !== knownTitle ? candidate : undefined;
         if (messages.length || newTitle) {
+          const protectedSids = new Set(this.e2e?.protectedSessionIds?.() ?? []);
+          const ownDirect =
+            this.e2eWireSidForLocal?.(sid) ?? (protectedSids.has(sid) ? sid : undefined);
+          const parentE2E = !!this.e2e?.isE2E(identitySid);
+          // E2E 父會話下沒有獨立 K_S 的子 agent：不落地明文。
+          if (isDerived && parentE2E && !ownDirect) {
+            this.internalAt.set(sid, size);
+            break;
+          }
+          // #1010：派生 / 明文續接以自己的 id 進 wire。E2E 續接沒有獨立鑰匙時仍掛父身份。
+          const sendOwn =
+            isDerived || identitySid === sid || !parentE2E || !!ownDirect;
           const directE2ESid = this.e2e?.isE2E(identitySid) ? identitySid : undefined;
-          const targetSid = mappedWireSid ?? directE2ESid ?? identitySid;
+          const targetSid = sendOwn
+            ? (ownDirect ?? sid)
+            : (mappedWireSid ?? directE2ESid ?? identitySid);
           if (!mappedWireSid && !directE2ESid && this.plaintextLocalAllowed?.(sid) === false) {
             console.error(
               `[mirror] E2E identity map 不可信，凍結未知 CC transcript ${sid}，不推水位/不發明文`,
@@ -1380,18 +1420,22 @@ export class Mirror {
   /**
    * #967/#985 這批消息要上報的血緣（`ImportSession.origin`）。
    *
-   * 續接檔已經由 `identitySid` 在本地併進父（舊 server 兼容，且 E2E 的 K_S 綁在上報
-   * 身份上）→ `wireSid !== localSid`，只能報父的 root。獨立 session（這條就是自己）據實
-   * 報 kind；今天 origins 不存 kind、E2E 身份閘沒合併的續接也被清成「自己」，所以走
-   * user/root——把綁了獨立 K_S 的續接報成 continuation，新 server 會把密文並進父會話。
-   *
-   * `evidence:"absent"` 不帶 origin。
+   * #1010：以自己的 id 上報時據實報 kind。自己持獨立 K_S 的續接 caller 會把
+   * wireSid 留在自己身上，這裡就報 root。`evidence:"absent"` 不帶 origin。
    */
   private originFor(localSid: string, wireSid: string): ThreadOriginWire | undefined {
+    const rec = this.state.origins?.[localSid];
     const identity = this.identitySid(localSid);
-    const evidence =
-      this.state.origins?.[identity]?.evidence ?? this.state.origins?.[localSid]?.evidence;
-    return toWireOrigin(wireSid, evidence, { threadId: localSid, kind: "user" });
+    const evidence = rec?.evidence ?? this.state.origins?.[identity]?.evidence;
+    const kind = rec?.kind ?? "user";
+    const conversationId =
+      rec?.parent ?? (kind === "user" ? localSid : identity !== localSid ? identity : localSid);
+    return toWireOrigin(wireSid, evidence, {
+      threadId: localSid,
+      kind,
+      conversationId,
+      ...(rec?.parent && rec.parent !== localSid ? { parentThreadId: rec.parent } : {}),
+    });
   }
 
   private entry(

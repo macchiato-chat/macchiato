@@ -193,7 +193,11 @@ export function resolveConversationId(
   return current || origin.threadId;
 }
 
-/** 鏡像口徑：只有 subagent / internal 整檔不進用戶會話；fork 改走「歸屬」。 */
+/**
+ * 派生執行單元（subagent / internal）。#1010 起鏡像不再用它整檔跳過——線程以自己的
+ * id 進 wire，server 判 nested / quarantined。仍用來：① 導入跳過 fork 之外的機器檔
+ * 之前先認得出派生；② E2E 父會話下沒有獨立 K_S 的派生不落地（明文會洩密）。
+ */
 export function isHiddenKind(kind: OriginKind): boolean {
   return kind === "subagent" || kind === "internal";
 }
@@ -215,12 +219,10 @@ export function toWireKind(kind: OriginKind): WireThreadOriginKind {
  *   2. 這批若已經在本地並進別人（`wireSid !== origin.threadId`）——派生線程併進父、fork
  *      歸屬到對話根——對 server 而言這就是**那條頂層對話自己的內容**，只能報 `root`。
  *      真報 `continuation`/`derived` 要這條線程以**自己的 id** 作為 `hermesSessionId`
- *      出現在 wire 上；今天本地 `isHiddenKind` / 歸屬合併還在（舊 server 沒判定表，停
- *      本地過濾會讓列表爆出重複），所以這條路徑仍是 root。
+ *      出現在 wire 上（#1010：生產 server 已跑判定 + 熔斷，鏡像按自己的 id 送）。
  *
- * 已經是獨立 session（`wireSid === origin.threadId`）→ **據實報 kind**，不再謊報 root。
- * 今天進得了這條路徑的幾乎都是 `user`（hidden/fork 在本地被跳過或併走了），所以生產
- * wire 形狀不變；打開這條路是為了判定權交回 server 時不必再改一次映射。
+ * 已經是獨立 session（`wireSid === origin.threadId`）→ **據實報 kind**。
+ * 自己持着獨立 K_S 的續接不得走 continuation（caller 會改成 user/root）。
  *
  * `evidence: "absent"` → 整個字段不上線，與 server `legacy` 等價。
  */

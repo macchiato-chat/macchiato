@@ -181,7 +181,7 @@ describe("#947 血緣夾具（子 agent 100% 歸位 / 續接 100% 接回父 / �
       continuations.push({ child, parent: m.sid });
     });
 
-    // ① 子 agent 100% 歸位：一個都不進發現列表，且都判為 subagent。
+    // ① 子 agent 100% 判為 subagent；#1010 起進發現列表（以自己的 id 進 wire）。
     for (const f of subagentFiles) {
       const origin = readTranscriptOrigin(f, basename(f, ".jsonl"));
       expect(origin.kind, f).toBe("subagent");
@@ -189,8 +189,8 @@ describe("#947 血緣夾具（子 agent 100% 歸位 / 續接 100% 接回父 / �
     }
     const found = discoverSessions(join(proj, ".."));
     const foundSids = new Set(found.map((s) => s.sid));
-    for (const f of subagentFiles) expect(foundSids.has(basename(f, ".jsonl")), f).toBe(false);
-    expect(found).toHaveLength(mains.length + continuations.length);
+    for (const f of subagentFiles) expect(foundSids.has(basename(f, ".jsonl")), f).toBe(true);
+    expect(found).toHaveLength(mains.length + continuations.length + subagentFiles.length);
 
     // ② 續接 100% 接回父會話；③ 主會話 0 誤傷。
     const { linkb } = fakeLinkb();
@@ -211,7 +211,7 @@ describe("#947 血緣夾具（子 agent 100% 歸位 / 續接 100% 接回父 / �
     const origin = readTranscriptOrigin(f, "agent-legacy0001");
     expect(origin.kind).toBe("subagent");
     expect(origin.evidence).toBe("inferred");
-    expect(discoverSessions(join(proj, "..")).map((s) => s.sid)).not.toContain("agent-legacy0001");
+    expect(discoverSessions(join(proj, "..")).map((s) => s.sid)).toContain("agent-legacy0001");
   });
 
   it("不誤傷：主會話裡內聯的 sidechain 洪流（老形態）不會讓整條會話消失", () => {
@@ -275,7 +275,13 @@ describe("#947 續接回流的鏡像行為", () => {
     (m as any).doPoll();
 
     const sids = new Set(appends(frames).map((f) => f.sessions[0].hermesSessionId));
-    expect([...sids]).toEqual([parent]); // ← 沒有第二條會話
+    expect(sids.has(parent)).toBe(true);
+    expect(sids.has(child)).toBe(true);
+    const childSess = appends(frames)
+      .flatMap((f: any) => f.sessions)
+      .find((s: any) => s.hermesSessionId === child);
+    expect(childSess.origin.kind).toBe("continuation");
+    expect(childSess.origin.conversationId).toBe(parent);
     const texts = appends(frames).flatMap((f: any) => f.sessions[0].messages.map((x: any) => x.text));
     expect(texts).toContain("續接後的新問題");
     // 複製來的那段照樣帶原始 srcId（= transcript 行 uuid）→ server 端 (session_id, dedup_key)
@@ -307,7 +313,13 @@ describe("#947 續接回流的鏡像行為", () => {
       render([...continuationOf(base, child, 4), userLine(child, "換個方向重問")]),
     );
     (m as any).doPoll();
-    expect(new Set(appends(frames).map((f) => f.sessions[0].hermesSessionId))).toEqual(new Set([parent]));
+    const sids = new Set(appends(frames).map((f) => f.sessions[0].hermesSessionId));
+    expect(sids.has(parent)).toBe(true);
+    expect(sids.has(child)).toBe(true);
+    const childSess = appends(frames)
+      .flatMap((f: any) => f.sessions)
+      .find((s: any) => s.hermesSessionId === child);
+    expect(childSess.origin.kind).toBe("continuation");
   });
 
   // #967 起這條的判據換成了「別名歷史是否可信」：這裡的 keystore 替身連 protectedSessionIds

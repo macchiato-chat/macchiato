@@ -55,6 +55,19 @@ function withRootOrigins(built: BuiltSession[], files: Map<string, string>): Bui
   return built.map((s) => {
     const o = origins.get(s.hermesSessionId)!;
     const shared = o.fingerprints.some((fp) => (fpOwners.get(fp) ?? 0) > 1);
+    if (o.kind === "subagent") {
+      const parent = o.declaredParent && o.declaredParent !== s.hermesSessionId ? o.declaredParent : undefined;
+      return {
+        ...s,
+        origin: {
+          threadId: s.hermesSessionId,
+          conversationId: parent ?? s.hermesSessionId,
+          kind: "derived",
+          ...(parent ? { parentThreadId: parent } : {}),
+          evidence: o.evidence === "absent" ? "inferred" : o.evidence,
+        },
+      };
+    }
     if (o.kind !== "user" || o.evidence === "absent" || shared) return s;
     return {
       ...s,

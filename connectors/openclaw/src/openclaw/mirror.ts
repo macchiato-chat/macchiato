@@ -508,47 +508,25 @@ export class Mirror {
   private readonly loggedDerived = new Set<string>();
 
   /**
-   * #949 這一行該不該成為用戶列表裡的一條會話。
-   *
-   * 命中即**不建會話、不推內容**；水位線也不碰（本輪整條 `continue`，與 cron 既有語義逐字一致）。
-   * 派生線程的正文並沒有丟——OpenClaw 的子 agent 完成後**自動把結果回報給父會話**（system prompt
-   * 原文：「Your sub-agents will announce their results back to you automatically」，完成事件以
-   * user message 落進父會話 transcript），所以有意義的產出本來就已經在父會話裡鏡像過了。把子檔的
-   * 整份 transcript 再灌進父會話只會多一份重複、並把父會話變成一堵工具調用的牆（#926 §2 引 Zed
-   * zed#57481 的結論：數據層保留、列表層不平鋪、父線程裡渲染卡片可下鑽）。卡片要等協議帶上
-   * `origin` 才畫得出來（#950），在那之前歸屬先算出來、記在日誌與計數裡。
-   *
-   * 三條例外，一條都不能少：
-   *  - **driven / macchiato 會話永不隱藏**：那是 app 自己建的對話，隱藏 = 用戶剛發的消息沒了。
-   *  - **E2E 只豁免「這條 key 自己就是一條 E2E 會話」**（#968 放開，判據見 `keepsLegacyE2EPath`）。
-   *  - **隔離只對還沒鏡像過的 key 生效**：已經有水位線 = 這條會話早就在用戶列表裡了，上游改個
-   *    `kind` 字面量不該讓它從此不再更新（#926 §5「未知 ≠ 沒有」的同一條安全閥）。
-   *    形狀上就是派生的（子 agent / cron / hook / node）不吃這條——它們從來就不是一段對話。
+   * #1010：派生以自己的 key 進 wire，server 判 nested / quarantined。
+   * 本地還擋的只剩一種：E2E 父會話下這條派生自己沒有 K_S（落地明文會把加密對話的
+   * 內部執行洩到 server）。driven / macchiato / 已有水位的行永不擋。
    */
   private isHiddenSession(key: string, origin: SessionOrigin): boolean {
     if (!isHiddenOrigin(origin)) return false;
     if (key.startsWith(MACCHIATO_PREFIX) || this.drivenKeys.has(key)) return false;
-    if (origin.quarantined) {
-      if (this.state.offsets[key] !== undefined) return false;
-      if (this.keepsLegacyE2EPath(key)) return false;
-      this.counters.mirrorQuarantined += 1;
-      if (!this.loggedDerived.has(key)) {
-        this.loggedDerived.add(key);
-        console.warn(
-          `⚠️ #949 ${key}:gateway 給了未知的 kind(${origin.reason})→ 隔離,不建新會話。` +
-            "OpenClaw 可能加了新的會話類別,該去看它改了什麼。",
-        );
-      }
-      return true;
-    }
-    // cron 是既有規則(OpenClaw 已把 cron 輸出插進 deliver target 的聊天記錄),無條件跳過、不看 E2E。
-    if (origin.reason !== "cron" && this.keepsLegacyE2EPath(key)) return false;
+    if (this.state.offsets[key] !== undefined) return false;
+    if (this.keepsLegacyE2EPath(key)) return false;
+    const parent = origin.conversationId;
+    const parentE2E =
+      !!parent && parent !== key && !!this.e2e && this.e2e.isE2E(parent);
+    if (!parentE2E) return false;
     this.counters.mirrorDerivedSkipped += 1;
     if (!this.loggedDerived.has(key)) {
       this.loggedDerived.add(key);
       console.log(
-        `· #949 ${key}:派生會話(${origin.kind}/${origin.reason ?? "?"})不進列表` +
-          (origin.conversationId !== key ? `,歸屬 ${origin.conversationId}` : ""),
+        `· #1010 ${key}:E2E 父會話下的派生無獨立 K_S，不落地明文` +
+          `（${origin.kind}/${origin.reason ?? "?"} → ${parent}）`,
       );
     }
     return true;

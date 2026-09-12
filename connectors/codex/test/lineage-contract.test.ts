@@ -194,16 +194,23 @@ describe("#951 codex 血緣契約：整套語料喂給鏡像", () => {
     throw new Error("鏡像批次沒有收斂（超過 maxRounds）");
   };
 
-  it("①③ 只有根線程建會話：派生 0 條、續接 0 條新會話，根線程一條不少", () => {
+  it("①③ 根線程 + 派生以自己的 id 進 wire；續接首見坐到分叉點", () => {
     const sent: Record<string, unknown>[] = [];
     const mirror = newMirror(sent);
     drainPolls(mirror, sent);
 
     const roots = cases.filter((c) => c.role === "root").map((c) => c.expect.threadId);
-    expect(new Set(sessionIdsOf(sent))).toEqual(new Set(roots));
-    // 派生線程整檔跳過（歸屬已知也不重灌歷史），續接線程首見坐到分叉點。
-    expect(mirror.counters.mirrorInternalSkipped).toBe(cases.filter((c) => c.role === "derived").length);
+    const derived = cases.filter((c) => c.role === "derived").map((c) => c.expect.threadId);
+    expect(new Set(sessionIdsOf(sent))).toEqual(new Set([...roots, ...derived]));
+    expect(mirror.counters.mirrorInternalSkipped).toBe(0);
     expect(mirror.counters.mirrorForkAdopted).toBe(cases.filter((c) => c.role === "continuation").length);
+    for (const c of cases.filter((x) => x.role === "derived")) {
+      const entry = sent
+        .filter((f: any) => f.t === "mirror_append")
+        .flatMap((f: any) => f.sessions)
+        .find((s: any) => s.hermesSessionId === c.expect.threadId);
+      expect(entry?.origin?.kind, c.file).toBe("derived");
+    }
   });
 
   it("② 續接之後在終端繼續聊：新消息投進**父會話**，不另建一條", () => {
@@ -234,12 +241,15 @@ describe("#951 codex 血緣契約：整套語料喂給鏡像", () => {
       expect(entry, `${c.file} 的新消息沒到達 server`).toBeTruthy();
       const sess = entry.sessions.find((s: any) =>
         s.messages.some((m: any) => m.text === `續接後的新問題 ${c.expect.threadId}`));
-      expect(sess.hermesSessionId, c.file).toBe(c.expect.conversationId); // ← 歸位到父，不另建
+      expect(sess.hermesSessionId, c.file).toBe(c.expect.threadId);
+      expect(sess.origin?.kind, c.file).toBe("continuation");
+      expect(sess.origin?.conversationId, c.file).toBe(c.expect.conversationId);
     }
-    // 沒有任何新會話身份冒出來（續接檔自己的 threadId 一個都不許出現）。
     for (const sid of sessionIdsOf(sent.slice(cur))) {
-      expect(before.has(sid) || cases.some((c) => c.expect.conversationId === sid), sid).toBe(true);
-      expect(continuations.some((c) => c.expect.threadId === sid), sid).toBe(false);
+      expect(
+        before.has(sid) || continuations.some((c) => c.expect.threadId === sid),
+        sid,
+      ).toBe(true);
     }
   });
 });

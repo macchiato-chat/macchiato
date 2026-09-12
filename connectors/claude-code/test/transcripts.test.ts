@@ -197,7 +197,7 @@ describe("#947 titleFromText", () => {
 });
 
 describe("discoverSessions", () => {
-  it("只認 <uuid>.jsonl,跳過 agent-*.jsonl 等雜檔", () => {
+  it("認 <uuid>.jsonl 與 agent-*.jsonl，跳過雜檔", () => {
     const root = mkdtempSync(join(tmpdir(), "cc-d-"));
     const proj = join(root, "-home-x");
     mkdirSyncSafe(proj);
@@ -205,8 +205,10 @@ describe("discoverSessions", () => {
     writeFileSync(join(proj, "agent-abc123.jsonl"), "");
     writeFileSync(join(proj, "notes.txt"), "");
     const s = discoverSessions(root);
-    expect(s).toHaveLength(1);
-    expect(s[0]!.sid).toBe("6966afc5-2dca-477d-a987-848421d25124");
+    expect(s.map((x) => x.sid).sort()).toEqual([
+      "6966afc5-2dca-477d-a987-848421d25124",
+      "agent-abc123",
+    ].sort());
   });
 });
 

@@ -142,6 +142,18 @@ describe("drive 下行分派", () => {
     expect(calls[1].params).toMatchObject({ key: `${MACCHIATO_PREFIX}01sid`, message: "追加" });
   });
 
+  it("#1030 回合進行中 + 2.0 能力位 → chat.send queueMode=steer(sessions.steer 已語義反轉成 interrupt)", async () => {
+    const { gw, linkb, calls } = makeDrive();
+    gw.helloOk = { features: { capabilities: ["chat-send-routing-contract"] } };
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "第一條" }));
+    gw.fire({ event: "agent", payload: { stream: "lifecycle", data: { phase: "start" }, runId: "r1", sessionKey: `${MACCHIATO_PREFIX}01sid` } });
+    await linkb.deliver(tui("prompt.submit", "01SID", { text: "追加" }));
+    expect(calls[1].method).toBe("chat.send");
+    expect(calls[1].params).toMatchObject({ sessionKey: `${MACCHIATO_PREFIX}01sid`, message: "追加", queueMode: "steer" });
+    expect(calls[1].params.idempotencyKey).toBeTruthy();
+    expect(calls.some((c) => c.method === "sessions.steer")).toBe(false);
+  });
+
   it("session.interrupt → sessions.abort", async () => {
     const { linkb, calls } = makeDrive();
     await linkb.deliver(tui("session.interrupt", "agent:main:discord:channel:9"));

@@ -2,7 +2,8 @@
  * Drive：Macchiato → OpenClaw 的雙向橋（對應 Hermes 連接器的 tui 分派 + 事件回傳）。
  *
  * 下行（server → 連接器, t:"tui" 幀）：
- *   prompt.submit  → chat.send（回合進行中 → sessions.steer 注入, §18 方案 D, 實測可用）
+ *   prompt.submit  → chat.send（回合進行中 → 注入：2.0+ 走 chat.send queueMode:"steer"
+ *                    〔chat-send-routing-contract 能力位,#1030〕,老 gateway 走 sessions.steer, §18 方案 D）
  *   session.interrupt → sessions.abort
  *   session.create → 登記 driven（chat.send 首次提交時自動建會話）
  * 上行（OpenClaw gateway 事件 → server tui EVENT, 形狀均為 2026-07-04 活測捕獲）：
@@ -974,9 +975,27 @@ export class Drive {
           return;
         }
         if (!text) return; // 純附件 + 回合進行中:無可 steer
-        const r = await this.gw.request("sessions.steer", { key, message: text });
-        this.recordSent(key, sid, text); // #244
-        console.log(`· Turn in progress → steering follow-up into (${key}, status=${r?.status})`);
+        // #1030:OpenClaw 2.0 起 sessions.steer 語義反轉——變成 chat.send queueMode:"interrupt"
+        // 的 deprecated 別名(打斷當前回合再開新回合)。2.0+ 以 chat-send-routing-contract
+        // 能力位宣告新路由:注入當前回合 = chat.send queueMode:"steer"(白撿冪等鍵)。
+        // 沒有該能力位的老 gateway 維持 sessions.steer——在老版本上它就是同回合注入,行為不變。
+        const caps: unknown[] = this.gw.helloOk?.features?.capabilities ?? [];
+        if (caps.includes("chat-send-routing-contract")) {
+          await this.gw.request("chat.send", {
+            sessionKey: key,
+            message: text,
+            idempotencyKey: idem,
+            queueMode: "steer",
+          });
+          this.recordSent(key, sid, text); // #244
+          // ⚠️ 「Turn in progress → steering follow-up into」是回歸契約串(scripts/regression/
+          // README 清單 + run-live-smoke contractSteer)——改文案要兩邊同步,别再踩(09-12 狗糧實紅)。
+          console.log(`· Turn in progress → steering follow-up into (${key}, via chat.send queueMode=steer)`);
+        } else {
+          const r = await this.gw.request("sessions.steer", { key, message: text });
+          this.recordSent(key, sid, text); // #244
+          console.log(`· Turn in progress → steering follow-up into (${key}, status=${r?.status})`);
+        }
       } else {
         await this.gw.request("chat.send", {
           sessionKey: key,

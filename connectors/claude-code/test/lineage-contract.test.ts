@@ -151,9 +151,9 @@ describe("#951 claude-code 血緣契約：靜態語料", () => {
         expect(o.declaredParent, c.file).toBe(c.expect.declaredParent);
       }
     }
-    // 子 agent 一條都不許進發現列表（進了 = 用戶列表裡多出一條同名會話）。
+    // #1010：子 agent 進發現列表（以自己的 id 進 wire，server 判 nested）。
     const found = new Set(discoverSessions(sandbox.projects).map((s) => s.sid));
-    for (const c of derived) expect(found.has(c.sid), c.file).toBe(false);
+    for (const c of derived) expect(found.has(c.sid), c.file).toBe(true);
   });
 
   it("② 續接：100% 接回正確的父（--resume 全量副本 + rewind 截斷副本）", () => {
@@ -203,10 +203,20 @@ describe("#951 claude-code 血緣契約：整套語料喂給鏡像", () => {
 
     const sids = new Set(appends(frames).flatMap((f) => f.sessions.map((s: any) => s.hermesSessionId as string)));
     const roots = cases.filter((c) => c.role === "root").map((c) => c.sid);
-    // 續接檔的正文投進父會話的身份 → 出現的身份只可能是主會話。
-    expect([...sids].sort()).toEqual([...roots].sort());
-    for (const c of cases.filter((c) => c.role !== "root")) {
-      expect(sids.has(c.sid), `${c.file} 冒出了自己的會話身份（＝用戶列表裡多一行）`).toBe(false);
+    const derived = cases.filter((c) => c.role === "derived").map((c) => c.sid);
+    const cont = cases.filter((c) => c.role === "continuation").map((c) => c.sid);
+    for (const r of roots) expect(sids.has(r), `root ${r} 沒被鏡像`).toBe(true);
+    for (const sid of sids) {
+      expect(
+        roots.includes(sid) || derived.includes(sid) || cont.includes(sid),
+        `${sid} 不在語料裡`,
+      ).toBe(true);
+    }
+    for (const c of cases.filter((c) => c.role === "derived" && sids.has(c.sid))) {
+      const sess = appends(frames)
+        .flatMap((f) => f.sessions)
+        .find((s: any) => s.hermesSessionId === c.sid);
+      expect(sess?.origin?.kind, c.file).toBe("derived");
     }
 
     // 續接檔複製來的歷史不重灌：父會話裡同一段正文的 srcId 只有一份（server 端唯一索引吃掉）。
@@ -243,7 +253,9 @@ describe("#951 claude-code 血緣契約：整套語料喂給鏡像", () => {
     expect(landed, "續接後的新消息沒到達 server").toBeTruthy();
     const sess = landed!.sessions.find((s: any) =>
       s.messages.some((msg: any) => msg.text === "續接之後的又一個問題"));
-    expect(sess.hermesSessionId).toBe(cont.expect.parent);
+    expect(sess.hermesSessionId).toBe(cont.sid);
+    expect(sess.origin?.kind).toBe("continuation");
+    expect(sess.origin?.conversationId).toBe(cont.expect.parent);
   });
 });
 

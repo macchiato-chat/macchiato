@@ -93,24 +93,29 @@ const TOP = {
   kind: "group",
 };
 
-describe("#949 鏡像過濾派生會話", () => {
-  it("子 agent 不建會話，頂層會話照發", async () => {
-    const { mirror, sent, pollWithNewContent } = setup([
-      TOP,
-      {
-        key: "agent:main:subagent:child-1",
-        sessionId: "bbbbbbbb-0000-4000-8000-00000000bbbb",
-        kind: "direct",
-        parentSessionKey: TOP.key,
-      },
-    ]);
+describe("#1010 派生以自己的 id 進 wire", () => {
+  it("子 agent 以自己的 key 上報 derived，頂層會話照發", async () => {
+    const sub = {
+      key: "agent:main:subagent:child-1",
+      sessionId: "bbbbbbbb-0000-4000-8000-00000000bbbb",
+      kind: "direct",
+      parentSessionKey: TOP.key,
+    };
+    const { mirror, sent, pollWithNewContent } = setup([TOP, sub]);
     await pollWithNewContent();
-    expect(mirrored(sent)).toEqual([TOP.key]);
-    expect(watermarked(mirror)).toEqual([TOP.key]);
-    expect(mirror.counters.mirrorDerivedSkipped).toBe(2); // 兩輪 poll 各記一次
+    expect(mirrored(sent).sort()).toEqual([TOP.key, sub.key].sort());
+    expect(watermarked(mirror).sort()).toEqual([TOP.key, sub.key].sort());
+    expect(mirror.counters.mirrorDerivedSkipped).toBe(0);
+    const child = sent
+      .filter((f) => f.t === "mirror_append")
+      .flatMap((f) => f.sessions as any[])
+      .find((s) => s.hermesSessionId === sub.key);
+    expect(child.origin.kind).toBe("derived");
+    expect(child.origin.threadId).toBe(sub.key);
+    expect(child.origin.conversationId).toBe(TOP.key);
   });
 
-  it("cron / hook / node / heartbeat 全部不建會話", async () => {
+  it("cron / hook / node / heartbeat 以自己的 key 進 wire（server 判 quarantined）", async () => {
     const rows: Row[] = [
       TOP,
       { key: "agent:main:cron:daily:run:1", sessionId: "cccccccc-0000-4000-8000-00000000c001", kind: "direct" },
@@ -118,22 +123,16 @@ describe("#949 鏡像過濾派生會話", () => {
       { key: "agent:main:node:mini:talk:3", sessionId: "cccccccc-0000-4000-8000-00000000c003", kind: "direct" },
       { key: "agent:main:heartbeat", sessionId: "cccccccc-0000-4000-8000-00000000c004", kind: "direct" },
     ];
-    const { mirror, sent, pollWithNewContent } = setup(rows);
+    const { sent, pollWithNewContent } = setup(rows);
     await pollWithNewContent();
-    expect(mirrored(sent)).toEqual([TOP.key]);
-    expect(watermarked(mirror)).toEqual([TOP.key]);
+    expect(mirrored(sent).sort()).toEqual(rows.map((r) => r.key).sort());
   });
 
-  it("未知 kind → 隔離 + 打點，不建新會話", async () => {
-    const { mirror, sent, pollWithNewContent } = setup([
-      TOP,
-      { key: "agent:main:swarm:node-7", sessionId: "dddddddd-0000-4000-8000-00000000dddd", kind: "swarm" },
-    ]);
+  it("未知 kind 也進 wire（server fail-closed 隔離），不再本地吞掉", async () => {
+    const swarm = { key: "agent:main:swarm:node-7", sessionId: "dddddddd-0000-4000-8000-00000000dddd", kind: "swarm" };
+    const { sent, pollWithNewContent } = setup([TOP, swarm]);
     await pollWithNewContent();
-    expect(mirrored(sent)).toEqual([TOP.key]);
-    expect(watermarked(mirror)).toEqual([TOP.key]);
-    expect(mirror.counters.mirrorQuarantined).toBe(2);
-    expect(mirror.counters.mirrorDerivedSkipped).toBe(0);
+    expect(mirrored(sent).sort()).toEqual([TOP.key, swarm.key].sort());
   });
 
   it("隔離只擋新 key：已經有水位線的會話照舊更新（不靜默停更）", async () => {
@@ -144,12 +143,12 @@ describe("#949 鏡像過濾派生會話", () => {
     expect(mirror.counters.mirrorQuarantined).toBe(0);
   });
 
-  it("形狀上就是派生的不吃「已鏡像過」的例外——它從來就不是一段對話", async () => {
+  it("已經有水位線的派生照舊更新（以自己的 id）", async () => {
     const sub = { key: "agent:main:subagent:child-1", sessionId: "bbbbbbbb-0000-4000-8000-00000000bbbb", kind: "direct" };
     const { mirror, sent } = setup([sub], { offsets: { [sub.key]: 0 } });
     await (mirror as any).pollOnce();
-    expect(mirrored(sent)).toEqual([]);
-    expect(mirror.counters.mirrorDerivedSkipped).toBe(1);
+    expect(mirrored(sent)).toEqual([sub.key]);
+    expect(mirror.counters.mirrorDerivedSkipped).toBe(0);
   });
 
   it("kind 缺席（老 gateway）行為一個字不變", async () => {
@@ -248,13 +247,12 @@ describe("#949 鏡像過濾派生會話", () => {
     expect(session.messages[0].text).toBeUndefined();
   });
 
-  it("日誌只吼一次：多輪 poll 不刷屏（計數照樣每輪累加）", async () => {
-    const { mirror } = setup([
+  it("明文派生不再本地跳過，也就不再刷 skip 日誌", async () => {
+    const { mirror, sent, pollWithNewContent } = setup([
       { key: "agent:main:subagent:child-1", sessionId: "bbbbbbbb-0000-4000-8000-00000000bbbb", kind: "direct" },
     ]);
-    await (mirror as any).pollOnce();
-    await (mirror as any).pollOnce();
-    expect((mirror as any).loggedDerived.size).toBe(1);
-    expect(mirror.counters.mirrorDerivedSkipped).toBe(2);
+    await pollWithNewContent();
+    expect(mirror.counters.mirrorDerivedSkipped).toBe(0);
+    expect(sent.some((f) => f.t === "mirror_append")).toBe(true);
   });
 });

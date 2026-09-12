@@ -161,7 +161,9 @@ describe("#946 終端側 rewind/fork：接回父會話而不是靜默停更", ()
     const appends = sent.filter((f: any) => f.t === "mirror_append") as any[];
     expect(appends).toHaveLength(1);
     const entry = appends[0].sessions[0];
-    expect(entry.hermesSessionId).toBe(PARENT); // ← 歸位，而不是另起一條會話
+    expect(entry.hermesSessionId).toBe(FORK);
+    expect(entry.origin.kind).toBe("continuation");
+    expect(entry.origin.conversationId).toBe(PARENT);
     expect(entry.messages.map((m: any) => m.text)).toEqual(["改成別的做法", "好"]);
   });
 
@@ -213,8 +215,11 @@ describe("#946 派生線程 100% 歸位或隔離、用戶線程 0 誤傷", () =>
     const sent: Record<string, unknown>[] = [];
     const mirror = newMirror(sent);
     mirror.pollOnce();
-    expect(sent.filter((f) => f.t === "mirror_append")).toHaveLength(0);
-    expect(mirror.counters.mirrorInternalSkipped).toBe(1);
+    const batches = sent.filter((f) => f.t === "mirror_append") as any[];
+    expect(batches).toHaveLength(1);
+    expect(batches[0].sessions[0].hermesSessionId).toBe(FORK);
+    expect(batches[0].sessions[0].origin.kind).toBe("derived");
+    expect(mirror.counters.mirrorInternalSkipped).toBe(0);
     expect(mirror.counters.mirrorForkAdopted).toBe(0);
   });
 
@@ -241,9 +246,11 @@ describe("#946 派生線程 100% 歸位或隔離、用戶線程 0 誤傷", () =>
     const sent: Record<string, unknown>[] = [];
     const mirror = newMirror(sent);
     mirror.pollOnce();
-    expect(sent.filter((f) => f.t === "mirror_append")).toHaveLength(0);
-    expect(mirror.counters.mirrorInferredSkipped).toBe(1);
-    expect(mirror.counters.mirrorInternalSkipped).toBe(1);
+    const batches = sent.filter((f) => f.t === "mirror_append") as any[];
+    expect(batches).toHaveLength(1);
+    expect(batches[0].sessions[0].origin.kind).toBe("derived");
+    expect(mirror.counters.mirrorInferredSkipped).toBe(0);
+    expect(mirror.counters.mirrorInternalSkipped).toBe(0);
   });
 });
 
@@ -367,11 +374,13 @@ describe("#966 E2E 會話 rewind 之後正文恢復鏡像", () => {
     keepTalking(forkFile);
     mirror.pollOnce();
 
-    expect(sent.filter((f) => f.t === "mirror_append")).toHaveLength(0);
-    expect(mirror.counters.mirrorForkAdopted).toBe(0);
-    expect(mirror.counters.mirrorE2EIdentityHeld).toBeGreaterThan(0);
-    expect(mirror.state.offsets[FORK]).toBe(statSync(forkFile).size);
-    expect(e2e.protectedSessionIds()).toEqual([FORK]); // 一把都沒多生成
+    const appends = sent.filter((f) => f.t === "mirror_append") as any[];
+    expect(appends).toHaveLength(1);
+    const entry = appends[0].sessions[0];
+    expect(entry.hermesSessionId).toBe(FORK);
+    expect(entry.origin.kind).toBe("root");
+    expect(entry.e2e).toBe(true);
+    expect(e2e.protectedSessionIds()).toEqual([FORK]);
   });
 
   it("aliasHistoryTrusted 不可信 → 認不出舊鍵下的同一段對話，維持舊身份", () => {
@@ -489,14 +498,12 @@ describe("#966 mirror_append 帶 ThreadOrigin", () => {
     );
     mirror.pollOnce();
     const entry = (sent.filter((f: any) => f.t === "mirror_append") as any[])[0].sessions[0];
-    // 派生線程在**本地**就已經並進父會話了，所以這批內容對 server 而言就是那條對話自己的
-    // 內容。報 continuation 只會被 classifyThreadOrigin 判成自相矛盾丟掉（threadId ≠ 掛載
-    // 身份）——判定權交回 server 時把 hermesSessionId 換成線程自己的 id，那時才報得出去。
-    expect(entry.hermesSessionId).toBe(PARENT);
+    expect(entry.hermesSessionId).toBe(FORK);
     expect(entry.origin).toEqual({
-      threadId: PARENT,
+      threadId: FORK,
       conversationId: PARENT,
-      kind: "root",
+      kind: "continuation",
+      parentThreadId: PARENT,
       evidence: "declared",
     });
   });
@@ -559,7 +566,9 @@ describe("#966 mirror_append 帶 ThreadOrigin", () => {
     );
     mirror.pollOnce();
     const entry = (sent.filter((f: any) => f.t === "mirror_append") as any[])[0].sessions[0];
-    expect(entry.hermesSessionId).toBe(PARENT);
+    expect(entry.hermesSessionId).toBe(FORK);
+    expect(entry.origin.kind).toBe("continuation");
+    expect(entry.origin.conversationId).toBe(PARENT);
   });
 
   it("import_batch 同樣帶：導入口徑下派生線程整檔不進來，故恒是 root", () => {

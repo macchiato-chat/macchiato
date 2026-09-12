@@ -120,7 +120,7 @@ LINK_B_PROTO = 5  # 對齊 server（packages/protocol：B=5，#348/#368 可靠 A
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.82"
+CONNECTOR_VERSION = "1.5.83"
 
 # #768 安裝目錄版本標記（對齊 TS connector-core/disk-version.ts）。
 _INSTALLED_VERSION_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
@@ -3500,19 +3500,21 @@ class Connector:
         for row in rows:
             sid, source, title, archived, maxid = row[:5]
             origin = origins.get(sid) or self_origin(sid, lineage_ev)
-            if origin["kind"] == "derived":
-                # #948 派生（子代理 / 委派）＝ 父會話的執行細節，**永不**成為獨立會話。
-                # 判據是結構化的（`model_config.$._delegate_from` / `source='subagent'`，都是
-                # Hermes 自己聲明的），而且擋在**所有**豁免之前：#592 那條「E2E + 已建立就
-                # 放行」的特判曾讓已鏡像過的 subagent 子會話從 source 黑名單底下繞過去
-                # （2026-07-31 實踩：兩個 subagent ＝ 兩個殭屍會話）。這一刀把那條路堵死。
-                self._count("mirrorDerivedSkipped")
-                continue
             # sid = state.db 會話 id。自驅會話（Macchiato 新建）的 state.db id（= gateway
             # session_key，經 _stored 持久映射）≠ server 持久化 hermesSessionId；K_S 按持久化
             # id 鍵控、mirror 也須用持久化 id 才能落回原會話 → 先映射回 pid（運行時 _rev 或
             # 持久 _stored_rev）判 E2E / 加密 / 標識。讀消息與水位線仍按 state.db 的 sid。
             own_pid = self._rev.get(sid) or self._stored_rev.get(sid, sid)
+            # #1010：派生以自己的 id 進 wire。E2E 父會話下這條自己沒有 K_S → 不落地明文。
+            if origin["kind"] == "derived":
+                conv_early = origin.get("conversationId") or sid
+                conv_pid_early = self._rev.get(conv_early) or self._stored_rev.get(conv_early, conv_early)
+                parent_e2e = conv_pid_early != own_pid and (
+                    self._e2e.is_protected(conv_pid_early) or self._e2e.is_e2e(conv_pid_early)
+                )
+                if parent_e2e and own_pid not in direct_protected:
+                    self._count("mirrorDerivedSkipped")
+                    continue
             # #948 這條 session 行屬於哪段對話（壓縮鏈的根）。根 ＝ 自己時，以下全部逐字不變。
             conv = origin["conversationId"]
             conv_pid = self._rev.get(conv) or self._stored_rev.get(conv, conv)
@@ -3532,6 +3534,11 @@ class Connector:
                 conv_owner = reg.conversation_of(conv_pid)
                 if conv_owner is not None:
                     conv_pid = reg.wire_identity_of(conv_owner) or conv_pid
+            # #1048/I2：身份已在別名表確立（pre-#1010 併投過的對話）＝ server 只以那個 id
+            # 認識這段對話。這種明文續接必須維持合併上報：以自己的 id 進 wire 會讓
+            # conversationId 指向一個 server 從沒見過的線程 → 同一段對話在列表長出第二行。
+            identity_established = conv_owner is not None
+            e2e_adopted = False
             if pinned is None and conv_pid != own_pid and (
                 self._e2e.is_protected(own_pid) or self._e2e.is_protected(conv_pid)
             ):
@@ -3559,9 +3566,16 @@ class Connector:
                     conv, conv_pid = sid, own_pid
                 else:
                     self._count("mirrorLineageE2eAdopted")
+                    e2e_adopted = True
             adopted = conv_pid != own_pid
             pid = conv_pid
-            if adopted and pinned is None:
+            if origin["kind"] == "derived":
+                # #1010：派生不併進父。以自己的 id 上報，server 建 nested 行。
+                conv, conv_pid, pid, adopted = sid, own_pid, own_pid, False
+            if adopted and pinned is None and (identity_established or e2e_adopted):
+                # #1048：只有真走合併身份的歸屬才登記。#1010 的明文 send_own 線程在 wire 上
+                # 用自己的 id——登記它等於宣告「server 以合併身份認識它」，下一輪就會被 I2
+                # 釘回合併身份，跨輪輪換。
                 # #950 歸屬**先落表**（下面發批前 `_save_mirror_state(strict=True)` 落盤，
                 # 早於任何內容離開本機）：崩在中間會讓別名少一環，而 aliasHistoryTrusted 是
                 # 持久 true 的——丟了就再也發現不了。只登記**真的發生過歸屬**的線程：根線程
@@ -3665,19 +3679,39 @@ class Connector:
             # 續接就會被 SKIP_SOURCES 濾掉、那條會話從此靜默停更（正文只有加密鏡像這一條路）。
             # 未採納時 pid ≡ own_pid，與改前逐字節相同。
             established = (pid != sid) or (sid in wm)
-            if not keepable(eff_source, eff_title) and not (e2e and established):
+            if (
+                origin.get("kind") != "derived"
+                and not keepable(eff_source, eff_title)
+                and not (e2e and established)
+            ):
                 continue
-            # #969/#985 上報血緣。鏡像一律當「已在本地判定過」：續接併進 `pid`、派生
-            # 不建會話。E2E 身份閘沒合併的續接也必須報 root——據實報 continuation 會讓
-            # 新 server 把密文並進父會話，而 K_S 還綁在這條 child 上。
-            wire_origin = to_wire_origin(
-                pid,
-                {
+            # #1010：派生 / 明文續接以自己的 id 進 wire，據實報 kind。
+            # E2E 續接沒有獨立 K_S 時仍掛父身份（密文必須用父鑰匙）。
+            # 自己持着另一把 K_S 的續接報 root，絕不報 continuation。
+            send_own = (
+                origin.get("kind") == "derived"
+                or not adopted
+                or own_pid in direct_protected
+                # #1048：身份確立過的明文續接不輪換（I2），維持合併上報。
+                or (not e2e and not identity_established)
+            )
+            if send_own:
+                wire_id = own_pid
+                report = {
                     **origin,
                     "evidence": origin.get("evidence") or lineage_ev,
-                },
-                merged=True,
-            )
+                }
+                if own_pid in direct_protected and origin.get("kind") == "continuation":
+                    report["kind"] = "root"
+                    report["conversationId"] = own_pid
+                wire_origin = to_wire_origin(wire_id, report, merged=False)
+            else:
+                wire_id = pid
+                wire_origin = to_wire_origin(
+                    pid,
+                    {**origin, "evidence": origin.get("evidence") or lineage_ev},
+                    merged=True,
+                )
             if wire_origin["evidence"] == "absent":
                 self._count("mirrorOriginsAbsent")
             if has_new:
@@ -3687,7 +3721,7 @@ class Connector:
                         self._count("mirrorContinuationAdopted")
                     batch.append(
                         self._mirror_entry(
-                            pid, eff_title, eff_source, archived, msgs, e2e, origin=wire_origin
+                            wire_id, eff_title, eff_source, archived, msgs, e2e, origin=wire_origin
                         )
                     )
                     touched[sid] = new_wm
@@ -3699,7 +3733,7 @@ class Connector:
                 # 不入 touched（不推水位線）。server 對非占位的會話自會 no-op。
                 batch.append(
                     self._mirror_entry(
-                        pid, eff_title, eff_source, archived, [], e2e, origin=wire_origin
+                        wire_id, eff_title, eff_source, archived, [], e2e, origin=wire_origin
                     )
                 )
                 title_updates[sid] = eff_title

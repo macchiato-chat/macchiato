@@ -152,14 +152,12 @@ describe("#967 ① mirror_append 帶上 ThreadOrigin", () => {
     );
     (m as any).doPoll();
 
-    for (const s of sessionsOf(frames)) {
-      expect(s.hermesSessionId).toBe(parent);
-      // origin.threadId 必須 === hermesSessionId，否則 server 判成「連接器發了自相矛盾的
-      // 元數據」→ 退回老行為，這份上報等於白發。
-      expect(s.origin.threadId).toBe(s.hermesSessionId);
-      expect(s.origin.conversationId).toBe(parent);
-      expect(s.origin.kind).toBe("root");
-    }
+    const byId = new Map(sessionsOf(frames).map((s: any) => [s.hermesSessionId, s]));
+    expect(byId.get(parent).origin.kind).toBe("root");
+    const childSess = byId.get(child);
+    expect(childSess.origin.threadId).toBe(child);
+    expect(childSess.origin.conversationId).toBe(parent);
+    expect(childSess.origin.kind).toBe("continuation");
   });
 
   it("連對話指紋都取不到（evidence=absent）→ 不帶 origin，server 走老行為", () => {

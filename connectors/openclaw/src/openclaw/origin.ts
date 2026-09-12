@@ -195,9 +195,9 @@ export function parseSessionOrigin(row: GatewaySessionRow): SessionOrigin {
 /**
  * #968 本地血緣 → 協議 `ThreadOrigin`（上報給 server 的那份**事實**）。
  *
- * #985：映射本身已經據實（`user→root` / `subagent|internal→derived` / 未知 kind 加前綴）。
- * 連接器**仍按本地 `isHiddenOrigin` 過濾**（老 server 沒判定表，停本地隱藏會讓列表爆出
- * cron/子 agent）。判定權交回 server 要等生產 server 已跑 #926 判定 + #985 熔斷，再開後續。
+ * #985 / #1010：映射據實（`user→root` / `subagent|internal→derived` / 未知 kind 加前綴）。
+ * 鏡像不再按 `isHiddenOrigin` 整檔丟掉——線程以自己的 key 進 wire，server 判 nested /
+ * quarantined。`isHiddenOrigin` 只留給 E2E 父會話下沒有獨立 K_S 的派生（明文會洩密）。
  *
  * 詞彙對照（左 = 四家連接器共用的說法，右 = server 判定表的值域）：
  *   - `user`     → `root`     頂層用戶對話 → 進列表
@@ -233,8 +233,7 @@ export function toThreadOrigin(origin: SessionOrigin, wireId: string): ThreadOri
 }
 
 /**
- * 鏡像口徑：只有 `user` 進用戶列表；`subagent` / `internal` 是執行單元，不佔一行。
- * #985 先不拆這道閘——舊 server / 當前 prod 還沒判定表，拆了就是列表裡多出一堆機器線程。
+ * 派生 / 未知 kind。#1010 起不再等於「本地不建會話」——server 才決定可見性。
  */
 export function isHiddenOrigin(origin: SessionOrigin): boolean {
   return origin.kind !== "user" || origin.quarantined === true;
