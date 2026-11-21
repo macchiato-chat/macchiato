@@ -1,5 +1,5 @@
 {
-  "version": "1.5.83",
+  "version": "1.5.84",
   "bootstrapVersion": 1,
   "bootstrapSha256": "85c0cd42ce9c49b7e8bd55b3987e44f90fc9b7f1516b6a4341352fd0901d79c1",
   "files": {
@@ -47,7 +47,7 @@
   "connectors/claude-code/src/health.ts": "c4213385c01aed264bd71891dc051b3562bf9635d66675ea874ebd4243cda6e9",
   "connectors/claude-code/src/identity.ts": "d5f30438365ecf8d129a44fc82200cc9053bc53023b71909cacf4df607dcbcab",
   "connectors/claude-code/src/index.ts": "35f3bdcf077902c96ae0d1417172d2cacb6806b3b666824c5d999607380195e1",
-  "connectors/claude-code/src/linkb/proto.ts": "17b7e339fa7ce81cf5208d01b8b48042990776bc3366995db279809fcdeab3b9",
+  "connectors/claude-code/src/linkb/proto.ts": "1d89eb6d5c3e83ffbca56030037910d1f9d9c992b94b4ca4ca5a397cfb095e5d",
   "connectors/claude-code/tsconfig.json": "a353353d0e9ff9d32180e84354309b57d0a3d54ee2c8a9a328abdfeb4c089dfc",
   "connectors/codex/package-lock.json": "32a3501221c83c3350393c57ffc77f885d75ff1cea8d94fbbd21072da72b403b",
   "connectors/codex/package.json": "6696b61e3ec3478ed3aca371daab12c12ae5a3cab3dcafabab46ac22e6842da4",
@@ -94,15 +94,15 @@
   "connectors/codex/src/health.ts": "2b0db3ebb20878d64ba2a21f7ef0ac2e7a1edc4c907196293b1803dc2509adef",
   "connectors/codex/src/identity.ts": "e8215539164cf3f6effb45ff30d93e345b6fcb40b1fb269531c84bdb53bbff4d",
   "connectors/codex/src/index.ts": "bbeecf042ffa99de6edf026954dae8d2633205bd4ea45eaae59e855657c31511",
-  "connectors/codex/src/linkb/proto.ts": "ac19d4b41a6614fdcb869d69e30a6662b0c7b0b24b3256c11510cd49dd9d787f",
+  "connectors/codex/src/linkb/proto.ts": "b11e1d5516502fb4b9f1115c5fb2df6f7b134571fc5ff0c3dae33fb8e3f4ec9a",
   "connectors/codex/tsconfig.json": "a353353d0e9ff9d32180e84354309b57d0a3d54ee2c8a9a328abdfeb4c089dfc",
   "connectors/hermes/backfill.py": "0b0e73be9aa905c9c6471e3c62a36ff82754b9e1777c7aba2383bd6053c2729d",
-  "connectors/hermes/connector.py": "c073340a1da4cddf185dc33720fdade090575f505e5905483e3c7075240b47b8",
+  "connectors/hermes/connector.py": "a02e624ccab99d69ea05e445f3ec489522baaf4c66a9d9dc602bfd0cb4863877",
   "connectors/hermes/cwd.py": "d4db2a2f608b709e8fe888f906fe3ebec9f6a5b9052e8eefd9558d532e21e209",
   "connectors/hermes/e2e_control.py": "569fe32dc0b19b8caace0d38bd96791a59b69121a7900e804ca73cb326dff6b2",
   "connectors/hermes/e2e_crypto.py": "cd22ee138ff829317883551e07c3992da606951fd30e920fb03fbeebb97d6915",
   "connectors/hermes/e2e_keys.py": "e4dc2e215ae9ab737530429b3d9056c59cb66164250733586d35957bae3c2f0d",
-  "connectors/hermes/gateway_client.py": "d8a4e9b48bc9bee170393d09d78be68c51286f30fc6ddc21455fcf154e4f6917",
+  "connectors/hermes/gateway_client.py": "8c8d5bbd90777de9960151075ca75acb80115ba654eeb8ff55df4733a39b919a",
   "connectors/hermes/media.py": "9c249a5e1867f111e1625b24364a46b9b76b67a23dc2eafba5e61a04f834fc45",
   "connectors/hermes/pair.py": "16e7bba49677c4fea521e1a1ed6bb2516aec2489aac8896f75254bc00e11e9df",
   "connectors/hermes/plugin/macchiato/__init__.py": "1792e361eab0aea87bc38b61e2e200f55b885fcaf0ae1897d332d3bdffa722e6",
@@ -144,7 +144,7 @@
   "connectors/openclaw/src/health.ts": "f6f7a193c8da5322ed7c9547462cde75603e67ae8f676aa5db807ac7a25ba565",
   "connectors/openclaw/src/identity.ts": "8f1600bc783a53126490f5294afd407e856f2292a236be65850eed66ae2dc2dc",
   "connectors/openclaw/src/index.ts": "e56bf6b26cb89c927f9b8a320f2300b7679964c811ef43f150d8391654aa42c1",
-  "connectors/openclaw/src/linkb/proto.ts": "d48804bf81a7f89e4b6ff382ae119a15394892a4794875efedd655d5b78c863e",
+  "connectors/openclaw/src/linkb/proto.ts": "95aaf817ad9f81c62c4893c62bb550caa5539a959f54a8b2477b5bb2af2a3096",
   "connectors/openclaw/src/openclaw/attachments.ts": "d09b10c6f14dce80e12edd0d5f29f2128deec7f74a584562fe109df21df2e5f7",
   "connectors/openclaw/src/openclaw/commands.ts": "548d4742fac6821b2e04394cf95c64d333cdc3d8ae82987f4cfa643a5162bb8a",
   "connectors/openclaw/src/openclaw/config.ts": "58cc7910ded50025dc380b187b27f1e2f4b88fbc067617d845e50efe986e19cb",
@@ -157,6 +157,6 @@
   "connectors/openclaw/src/openclaw/titles.ts": "12c75e3fcf78dfe60e2b3199b62ab4128f15c214de095f28c8ae8d896d571624",
   "connectors/openclaw/src/push/handler.ts": "ba590bf4f89f84a3e0e836f56def493274c89a2da55cd3313c60767e02716b49",
   "connectors/openclaw/tsconfig.json": "a353353d0e9ff9d32180e84354309b57d0a3d54ee2c8a9a328abdfeb4c089dfc",
-  "install.sh": "bffd78819df86133145dd712da6f020d99467162abc912b61e373f563525ed36"
+  "install.sh": "8223344949e6a67c66533664278c403415d9928c5b13276cb7dd7486a1de91bb"
   }
 }

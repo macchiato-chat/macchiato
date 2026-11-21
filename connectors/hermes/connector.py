@@ -30,6 +30,38 @@ Env:
 
 from __future__ import annotations
 
+if __name__ == "__main__":
+    # Hermes ≥ 0.22 keeps its packages in a managed environment that is rebuilt on every update,
+    # and the interpreter that launched us may be an older venv whose packages no longer match the
+    # checkout (`import gateway.platforms.base` then fails on modules that venv never knew).
+    # `hermes_bootstrap` is Hermes's own entry hook for exactly this: it selects the current
+    # environment and, when the interpreter itself is the wrong one, re-executes this script
+    # under the right one (it ships with Hermes 0.21.5+; older ones have no module to import).
+    # Only when run as the program: importing this module (the supervisor's probe, the tests) must
+    # never re-exec the importer. Not when the stdio transport is pinned: that is localchain's fake
+    # gateway, which lives on a PYTHONPATH the re-exec would drop.
+    import os as _os
+    import sys as _sys
+
+    if (_os.environ.get("MACCHIATO_HERMES_TRANSPORT") or "").strip().lower() != "stdio":
+        try:
+            import hermes_bootstrap  # noqa: F401
+        except ImportError:
+            pass  # no Hermes on the path — the imports below will say what is actually missing
+    # The re-exec runs this file through runpy, which (unlike `python connector.py`) does not put
+    # the script's own directory on sys.path — and that is where our sibling modules live.
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    if _here not in _sys.path:
+        _sys.path.insert(0, _here)
+    # It also runs isolated (-I), so PYTHONUNBUFFERED from the service unit no longer applies and
+    # stdout into journald would arrive in 8 KB lumps. Our log lines are read live (the supervisor,
+    # the regression contracts, a person tailing the journal): keep them line-buffered.
+    for _stream in (_sys.stdout, _sys.stderr):
+        try:
+            _stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
+
 import asyncio
 import errno
 import importlib
@@ -120,7 +152,7 @@ LINK_B_PROTO = 5  # 對齊 server（packages/protocol：B=5，#348/#368 可靠 A
 # 四連接器常量(cc/codex/openclaw 各自 src/index.ts + 這裡)+ protocol link.ts 全局。全局是 server
 # 判 updateAvailable 的標尺——bump 全局漏任何一家=該家 app 永亮「更新」(本機與公開用戶一起亮,
 # 重啟無用;2026-07-20 實踩);全局上生產後應儘快 sync-public 發版閉環。
-CONNECTOR_VERSION = "1.5.83"
+CONNECTOR_VERSION = "1.5.84"
 
 # #768 安裝目錄版本標記（對齊 TS connector-core/disk-version.ts）。
 _INSTALLED_VERSION_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
@@ -244,6 +276,17 @@ def _build_installer_env(source: dict[str, str], manifest_path: str) -> dict[str
 
 IMPORT_BATCH = 20
 # §15 全渠道持續鏡像（tail state.db）——默認常開;#308 MACCHIATO_MIRROR=off 可停(見 MIRROR_OFF)。
+# #1065 Hermes 0.21+ 的網關級變更通知(stdio 的 tui_gateway 也發):不帶 session_id、不屬於任何會話。
+GATEWAY_WIDE_EVENTS = frozenset({
+    "sessions.changed", "platforms.changed", "skills.changed", "projects.changed", "cron.changed",
+    "pairing.changed", "groups.changed", "skin.changed", "pet.changed", "bot_relay.outbox.pending",
+})
+
+
+def _is_gateway_wide(params: dict) -> bool:
+    return params.get("type") in GATEWAY_WIDE_EVENTS
+
+
 MIRROR_POLL_S = float(os.environ.get("MACCHIATO_MIRROR_POLL_S", "2"))  # 輪詢間隔（小=更即時、多步回合更增量）
 # F-01 / #348 durable outbox：未 ACK 批按此間隔重發（對齊 CC/Codex 15s），避免每 2s 刷 server。
 MIRROR_RESEND_S = float(os.environ.get("MACCHIATO_MIRROR_RESEND_S", "15"))
@@ -1004,17 +1047,42 @@ def _gc_attachments() -> int:
     return removed
 
 
-def _check_hermes_compat() -> dict:
+def _check_hermes_compat(transport: str = "stdio") -> dict:
     """探測連接器依賴的 Hermes 內部 API + 版本（Hermes 自動更新可能改動內部，需自檢）。
-    返回 {hermes_version, checks:{name: True|"FAIL: ..."}}。"""
+    返回 {hermes_version, checks:{name: True|"FAIL: ..."}}。
+
+    `transport` 決定回寫與主幹查什麼:stdio(Hermes ≤ 0.22)回寫走 `hermes_state.SessionDB`、
+    主幹是 `tui_gateway.entry`;attach(≥ 0.23)兩者都改由 gateway 承擔——`hermes_state` 在那邊
+    只剩轉發殼、歸檔 / rewind 方法已經沒了,再查它只會讓每個新版用戶永遠顯示「兼容降級」。"""
     checks: dict = {}
     ver = None
     try:
-        from importlib.metadata import version as _ver
+        # Hermes ≥ 0.21.6 的版本來自 checkout 本身(release tag + 距離);包元數據在那邊只是佔位,
+        # 升級上來的機器還會讀到最後一個有元數據的版本留下的 egg-info——0.23 的樹報成 0.20.0。
+        from hermes_cli import version_info as _vi
 
-        ver = _ver("hermes-agent")
-    except Exception as exc:
-        checks["hermes_version"] = f"FAIL: {exc!r}"
+        info = _vi.get_version_info()
+        if getattr(info, "source", None) == "unknown":
+            # profile 實例(HERMES_HOME=~/.hermes/profiles/<name>):Hermes 只在執行中的程式碼目錄
+            # (受管環境裡是一份不帶 .git 的副本)和 <HERMES_HOME>/hermes-agent 找 checkout,兩處
+            # 都沒有就算不出版本。checkout 其實在預設根底下,所有 profile 共用。
+            from pathlib import Path
+
+            from hermes_constants import get_default_hermes_root
+
+            checkout = Path(get_default_hermes_root()) / "hermes-agent"
+            if (checkout / ".git").exists():
+                info = _vi._git_version_info(checkout)
+        ver = info.display_version if info.display_version not in ("", "unknown") else None
+    except Exception:
+        ver = None  # 老 Hermes 沒有這個模塊 → 走下面的包元數據
+    if not ver:
+        try:
+            from importlib.metadata import version as _ver
+
+            ver = _ver("hermes-agent")
+        except Exception as exc:
+            checks["hermes_version"] = f"FAIL: {exc!r}"
 
     def _probe(name, fn):
         try:
@@ -1033,15 +1101,22 @@ def _check_hermes_compat() -> dict:
         for a in ("extract_media", "extract_local_files", "filter_media_delivery_paths"):
             assert hasattr(b, a), a
 
-    _probe("hermes_state.SessionDB", _sdb)  # session.archive 回寫
+    def _spec(module):
+        def _check():
+            import importlib.util as _u
+
+            # 只查模塊存在、不 import（tui_gateway.entry import 時會註冊 signal，工作線程里會炸）。
+            assert _u.find_spec(module) is not None, module
+
+        return _check
+
+    if transport == "attach":
+        _probe("gateway.session_mutations", _spec("gateway.session_mutations"))  # 歸檔/改名/rewind 回寫
+        _probe("hermes_cli.gateway_runtime_attach", _spec("hermes_cli.gateway_runtime_attach"))  # 主幹
+    else:
+        _probe("hermes_state.SessionDB", _sdb)  # session.archive 回寫
+        _probe("tui_gateway.entry", _spec("tui_gateway.entry"))  # gateway 主幹
     _probe("gateway.platforms.base", _base)  # 出站附件 extract_media
-    def _tui():
-        import importlib.util as _u
-
-        # 只查模塊存在、不 import（tui_gateway.entry import 時會註冊 signal，工作線程里會炸）。
-        assert _u.find_spec("tui_gateway.entry") is not None
-
-    _probe("tui_gateway.entry", _tui)  # gateway 主幹
     return {"hermes_version": ver, "checks": checks}
 
 
@@ -1249,6 +1324,8 @@ class Connector:
         loop = asyncio.get_running_loop()
 
         def on_event(params: dict) -> None:
+            if _is_gateway_wide(params):
+                return  # #1065 網關級變更通知,不屬於任何會話:server 那邊只會解析失敗
             # agent → you: translate real session id back to the server's, then forward.
             real_sid = params.get("session_id")
             server_sid = self._rev.get(real_sid, real_sid)
@@ -1325,11 +1402,15 @@ class Connector:
             on_event=on_event,
             on_restart=self._on_gateway_restart,
             hermes_python=self.hermes_python,
+            client_version=CONNECTOR_VERSION,
         )
         await self.gw.start()
         print("· hermes gateway up")
+        if self._attached():
+            # Hermes ≥ 0.23: we are a client of the home's gateway, not the owner of a process.
+            print("· hermes gateway: attached to the running gateway (hermes-gateway-v1)")
 
-        self._compat = await asyncio.to_thread(_check_hermes_compat)
+        self._compat = await asyncio.to_thread(_check_hermes_compat, getattr(self.gw, "transport", None) or "stdio")
         self._log_compat()
 
         # #154 首裝採樣:水位線文件(含 .bak)從未存在 = 這台機器第一次跑 → ready 後自動全量導入。
@@ -1356,7 +1437,9 @@ class Connector:
                 "e2eDeviceAuth": 1,  # #731 配對 secret + wrap 校驗 authProof
                 "e2eQuiesce": 1,
                 "mirrorDurable": 1,
-                "rewind": 1,  # #473 SessionDB.rewind_to_message(軟刪 active=0,原生能力)
+                # #473/#490 能力誠實:回寫路徑探測通過才宣告(stdio = SessionDB.rewind_to_message,
+                # attach = gateway 的 session.mutate rewind;兩者都是軟刪 active=0)。
+                **({"rewind": 1} if self._rewind_supported() else {}),
             }
         )
         # 保活心跳 + 自動重連：Fly 邊緣會掐閒置 WS；gateway 與 session 映射跨重連保留。
@@ -1733,6 +1816,16 @@ class Connector:
             self._save_mirror_state(self._mirror_st)
             print("· 鏡像水位線推進(≤srcId floor)——重啟不重發、in-flight 行留給鏡像補投", file=sys.stderr)
 
+    def _attached(self) -> bool:
+        """Hermes ≥ 0.23:我們是 home 裡那個 gateway 的客戶端,回寫經它的 session.mutate。"""
+        return getattr(getattr(self, "gw", None), "transport", None) == "attach"
+
+    def _rewind_supported(self) -> bool:
+        checks = (self._compat or {}).get("checks") or {}
+        if self._attached():
+            return checks.get("gateway.session_mutations") is True
+        return checks.get("hermes_state.SessionDB") is True
+
     def _session_db(self):
         # 懶加載 Hermes 的 SessionDB（連接器跑在 hermes-agent venv 內，同一份 hermes_state）。
         # 用它官方的 set_session_archived（會連帶處理壓縮 lineage，比裸 UPDATE 穩）。
@@ -1756,6 +1849,8 @@ class Connector:
             target_id = int(str(target_src_id).strip())
         except (TypeError, ValueError):
             return False, 0, "not_found"  # 非 state.db 行 id（導入/舊會話）→ 定位不到
+        if self._attached():
+            return await self._rewind_via_gateway(server_sid, real, target_id)
 
         def _do():
             db = self._session_db()
@@ -1782,9 +1877,55 @@ class Connector:
         print(f"· session.rewind {sid} → 軟刪 {rewound} 行(active=0),運行時句柄已丟")
         return True, rewound, None
 
+    async def _rewind_via_gateway(self, server_sid: str, real: str, target_id: int) -> tuple[bool, int, str | None]:
+        """Hermes ≥ 0.23:gateway 擁有 state.db,rewind 經 `session.mutate`(同樣軟刪 active=0)。
+        寫的是目標行所在的那一段:壓縮過的會話,鏡像身份是血緣的根,用戶點的那條卻在後面的段裡。"""
+        sid = await asyncio.to_thread(self._row_session, target_id) or real
+        try:
+            res = await self.gw.mutate(sid, "rewind", {"target_message_id": target_id})
+        except GatewayError as exc:
+            reason = exc.data.get("reason") or exc.message
+            if reason == "session_busy":
+                return False, 0, "busy"  # 回合在跑:server 照 409 告訴用戶稍後再試
+            if reason in ("not_found", "invalid_params", "invalid_target"):
+                return False, 0, "not_found"
+            print(f"[rewind failed] {safe_err(exc)}", file=sys.stderr)
+            return False, 0, "failed"
+        rewound = int((res or {}).get("rewound_count") or 0)
+        print(f"· session.rewind {short_id(sid)} → 軟刪 {rewound} 行(active=0,經 gateway)")
+        return True, rewound, None
+
+    @staticmethod
+    def _row_session(row_id: int) -> str | None:
+        """state.db 某行屬於哪個會話(唯讀)。查不到就 None,調用方退回映射出來的 id。"""
+        import sqlite3
+
+        db = os.path.join(_hermes_home(), "state.db")
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        except sqlite3.Error:
+            return None
+        try:
+            row = con.execute("select session_id from messages where id=?", (row_id,)).fetchone()
+            return row[0] if row and row[0] else None
+        except sqlite3.Error:
+            return None
+        finally:
+            con.close()
+
     async def _set_hermes_title(self, server_sid: str, title: str) -> None:
         # #161 手動改名回寫(archive 同款路徑):自驅會話用持久映射的 state.db id;導入會話用原值。
         real = self._stored.get(server_sid) or self._fwd.get(server_sid, server_sid)
+        if self._attached():
+            try:
+                await self.gw.mutate(real, "rename", {"title": title})
+            except GatewayError as exc:
+                # 例如 Hermes 這邊已有同名會話(標題唯一):Macchiato 的標題照改,Hermes 保留原名。
+                print(f"[session.rename {short_id(real)} 未寫回 Hermes] {safe_err(exc)}", file=sys.stderr)
+                return
+            print(f"· session.rename {short_id(real)} len={text_len(title)} (ok,經 gateway)")
+            log_content("session.rename", title)
+            return
 
         def _do():
             db = self._session_db()
@@ -1800,6 +1941,11 @@ class Connector:
         # session.archive 是 server 造的合成方法、tui_gateway 沒有 → 連接器自己寫 state.db。
         # 自驅會話用持久映射的 state.db id（運行時句柄不是庫行）；導入會話 fallback 用原值。
         real = self._stored.get(server_sid) or self._fwd.get(server_sid, server_sid)
+        if self._attached():
+            # Hermes ≥ 0.23:gateway 擁有 state.db,經 session.mutate 寫(歸檔整條壓縮血緣)。
+            await self.gw.mutate(real, "archive", {"archived": archived})
+            print(f"· session.archive {short_id(real)} → archived={archived}（ok,經 gateway）")
+            return
 
         def _do():
             db = self._session_db()
@@ -3644,8 +3790,16 @@ class Connector:
                 if has_new:
                     # cron → 訂閱 feed：只取 agent 文字報告，併進合成線 cron:<job>（§16）。
                     msgs, new_wm = await tail_session(sid, floor)
+                    # #1067 srcId 必須帶上：durable outbox 在 ACK 前每 15s 原樣重發，server 只靠它
+                    # 去重。丟了它，DB 卡 22 分鐘 = 一份日報落 85 份（2026-10-17 生產）。feed 線
+                    # 併多次運行，但 state.db 消息 id 全局唯一，不會互撞。
                     reports = [
-                        {"role": "agent", "text": m["text"], "createdAt": m.get("createdAt")}
+                        {
+                            "role": "agent",
+                            "text": m["text"],
+                            "createdAt": m.get("createdAt"),
+                            **({"srcId": m["srcId"]} if m.get("srcId") else {}),
+                        }
                         for m in msgs
                         if m["role"] == "agent" and (m.get("text") or "").strip()
                     ]
@@ -5228,10 +5382,13 @@ class Connector:
                             self._e2e_approvals.pop(server_sid, None)
                     real = await self._ensure_session(server_sid)
                     self._plain_approvals.discard(server_sid)  # #669 心跳:已答覆 → 不再掛起
-                    await self.gw.request(
-                        "approval.respond",
-                        {"session_id": real, "choice": params.get("choice", "deny"), "all": params.get("all", False)},
-                    )
+                    respond = {"session_id": real, "choice": params.get("choice", "deny"), "all": params.get("all", False)}
+                    # #1123 Hermes ≥ 0.23:卡上的 request_id 就是 gateway 的 prompt id → 回帶,答到這一張而不是
+                    # 最舊那張。stdio 不帶:那邊的 id 可能是 E2E 路徑自己生成的(hermes-<uuid>),gateway 不認得。
+                    card_id = params.get("request_id") or params.get("requestId")
+                    if self._attached() and isinstance(card_id, str) and card_id:
+                        respond["request_id"] = card_id
+                    await self.gw.request("approval.respond", respond)
                 # requestId/digest 在排队前同步核对一次，避免先 ACK 后才在异步链发现错卡。
                 if authenticated_control:
                     pending = self._e2e_approvals.get(server_sid)

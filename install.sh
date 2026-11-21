@@ -560,8 +560,71 @@ fi
 install_supervisor
 
 # ═════════════════════════════ Hermes ═══════════════════════════════════════
+# #1121: Hermes >= 0.22 ('hermes pm') keeps its Python in a managed environment rebuilt on every
+# update, beside a toolchain whose directory carries its version: a service may pin neither. For a
+# launcher that answers --print-runtime-command (Hermes's machine boundary for external consumers)
+# write $HOME/.macchiato/bin/hermes-python, which asks it afresh on every start and runs our script
+# with the bootstrap it hands back, the way Hermes starts itself. Prints the runner's path;
+# non-zero when this launcher predates the boundary.
+hermes_runner() {
+  local launcher="$1" out runner tmp
+  case "$launcher" in *"'"*) return 1 ;; esac
+  out="$("$launcher" --print-runtime-command --module __macchiato_entry__ </dev/null 2>/dev/null)" || return 1
+  case "$out" in '['*__macchiato_entry__*) ;; *) return 1 ;; esac
+  runner="$HOME/.macchiato/bin/hermes-python"
+  mkdir -p "$HOME/.macchiato/bin" || return 1
+  tmp="$runner.tmp.$$"
+  {
+    printf '%s\n' '#!/bin/sh' \
+      '# Macchiato hermes-python (#1121): run Python inside the Hermes managed environment.' \
+      '# Written by the Macchiato installer and rewritten on every install / self-update.' \
+      '# Mirrors the python forms the connector and its supervisor use:' \
+      '#   hermes-python SCRIPT [ARG ...]   |   hermes-python -c CODE [ARG ...]'
+    printf "launcher='%s'\n" "$launcher"
+    cat <<'RUNNER'
+# (No line of this here-document may start with "}": function extractors stop there.)
+cmd=$("$launcher" --print-runtime-command --module __macchiato_entry__ </dev/null) ||
+  { echo "hermes-python: $launcher did not answer --print-runtime-command (was Hermes moved or removed?)" >&2; exit 1; }
+py=$(printf '%s\n' "$cmd" | sed -n 's/^\[ *"\([^"]*\)".*/\1/p')
+if [ -z "$py" ] || [ ! -x "$py" ]; then
+  echo "hermes-python: unexpected runtime command from $launcher" >&2
+  exit 1
+fi
+exec "$py" -I -c '
+import json, os, sys
+argv = json.loads(sys.argv[1])
+code = argv[argv.index("-c") + 1]
+entry = "runpy.run_module(%r, run_name=%r, alter_sys=True)" % ("__macchiato_entry__", "__main__")
+if entry not in code:
+    sys.exit("hermes-python: this Hermes returned a runtime command it does not know how to wrap")
+args = sys.argv[2:]
+if args[:1] == ["-c"] and len(args) > 1:
+    run = ("sys.argv = [%r] + %r; sys.path.insert(0, os.getcwd()); "
+           "exec(compile(%r, %r, %r), {%r: %r, %r: __builtins__})"
+           % ("-c", args[2:], args[1], "<string>", "exec", "__name__", "__main__", "__builtins__"))
+elif args and args[0] != "-c":
+    script = os.path.abspath(args[0])
+    run = ("sys.argv = %r; sys.path.insert(0, %r); runpy.run_path(%r, run_name=%r)"
+           % (args, os.path.dirname(script), script, "__main__"))
+else:
+    sys.exit("usage: hermes-python SCRIPT [ARG ...] | hermes-python -c CODE [ARG ...]")
+exec(code.replace(entry, run))
+' "$cmd" "$@"
+RUNNER
+  } >"$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$runner" || { rm -f "$tmp"; return 1; }
+  echo "$runner"
+}
+
 find_hermes_python() {
   if [ -n "${HERMES_PYTHON:-}" ]; then echo "$HERMES_PYTHON"; return; fi
+  # #1121: Hermes >= 0.22 first — its launcher hands out the current runtime (see hermes_runner).
+  # The checkout's own launcher by absolute path (heal runs under env -i, PATH not widened), then
+  # the $HOME/.local/bin shim / PATH for --dir installs.
+  local launcher runner
+  for launcher in "$HOME/.hermes/hermes-agent/.hermes/bin/hermes" "$HOME/.local/bin/hermes" "$(command -v hermes 2>/dev/null || true)"; do
+    [ -n "$launcher" ] && [ -f "$launcher" ] || continue
+    runner="$(hermes_runner "$launcher")" && { echo "$runner"; return; }
+  done
   local cand
   # #927: Hermes 0.20+ 的官方安裝器把 agent 和它的 venv 放在 $HERMES_HOME/hermes-agent
   # (默認 ~/.hermes);升級後 pipx 目錄常留著 0.19 的殘骸,先命中它就會綁錯解釋器。
@@ -605,7 +668,8 @@ install_hermes() { # $1 = Hermes profile name ("" / absent = the default ~/.herm
   local PY APP="$STATE/app" CRED="$STATE/connector.json"
   PY="$(find_hermes_python)"
   [ -n "$PY" ] || fail "Hermes not found. Install it first (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash), or set HERMES_PYTHON and re-run."
-  "$PY" -c "import websockets" 2>/dev/null || fail "Hermes venv is missing websockets (required). Run: $PY -m pip install websockets"
+  # #1121: never send people to pip into Hermes's own environment ('hermes pm' owns it).
+  "$PY" -c "import websockets" 2>/dev/null || fail "Hermes's Python ($PY) cannot import websockets (required). Run 'hermes update' (or 'hermes pm repair'), then re-run this installer."
   say "$WHAT connector → $APP  (python: $PY)"
   verify_tree "$TMP/connectors/hermes" "connectors/hermes"
   mkdir -p "$APP"
@@ -1026,7 +1090,7 @@ do_uninstall() {
     "$HOME/.macchiato"/*-app.next "$HOME/.macchiato/app.next" \
     "$HOME/.macchiato"/*-app.bad "$HOME/.macchiato/app.bad"
   rm -f "$HOME/.macchiato/bin/macchiato-supervise" "$HOME/.macchiato/bin/release_verify.py" \
-    "$HOME/.macchiato/bin/update_decider.py"
+    "$HOME/.macchiato/bin/update_decider.py" "$HOME/.macchiato/bin/hermes-python"
   # #669 原子就位留下的舊版備份與(中斷才會殘留的)暫存檔——不清掉 rmdir 永遠清不空 bin/。
   rm -f "$HOME/.macchiato/bin"/*.prev "$HOME/.macchiato/bin"/*.new
   rmdir "$HOME/.macchiato/bin" 2>/dev/null || true

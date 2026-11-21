@@ -1,9 +1,9 @@
 {
   "schema": 1,
-  "signedAt": "2026-09-12T23:53:39Z",
-  "expires": "2026-10-12T23:53:39Z",
-  "version": "1.5.83",
-  "rolloutPercent": 100,
+  "signedAt": "2026-11-21T04:55:01Z",
+  "expires": "2026-12-21T04:55:01Z",
+  "version": "1.5.84",
+  "rolloutPercent": 0,
   "blocked": [],
-  "sequence": 11
+  "sequence": 12
 }
